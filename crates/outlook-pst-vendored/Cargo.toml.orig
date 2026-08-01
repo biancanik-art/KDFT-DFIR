@@ -1,0 +1,17 @@
+[package]
+name = "outlook-pst"
+description = "Outlook PST Store Provider in Rust"
+version = "1.2.0"
+
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+byteorder.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

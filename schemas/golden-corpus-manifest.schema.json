@@ -1,0 +1,604 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kdft.local/schemas/golden-corpus-manifest.schema.json",
+  "title": "KDFT Golden Corpus Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "dataset_id",
+    "dataset_version",
+    "creation_script_version",
+    "purpose",
+    "source_image",
+    "environment",
+    "expected",
+    "limitations",
+    "sources"
+  ],
+  "properties": {
+    "dataset_id": {
+      "type": "string",
+      "pattern": "^kdft-[a-z0-9][a-z0-9-]*-[0-9]{3}$"
+    },
+    "dataset_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "creation_script_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scope": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "source_image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "format",
+        "path_or_external_id",
+        "sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "format": {
+          "type": "string",
+          "enum": [
+            "raw",
+            "dd",
+            "e01",
+            "segmented_e01",
+            "vhd",
+            "vhdx",
+            "vdi",
+            "vmdk",
+            "aff4",
+            "fixture"
+          ]
+        },
+        "path_or_external_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "segment_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sparse": {
+          "type": "boolean"
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "architecture",
+        "partition_table",
+        "sector_size_bytes",
+        "filesystems"
+      ],
+      "properties": {
+        "os": {
+          "type": "string",
+          "minLength": 1
+        },
+        "os_build": {
+          "type": "string"
+        },
+        "architecture": {
+          "type": "string",
+          "enum": [
+            "x86_64",
+            "aarch64",
+            "arm64",
+            "i386",
+            "unknown"
+          ]
+        },
+        "partition_table": {
+          "type": "string",
+          "enum": [
+            "mbr",
+            "gpt",
+            "hybrid",
+            "none",
+            "corrupt",
+            "unknown"
+          ]
+        },
+        "sector_size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "filesystems": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "version": {
+                "type": "string"
+              },
+              "options": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "uniqueItems": true
+              }
+            }
+          }
+        },
+        "encryption": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "state"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "none",
+                "bitlocker",
+                "filevault",
+                "luks",
+                "other"
+              ]
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "unencrypted",
+                "locked",
+                "unlockable",
+                "unsupported",
+                "detect_only"
+              ]
+            },
+            "method": {
+              "type": "string"
+            },
+            "credential_policy": {
+              "type": "string",
+              "description": "Describe how synthetic credentials are supplied without storing real secrets."
+            }
+          }
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "partitions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/partition"
+          }
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/file"
+          }
+        },
+        "deleted_files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/deletedFile"
+          }
+        },
+        "timestamps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/timestampExpectation"
+          }
+        },
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
+        },
+        "parser_outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/parserOutput"
+          }
+        },
+        "raw_search_hits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/rawSearchHit"
+          }
+        },
+        "reports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reportExpectation"
+          }
+        }
+      }
+    },
+    "intentional_corruption": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "description",
+          "expected_behavior"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "expected_behavior": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "known_unsupported_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "capability",
+          "expected_message"
+        ],
+        "properties": {
+          "capability": {
+            "type": "string"
+          },
+          "expected_message": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "validation_commands": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "url"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{64}$"
+    },
+    "rfc3339": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "partition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "start_offset",
+        "size_bytes",
+        "filesystem"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "name": {
+          "type": "string"
+        },
+        "start_offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "filesystem": {
+          "type": "string"
+        },
+        "expected_region": {
+          "type": "string"
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "physical_offsets": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "attributes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        }
+      }
+    },
+    "deletedFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "recovery",
+        "layout"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "physical_offsets": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "attributes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "recovery": {
+          "type": "string",
+          "enum": [
+            "complete",
+            "partial",
+            "metadata_only",
+            "not_recoverable"
+          ]
+        },
+        "layout": {
+          "type": "string",
+          "enum": [
+            "contiguous",
+            "fragmented",
+            "partially_overwritten",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "timestampExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "field",
+        "value_utc"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "field": {
+          "type": "string",
+          "enum": [
+            "created",
+            "modified",
+            "accessed",
+            "mft_modified",
+            "artifact_time",
+            "other"
+          ]
+        },
+        "value_utc": {
+          "$ref": "#/$defs/rfc3339"
+        },
+        "timezone": {
+          "type": "string"
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_kind",
+        "path",
+        "expected_count"
+      ],
+      "properties": {
+        "artifact_kind": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "expected_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expected_fields": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "number",
+              "integer",
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "parserOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "parser",
+        "expected_entries"
+      ],
+      "properties": {
+        "parser": {
+          "type": "string"
+        },
+        "expected_entries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expected_status": {
+          "type": "string"
+        },
+        "canonical_json_path": {
+          "type": "string"
+        }
+      }
+    },
+    "rawSearchHit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "query",
+        "offset",
+        "length",
+        "encoding"
+      ],
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "length": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "encoding": {
+          "type": "string"
+        },
+        "sector": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "region": {
+          "type": "string"
+        }
+      }
+    },
+    "reportExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bookmark_folder",
+        "expected_item_count"
+      ],
+      "properties": {
+        "bookmark_folder": {
+          "type": "string"
+        },
+        "expected_item_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "must_include": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

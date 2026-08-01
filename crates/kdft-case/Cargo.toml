@@ -1,0 +1,45 @@
+[package]
+name = "kdft-case"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aho-corasick.workspace = true
+anyhow.workspace = true
+bitlocker-decrypt = { path = "../bitlocker-decrypt" }
+chrono.workspace = true
+chrome-cache-parser.workspace = true
+codepage-strings.workspace = true
+disk-forensic.workspace = true
+evtx.workspace = true
+ext4.workspace = true
+fatfs.workspace = true
+mft.workspace = true
+ntfs.workspace = true
+nom.workspace = true
+notatin.workspace = true
+outlook-pst.workspace = true
+positioned-io.workspace = true
+positioned-io2.workspace = true
+quick-xml.workspace = true
+rayon.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+vdi.workspace = true
+zip.workspace = true
+xpress-huffman.workspace = true
+
+[[test]]
+name = "pst_tests"
+path = "src/pst.rs"
+
+[[test]]
+name = "lnk_tests"
+path = "src/lnk.rs"
+
+[[test]]
+name = "prefetch_tests"
+path = "src/prefetch.rs"

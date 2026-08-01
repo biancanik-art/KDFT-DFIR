@@ -1,0 +1,16 @@
+﻿[package]
+name = "kdft-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kdft"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+kdft-case = { path = "../kdft-case" }
+serde.workspace = true
+serde_json.workspace = true

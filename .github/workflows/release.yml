@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust quality components
+        run: rustup component add clippy rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint every target
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Enforce panic-free production code
+        run: cargo clippy --workspace --lib --bins --locked -- -D warnings -D clippy::panic -D clippy::todo -D clippy::unimplemented -D clippy::unreachable -D clippy::unwrap_used -D clippy::expect_used
+      - name: Test the complete workspace
+        run: cargo test --workspace --all-targets --locked
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+  windows:
+    name: Build Windows x64
+    needs: verify
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release --locked -p kdft-ui -p kdft-cli
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item target/release/kdft-ui.exe, target/release/kdft.exe, README.md, LICENSE, NOTICE, THIRD_PARTY_NOTICES pkg/
+          Compress-Archive -Path pkg/* -DestinationPath "kdft-$tag-windows-x64.zip"
+          Copy-Item target/release/kdft-ui.exe "kdft-ui-$tag-windows-x64.exe"
+          Copy-Item target/release/kdft.exe "kdft-$tag-windows-x64.exe"
+      - name: Upload build products
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: |
+            kdft-${{ github.ref_name }}-windows-x64.zip
+            kdft-ui-${{ github.ref_name }}-windows-x64.exe
+            kdft-${{ github.ref_name }}-windows-x64.exe
+          if-no-files-found: error
+
+  linux:
+    name: Build Linux x64
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release --locked -p kdft-ui -p kdft-cli
+      - name: Package
+        run: |
+          tag="${{ github.ref_name }}"
+          mkdir pkg
+          cp target/release/kdft-ui target/release/kdft README.md LICENSE NOTICE THIRD_PARTY_NOTICES pkg/
+          tar -czf "kdft-$tag-linux-x64.tar.gz" -C pkg kdft-ui kdft README.md LICENSE NOTICE THIRD_PARTY_NOTICES
+      - name: Upload build product
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x64
+          path: kdft-${{ github.ref_name }}-linux-x64.tar.gz
+          if-no-files-found: error
+
+  macos:
+    name: Build macOS
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Apple Silicon and Intel
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo build --release --locked -p kdft-ui -p kdft-cli
+          cargo build --release --locked --target x86_64-apple-darwin -p kdft-ui -p kdft-cli
+      - name: Ad-hoc sign macOS binaries
+        run: |
+          codesign --force -s - target/release/kdft-ui target/release/kdft target/x86_64-apple-darwin/release/kdft-ui target/x86_64-apple-darwin/release/kdft
+      - name: Package
+        run: |
+          tag="${{ github.ref_name }}"
+          mkdir pkg-arm64 pkg-x64
+          cp target/release/kdft-ui target/release/kdft README.md LICENSE NOTICE THIRD_PARTY_NOTICES pkg-arm64/
+          cp target/x86_64-apple-darwin/release/kdft-ui target/x86_64-apple-darwin/release/kdft README.md LICENSE NOTICE THIRD_PARTY_NOTICES pkg-x64/
+          tar -czf "kdft-$tag-macos-arm64.tar.gz" -C pkg-arm64 kdft-ui kdft README.md LICENSE NOTICE THIRD_PARTY_NOTICES
+          tar -czf "kdft-$tag-macos-x64.tar.gz" -C pkg-x64 kdft-ui kdft README.md LICENSE NOTICE THIRD_PARTY_NOTICES
+      - name: Upload build products
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: kdft-${{ github.ref_name }}-macos-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build products
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksum manifest
+        working-directory: dist
+        run: sha256sum kdft-* > SHA256SUMS.txt
+      - name: Publish release once
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${{ github.ref_name }}"
+          gh release create "$tag" kdft-* SHA256SUMS.txt \
+            --verify-tag \
+            --title "KDFT $tag" \
+            --notes "KDFT builds for Windows, macOS, and Linux. Unpack and run kdft-ui (--port 8780 --open) for the local-only workbench; kdft is the command-line interface. The macOS binaries are ad-hoc signed, not notarized. Verify every download against SHA256SUMS.txt."

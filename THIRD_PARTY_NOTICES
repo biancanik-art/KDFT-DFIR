@@ -1,0 +1,21 @@
+KDFT-DFIR includes modified, vendored copies of the following components.
+Their original licenses continue to apply to those components.
+
+ext4-rs 0.9.0
+Upstream: https://github.com/FauxFaux/ext4-rs
+License: MIT
+Copyright (c) 2017 Chris West
+The complete license text is in crates/ext4-vendored/LICENSE.MIT.
+
+ewf 0.2.3
+Upstream: https://github.com/SecurityRonin/ewf
+License: Apache-2.0
+Authors: Albert Hui and project contributors
+
+outlook-pst 1.2.0
+Upstream: https://github.com/microsoft/outlook-pst-rs
+License: MIT
+Copyright (c) Microsoft Corporation
+
+The dependency graph also contains third-party Rust crates distributed under their
+respective licenses. Cargo.lock records the exact dependency versions used for release builds.

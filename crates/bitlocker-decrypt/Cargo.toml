@@ -1,0 +1,10 @@
+[package]
+name = "bitlocker-decrypt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bitlocker-core.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true

@@ -1,0 +1,65 @@
+﻿[workspace]
+resolver = "2"
+members = [
+    "crates/bitlocker-decrypt",
+    "crates/ext4-vendored",
+    "crates/ewf-vendored",
+    "crates/outlook-pst-vendored",
+    "crates/kdft-case",
+    "crates/kdft-cli",
+    "crates/kdft-ui",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/biancanik-art/KDFT-DFIR"
+
+[workspace.dependencies]
+aho-corasick = "1"
+anyhow = "1.0"
+bitlocker-core = "0.3.0"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrome-cache-parser = "0.2.5"
+clap = { version = "4.5", features = ["derive"] }
+codepage-strings = "1"
+disk-forensic = "0.8.6"
+evtx = { version = "0.12.2", default-features = false }
+# Vendored, not crates.io: see the notice at the top of crates/ext4-vendored/src/lib.rs
+# for why (upstream 0.9.0 rejects CSUM_SEED, which real-world modern ext4 filesystems set).
+ext4 = { path = "crates/ext4-vendored" }
+fatfs = { version = "0.3.6", default-features = false, features = ["alloc", "std"] }
+mft = "0.7.0"
+ntfs = "0.4.0"
+# notatin 1.0.1 declares `nom = ">= 6"` with no upper bound; without this pin Cargo resolves
+# nom 8, whose Parser/count/many0 API notatin 1.0.1's own source does not compile against
+# (verified: cargo check fails inside notatin-1.0.1/src/*.rs itself, not our code). Pinning to
+# the 7.x line notatin was actually built against fixes it.
+nom = "7"
+notatin = "1.0.1"
+outlook-pst = "1.2.0"
+# Pinned to match the version the `ext4` crate itself depends on internally,
+# since Ext4ImageReader implements positioned_io::ReadAt directly.
+positioned-io = "0.2"
+positioned-io2 = "0.3.4"
+quick-xml = "0.41"
+rayon = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2"
+vdi = "0.2.0"
+zeroize = "1.8"
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+xpress-huffman = { version = "=0.1.2", features = ["std"] }
+
+[patch.crates-io]
+# The vendored EWF reader uses bounded cumulative allocation while supporting
+# acquisition images whose valid chunk counts exceed the upstream guard.
+ewf = { path = "crates/ewf-vendored" }
+# Upstream 1.2.0 materializes individual MAPI properties and attachment
+# payloads with unbounded read_to_end calls. The vendored patch imposes a
+# documented per-property bound before KDFT receives the value.
+outlook-pst = { path = "crates/outlook-pst-vendored" }

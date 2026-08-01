@@ -1,0 +1,93 @@
+{
+  "dataset_id": "kdft-layout-mbr-gpt-001",
+  "dataset_version": "0.1.0",
+  "creation_script_version": "example-only",
+  "purpose": "Example manifest shape for a small layout and raw-search offset dataset.",
+  "scope": [
+    "partition-discovery",
+    "raw-search-offsets",
+    "report-provenance"
+  ],
+  "source_image": {
+    "format": "raw",
+    "path_or_external_id": "external://kdft-layout-mbr-gpt-001.raw",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "size_bytes": 1048576,
+    "sparse": false
+  },
+  "environment": {
+    "os": "synthetic",
+    "architecture": "unknown",
+    "partition_table": "mbr",
+    "sector_size_bytes": 512,
+    "filesystems": [
+      {
+        "name": "none",
+        "options": [
+          "layout-only"
+        ]
+      }
+    ],
+    "encryption": {
+      "type": "none",
+      "state": "unencrypted"
+    }
+  },
+  "expected": {
+    "partitions": [
+      {
+        "index": 0,
+        "name": "001-part0",
+        "start_offset": 1048576,
+        "size_bytes": 0,
+        "filesystem": "unknown",
+        "expected_region": "partition-gap/unpartitioned"
+      }
+    ],
+    "files": [],
+    "deleted_files": [],
+    "timestamps": [],
+    "artifacts": [],
+    "parser_outputs": [],
+    "raw_search_hits": [
+      {
+        "query": "hex:55 AA",
+        "offset": 510,
+        "length": 2,
+        "encoding": "hex",
+        "sector": 0,
+        "region": "partition-gap/unpartitioned"
+      }
+    ],
+    "reports": []
+  },
+  "limitations": [
+    "Example manifest only; not a real validation dataset."
+  ],
+  "known_unsupported_results": [],
+  "validation_commands": [
+    "future: kdft corpus validate --manifest testdata/golden-corpus/minimal-manifest.example.json"
+  ],
+  "sources": [
+    {
+      "name": "NIST CFTT",
+      "url": "https://www.nist.gov/itl/csd/secure-systems-and-applications/computer-forensics-tool-testing-program-cftt",
+      "notes": "Forensic tool tests should be organized around test procedures, criteria, test sets, and repeatable results."
+    },
+    {
+      "name": "NIST CFReDS",
+      "url": "https://www.nist.gov/programs-projects/computer-forensic-reference-data-sets",
+      "notes": "Documented simulated evidence can be used to compare tool output against known contents and locations."
+    },
+    {
+      "name": "GOV.UK Method Validation in Digital Forensics",
+      "url": "https://www.gov.uk/government/publications/method-validation-in-digital-forensics/method-validation-in-digital-forensics-accessible",
+      "notes": "Validation data should be representative, include challenges where needed, and state caveats."
+    },
+    {
+      "name": "SWGDE Minimum Requirements for Testing Tools",
+      "url": "https://www.swgde.org/documents/published-complete-listing/18-q-001-minimum-requirements-for-testing-tools-used-in-digital-and-multimedia-forensics/",
+      "notes": "Search and recovery validation should use known datasets or explicit manual verification."
+    }
+  ]
+}
