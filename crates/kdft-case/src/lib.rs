@@ -43130,7 +43130,10 @@ mod tests {
         assert!(error.to_string().contains("real directory"));
         assert!(!outside.join("escaped.bin").exists());
 
+        #[cfg(windows)]
         fs::remove_dir(&linked)?;
+        #[cfg(unix)]
+        fs::remove_file(&linked)?;
         fs::remove_dir_all(output_root)?;
         fs::remove_dir_all(outside)?;
         Ok(())
