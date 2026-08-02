@@ -13,6 +13,7 @@ chrome-cache-parser.workspace = true
 codepage-strings.workspace = true
 disk-forensic.workspace = true
 evtx.workspace = true
+ewf.workspace = true
 ext4.workspace = true
 fatfs.workspace = true
 mft.workspace = true

@@ -16,6 +16,7 @@ pub const LNK_SIGNATURE: [u8; 20] = [
     0x4C, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x46,
 ];
+const CUSTOM_DESTINATIONS_EMPTY_FOOTER: [u8; 4] = [0xAB, 0xFB, 0xBF, 0xBA];
 
 const FREE_SECTOR: u32 = 0xFFFF_FFFF;
 const END_OF_CHAIN: u32 = 0xFFFF_FFFE;
@@ -124,6 +125,7 @@ pub struct JumpListStats {
     pub lnk_streams_emitted: u64,
     pub lnk_bytes_emitted: u64,
     pub dest_list_streams: u64,
+    pub auxiliary_streams: u64,
     pub corrupt_streams: u64,
     pub incomplete_streams: u64,
     pub omitted_lnk_streams: u64,
@@ -380,9 +382,13 @@ pub fn is_custom_destinations<R: Read + Seek>(
         file_size,
         ..JumpListStats::default()
     };
-    let found = find_next_signature(reader, 0, file_size, options, &mut stats)
+    let found = match find_next_signature(reader, 0, file_size, options, &mut stats)
         .map_err(|error| public_error(error, stats.clone()))?
-        .is_some();
+    {
+        Some(_) => true,
+        None => is_empty_custom_destinations(reader, file_size, &mut stats)
+            .map_err(|error| public_error(error, stats.clone()))?,
+    };
     reader
         .seek(SeekFrom::Start(original))
         .map_err(|error| JumpListError {
@@ -556,6 +562,10 @@ fn parse_automatic_inner<R: Read + Seek, S: JumpListSink>(
                     }
                     Err(error) => return Err(error),
                 }
+            } else if entry.label.eq_ignore_ascii_case("DestListPropertyStore") {
+                // This stream is auxiliary property-store metadata, not an embedded Shell Link.
+                // Treating it as a LNK creates a false parse failure on otherwise valid Jump Lists.
+                stats.auxiliary_streams = stats.auxiliary_streams.saturating_add(1);
             } else {
                 stats.lnk_candidates = stats.lnk_candidates.saturating_add(1);
                 match parse_lnk_stream(context, mini_context.as_mut(), &entry, sink, stats) {
@@ -605,6 +615,9 @@ fn parse_custom_inner<R: Read + Seek, S: JumpListSink>(
         .map_err(|error| CoreError::io(None, "measuring Custom Destinations file", error))?;
     stats.file_size = file_size;
     let Some(mut current_start) = find_next_signature(reader, 0, file_size, options, stats)? else {
+        if is_empty_custom_destinations(reader, file_size, stats)? {
+            return Ok(());
+        }
         return Err(CoreError::new(
             JumpListErrorKind::NotJumpList,
             None,
@@ -662,6 +675,26 @@ fn parse_custom_inner<R: Read + Seek, S: JumpListSink>(
         }
     }
     Ok(())
+}
+
+fn is_empty_custom_destinations<R: Read + Seek>(
+    reader: &mut R,
+    file_size: u64,
+    stats: &mut JumpListStats,
+) -> CoreResult<bool> {
+    // Empty Custom Destinations files emitted by Windows are a compact 24-byte
+    // container: a stable four-DWORD prologue, one state DWORD, and the standard
+    // footer. There is intentionally no embedded Shell Link signature.
+    if file_size != 24 {
+        return Ok(false);
+    }
+    let mut bytes = [0_u8; 24];
+    read_exact_at(reader, 0, &mut bytes, stats)?;
+    Ok(bytes[0..4] == 2_u32.to_le_bytes()
+        && bytes[4..8] == 1_u32.to_le_bytes()
+        && bytes[8..12] == 0_u32.to_le_bytes()
+        && bytes[12..16] == 1_u32.to_le_bytes()
+        && bytes[20..24] == CUSTOM_DESTINATIONS_EMPTY_FOOTER)
 }
 
 fn validate_options(options: &JumpListParseOptions) -> Result<(), String> {
@@ -1603,6 +1636,22 @@ fn parse_dest_list_stream<R: Read + Seek>(
     entry: &DirectoryEntry,
     stats: &mut JumpListStats,
 ) -> CoreResult<DestListMetadata> {
+    if entry.stream_size == 0 {
+        return Ok(DestListMetadata {
+            declared_size: 0,
+            header_bytes_read: 0,
+            version: None,
+            entry_count: Some(0),
+            pinned_entry_count: Some(0),
+            unknown_header_dword: None,
+            last_entry_id: None,
+            action_count: None,
+            created_filetime: entry.created_filetime,
+            created_utc: entry.created_filetime.and_then(filetime_to_rfc3339),
+            modified_filetime: entry.modified_filetime,
+            modified_utc: entry.modified_filetime.and_then(filetime_to_rfc3339),
+        });
+    }
     let plan = stream_plan(context, mini.as_deref_mut(), entry, stats)?;
     let mut header_bytes = Vec::with_capacity(32);
     visit_stream(context, mini, plan, stats, |_, bytes| {
@@ -2455,6 +2504,52 @@ mod tests {
         cfb
     }
 
+    fn empty_automatic_fixture() -> Vec<u8> {
+        let sector_size = 512_usize;
+        let mut cfb = vec![0_u8; sector_size * 3];
+        cfb[..8].copy_from_slice(&CFB_MAGIC);
+        cfb[24..26].copy_from_slice(&0x003E_u16.to_le_bytes());
+        cfb[26..28].copy_from_slice(&3_u16.to_le_bytes());
+        cfb[28..30].copy_from_slice(&0xFFFE_u16.to_le_bytes());
+        cfb[30..32].copy_from_slice(&9_u16.to_le_bytes());
+        cfb[32..34].copy_from_slice(&6_u16.to_le_bytes());
+        cfb[44..48].copy_from_slice(&1_u32.to_le_bytes());
+        cfb[48..52].copy_from_slice(&1_u32.to_le_bytes());
+        cfb[56..60].copy_from_slice(&4096_u32.to_le_bytes());
+        cfb[60..64].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        cfb[68..72].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        cfb[76..80].copy_from_slice(&0_u32.to_le_bytes());
+        for index in 1..109 {
+            let offset = 76 + index * 4;
+            cfb[offset..offset + 4].copy_from_slice(&FREE_SECTOR.to_le_bytes());
+        }
+
+        let fat = sector_size;
+        cfb[fat..fat + 4].copy_from_slice(&FAT_SECTOR.to_le_bytes());
+        cfb[fat + 4..fat + 8].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        for index in 2..sector_size / 4 {
+            let offset = fat + index * 4;
+            cfb[offset..offset + 4].copy_from_slice(&FREE_SECTOR.to_le_bytes());
+        }
+
+        let directory = sector_size * 2;
+        write_directory_entry(
+            &mut cfb[directory..directory + 128],
+            "Root Entry",
+            5,
+            END_OF_CHAIN,
+            0,
+        );
+        write_directory_entry(
+            &mut cfb[directory + 128..directory + 256],
+            "DestList",
+            2,
+            END_OF_CHAIN,
+            0,
+        );
+        cfb
+    }
+
     fn regular_stream_fixture() -> Vec<u8> {
         let sector_size = 512_usize;
         let sector_count = 10_usize;
@@ -2597,6 +2692,53 @@ mod tests {
     }
 
     #[test]
+    fn empty_automatic_destinations_is_valid_without_minifat() {
+        let mut sink = CollectSink::default();
+        let result = parse_automatic_destinations(
+            &mut Cursor::new(empty_automatic_fixture()),
+            &mut sink,
+            &JumpListParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.status, JumpListTerminalStatus::Recognized);
+        assert_eq!(result.stats.dest_list_streams, 1);
+        assert_eq!(result.stats.missing_dest_list, 0);
+        assert_eq!(result.stats.lnk_candidates, 0);
+        let dest = result.dest_list.unwrap();
+        assert_eq!(dest.declared_size, 0);
+        assert_eq!(dest.entry_count, Some(0));
+    }
+
+    #[test]
+    fn dest_list_property_store_is_not_misclassified_as_lnk() {
+        let mut data = automatic_fixture(false);
+        let directory = 512 * 2;
+        write_directory_entry(
+            &mut data[directory + 384..directory + 512],
+            "DestListPropertyStore",
+            2,
+            2,
+            16,
+        );
+        let mini_stream = 512 * 3;
+        data[mini_stream + 128..mini_stream + 144].copy_from_slice(b"property-store!!");
+        let mini_fat = 512 * 4;
+        data[mini_fat + 8..mini_fat + 12].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+
+        let mut sink = CollectSink::default();
+        let result = parse_automatic_destinations(
+            &mut Cursor::new(data),
+            &mut sink,
+            &JumpListParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.status, JumpListTerminalStatus::Recognized);
+        assert_eq!(result.stats.auxiliary_streams, 1);
+        assert_eq!(result.stats.lnk_candidates, 1);
+        assert_eq!(result.stats.omitted_lnk_streams, 0);
+    }
+
+    #[test]
     fn regular_fat_stream_is_complete_without_payload_buffer_cap() {
         let mut reader = Cursor::new(regular_stream_fixture());
         let mut sink = CollectSink::default();
@@ -2656,6 +2798,35 @@ mod tests {
     }
 
     #[test]
+    fn invalid_minifat_does_not_discard_regular_fat_lnk_streams() {
+        let mut data = regular_stream_fixture();
+        // Advertise a root mini stream and a miniFAT sector outside the file.
+        // The valid 4096-byte LNK stream is FAT-backed and remains recoverable.
+        data[60..64].copy_from_slice(&99_u32.to_le_bytes());
+        data[64..68].copy_from_slice(&1_u32.to_le_bytes());
+        let root = 512 * 2;
+        data[root + 116..root + 120].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+        data[root + 120..root + 128].copy_from_slice(&64_u64.to_le_bytes());
+
+        let mut sink = CollectSink::default();
+        let result = parse_automatic_destinations(
+            &mut Cursor::new(data),
+            &mut sink,
+            &JumpListParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.status, JumpListTerminalStatus::Partial);
+        assert_eq!(result.stats.lnk_streams_emitted, 1);
+        assert_eq!(sink.entries.len(), 1);
+        assert_eq!(&sink.entries[0].1[..LNK_SIGNATURE.len()], &LNK_SIGNATURE);
+        assert!(result
+            .stats
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.label.as_deref() == Some("Root Entry")));
+    }
+
+    #[test]
     fn directory_fat_cycle_is_fatal_failed() {
         let mut data = automatic_fixture(false);
         let fat = 512;
@@ -2692,6 +2863,44 @@ mod tests {
         assert_eq!(&sink.entries[0].1[..20], &LNK_SIGNATURE);
         assert_eq!(sink.entries[0].1.len(), 25);
         assert_eq!(sink.entries[1].1.len(), 26);
+    }
+
+    #[test]
+    fn canonical_empty_custom_destinations_is_not_a_failure() {
+        for state in [1_u32, 2_u32, u32::MAX] {
+            let mut data = Vec::new();
+            data.extend_from_slice(&2_u32.to_le_bytes());
+            data.extend_from_slice(&1_u32.to_le_bytes());
+            data.extend_from_slice(&0_u32.to_le_bytes());
+            data.extend_from_slice(&1_u32.to_le_bytes());
+            data.extend_from_slice(&state.to_le_bytes());
+            data.extend_from_slice(&CUSTOM_DESTINATIONS_EMPTY_FOOTER);
+            let mut sink = CollectSink::default();
+            let result = parse_custom_destinations(
+                &mut Cursor::new(data),
+                &mut sink,
+                &JumpListParseOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(result.status, JumpListTerminalStatus::Recognized);
+            assert_eq!(result.stats.lnk_candidates, 0);
+            assert_eq!(result.stats.lnk_streams_emitted, 0);
+        }
+    }
+
+    #[test]
+    fn canonical_empty_custom_destinations_probe_recognizes_and_restores_position() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2_u32.to_le_bytes());
+        data.extend_from_slice(&1_u32.to_le_bytes());
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data.extend_from_slice(&1_u32.to_le_bytes());
+        data.extend_from_slice(&2_u32.to_le_bytes());
+        data.extend_from_slice(&CUSTOM_DESTINATIONS_EMPTY_FOOTER);
+        let mut reader = Cursor::new(data);
+        reader.set_position(7);
+        assert!(is_custom_destinations(&mut reader, &JumpListParseOptions::default()).unwrap());
+        assert_eq!(reader.position(), 7);
     }
 
     struct RejectSink;

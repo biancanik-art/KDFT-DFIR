@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     let Some(args) = ServerArgs::parse()? else {
         return Ok(());
     };
-    let config = Arc::new(ServerConfig::new()?);
+    let config = Arc::new(ServerConfig::new(args.case_path.as_deref())?);
     let (listener, port) = bind_listener(&args.host, args.port)?;
     let url_host = if args.host == "::1" {
         "[::1]"
@@ -133,6 +133,7 @@ struct ServerArgs {
     host: String,
     port: u16,
     open: bool,
+    case_path: Option<PathBuf>,
 }
 
 impl ServerArgs {
@@ -147,6 +148,7 @@ impl ServerArgs {
         let mut host = "127.0.0.1".to_string();
         let mut port = 8777_u16;
         let mut open = false;
+        let mut case_path = None;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
             let arg = arg
@@ -166,6 +168,10 @@ impl ServerArgs {
                         .parse::<u16>()
                         .with_context(|| format!("invalid TCP port {value:?}"))?;
                 }
+                "--case" => {
+                    let value = args.next().context("--case requires a value")?;
+                    case_path = Some(PathBuf::from(value));
+                }
                 "--open" => open = true,
                 "-h" | "--help" => {
                     print_server_help();
@@ -178,18 +184,24 @@ impl ServerArgs {
                 _ => bail!("unknown KDFT UI argument {arg:?}; use --help for usage"),
             }
         }
-        Ok(Some(Self { host, port, open }))
+        Ok(Some(Self {
+            host,
+            port,
+            open,
+            case_path,
+        }))
     }
 }
 
 fn print_server_help() {
     println!(
-        "KDFT local browser workbench\n\nUsage: kdft-ui [OPTIONS]\n\nOptions:\n  --host <HOST>  Loopback host [default: 127.0.0.1]\n  --port <PORT>  Starting TCP port [default: 8777]\n  --open         Open the workbench in the default browser\n  -h, --help     Print help\n  -V, --version  Print version"
+        "KDFT local browser workbench\n\nUsage: kdft-ui [OPTIONS]\n\nOptions:\n  --host <HOST>  Loopback host [default: 127.0.0.1]\n  --port <PORT>  Starting TCP port [default: 8777]\n  --case <PATH>  Case opened when a browser visits the base address\n  --open         Open the workbench in the default browser\n  -h, --help     Print help\n  -V, --version  Print version"
     );
 }
 
 struct ServerConfig {
     default_case_path: String,
+    default_case_pinned: bool,
     default_evidence_path: String,
     default_vhd_sample_path: String,
     default_history_path: String,
@@ -201,14 +213,22 @@ struct ServerConfig {
 }
 
 impl ServerConfig {
-    fn new() -> Result<Self> {
+    fn new(default_case_path: Option<&Path>) -> Result<Self> {
         let cwd = std::env::current_dir().context("reading current directory")?;
         let output = cwd.join("ui-output");
+        let default_case_pinned = default_case_path.is_some();
+        let default_case_path = default_case_path
+            .map(|path| {
+                if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    cwd.join(path)
+                }
+            })
+            .unwrap_or_else(|| output.join("workbench.kdft.sqlite"));
         Ok(Self {
-            default_case_path: output
-                .join("workbench.kdft.sqlite")
-                .to_string_lossy()
-                .into_owned(),
+            default_case_path: default_case_path.to_string_lossy().into_owned(),
+            default_case_pinned,
             default_evidence_path: cwd
                 .join("testdata")
                 .join("smoke-evidence")
@@ -427,6 +447,8 @@ struct RecoverEntryRequest {
 struct OpenEntryRequest {
     case_path: String,
     entry_id: i64,
+    #[serde(default)]
+    acknowledge_host_app_risk: bool,
 }
 
 #[derive(Deserialize)]
@@ -923,7 +945,7 @@ mod http_security_tests {
 
     #[test]
     fn api_requires_local_host_same_origin_and_process_token() {
-        let config = ServerConfig::new().unwrap();
+        let config = ServerConfig::new(None).unwrap();
         assert!(authorize_request(
             &request(
                 &config,
@@ -3908,8 +3930,38 @@ fn external_preview_output_path(case_path: &Path, entry_id: i64, name: &str) -> 
     candidate
 }
 
+fn unique_report_output_path(requested_path: &Path) -> PathBuf {
+    if !requested_path.exists() {
+        return requested_path.to_path_buf();
+    }
+    let mut suffix = 2usize;
+    let stem = requested_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("quick-report");
+    let extension = requested_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty());
+    let mut candidate = requested_path.to_path_buf();
+    while candidate.exists() {
+        let file_name = extension.map_or_else(
+            || format!("{stem}-{suffix}"),
+            |extension| format!("{stem}-{suffix}.{extension}"),
+        );
+        candidate = requested_path.with_file_name(file_name);
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
+}
+
 fn api_open_entry(body: &[u8]) -> Result<serde_json::Value> {
     let request: OpenEntryRequest = parse_json_body(body)?;
+    if !request.acknowledge_host_app_risk {
+        bail!(
+            "opening untrusted evidence in a host application requires explicit examiner risk acknowledgement"
+        );
+    }
     let case_path = request_path(&request.case_path, "case_path")?;
     let entry = filesystem_entry_by_id(&case_path, request.entry_id)?
         .with_context(|| format!("filesystem entry {} not found", request.entry_id))?;
@@ -4442,7 +4494,7 @@ fn api_bookmark_folder_recursive_live(body: &[u8]) -> Result<kdft_case::Recursiv
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("Live Browse");
+        .unwrap_or("Source Browse");
     let folder_id = ensure_report_folder(&case_path, folder_name)?;
     let path_title = if request.path.trim().is_empty() {
         "/"
@@ -4497,7 +4549,8 @@ fn api_recategorize(body: &[u8]) -> Result<serde_json::Value> {
 fn api_export_report(body: &[u8], config: &ServerConfig) -> Result<serde_json::Value> {
     let request: ExportReportRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
-    let output_path = request_path(&request.output_path, "output_path")?;
+    let requested_output_path = request_path(&request.output_path, "output_path")?;
+    let output_path = unique_report_output_path(&requested_output_path);
     let report = report_data_with_directory_structure(&case_path, REPORT_DIRECTORY_TREE_MAX_LINES)?;
     let rendered = render_report(&report);
     if let Some(parent) = output_path
@@ -4528,9 +4581,9 @@ fn api_export_report(body: &[u8], config: &ServerConfig) -> Result<serde_json::V
         .exported_reports
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(canonical_output);
+        .insert(canonical_output.clone());
     Ok(json!({
-        "report": output_path,
+        "report": canonical_output,
         "folders": report.folders.len(),
         "content_prefix_sha256": rendered.content_prefix_sha256,
         "report_file_sha256": report_file_sha256
@@ -4861,11 +4914,17 @@ mod tests {
             OsString::from("::1"),
             OsString::from("--port"),
             OsString::from("8780"),
+            OsString::from("--case"),
+            OsString::from("C:\\Cases\\demo.kdft.sqlite"),
             OsString::from("--open"),
         ])?
         .ok_or_else(|| anyhow::anyhow!("valid server arguments did not request a server run"))?;
         assert_eq!(parsed.host, "::1");
         assert_eq!(parsed.port, 8780);
+        assert_eq!(
+            parsed.case_path,
+            Some(PathBuf::from("C:\\Cases\\demo.kdft.sqlite"))
+        );
         assert!(parsed.open);
         Ok(())
     }
@@ -5008,7 +5067,7 @@ mod tests {
     fn active_progress_exposes_the_complete_diagnostic_log_path() -> anyhow::Result<()> {
         let case_path = unique_test_path("active-diagnostic-log", ".kdft.sqlite");
         let log = StreamingDiagnosticLog::start(&case_path, 9, "analysis")?;
-        let config = super::ServerConfig::new()?;
+        let config = super::ServerConfig::new(None)?;
         let progress_id = "diagnostic-path-test";
         let tracker = config.progress.start(
             progress_id,
@@ -5085,6 +5144,148 @@ mod tests {
         ));
         assert!(!INDEX_HTML.contains("E01, dd/raw, VHD/VHDX, VMDK, VDI disk images"));
         assert!(INDEX_HTML.contains("Attach only keeps the evidence read-only"));
+        assert!(!INDEX_HTML.contains(">Live browse</button>"));
+        assert!(INDEX_HTML.contains(">Browse source</button>"));
+        assert!(INDEX_HTML.contains(">Choose&hellip;</button>"));
+        assert!(INDEX_HTML.contains(">View index</button>"));
+    }
+
+    #[test]
+    fn deep_search_survives_navigation_and_fullscreen_back() {
+        assert!(INDEX_HTML.contains("function persistDeepSearchSession()"));
+        assert!(INDEX_HTML.contains("function restoreDeepSearchSession()"));
+        assert!(INDEX_HTML.contains("function deepSearchSessionCasePath()"));
+        let persistence = INDEX_HTML
+            .split_once("function persistDeepSearchSession() {")
+            .expect("Deep Search persistence function")
+            .1
+            .split_once("function restoreDeepSearchSession()")
+            .expect("end of Deep Search persistence function")
+            .0;
+        assert!(persistence.contains("const casePath = deepSearchSessionCasePath()"));
+        assert!(!persistence.contains("currentCasePath()"));
+        assert!(INDEX_HTML.contains("sessionStorage.setItem(deepSearchSessionKey(casePath)"));
+        assert!(
+            INDEX_HTML.contains("window.addEventListener(\"pagehide\", persistDeepSearchSession)")
+        );
+        assert!(INDEX_HTML.contains("kdftViewerFullscreen: true"));
+        assert!(INDEX_HTML.contains("window.addEventListener(\"popstate\""));
+        assert!(!INDEX_HTML.contains("$(\"bitwiseControls\").hidden"));
+        assert!(!INDEX_HTML.contains(
+            "This case has no indexed entries; Deep Search only searches processed evidence"
+        ));
+    }
+
+    #[test]
+    fn case_refresh_ignores_out_of_order_responses() {
+        let refresh = INDEX_HTML
+            .split_once("async function refresh() {")
+            .expect("refresh function")
+            .1
+            .split_once("function suggestedNewCasePath()")
+            .expect("end of refresh function")
+            .0;
+        assert!(refresh.contains("const generation = ++state.refreshGeneration"));
+        assert!(
+            refresh
+                .matches("refreshRequestIsCurrent(casePath, generation)")
+                .count()
+                >= 3
+        );
+        assert!(refresh.contains("state.loadedCasePath = casePath"));
+        assert!(INDEX_HTML.contains("function clearLoadedCaseForRefresh(casePath)"));
+        assert!(INDEX_HTML.contains("loaded && state.loadedCasePath === target"));
+    }
+
+    #[test]
+    fn restored_tabs_refresh_local_auth_and_tolerate_missing_optional_controls() {
+        assert!(INDEX_HTML.contains("async function fetchWithLocalAuthRetry(request)"));
+        assert!(INDEX_HTML.contains("if (response.status !== 403)"));
+        assert!(INDEX_HTML.contains("await refreshLocalUiAuthentication()"));
+        assert!(INDEX_HTML.contains("credentials: \"same-origin\""));
+        assert!(INDEX_HTML.contains("if (recategorizeButton)"));
+        assert!(!INDEX_HTML.contains("$(\"recategorizeBtn\").hidden"));
+        assert!(!INDEX_HTML.contains("$(\"fsOptionsRow\").hidden"));
+        assert!(!INDEX_HTML.contains("$(\"historyOptionsRow\").hidden"));
+    }
+
+    #[test]
+    fn selected_search_bookmarking_includes_filtered_out_rows() {
+        let bookmarking = INDEX_HTML
+            .split_once("async function bookmarkSelectedSearchResults() {")
+            .expect("selected search bookmarking function")
+            .1
+            .split_once("async function clearFindings()")
+            .expect("end of selected search bookmarking function")
+            .0;
+        assert!(bookmarking.contains("const indexedRows = selectedSearchResultRows()"));
+        assert!(bookmarking.contains("const rawRows = selectedRawSearchResultRows()"));
+        assert!(!bookmarking.contains("selectedVisibleSearchResultRows()"));
+        assert!(!bookmarking.contains("selectedVisibleRawSearchResultRows()"));
+        assert!(bookmarking.contains("remainingIndexedKeys.delete(row.key)"));
+        assert!(bookmarking.contains("remainingRawKeys.delete(row.key)"));
+    }
+
+    #[test]
+    fn raw_search_continuation_preserves_grid_filters_and_sort() {
+        let load_more = INDEX_HTML
+            .split_once("async function loadMoreRawSearchResults() {")
+            .expect("raw search continuation function")
+            .1
+            .split_once("function bitwiseStopReasonNote(merged)")
+            .expect("end of raw search continuation function")
+            .0;
+        assert!(!load_more.contains("resetGridView(\"rawSearch\")"));
+        assert!(load_more.contains("renderRawSearchResults()"));
+    }
+
+    #[test]
+    fn fullscreen_history_exit_is_single_step_and_popstate_synchronized() {
+        let fullscreen = INDEX_HTML
+            .split_once("function setViewerFullscreen(enabled, historyMode = \"auto\") {")
+            .expect("fullscreen state function")
+            .1
+            .split_once("function updateEntryRowHighlight()")
+            .expect("end of fullscreen state functions")
+            .0;
+        assert!(fullscreen.contains("state.viewerFullscreenHistoryPending = true"));
+        assert_eq!(fullscreen.matches("history.back()").count(), 1);
+        assert!(fullscreen.contains("function toggleViewerFullscreen()"));
+        assert!(INDEX_HTML.contains(
+            "setViewerFullscreen(Boolean(event.state && event.state.kdftViewerFullscreen), \"popstate\")"
+        ));
+    }
+
+    #[test]
+    fn analysis_fullscreen_preserves_direct_browse_location() {
+        assert!(INDEX_HTML.contains("const location = currentAnalyzeLocation();"));
+        assert!(INDEX_HTML.contains("params.set(\"tree_mode\", treeMode)"));
+        assert!(INDEX_HTML.contains("params.set(\"live_volume\", String(location.liveVolume))"));
+        assert!(INDEX_HTML.contains("PAGE_PARAMS.get(\"tree_mode\") === \"live\""));
+        assert!(INDEX_HTML.contains("await applyPendingAnalysisSelection();"));
+        assert!(INDEX_HTML.contains("await applyAnalyzeLocation({"));
+        assert!(INDEX_HTML.contains("params.set(\"viewer_target\", \"live\")"));
+        assert!(INDEX_HTML.contains("params.set(\"viewer_target\", \"raw\")"));
+        assert!(INDEX_HTML.contains("params.set(\"viewer_entry_id\", String(state.hex.entryId))"));
+        assert!(INDEX_HTML.contains("await restorePendingViewerTarget(pending, evidence)"));
+        assert!(INDEX_HTML.contains("pending.applying || !state.data"));
+        assert!(INDEX_HTML.contains("if (!pendingLiveRestore && maybeAutoLiveBrowse(evidence))"));
+        assert!(!INDEX_HTML.contains(
+            "${liveBrowseButtonHtml(evidence)}\n               ${processActionHtml(evidence)}"
+        ));
+    }
+
+    #[test]
+    fn bitwise_hits_support_shared_multi_selection_and_bulk_bookmarking() {
+        assert!(INDEX_HTML.contains("selectedRawSearchKeys: new Set()"));
+        assert!(INDEX_HTML.contains("{ key: \"select\", label: \"\", sortable: false"));
+        assert!(INDEX_HTML.contains("function toggleRawSearchHitSelection"));
+        assert!(INDEX_HTML.contains("function selectedVisibleRawSearchResultRows"));
+        assert!(INDEX_HTML.contains("function selectedRawSearchResultRows"));
+        assert!(INDEX_HTML.contains("bookmarkRawSearchHitRecord(row.hit"));
+        assert!(INDEX_HTML.contains("remainingRawKeys.delete(row.key)"));
+        assert!(INDEX_HTML.contains("event.shiftKey && state.lastRawSearchKey"));
+        assert!(INDEX_HTML.contains("aria-label=\"Select raw hit at"));
     }
 
     #[test]
@@ -5184,13 +5385,19 @@ mod tests {
         assert!(INDEX_HTML.contains("Image bytes (raw; not a volume)"));
         assert!(INDEX_HTML
             .contains("The raw image row is a byte view and is not counted as another volume."));
+        assert!(INDEX_HTML.contains("analysis-status transient-guidance"));
+        assert!(INDEX_HTML.contains(
+            "animation: transientGuidanceExpire var(--guidance-duration, 7s) ease forwards"
+        ));
+        assert!(INDEX_HTML.contains("liveGuidanceExpiresAt: 0"));
+        assert!(INDEX_HTML.contains("state.liveGuidanceExpiresAt = Date.now() + 7000"));
+        assert!(INDEX_HTML.contains("const guidanceRemainingMs = Math.max(0"));
         assert!(INDEX_HTML
             .contains("$(\"treeCount\").textContent = String(state.live.volumes.length);"));
         assert!(INDEX_HTML.contains("leaveLiveBrowseForIndexedMode()"));
-        assert!(
-            INDEX_HTML.contains("live-browse rows are intentionally not mirrored into Categories")
-        );
-        assert!(INDEX_HTML.contains("Closed live browse. Showing indexed categories."));
+        assert!(INDEX_HTML
+            .contains("direct-browse rows are intentionally not mirrored into Categories"));
+        assert!(INDEX_HTML.contains("Closed source browse. Showing indexed categories."));
     }
 
     #[test]
@@ -5697,7 +5904,7 @@ mod tests {
             "run_carve": false
         })
         .to_string();
-        let config = super::ServerConfig::new()?;
+        let config = super::ServerConfig::new(None)?;
         let response = super::api_process_evidence(body.as_bytes(), &config)?;
         assert_eq!(response["status"], "completed");
         assert_eq!(response["progress"]["state"], "complete");
@@ -5905,6 +6112,44 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn quick_report_export_creates_unique_output_paths_and_keeps_previous_report_intact(
+    ) -> anyhow::Result<()> {
+        let case_path = unique_test_path("quick-report-collision", ".kdft.sqlite");
+        cleanup_ui_test_case(&case_path);
+        create_ui_test_case(&case_path, "quick-report-collision")?;
+
+        let output_path = unique_test_path("quick-report-collision", ".html");
+        let _ = std::fs::remove_file(&output_path);
+
+        let export_request = |path: &Path| -> anyhow::Result<serde_json::Value> {
+            let body = serde_json::json!({
+                "case_path": case_path.to_string_lossy(),
+                "output_path": path.to_string_lossy(),
+            })
+            .to_string();
+            let config = super::ServerConfig::new(None)?;
+            super::api_export_report(body.as_bytes(), &config)
+        };
+
+        let first = export_request(&output_path)?;
+        let first_path = std::path::Path::new(first["report"].as_str().expect("report path"));
+        let first_bytes = std::fs::read(first_path)?;
+
+        let second = export_request(&output_path)?;
+        let second_path = std::path::Path::new(second["report"].as_str().expect("report path"));
+
+        assert_ne!(first_path, second_path);
+        let second_bytes = std::fs::read(second_path)?;
+        assert_eq!(first_bytes, second_bytes);
+        assert_eq!(first_bytes, std::fs::read(&output_path)?);
+
+        std::fs::remove_file(&output_path)?;
+        std::fs::remove_file(second_path)?;
+        cleanup_ui_test_case(&case_path);
+        Ok(())
+    }
+
     // Examiner-typed limits big enough to round-trip through JavaScript as
     // scientific notation (5e+21) used to fail the whole request with a serde
     // type error; the lenient deserializers must saturate instead. The search
@@ -5976,6 +6221,49 @@ mod tests {
     }
 
     #[test]
+    fn external_host_application_open_requires_strong_untrusted_evidence_confirmation() {
+        for warning in [
+            "SECURITY WARNING: UNTRUSTED EVIDENCE",
+            "launch a host application outside KDFT's internal viewer",
+            "malicious macros, exploits, external links",
+            "KDFT cannot sandbox or make the host application safe",
+            "Cancel is the safe default; use View bytes in KDFT",
+            "appropriately isolated forensic environment",
+        ] {
+            assert!(INDEX_HTML.contains(warning), "missing warning: {warning}");
+        }
+
+        let external_open = INDEX_HTML
+            .split_once("async function openSelectedEntryExternal(entryId = null) {")
+            .expect("external-open function")
+            .1
+            .split_once("function updateByteContextControls()")
+            .expect("end of external-open function")
+            .0;
+        let confirmation = external_open
+            .find("window.confirm(externalOpenWarning(entry))")
+            .expect("explicit external-open confirmation");
+        let host_launch_request = external_open
+            .find("apiPost(\"/api/entry/open\"")
+            .expect("host-app launch request");
+        assert!(
+            confirmation < host_launch_request,
+            "confirmation must occur before the host-app launch request"
+        );
+        assert!(external_open.contains("return;"));
+        assert!(external_open.contains("acknowledge_host_app_risk: true"));
+    }
+
+    #[test]
+    fn external_host_application_api_rejects_missing_risk_acknowledgement() {
+        let error = super::api_open_entry(br#"{"case_path":"missing.kdft.sqlite","entry_id":1}"#)
+            .expect_err("host-app open without explicit risk acknowledgement must fail");
+        assert!(error
+            .to_string()
+            .contains("requires explicit examiner risk acknowledgement"));
+    }
+
+    #[test]
     fn external_preview_name_is_flat_and_preserves_the_extension() {
         let name = safe_external_preview_name(42, r#"..\folder/unsafe name?.PDF"#);
         assert_eq!(name, "42-unsafe_name.PDF");
@@ -6027,8 +6315,8 @@ mod tests {
             "/Users/examiner/Downloads/image.E01"
         );
         assert_eq!(
-            normalize_request_path("/home/xt/old/home/xt/new/image.E01"),
-            "/home/xt/new/image.E01"
+            normalize_request_path("/home/examiner/old/home/examiner/new/image.E01"),
+            "/home/examiner/new/image.E01"
         );
     }
 
@@ -6308,6 +6596,7 @@ fn open_target(target: &str) -> Result<()> {
 fn index_html(config: &ServerConfig) -> String {
     let bootstrap = json!({
         "defaultCasePath": config.default_case_path,
+        "defaultCasePinned": config.default_case_pinned,
         "defaultEvidencePath": config.default_evidence_path,
         "defaultVhdSamplePath": config.default_vhd_sample_path,
         "defaultHistoryPath": config.default_history_path,
@@ -8552,6 +8841,30 @@ const INDEX_HTML: &str = r###"<!doctype html>
       font-size: 13px;
       line-height: 1.35;
     }
+    /* Short-lived examiner guidance must not permanently consume evidence
+       workspace height. Error and warning notices intentionally do not use
+       this class and therefore remain visible. */
+    .analysis-status.transient-guidance {
+      overflow: hidden;
+      animation: transientGuidanceExpire var(--guidance-duration, 7s) ease forwards;
+    }
+    @keyframes transientGuidanceExpire {
+      0%, 72% {
+        opacity: 1;
+        max-height: 120px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        border-left-width: 4px;
+      }
+      100% {
+        opacity: 0;
+        max-height: 0;
+        padding-top: 0;
+        padding-bottom: 0;
+        border-left-width: 0;
+        visibility: hidden;
+      }
+    }
     body.analysis-fullscreen .app {
       grid-template-columns: 1fr;
       min-height: 100vh;
@@ -8747,10 +9060,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
               </div>
               <div class="path-pick-row">
                 <label id="evidencePathLabel" class="path-pick-label">Image path<input id="evidencePath" spellcheck="false" placeholder="C:\Evidence\image.E01"></label>
-                <button id="browseEvidence" class="secondary">Browse&hellip;</button>
+                <button id="browseEvidence" class="secondary">Choose&hellip;</button>
               </div>
               <div class="row" id="fsOptionsRow">
-                <label title="Attach only keeps the evidence read-only and immediately available through Live browse. Index now additionally creates the searchable snapshot used by Deep Search, Categories, Bookmarks, and Reports.">Read File System<select id="readFileSystem" title="Live browse is always complete and read-only. This choice controls whether KDFT also creates the searchable case index."><option value="true">yes &mdash; index now</option><option value="false">no &mdash; attach only</option></select></label>
+                <label title="Attach only keeps the evidence read-only and immediately available through Browse source. Index now additionally creates the searchable snapshot used by Deep Search, Categories, Bookmarks, and Reports.">Read File System<select id="readFileSystem" title="Browse source is always complete and read-only. This choice controls whether KDFT also creates the searchable case index."><option value="true">yes &mdash; index now</option><option value="false">no &mdash; attach only</option></select></label>
               </div>
               <details id="processingOptions" class="processing-options" title="Processors can be rerun additively. Legacy OLE, structured Unix syslog, and picture-content analysis do not yet have dedicated decoders; Deep Search already uses captured content and extracted parser text.">
                 <summary class="muted tiny">Processors</summary>
@@ -8800,7 +9113,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
               <div class="toolbar">
                 <button id="analyzeBack" class="ghost" title="Back in Analyze" disabled>&larr; Back</button>
                 <button id="analyzeForward" class="ghost" title="Forward in Analyze" disabled>Forward &rarr;</button>
-                <button id="liveBrowse" class="ghost" title="Browse the complete attached source read-only without waiting for indexing. Index limits affect Deep Search, Categories, Bookmarks, and Reports, not Live browse.">Live browse</button>
+                <button id="liveBrowse" class="ghost" title="Browse the complete attached source read-only without waiting for indexing. Index limits affect Deep Search, Categories, Bookmarks, and Reports, not this direct source view.">Browse source</button>
                 <button id="recategorizeBtn" class="ghost" hidden title="Entries in this case were categorized by an older classifier version. Refresh re-runs the current classifier over the case database only (fast; evidence is not re-read).">Update categories</button>
                 <button id="exportReportFromAnalyze" class="ghost">Export report</button>
                 <button id="openAnalyzeWindow" class="ghost">Open full screen</button>
@@ -9050,7 +9363,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       };
     }
     const state = {
-      casePath: PAGE_PARAMS.get("case_path") || localStorage.getItem("kdft.casePath") || BOOTSTRAP.defaultCasePath,
+      casePath: PAGE_PARAMS.get("case_path")
+        || (BOOTSTRAP.defaultCasePinned
+          ? BOOTSTRAP.defaultCasePath
+          : (localStorage.getItem("kdft.casePath") || BOOTSTRAP.defaultCasePath)),
+      loadedCasePath: null,
+      refreshGeneration: 0,
       data: null,
       searchResults: [],
       searchCursor: null,
@@ -9058,9 +9376,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       searchPageLoading: false,
       searchCoverage: null,
       selectedSearchKeys: new Set(),
+      selectedRawSearchKeys: new Set(),
+      lastRawSearchKey: null,
+      searchSessionRestoredCasePath: null,
       searchSort: { column: "", direction: "asc" },
       searchColumnFilters: {},
       gridViews: {},
+      lookupEntries: new Map(),
       currentEntryGrid: { gridId: "", entries: [] },
       currentLiveGrid: { gridId: "", items: [] },
       browserState: { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" },
@@ -9072,9 +9394,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
       collapsedCategoryMains: new Set(),
       inspectorCollapsed: false,
       viewerFullscreen: false,
+      viewerFullscreenHistoryPending: false,
       selectedEntryIds: new Set(),
       lastSelectedEntryId: null,
       pictureViewMode: "grid",
+      liveGuidanceExpiresAt: 0,
       dateFilter: { from: "", to: "" },
       timeline: newTimelineState(),
       hex: makeHexState(),
@@ -9082,8 +9406,24 @@ const INDEX_HTML: &str = r###"<!doctype html>
       pendingAnalysisSelection: ANALYSIS_MODE ? {
         evidenceId: Number.isFinite(REQUESTED_EVIDENCE_ID) && REQUESTED_EVIDENCE_ID > 0 ? REQUESTED_EVIDENCE_ID : null,
         selectedPath: PAGE_PARAMS.get("selected_path") || null,
-        treeMode: PAGE_PARAMS.get("tree_mode") === "categories" || PAGE_PARAMS.has("selected_category") || PAGE_PARAMS.has("category") ? "categories" : "filesystem",
+        treeMode: PAGE_PARAMS.get("tree_mode") === "live"
+          ? "live"
+          : (PAGE_PARAMS.get("tree_mode") === "categories" || PAGE_PARAMS.has("selected_category") || PAGE_PARAMS.has("category") ? "categories" : "filesystem"),
         selectedCategory: PAGE_PARAMS.get("selected_category") || PAGE_PARAMS.get("category") || "",
+        liveVolume: PAGE_PARAMS.get("live_volume") || "",
+        viewerTarget: PAGE_PARAMS.get("viewer_target") || "",
+        viewerEntryId: PAGE_PARAMS.get("viewer_entry_id") || "",
+        viewerVolume: PAGE_PARAMS.get("viewer_volume") || "",
+        viewerPath: PAGE_PARAMS.get("viewer_path") || "",
+        viewerName: PAGE_PARAMS.get("viewer_name") || "",
+        viewerLogicalPath: PAGE_PARAMS.get("viewer_logical_path") || "",
+        viewerOffset: PAGE_PARAMS.get("viewer_offset") || "",
+        viewerLength: PAGE_PARAMS.get("viewer_length") || "",
+        viewerStartOffset: PAGE_PARAMS.get("viewer_start_offset") || "",
+        viewerSize: PAGE_PARAMS.get("viewer_size") || "",
+        viewerMode: PAGE_PARAMS.get("viewer_mode") || "",
+        viewerSelectionStart: PAGE_PARAMS.get("viewer_selection_start") || "",
+        viewerSelectionEnd: PAGE_PARAMS.get("viewer_selection_end") || "",
         applied: false
       } : null
     };
@@ -9093,6 +9433,26 @@ const INDEX_HTML: &str = r###"<!doctype html>
     let hexPointerId = null;
     let categoryFilterTimer = null;
     let categoryScrollObserver = null;
+    const liveVolumeRequests = new Map();
+    let localAuthRefreshPromise = null;
+
+    function loadLiveVolumes(evidenceId) {
+      const requestKey = currentCasePath() + "|" + String(evidenceId);
+      const existing = liveVolumeRequests.get(requestKey);
+      if (existing) {
+        return existing;
+      }
+      const request = apiGet("/api/image/volumes", {
+        case_path: currentCasePath(),
+        evidence_id: evidenceId
+      }).finally(() => {
+        if (liveVolumeRequests.get(requestKey) === request) {
+          liveVolumeRequests.delete(requestKey);
+        }
+      });
+      liveVolumeRequests.set(requestKey, request);
+      return request;
+    }
 
     function newCategoryCache(evidenceId = null, key = "") {
       return { evidenceId, key, entries: [], total: null, categoryTotal: null, nextCursor: null, loading: false, error: "", pageSize: 1000 };
@@ -9122,6 +9482,139 @@ const INDEX_HTML: &str = r###"<!doctype html>
         building: false,
         buildGeneration: 0
       };
+    }
+
+    // Deep Search can be expensive (especially an E01 whole-disk pass), so a
+    // browser-history mistake must not discard a completed page of results.
+    // Keep the latest search in per-tab session storage: it survives reload,
+    // Back/Forward and leaving/re-entering this localhost page, but disappears
+    // when the examiner closes the tab and is never written into the evidence.
+    function deepSearchSessionCasePath() {
+      return normalizePathInput(state.loadedCasePath || state.casePath || "");
+    }
+
+    function deepSearchSessionKey(casePath = deepSearchSessionCasePath()) {
+      return "kdft.deepSearch.v1:" + String(casePath || "");
+    }
+
+    function deepSearchFormSnapshot() {
+      const value = (id, fallback = "") => {
+        const field = $(id);
+        return field ? field.value : fallback;
+      };
+      return {
+        query: value("searchQuery"),
+        mode: currentSearchMode(),
+        evidence: value("searchEvidence"),
+        includeContent: value("includeContent", "true"),
+        maxResults: value("maxResults", "200"),
+        maxFileBytes: value("maxFileBytes", "4096"),
+        category: value("searchCategory"),
+        fileTypes: value("searchFileTypes")
+      };
+    }
+
+    function persistDeepSearchSession() {
+      const casePath = deepSearchSessionCasePath();
+      if (!casePath) {
+        return false;
+      }
+      const snapshot = {
+        version: 1,
+        casePath,
+        savedAt: new Date().toISOString(),
+        form: deepSearchFormSnapshot(),
+        searchResults: state.searchResults || [],
+        searchCursor: state.searchCursor || null,
+        searchComplete: Boolean(state.searchComplete),
+        searchCoverage: state.searchCoverage || null,
+        searchError: state.searchError || null,
+        rawSearchResult: state.rawSearchResult || null,
+        selectedSearchKeys: Array.from(state.selectedSearchKeys || []),
+        selectedRawSearchKeys: Array.from(state.selectedRawSearchKeys || []),
+        gridViews: {
+          search: state.gridViews && state.gridViews.search ? state.gridViews.search : null,
+          rawSearch: state.gridViews && state.gridViews.rawSearch ? state.gridViews.rawSearch : null
+        }
+      };
+      try {
+        sessionStorage.setItem(deepSearchSessionKey(casePath), JSON.stringify(snapshot));
+        return true;
+      } catch (err) {
+        // Storage quotas vary. Preserve at least the examiner's query/options
+        // rather than allowing a large result page to erase everything.
+        try {
+          sessionStorage.setItem(deepSearchSessionKey(casePath), JSON.stringify({
+            version: 1,
+            casePath,
+            savedAt: snapshot.savedAt,
+            form: snapshot.form,
+            storageWarning: "Result page exceeded browser session storage. Re-run the search to reload hits."
+          }));
+        } catch (ignored) {
+          // Private/locked-down browsers can disable sessionStorage entirely.
+        }
+        return false;
+      }
+    }
+
+    function restoreDeepSearchSession() {
+      const casePath = deepSearchSessionCasePath();
+      if (!casePath || state.searchSessionRestoredCasePath === casePath) {
+        return false;
+      }
+      state.searchSessionRestoredCasePath = casePath;
+      let snapshot;
+      try {
+        snapshot = JSON.parse(sessionStorage.getItem(deepSearchSessionKey(casePath)) || "null");
+      } catch (err) {
+        return false;
+      }
+      if (!snapshot || snapshot.version !== 1 || snapshot.casePath !== casePath || !snapshot.form) {
+        return false;
+      }
+      const form = snapshot.form;
+      $("searchQuery").value = String(form.query || "");
+      $("searchMode").value = form.mode === "all" ? "all" : "indexed";
+      $("searchEvidence").value = String(form.evidence || "");
+      $("includeContent").value = form.includeContent === "false" ? "false" : "true";
+      $("maxResults").value = String(form.maxResults || "200");
+      $("maxFileBytes").value = String(form.maxFileBytes || "4096");
+      $("searchCategory").value = String(form.category || "");
+      $("searchFileTypes").value = String(form.fileTypes || "");
+      state.searchResults = Array.isArray(snapshot.searchResults) ? snapshot.searchResults : [];
+      state.searchCursor = snapshot.searchCursor || null;
+      state.searchComplete = snapshot.searchComplete !== false;
+      state.searchCoverage = snapshot.searchCoverage || null;
+      state.searchError = snapshot.searchError || null;
+      state.rawSearchResult = snapshot.rawSearchResult && Array.isArray(snapshot.rawSearchResult.hits)
+        ? snapshot.rawSearchResult
+        : null;
+      state.searchRunning = false;
+      state.rawSearchRunning = false;
+      state.selectedSearchKeys = new Set(Array.isArray(snapshot.selectedSearchKeys) ? snapshot.selectedSearchKeys : []);
+      state.selectedRawSearchKeys = new Set(Array.isArray(snapshot.selectedRawSearchKeys) ? snapshot.selectedRawSearchKeys : []);
+      if (snapshot.gridViews && snapshot.gridViews.search) {
+        state.gridViews.search = snapshot.gridViews.search;
+        state.searchSort = snapshot.gridViews.search.sort || { column: "", direction: "asc" };
+        state.searchColumnFilters = snapshot.gridViews.search.filters || {};
+      }
+      if (snapshot.gridViews && snapshot.gridViews.rawSearch) {
+        state.gridViews.rawSearch = snapshot.gridViews.rawSearch;
+      }
+      const rawSection = $("rawSearchSection");
+      if (rawSection) {
+        rawSection.hidden = currentSearchMode() !== "all";
+      }
+      renderSearchResults();
+      renderRawSearchResults();
+      if (snapshot.storageWarning) {
+        setNotice(snapshot.storageWarning, true);
+      } else {
+        const loaded = state.searchResults.length + (state.rawSearchResult ? state.rawSearchResult.hits.length : 0);
+        setNotice("Restored the previous Deep Search query and " + loaded.toLocaleString() + " loaded result" + (loaded === 1 ? "" : "s") + " for this tab.");
+      }
+      return true;
     }
 
     function newLiveBrowseState() {
@@ -9190,8 +9683,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       // Search and timeline results are independent caches, not projections of
       // state.data, and otherwise retain rows belonging to removed evidence.
+      state.lookupEntries = new Map();
       state.searchResults = [];
       state.selectedSearchKeys = new Set();
+      state.selectedRawSearchKeys = new Set();
+      state.lastRawSearchKey = null;
       state.rawSearchResult = null;
       state.timeline = newTimelineState();
       state.timeline.casePath = state.casePath;
@@ -9246,18 +9742,62 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
+    async function refreshLocalUiAuthentication() {
+      if (!localAuthRefreshPromise) {
+        localAuthRefreshPromise = (async () => {
+          const response = await fetch("/", {
+            method: "GET",
+            cache: "no-store",
+            credentials: "same-origin"
+          });
+          if (!response.ok) {
+            throw new Error("Could not refresh local UI authentication (HTTP " + response.status + ").");
+          }
+          if (response.body) {
+            await response.body.cancel();
+          }
+        })().finally(() => {
+          localAuthRefreshPromise = null;
+        });
+      }
+      return localAuthRefreshPromise;
+    }
+
+    async function fetchWithLocalAuthRetry(request) {
+      let response = await request();
+      if (response.status !== 403) {
+        return response;
+      }
+      if (response.body) {
+        await response.body.cancel();
+      }
+      // A restored tab or newly opened fullscreen window can issue its first
+      // API request before the current process cookie replaces a stale one.
+      // GET / is unauthenticated and sets the HttpOnly cookie; a rejected 403
+      // never reached an API handler, so replaying the request once is safe.
+      await refreshLocalUiAuthentication();
+      response = await request();
+      return response;
+    }
+
     async function apiGet(path, params) {
       const qs = new URLSearchParams(params || {});
-      const response = await fetch(path + (qs.toString() ? "?" + qs.toString() : ""));
+      const url = path + (qs.toString() ? "?" + qs.toString() : "");
+      const response = await fetchWithLocalAuthRetry(() => fetch(url, {
+        cache: "no-store",
+        credentials: "same-origin"
+      }));
       return readApiResponse(response);
     }
 
     async function apiPost(path, body) {
-      const response = await fetch(path, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      });
+      const encodedBody = JSON.stringify(body);
+      const response = await fetchWithLocalAuthRetry(() => fetch(path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: encodedBody
+        }));
       return readApiResponse(response);
     }
 
@@ -9293,6 +9833,43 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.casePath = value;
       localStorage.setItem("kdft.casePath", value);
       return value;
+    }
+
+    function refreshRequestIsCurrent(casePath, generation) {
+      return generation === state.refreshGeneration
+        && state.casePath === casePath
+        && normalizePathInput($("casePath").value) === casePath;
+    }
+
+    function clearLoadedCaseForRefresh(casePath) {
+      if (!state.loadedCasePath || state.loadedCasePath === casePath) {
+        return;
+      }
+      state.data = null;
+      state.loadedCasePath = null;
+      state.searchResults = [];
+      state.searchCursor = null;
+      state.searchComplete = true;
+      state.searchPageLoading = false;
+      state.searchCoverage = null;
+      state.searchError = null;
+      state.searchRunning = false;
+      state.rawSearchResult = null;
+      state.rawSearchRunning = false;
+      state.selectedSearchKeys = new Set();
+      state.selectedRawSearchKeys = new Set();
+      state.lastRawSearchKey = null;
+      state.searchSessionRestoredCasePath = null;
+      state.lookupEntries = new Map();
+      state.live = newLiveBrowseState();
+      state.idx = newIndexedBrowseState();
+      state.cat = newCategoryCache();
+      state.analyzeHistory = { back: [], forward: [], applying: false };
+      resetGridView("search");
+      resetGridView("rawSearch");
+      renderEmptyState();
+      renderSearchResults();
+      renderRawSearchResults();
     }
 
     function currentEvidencePath() {
@@ -9449,16 +10026,54 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const params = new URLSearchParams();
       params.set("mode", "analysis");
       params.set("case_path", currentCasePath());
-      if (state.browserState.evidenceId) {
-        params.set("evidence_id", String(state.browserState.evidenceId));
+      const location = currentAnalyzeLocation();
+      if (location && location.evidenceId) {
+        params.set("evidence_id", String(location.evidenceId));
       }
-      if (state.browserState.selectedPath) {
-        params.set("selected_path", state.browserState.selectedPath);
+      if (location && location.selectedPath) {
+        params.set("selected_path", location.selectedPath);
       }
-      const treeMode = state.browserState.treeMode || "filesystem";
+      const treeMode = location ? (location.treeMode || "filesystem") : "filesystem";
       params.set("tree_mode", treeMode);
       if (treeMode === "categories") {
-        params.set("selected_category", state.browserState.selectedCategory || "");
+        params.set("selected_category", location.selectedCategory || "");
+      } else if (treeMode === "live" && location.liveVolume !== undefined && location.liveVolume !== null) {
+        params.set("live_volume", String(location.liveVolume));
+      }
+      const viewerOffset = state.hex && state.hex.data
+        ? Number(state.hex.data.offset)
+        : Number(state.hex && state.hex.offset);
+      const viewerLength = Number(state.hex && state.hex.length);
+      if (state.hex && state.hex.live) {
+        params.set("viewer_target", "live");
+        params.set("evidence_id", String(state.hex.live.evidenceId));
+        params.set("viewer_volume", String(state.hex.live.volume));
+        params.set("viewer_path", state.hex.live.path || "/");
+        params.set("viewer_name", state.hex.live.name || "file");
+      } else if (state.hex && state.hex.raw) {
+        params.set("viewer_target", "raw");
+        params.set("evidence_id", String(state.hex.raw.evidenceId));
+        params.set("viewer_name", state.hex.raw.name || "Raw bytes");
+        params.set("viewer_logical_path", state.hex.raw.logicalPath || "[raw]");
+        params.set("viewer_start_offset", String(Number(state.hex.raw.startOffset) || 0));
+        if (state.hex.raw.volume !== undefined && state.hex.raw.volume !== null) {
+          params.set("viewer_volume", String(state.hex.raw.volume));
+        }
+        if (state.hex.raw.sizeBytes !== undefined && state.hex.raw.sizeBytes !== null) {
+          params.set("viewer_size", String(state.hex.raw.sizeBytes));
+        }
+      } else if (state.hex && state.hex.entryId) {
+        params.set("viewer_target", "entry");
+        params.set("viewer_entry_id", String(state.hex.entryId));
+      }
+      if (params.has("viewer_target")) {
+        params.set("viewer_offset", String(Number.isFinite(viewerOffset) ? Math.max(0, viewerOffset) : 0));
+        params.set("viewer_length", String(Number.isFinite(viewerLength) ? Math.max(1, viewerLength) : 512));
+        params.set("viewer_mode", $("viewerMode").value || "hex");
+        if (Number.isFinite(state.hex.selStart) && Number.isFinite(state.hex.selEnd)) {
+          params.set("viewer_selection_start", String(state.hex.selStart));
+          params.set("viewer_selection_end", String(state.hex.selEnd));
+        }
       }
       return window.location.origin + window.location.pathname + "?" + params.toString();
     }
@@ -9468,13 +10083,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function refresh() {
+      const generation = ++state.refreshGeneration;
       const casePath = currentCasePath();
       if (!casePath) {
         setNotice("Case path is empty.", true);
-        return;
+        return false;
       }
+      clearLoadedCaseForRefresh(casePath);
       try {
         const nextData = await apiGet("/api/state", { case_path: casePath });
+        if (!refreshRequestIsCurrent(casePath, generation)) {
+          return false;
+        }
         if (state.data) {
           const nextById = new Map(nextData.evidence.map((item) => [Number(item.id), item]));
           state.data.evidence
@@ -9494,21 +10114,32 @@ const INDEX_HTML: &str = r###"<!doctype html>
           }
         }
         state.data = nextData;
+        state.loadedCasePath = casePath;
         renderState();
-        applyPendingAnalysisSelection();
+        await applyPendingAnalysisSelection();
+        if (!refreshRequestIsCurrent(casePath, generation)) {
+          return false;
+        }
         // Once a case is open the sidebar is rarely needed - collapse it for
         // more workspace unless the examiner has expanded it explicitly.
         if (localStorage.getItem("kdft.sidebarCollapsed") !== "0") {
           document.querySelector(".app").classList.add("sidebar-collapsed");
         }
         setNotice("Loaded " + state.data.case.name + ".");
+        restoreDeepSearchSession();
+        return true;
       } catch (err) {
+        if (!refreshRequestIsCurrent(casePath, generation)) {
+          return false;
+        }
         state.data = null;
+        state.loadedCasePath = null;
         renderEmptyState();
         if (!ANALYSIS_MODE) {
           caseOpenSetupView();
         }
         setNotice(err.message, true);
+        return false;
       }
     }
 
@@ -9552,6 +10183,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         $("casePath").value = target;
         state.casePath = target;
         localStorage.setItem("kdft.casePath", target);
+        clearLoadedCaseForRefresh(target);
         const data = await apiPost("/api/case/create", {
           case_path: target,
           name: $("newCaseName").value,
@@ -9560,9 +10192,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
           case_type: $("newCaseType").value,
           description: $("newCaseDescription").value
         });
-        await refresh();
-        switchView("evidenceView");
-        setNotice("Created case " + data.case_id + ". Now add evidence.");
+        const loaded = await refresh();
+        if (loaded && state.loadedCasePath === target) {
+          switchView("evidenceView");
+          setNotice("Created case " + data.case_id + ". Now add evidence.");
+        }
       } catch (err) {
         setNotice(err.message, true);
       }
@@ -9574,11 +10208,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Enter the case database path to open.", true);
         return;
       }
+      if (state.loadedCasePath && state.loadedCasePath !== target) {
+        persistDeepSearchSession();
+      }
       $("casePath").value = target;
       state.casePath = target;
       localStorage.setItem("kdft.casePath", target);
-      await refresh();
-      if (state.data) {
+      const loaded = await refresh();
+      if (loaded && state.loadedCasePath === target) {
         switchView("dashboardView");
       }
     }
@@ -9604,8 +10241,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       label.childNodes[0].textContent = spec.label;
       $("evidencePath").placeholder = spec.placeholder;
       $("addEvidence").textContent = spec.button;
-      $("fsOptionsRow").hidden = type === "browser_history";
-      $("historyOptionsRow").hidden = type !== "browser_history";
+      const fsOptions = $("fsOptionsRow");
+      const historyOptions = $("historyOptionsRow");
+      if (fsOptions) {
+        fsOptions.hidden = type === "browser_history";
+      }
+      if (historyOptions) {
+        historyOptions.hidden = type !== "browser_history";
+      }
     }
 
     async function addEvidence() {
@@ -10403,6 +11046,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           if (!expectedEvidence) {
             return;
           }
+          let openedLiveForLocation = false;
           state.browserState = {
             evidenceId: location.evidenceId,
             selectedPath: normalizeLogicalPath(location.selectedPath || "/"),
@@ -10411,13 +11055,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
           };
           if (!(state.live.active && state.live.evidenceId === location.evidenceId)) {
             const initialLiveState = state.live;
-            const data = await apiGet("/api/image/volumes", { case_path: currentCasePath(), evidence_id: location.evidenceId });
+            const data = await loadLiveVolumes(location.evidenceId);
             if (state.live !== initialLiveState
               || Number(state.browserState.evidenceId) !== Number(location.evidenceId)
               || !selectedEvidenceIdentityMatches(expectedEvidence)) {
               return;
             }
             state.live = { active: true, evidenceId: location.evidenceId, volumes: data.volumes || [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
+            openedLiveForLocation = true;
           }
           const liveState = state.live;
           const path = normalizeLogicalPath(location.selectedPath || "/");
@@ -10428,6 +11073,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
             }
             state.live.selKey = liveKey(location.liveVolume, path);
             state.live.expanded.add(state.live.selKey);
+            if (openedLiveForLocation) {
+              state.liveGuidanceExpiresAt = Date.now() + 7000;
+            }
           } catch (err) {
             if (state.live !== liveState) {
               return;
@@ -10661,7 +11309,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
       renderEvidenceBrowserEntries();
       renderHexViewer();
-      setNotice((leftLiveBrowse ? "Closed live browse. " : "")
+      setNotice((leftLiveBrowse ? "Closed source browse. " : "")
         + "Selected indexed category " + (categoryLabel(key) || "All Categories") + ".");
       if (recordNavigation) {
         commitAnalyzeNavigation(previous);
@@ -10679,7 +11327,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         if (leftLiveBrowse && evidenceIndexedEntryCount(state.browserState.evidenceId) === 0) {
           setNotice("Categories use indexed evidence. Complete Analyze image to populate them; live files are not categories.", true);
         } else if (leftLiveBrowse) {
-          setNotice("Closed live browse. Showing indexed categories.");
+          setNotice("Closed source browse. Showing indexed categories.");
         }
       }
       renderEvidenceBrowserEntries();
@@ -10893,7 +11541,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         } else if (action === "clear") {
           clearLiveSelection();
         } else {
-          setNotice("That action is not available in live browse.", true);
+          setNotice("That action is not available while browsing the source directly.", true);
         }
         return;
       }
@@ -10935,7 +11583,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           setNotice("Select rows before reporting selected items.", true);
           return;
         }
-        setNotice("Bookmarking selected live items for the report...");
+        setNotice("Bookmarking selected source items for the report...");
         await bookmarkSelectedLive();
         await exportReport();
         return;
@@ -11309,6 +11957,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return Boolean(entry && entry.id && entry.entry_kind === "file" && EXTERNAL_OPEN_EXTENSIONS.has(filesystemFileExtension(entry)));
     }
 
+    function externalOpenWarning(entry) {
+      const name = entry && (entry.name || logicalName(entry.logical_path))
+        ? (entry.name || logicalName(entry.logical_path))
+        : "the selected file";
+      return [
+        "SECURITY WARNING: UNTRUSTED EVIDENCE",
+        "Opening " + name + " will launch a host application outside KDFT's internal viewer. The recovered copy is read-only, but its content may still contain malicious macros, exploits, external links, or media crafted to compromise this computer.",
+        "KDFT cannot sandbox or make the host application safe. Cancel is the safe default; use View bytes in KDFT whenever possible.",
+        "Select OK only if you accept this risk and are working in an appropriately isolated forensic environment."
+      ].join("\n\n");
+    }
+
     async function openSelectedEntryExternal(entryId = null) {
       const entry = entryId ? findLoadedEntry(entryId) : currentHexEntry();
       if (!entry || !entry.id || entry.entry_kind !== "file") {
@@ -11319,14 +11979,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("This file type is not enabled for external preview. Recover it explicitly for controlled inspection.", true);
         return;
       }
-      if (!window.confirm("Open a recovered read-only copy in the registered application? Treat evidence files as untrusted content.")) {
+      if (!window.confirm(externalOpenWarning(entry))) {
         return;
       }
       try {
         setNotice("Preparing read-only preview for " + (entry.name || logicalName(entry.logical_path)) + "...");
         const data = await apiPost("/api/entry/open", {
           case_path: currentCasePath(),
-          entry_id: entry.id
+          entry_id: entry.id,
+          acknowledge_host_app_risk: true
         });
         setNotice("Opened read-only preview copy " + data.output_path + ".");
       } catch (err) {
@@ -11584,12 +12245,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       if (mode !== "all") {
         state.rawSearchResult = null;
+        state.selectedRawSearchKeys = new Set();
+        state.lastRawSearchKey = null;
         const section = $("rawSearchSection");
         if (section) {
           section.hidden = true;
         }
         renderRawSearchResults();
       }
+      persistDeepSearchSession();
     }
 
     // One-line summary of how the indexed pass ended, reused by every notice
@@ -11643,6 +12307,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       } finally {
         state.searchPageLoading = false;
         renderSearchResults();
+        persistDeepSearchSession();
       }
     }
 
@@ -11665,6 +12330,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.searchCoverage = null;
       state.searchError = null;
       state.selectedSearchKeys = new Set();
+      state.selectedRawSearchKeys = new Set();
+      state.lastRawSearchKey = null;
       resetGridView("search");
       renderSearchResults();
       // Reset the bitwise section every run; it only re-appears for All mode.
@@ -11675,6 +12342,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         rawSection.hidden = mode !== "all";
       }
       renderRawSearchResults();
+      persistDeepSearchSession();
       try {
         const page = await apiPostReadOnlyWithNetworkRetry("/api/search/deep", {
           case_path: currentCasePath(),
@@ -11714,6 +12382,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           runButton.disabled = false;
           runButton.textContent = "Run Search";
         }
+        persistDeepSearchSession();
         return;
       }
       setNotice(indexedPassSummary() + ". Running bitwise whole-disk scan...", Boolean(state.searchError));
@@ -11802,6 +12471,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.rawSearchResult = merged;
       resetGridView("rawSearch");
       renderRawSearchResults();
+      persistDeepSearchSession();
       const errored = merged.sources.filter((source) => source.error);
       const scannedText = formatBytes(merged.bytes_scanned) + " scanned across " + targets.length + " source" + (targets.length === 1 ? "" : "s");
       setNotice(
@@ -11864,8 +12534,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       );
       merged.complete = (merged.sources || []).every((source) => !source.error && source.complete);
       merged.truncated = !merged.complete;
-      resetGridView("rawSearch");
       renderRawSearchResults();
+      persistDeepSearchSession();
       const errored = (merged.sources || []).filter((source) => source.error);
       setNotice(
         "Bitwise: " + merged.hits.length.toLocaleString() + " hit(s) loaded" +
@@ -11917,6 +12587,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!entry) {
         try {
           entry = await apiGet("/api/entry", { case_path: currentCasePath(), entry_id: entryId });
+          state.lookupEntries.set(Number(entry.id), entry);
         } catch (err) {
           setNotice("Could not load entry " + entryId + ": " + err.message, true);
           return;
@@ -12002,6 +12673,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const inState = state.data.entries.find((item) => item.id === entryId);
       if (inState) {
         return inState;
+      }
+      const lookedUp = state.lookupEntries && state.lookupEntries.get(Number(entryId));
+      if (lookedUp) {
+        return lookedUp;
       }
       const inCategory = (state.cat.entries || []).find((item) => item.id === entryId);
       if (inCategory) {
@@ -12181,10 +12856,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       await bookmarkSearchHit(hit, true);
     }
 
-    async function bookmarkSearchHit(hit, refreshAfter = true) {
+    async function bookmarkSearchHit(hit, refreshAfter = true, casePath = currentCasePath()) {
       try {
         await apiPost("/api/bookmark/quick", {
-          case_path: currentCasePath(),
+          case_path: casePath,
           folder_name: "Search Hits",
           title: "Search hit: " + hit.display_name,
           comment: "Match kind: " + hit.match_kind,
@@ -12212,37 +12887,84 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function bookmarkSelectedSearchResults() {
-      const rows = selectedVisibleSearchResultRows();
-      if (rows.length === 0) {
-        setNotice("No visible search results selected.", true);
+      const casePath = state.loadedCasePath;
+      if (!casePath || normalizePathInput($("casePath").value) !== casePath) {
+        setNotice("The loaded case changed. Reload it before bookmarking search results.", true);
+        return;
+      }
+      const indexedRows = selectedSearchResultRows();
+      const rawRows = selectedRawSearchResultRows();
+      const remainingIndexedKeys = new Set(state.selectedSearchKeys || []);
+      const remainingRawKeys = new Set(state.selectedRawSearchKeys || []);
+      if (indexedRows.length + rawRows.length === 0) {
+        const selected = remainingIndexedKeys.size + remainingRawKeys.size;
+        setNotice(
+          selected
+            ? "The selected search results are no longer loaded. Re-run the search before bookmarking them."
+            : "No indexed or bitwise search results selected.",
+          true
+        );
         return;
       }
       let succeeded = 0;
-      const failedKeys = [];
+      const failedIndexedKeys = [];
+      const failedRawKeys = [];
       let lastError = "";
-      for (const row of rows) {
+      for (const row of indexedRows) {
         const hit = row.hit;
         if (!hit) {
-          failedKeys.push(row.key);
+          failedIndexedKeys.push(row.key);
           lastError = "Search result is no longer loaded.";
           continue;
         }
         try {
-          await bookmarkSearchHit(hit, false);
+          await bookmarkSearchHit(hit, false, casePath);
           succeeded += 1;
+          remainingIndexedKeys.delete(row.key);
         } catch (err) {
-          failedKeys.push(row.key);
+          failedIndexedKeys.push(row.key);
           lastError = err.message || String(err);
         }
       }
-      state.selectedSearchKeys = new Set(failedKeys);
-      await refresh();
-      renderSearchResults();
-      if (failedKeys.length) {
-        setNotice("Bookmarked " + succeeded + " visible search result" + (succeeded === 1 ? "" : "s") + "; " + failedKeys.length + " failed" + (lastError ? ": " + lastError : "."), true);
+      for (const row of rawRows) {
+        try {
+          await bookmarkRawSearchHitRecord(row.hit, state.rawSearchResult, false, casePath);
+          succeeded += 1;
+          remainingRawKeys.delete(row.key);
+        } catch (err) {
+          failedRawKeys.push(row.key);
+          lastError = err.message || String(err);
+        }
+      }
+      if (state.loadedCasePath !== casePath || normalizePathInput($("casePath").value) !== casePath) {
         return;
       }
-      setNotice("Bookmarked " + succeeded + " visible search result" + (succeeded === 1 ? "" : "s") + ".");
+      state.selectedSearchKeys = remainingIndexedKeys;
+      state.selectedRawSearchKeys = remainingRawKeys;
+      const refreshed = await refresh();
+      if (!refreshed || state.loadedCasePath !== casePath) {
+        return;
+      }
+      renderSearchResults();
+      renderRawSearchResults();
+      persistDeepSearchSession();
+      const failed = failedIndexedKeys.length + failedRawKeys.length;
+      const unavailable = Math.max(0, remainingIndexedKeys.size + remainingRawKeys.size - failed);
+      if (failed || unavailable) {
+        const failureSummary = failed
+          ? failed + " failed" + (lastError ? ": " + lastError : "")
+          : "";
+        const unavailableSummary = unavailable
+          ? unavailable + " selected result" + (unavailable === 1 ? " is" : "s are") + " no longer loaded"
+          : "";
+        setNotice(
+          "Bookmarked " + succeeded + " selected search result" + (succeeded === 1 ? "" : "s") + "; "
+            + [failureSummary, unavailableSummary].filter(Boolean).join("; ") + ".",
+          true
+        );
+        return;
+      }
+      setNotice("Bookmarked " + succeeded + " selected search result" + (succeeded === 1 ? "" : "s") + " into the report.");
     }
 
     async function clearFindings() {
@@ -12313,16 +13035,24 @@ const INDEX_HTML: &str = r###"<!doctype html>
         state.selectedSearchKeys.delete(key);
       }
       renderSearchSelectionCount();
+      persistDeepSearchSession();
     }
 
     function selectAllSearchResults() {
       state.selectedSearchKeys = new Set(visibleSearchResultRows().map((row) => row.key));
+      state.selectedRawSearchKeys = new Set(visibleRawSearchResultRows().map((row) => row.key));
       renderSearchResults();
+      renderRawSearchResults();
+      persistDeepSearchSession();
     }
 
     function clearSelectedSearchResults() {
       state.selectedSearchKeys = new Set();
+      state.selectedRawSearchKeys = new Set();
+      state.lastRawSearchKey = null;
       renderSearchResults();
+      renderRawSearchResults();
+      persistDeepSearchSession();
     }
 
     // Re-run the classifier over the existing indexed entries (fast DB-only
@@ -12349,6 +13079,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
           output_path: currentReportPath()
         });
         state.lastReportPath = data.report;
+        if (data.report) {
+          const nextPath = normalizePathInput(data.report);
+          $("reportPath").value = nextPath;
+          state.lastReportPath = nextPath;
+        }
         await refresh();
         // Show the FULL-FILE digest: it is what sha256sum/certutil reproduce.
         // The embedded footer digest only covers bytes before the footer.
@@ -12363,10 +13098,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function openReport() {
+      const reportPath = normalizePathInput(state.lastReportPath || currentReportPath());
+      state.lastReportPath = reportPath;
+      $("reportPath").value = reportPath;
       try {
         await apiPost("/api/report/open", {
           case_path: currentCasePath(),
-          output_path: currentReportPath()
+          output_path: reportPath
         });
         setNotice("Opened report.");
       } catch (err) {
@@ -12386,7 +13124,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const source = entry.metadata_json && entry.metadata_json.category_source;
         return source && source !== BOOTSTRAP.classifierVersion;
       });
-      $("recategorizeBtn").hidden = !staleCategories;
+      const recategorizeButton = $("recategorizeBtn");
+      if (recategorizeButton) {
+        recategorizeButton.hidden = !staleCategories;
+      }
       $("statEvidence").textContent = data.evidence.length;
       $("statEntries").textContent = data.entry_count;
       $("statBookmarks").textContent = data.bookmarks.length;
@@ -12420,23 +13161,140 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderReport();
     }
 
-    function applyPendingAnalysisSelection() {
+    function pendingViewerInteger(value, fallback, minimum, maximum) {
+      if (value === "" || value === null || value === undefined) {
+        return fallback;
+      }
+      const parsed = Number(value);
+      if (!Number.isSafeInteger(parsed)) {
+        return fallback;
+      }
+      return Math.min(maximum, Math.max(minimum, parsed));
+    }
+
+    async function restorePendingViewerTarget(pending, evidence) {
+      if (!pending || !pending.viewerTarget || !evidence) {
+        return;
+      }
+      const offset = pendingViewerInteger(pending.viewerOffset, 0, 0, Number.MAX_SAFE_INTEGER);
+      const length = pendingViewerInteger(pending.viewerLength, 512, 16, 8 * 1024 * 1024);
+      if (pending.viewerTarget === "live") {
+        if (!state.live.active || Number(state.live.evidenceId) !== Number(evidence.id)) {
+          return;
+        }
+        const volume = pendingViewerInteger(
+          pending.viewerVolume || pending.liveVolume,
+          0,
+          0,
+          Number.MAX_SAFE_INTEGER
+        );
+        const path = normalizeLogicalPath(pending.viewerPath || "/");
+        state.hex = makeHexState(null, offset, length);
+        state.hex.live = {
+          evidenceId: evidence.id,
+          volume,
+          path,
+          name: pending.viewerName || logicalName(path) || "file"
+        };
+      } else if (pending.viewerTarget === "raw") {
+        const size = pendingViewerInteger(
+          pending.viewerSize,
+          evidence.size_bytes == null ? null : Number(evidence.size_bytes),
+          0,
+          Number.MAX_SAFE_INTEGER
+        );
+        state.hex = makeHexState(null, offset, length);
+        state.hex.byteContext = "filesystem";
+        state.hex.raw = {
+          evidenceId: evidence.id,
+          name: pending.viewerName || evidence.display_name || "Raw bytes",
+          logicalPath: pending.viewerLogicalPath || "[raw] " + (evidence.display_name || "evidence"),
+          startOffset: pendingViewerInteger(
+            pending.viewerStartOffset,
+            0,
+            0,
+            Number.MAX_SAFE_INTEGER
+          ),
+          volume: pending.viewerVolume === ""
+            ? null
+            : pendingViewerInteger(pending.viewerVolume, null, 0, Number.MAX_SAFE_INTEGER),
+          sizeBytes: size
+        };
+      } else if (pending.viewerTarget === "entry") {
+        const entryId = pendingViewerInteger(pending.viewerEntryId, 0, 1, Number.MAX_SAFE_INTEGER);
+        if (!entryId) {
+          return;
+        }
+        await goToEntryFolder(entryId);
+        if (!state.hex || Number(state.hex.entryId) !== entryId) {
+          return;
+        }
+        state.hex.offset = offset;
+        state.hex.length = length;
+      } else {
+        return;
+      }
+
+      const viewerMode = ["hex", "text", "metadata"].includes(pending.viewerMode)
+        ? pending.viewerMode
+        : "hex";
+      $("viewerMode").value = viewerMode;
+      $("hexOffset").value = String(offset);
+      $("hexLength").value = String(length);
+      await fetchEntryBytes();
+      const selectionStart = pendingViewerInteger(
+        pending.viewerSelectionStart,
+        -1,
+        0,
+        Number.MAX_SAFE_INTEGER
+      );
+      const selectionEnd = pendingViewerInteger(
+        pending.viewerSelectionEnd,
+        -1,
+        0,
+        Number.MAX_SAFE_INTEGER
+      );
+      if (selectionStart >= 0 && selectionEnd >= selectionStart) {
+        state.hex.selStart = selectionStart;
+        state.hex.selEnd = selectionEnd;
+        renderHexViewer();
+      }
+      setInspectorCollapsed(false);
+    }
+
+    async function applyPendingAnalysisSelection() {
       const pending = state.pendingAnalysisSelection;
-      if (!pending || pending.applied || !state.data) {
+      if (!pending || pending.applied || pending.applying || !state.data) {
         return;
       }
       const requested = pending.evidenceId;
       const evidence = state.data.evidence.find((item) => item.id === requested)
         || state.data.evidence.find((item) => item.id === state.browserState.evidenceId)
         || state.data.evidence[0];
-      pending.applied = true;
-      if (evidence) {
-        selectEvidenceSource(evidence.id, pending.selectedPath || preferredAnalysisPath(evidence.id));
-        if (pending.treeMode === "categories") {
-          selectCategory(pending.selectedCategory || "");
+      pending.applying = true;
+      try {
+        if (evidence) {
+          if (pending.treeMode === "live") {
+            await applyAnalyzeLocation({
+              evidenceId: evidence.id,
+              treeMode: "live",
+              selectedPath: pending.selectedPath || "/",
+              selectedCategory: "",
+              liveVolume: pending.liveVolume || "0"
+            });
+          } else {
+            selectEvidenceSource(evidence.id, pending.selectedPath || preferredAnalysisPath(evidence.id));
+          }
+          if (pending.treeMode === "categories") {
+            selectCategory(pending.selectedCategory || "");
+          }
+          await restorePendingViewerTarget(pending, evidence);
+        } else {
+          switchView("analyzeView");
         }
-      } else {
-        switchView("analyzeView");
+        pending.applied = true;
+      } finally {
+        pending.applying = false;
       }
     }
 
@@ -12690,7 +13548,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           <td>${evidenceProcessingStatusHtml(item)}${item.sha256_hex ? ' <span class="pill good">hashed</span>' : ""}</td>
           <td class="actions">
             <div class="toolbar">
-              <button class="secondary" onclick="selectEvidenceSource(${item.id}, preferredAnalysisPath(${item.id}))">Browse</button>
+              ${indexedBrowseButtonHtml(item)}
               ${liveBrowseButtonHtml(item)}
               ${processActionHtml(item)}
               ${item.source_kind === "folder" || item.source_kind === "browser_history" ? "" : `<button class="ghost" onclick="hashEvidence(${item.id})">${item.sha256_hex ? "Re-hash" : "Hash"}</button>`}
@@ -12784,6 +13642,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return `<button class="ghost" onclick="processEvidence(${item.id})">Process</button>`;
     }
 
+    function indexedBrowseButtonHtml(item) {
+      if (evidenceIndexedEntryCount(item.id) === 0) {
+        return "";
+      }
+      return `<button class="secondary" onclick="selectEvidenceSource(${item.id}, preferredAnalysisPath(${item.id}))" title="Open the processed filesystem index and derived categories for this evidence.">View index</button>`;
+    }
+
     function supportsLiveBrowseEvidence(item) {
       return !!item && (item.source_kind === "image" || item.source_kind === "folder" || item.source_kind === "file");
     }
@@ -12793,26 +13658,26 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return "";
       }
       const title = item.source_kind === "image"
-        ? "Browse the complete image read-only without indexing. Index limits affect Deep Search, Categories, Bookmarks, and Reports, not Live browse."
-        : "Browse the complete attached source read-only without indexing. Index limits affect Deep Search, Categories, Bookmarks, and Reports, not Live browse.";
-      return `<button class="secondary" onclick="liveBrowseEvidence(${item.id})" title="${escapeAttr(title)}">Live browse</button>`;
+        ? "Browse the complete image read-only without indexing. Index limits affect Deep Search, Categories, Bookmarks, and Reports, not this direct source view."
+        : "Browse the complete attached source read-only without indexing. Index limits affect Deep Search, Categories, Bookmarks, and Reports, not this direct source view.";
+      return `<button class="secondary" onclick="liveBrowseEvidence(${item.id})" title="${escapeAttr(title)}">Browse source</button>`;
     }
 
     function liveBrowseUnavailableMessage(evidence) {
       if (!evidence) {
-        return "Select an evidence source, then Live browse.";
+        return "Select an evidence source, then Browse source.";
       }
-      return "Live browse is available for disk images, folders, and single files; selected source is " + evidence.source_kind + ".";
+      return "Browse source is available for disk images, folders, and single files; selected source is " + evidence.source_kind + ".";
     }
 
     function liveBrowseReadyNotice(evidence) {
       if (evidence.source_kind === "image") {
-        return "Live browsing " + evidence.display_name + " directly from the image - no indexing.";
+        return "Browsing " + evidence.display_name + " directly from the image - no indexing.";
       }
       if (evidence.source_kind === "folder") {
-        return "Live browsing " + evidence.display_name + " as it is on disk right now - no indexing.";
+        return "Browsing " + evidence.display_name + " as it is on disk right now - no indexing.";
       }
-      return "Live browsing " + evidence.display_name + " directly from the file - no indexing.";
+      return "Browsing " + evidence.display_name + " directly from the file - no indexing.";
     }
 
     function looksLikeDiskImage(path) {
@@ -12880,7 +13745,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const previous = currentAnalyzeLocation();
         state.live = { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
         renderEvidenceBrowserEntries();
-        setNotice("Live browse off.");
+        setNotice("Source browse closed.");
         commitAnalyzeNavigation(previous);
         return;
       }
@@ -12900,7 +13765,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         ? "Reading volumes from " + evidence.display_name + "..."
         : "Opening live view for " + evidence.display_name + "...");
       try {
-        const data = await apiGet("/api/image/volumes", { case_path: currentCasePath(), evidence_id: evidence.id });
+        const data = await loadLiveVolumes(evidence.id);
         if (state.live !== initialLiveState || !selectedEvidenceIdentityMatches(evidence)) {
           return;
         }
@@ -12915,6 +13780,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           openedLiveState.expanded.add(liveKey(first.index, "/"));
           openedLiveState.selKey = liveKey(first.index, "/");
         }
+        state.liveGuidanceExpiresAt = Date.now() + 7000;
         renderEvidenceBrowserEntries();
         if (state.live !== openedLiveState || !selectedEvidenceIdentityMatches(evidence)) {
           return;
@@ -13183,7 +14049,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const itemRef = liveBookmarkItemRef(volume, path, name, isDir);
       await apiPost("/api/bookmark/quick", {
         case_path: currentCasePath(),
-        folder_name: "Live Browse",
+        folder_name: "Source Browse",
         title: name,
         bookmark_type: isDir ? "folder_info" : "notable_file",
         data_type: isDir ? "Live folder" : "Live file",
@@ -13201,7 +14067,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         await refresh();
         state.live.active = true;
         renderEvidenceBrowserEntries();
-        setNotice("Bookmarked " + (isDir ? "folder " : "") + name + " from live browse.");
+        setNotice("Bookmarked " + (isDir ? "folder " : "") + name + " from the source browse.");
       } catch (err) {
         setNotice(err.message, true);
       }
@@ -13215,7 +14081,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           evidence_id: state.live.evidenceId,
           volume: volume,
           path: path,
-          folder_name: "Live Browse",
+          folder_name: "Source Browse",
           max_entries: currentRecursiveBookmarkLimit()
         });
         await refresh();
@@ -13322,7 +14188,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       if (symlink) {
-        setNotice("Live browse lists symlinks but does not follow them.", true);
+        setNotice("Browse lists symlinks but does not follow them.", true);
         return;
       }
       if (isDir) {
@@ -13339,7 +14205,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       hideContextMenu();
       const items = selectedVisibleLiveItems();
       if (items.length === 0) {
-        setNotice("No live items selected.", true);
+        setNotice("No source items selected.", true);
         return;
       }
       if (items.length > LIVE_BOOKMARK_BATCH_LIMIT) {
@@ -13391,7 +14257,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       hideContextMenu();
       const items = selectedVisibleLiveItems();
       if (items.length === 0) {
-        setNotice("No live items selected.", true);
+        setNotice("No source items selected.", true);
         return;
       }
       const root = BOOTSTRAP.workspaceRoot || ".";
@@ -13749,7 +14615,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         "live-vol" + volume + "-" + safeFileName(name)
       ]);
       const evidence = state.data && state.data.evidence.find((item) => item.id === state.live.evidenceId);
-      setNotice("Exporting " + name + (evidence && evidence.source_kind === "image" ? " from the image..." : " from live browse..."));
+      setNotice("Exporting " + name + (evidence && evidence.source_kind === "image" ? " from the image..." : " from the attached source..."));
       try {
         const data = await apiPost("/api/image/export", {
           case_path: currentCasePath(),
@@ -13907,8 +14773,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderTreeModeControls();
       const evidence = state.data && state.data.evidence.find((item) => item.id === state.live.evidenceId);
       const localLive = evidence && (evidence.source_kind === "folder" || evidence.source_kind === "file");
-      $("treeTitle").textContent = localLive ? "Live source" : "Volumes (live)";
-      $("browserTitle").textContent = (evidence ? evidence.display_name : "Image") + " | live browse";
+      $("treeTitle").textContent = localLive ? "Attached source" : "Volumes";
+      $("browserTitle").textContent = (evidence ? evidence.display_name : "Image") + " | browse";
       const rows = [];
       if (evidence && evidence.source_kind === "image") {
         const rawActive = state.hex.raw && state.hex.raw.volume == null ? " active" : "";
@@ -13950,7 +14816,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const selVolume = selected ? Number(selected.split("|")[0]) : 0;
       $("folderTitle").textContent = selected ? selPath : "Select a volume";
       if (!selected) {
-        $("entryTable").innerHTML = empty("Select a volume or folder on the left to browse it live.");
+        $("entryTable").innerHTML = empty("Select a volume or folder on the left to browse it.");
         setCurrentLiveGrid("live", []);
         renderSelectionCount();
         return;
@@ -13961,27 +14827,32 @@ const INDEX_HTML: &str = r###"<!doctype html>
       setCurrentLiveGrid("live", tableResult.visibleRows.map((row) => row.item));
       renderSelectionCount();
       const caveat = evidence && evidence.source_kind === "folder"
-        ? `<div class="analysis-status">Live view reads the current disk state (not a preserved snapshot).</div>`
+        ? `<div class="analysis-status">Direct browse reads the current disk state (not a preserved snapshot).</div>`
         : "";
-      const imageLayout = evidence && evidence.source_kind === "image"
-        ? `<div class="analysis-status">Detected ${state.live.volumes.length.toLocaleString()} filesystem volume${state.live.volumes.length === 1 ? "" : "s"}. The raw image row is a byte view and is not counted as another volume.</div>`
+      const guidanceRemainingMs = Math.max(0, Number(state.liveGuidanceExpiresAt || 0) - Date.now());
+      const guidanceStyle = `style="--guidance-duration:${guidanceRemainingMs}ms"`;
+      const imageLayout = guidanceRemainingMs > 0 && evidence && evidence.source_kind === "image"
+        ? `<div class="analysis-status transient-guidance" role="status" ${guidanceStyle}>Detected ${state.live.volumes.length.toLocaleString()} filesystem volume${state.live.volumes.length === 1 ? "" : "s"}. The raw image row is a byte view and is not counted as another volume.</div>`
         : "";
-      const hint = caveat + imageLayout + `<div class="analysis-status">Live browse: click a file for hex/text, right-click a row for bookmark/export (folders can bookmark or export recursively), Ctrl/Shift-click or checkboxes to multi-select.</div>`;
+      const liveHint = guidanceRemainingMs > 0
+        ? `<div class="analysis-status transient-guidance" role="status" ${guidanceStyle}>Browse: click a file for hex/text, right-click a row for bookmark/export (folders can bookmark or export recursively), Ctrl/Shift-click or checkboxes to multi-select.</div>`
+        : "";
+      const hint = caveat + imageLayout + liveHint;
       const filterStatus = gridFilterStatusHtml("live", columns, tableResult.visibleRows.length, entries.length, "items");
       const pageStatus = paging && paging.nextCursor
-        ? `<div class="analysis-status">Loaded ${entries.length.toLocaleString()} of ${paging.totalEntries.toLocaleString()} live items. <button class="ghost" onclick="liveLoadMore(${selVolume}, '${escapeAttr(escapeJs(selPath))}')"${paging.loading ? " disabled" : ""}>Load more</button></div>`
+        ? `<div class="analysis-status">Loaded ${entries.length.toLocaleString()} of ${paging.totalEntries.toLocaleString()} items. <button class="ghost" onclick="liveLoadMore(${selVolume}, '${escapeAttr(escapeJs(selPath))}')"${paging.loading ? " disabled" : ""}>Load more</button></div>`
         : "";
       const allPictures = entries.length > 0 && entries.every((entry) => isLiveImageEntry(entry));
       if (allPictures && state.pictureViewMode !== "list") {
         $("entryTable").innerHTML = hint + pageStatus + filterStatus
           + renderLiveThumbnailContents(tableResult.visibleRows, state.live.evidenceId)
-          + (tableResult.visibleRows.length ? "" : empty("No live pictures match the column filters."));
+          + (tableResult.visibleRows.length ? "" : empty("No pictures match the column filters."));
       } else {
         const galleryToggle = allPictures
           ? `<div class="thumb-toolbar"><button class="ghost" onclick="setPictureViewMode('grid')">Gallery view</button></div>`
           : "";
         $("entryTable").innerHTML = entries.length
-          ? hint + pageStatus + galleryToggle + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No live items match the column filters."))
+          ? hint + pageStatus + galleryToggle + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No items match the column filters."))
           : empty("This folder is empty.");
       }
     }
@@ -14505,7 +15376,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       if (state.data && state.browserState.evidenceId
-        && state.browserState.treeMode !== "categories") {
+        && state.browserState.treeMode !== "categories"
+        && !(state.pendingAnalysisSelection
+          && !state.pendingAnalysisSelection.applied
+          && state.pendingAnalysisSelection.treeMode === "live")) {
         const evidenceForAuto = state.data.evidence.find((item) => item.id === state.browserState.evidenceId);
         if (evidenceForAuto && evidenceIndexedEntryCount(evidenceForAuto.id) === 0 && maybeAutoLiveBrowse(evidenceForAuto)) {
           renderHexViewer();
@@ -14560,7 +15434,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       if (entries.length === 0) {
-        if (maybeAutoLiveBrowse(evidence)) {
+        const pendingLiveRestore = state.pendingAnalysisSelection
+          && !state.pendingAnalysisSelection.applied
+          && state.pendingAnalysisSelection.treeMode === "live";
+        if (!pendingLiveRestore && maybeAutoLiveBrowse(evidence)) {
           renderHexViewer();
           return;
         }
@@ -14638,7 +15515,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
           <td>${escapeHtml(evidence.attached_at || "")}</td>
           <td class="actions">
             <div class="toolbar">
-              ${liveBrowseButtonHtml(evidence)}
               ${processActionHtml(evidence)}
               ${bookmark}
               <button class="ghost danger" onclick="removeEvidence(${evidence.id})">Remove</button>
@@ -14666,7 +15542,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const evidenceIndex = state.data.evidence.findIndex((item) => item.id === evidence.id);
       const status = evidenceProcessingStatusHtml(evidence);
       const liveNotice = (evidence.source_kind === "folder" || evidence.source_kind === "file") && !evidence.indexed_at
-        ? `<div class="analysis-status">Live browse shows this ${evidence.source_kind === "folder" ? "folder" : "file"} as it is on disk right now. Process (Read File System) to index it for search, categories, and reports.</div>`
+        ? `<div class="analysis-status">Browse shows this ${evidence.source_kind === "folder" ? "folder" : "file"} as it is on disk right now. Process (Read File System) to index it for search, categories, and reports.</div>`
         : "";
       const columns = attachedEvidenceGridColumns();
       const rows = [attachedEvidenceGridRow(evidence, evidenceIndex, status)];
@@ -14910,7 +15786,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function emptyIndexedCategoryMessage(fallback = "No entries in this category.") {
       const evidence = selectedEvidenceSource();
       if (evidence && evidenceIndexedEntryCount(evidence.id) === 0) {
-        return "No indexed categories are available. Complete Analyze image successfully; live-browse rows are intentionally not mirrored into Categories.";
+        return "No indexed categories are available. Complete Analyze image successfully; direct-browse rows are intentionally not mirrored into Categories.";
       }
       return fallback;
     }
@@ -15909,7 +16785,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       const total = (state.data.entry_count || 0).toLocaleString();
       const shown = (state.data.entries_limit || state.data.entries.length).toLocaleString();
-      return `<div class="analysis-status">This case has ${total} indexed entries; only the first ${shown} are loaded in this indexed view (loading all of them would hang the browser). Use <strong>Live browse</strong> to navigate the whole disk directly, or <strong>Deep Search</strong> to find specific files.</div>`;
+      return `<div class="analysis-status">This case has ${total} indexed entries; only the first ${shown} are loaded in this indexed view (loading all of them would hang the browser). Use <strong>Browse source</strong> to navigate the whole disk directly, or <strong>Deep Search</strong> to find specific files.</div>`;
     }
 
     function imageAnalysisStatusHtml(entries) {
@@ -18031,8 +18907,31 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return !!entry && entry.entry_kind === "file";
     }
 
-    function setViewerFullscreen(enabled) {
-      state.viewerFullscreen = Boolean(enabled);
+    function setViewerFullscreen(enabled, historyMode = "auto") {
+      const next = Boolean(enabled);
+      const historyMarked = Boolean(history.state && history.state.kdftViewerFullscreen);
+      if (!next && state.viewerFullscreen && historyMode === "auto" && historyMarked) {
+        // The marked entry was created solely to make Back/Escape an in-app
+        // fullscreen exit. Wait for popstate to synchronize the UI; guarding
+        // the request prevents key-repeat or a double click from going back a
+        // second time and abandoning the workbench.
+        if (!state.viewerFullscreenHistoryPending) {
+          state.viewerFullscreenHistoryPending = true;
+          history.back();
+        }
+        return;
+      }
+      if (historyMode === "popstate") {
+        state.viewerFullscreenHistoryPending = false;
+      }
+      if (next && !state.viewerFullscreen && historyMode === "auto" && !historyMarked) {
+        // Give a newly opened analysis tab one safe in-app history step. The
+        // browser Back button then exits the byte-view fullscreen state instead
+        // of immediately abandoning KDFT for the browser start page.
+        const prior = history.state && typeof history.state === "object" ? history.state : {};
+        history.pushState({ ...prior, kdftViewerFullscreen: true }, "", window.location.href);
+      }
+      state.viewerFullscreen = next;
       document.body.classList.toggle("viewer-fullscreen", state.viewerFullscreen);
       const button = $("toggleViewerFullscreen");
       if (button) {
@@ -19370,7 +20269,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // Bitwise hits from the unified search's "All" mode. The backend provides
     // authoritative sector size and partition containment.
     function rawSearchResultColumns() {
-      const columns = [];
+      const columns = [
+        { key: "select", label: "", sortable: false, filterable: false, sortType: "none" }
+      ];
       if (state.rawSearchResult && state.rawSearchResult.multiSource) {
         columns.push({ key: "evidence", label: "Evidence", sortable: true, filterable: true, sortType: "text" });
       }
@@ -19387,6 +20288,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return columns;
     }
 
+    function rawSearchHitKey(hit) {
+      return JSON.stringify([
+        hit.evidence_id,
+        Number(hit.offset) || 0,
+        Number(hit.length) || 0,
+        hit.encoding || "",
+        hit.data_preview || ""
+      ]);
+    }
+
     function rawSearchGridRow(hit, hitIndex) {
       const offset = Number(hit.offset) || 0;
       // The backend now reports the authoritative sector; keep the local
@@ -19401,8 +20312,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return {
         hit,
         hitIndex,
+        key: rawSearchHitKey(hit),
         partitionTitle,
         values: {
+          select: "",
           evidence: hit.evidence_name || (hit.evidence_id != null ? String(hit.evidence_id) : ""),
           offset: offset.toLocaleString() + " (0x" + offset.toString(16).toUpperCase() + ")",
           sector: sector.toLocaleString(),
@@ -19422,8 +20335,84 @@ const INDEX_HTML: &str = r###"<!doctype html>
       };
     }
 
+    function visibleRawSearchResultRows() {
+      const result = state.rawSearchResult;
+      const rows = result && Array.isArray(result.hits)
+        ? result.hits.map(rawSearchGridRow)
+        : [];
+      return visibleGridRows("rawSearch", rawSearchResultColumns(), rows);
+    }
+
+    function selectedVisibleRawSearchResultRows() {
+      const selected = state.selectedRawSearchKeys || new Set();
+      return visibleRawSearchResultRows().filter((row) => selected.has(row.key));
+    }
+
+    function selectedRawSearchResultRows() {
+      const result = state.rawSearchResult;
+      const selected = state.selectedRawSearchKeys || new Set();
+      const rows = result && Array.isArray(result.hits)
+        ? result.hits.map(rawSearchGridRow)
+        : [];
+      return rows.filter((row) => selected.has(row.key));
+    }
+
+    function toggleRawSearchHitSelection(hitIndex, selected, event = null) {
+      const result = state.rawSearchResult;
+      const hit = result && result.hits ? result.hits[hitIndex] : null;
+      if (!hit) {
+        renderSearchSelectionCount();
+        return;
+      }
+      const key = rawSearchHitKey(hit);
+      const visible = visibleRawSearchResultRows();
+      if (event && event.shiftKey && state.lastRawSearchKey) {
+        const anchor = visible.findIndex((row) => row.key === state.lastRawSearchKey);
+        const target = visible.findIndex((row) => row.key === key);
+        if (anchor >= 0 && target >= 0) {
+          const from = Math.min(anchor, target);
+          const to = Math.max(anchor, target);
+          visible.slice(from, to + 1).forEach((row) => {
+            if (selected) {
+              state.selectedRawSearchKeys.add(row.key);
+            } else {
+              state.selectedRawSearchKeys.delete(row.key);
+            }
+          });
+        }
+      } else if (selected) {
+        state.selectedRawSearchKeys.add(key);
+      } else {
+        state.selectedRawSearchKeys.delete(key);
+      }
+      state.lastRawSearchKey = key;
+      renderRawSearchResults();
+      persistDeepSearchSession();
+    }
+
+    function handleRawSearchHitRowClick(event, hitIndex) {
+      if (event.target.closest("button, input, a")) {
+        return;
+      }
+      const result = state.rawSearchResult;
+      const hit = result && result.hits ? result.hits[hitIndex] : null;
+      if (!hit) {
+        return;
+      }
+      const key = rawSearchHitKey(hit);
+      if (!event.ctrlKey && !event.metaKey && !event.shiftKey) {
+        state.selectedRawSearchKeys = new Set([key]);
+        state.lastRawSearchKey = key;
+        renderRawSearchResults();
+        persistDeepSearchSession();
+        return;
+      }
+      toggleRawSearchHitSelection(hitIndex, !state.selectedRawSearchKeys.has(key), event);
+    }
+
     function renderRawSearchGridRow(row) {
       const multi = state.rawSearchResult && state.rawSearchResult.multiSource;
+      const checked = (state.selectedRawSearchKeys || new Set()).has(row.key) ? " checked" : "";
       const evidenceCell = multi
         ? `<td title="${escapeAttr(row.values.evidence)}">${escapeHtml(row.values.evidence)}</td>`
         : "";
@@ -19433,16 +20422,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
       // full hex/ASCII view (this is the "bigger preview" affordance).
       const openTitle = "Open this offset in the hex/ASCII viewer (hit bytes pre-selected; drag to extend, then Bookmark selection)";
       return `
-      <tr data-raw-hit-index="${row.hitIndex}">
+      <tr data-raw-hit-index="${row.hitIndex}" onclick="handleRawSearchHitRowClick(event, ${row.hitIndex})">
+        <td><input type="checkbox"${checked} aria-label="Select raw hit at ${escapeAttr(row.values.offset)}" onclick="event.stopPropagation(); toggleRawSearchHitSelection(${row.hitIndex}, this.checked, event)"></td>
         ${evidenceCell}
-        <td class="entry-offset"><button class="offset-link" title="${escapeAttr(openTitle)}" onclick="openRawHitInHex(${row.hitIndex})">${escapeHtml(row.values.offset)}</button></td>
+        <td class="entry-offset"><button class="offset-link" title="${escapeAttr(openTitle)}" onclick="event.stopPropagation(); openRawHitInHex(${row.hitIndex})">${escapeHtml(row.values.offset)}</button></td>
         <td>${escapeHtml(row.values.sector)}</td>
         <td title="${escapeAttr(row.partitionTitle || row.values.partition)}">${escapeHtml(row.values.partition)}</td>
         <td class="tiny" title="${escapeAttr(row.values.region)}">${escapeHtml(row.values.region)}</td>
         <td>${escapeHtml(row.values.encoding)}</td>
         <td>${escapeHtml(row.values.length)}</td>
-        <td class="mono tiny offset-link-cell" title="${escapeAttr(openTitle)}" onclick="openRawHitInHex(${row.hitIndex})">${escapeHtml(row.values.preview)}</td>
-        <td class="mono tiny offset-link-cell" title="${escapeAttr(openTitle)}" onclick="openRawHitInHex(${row.hitIndex})">${escapeHtml(row.values.ascii)}</td>
+        <td class="mono tiny offset-link-cell" title="${escapeAttr(openTitle)}" onclick="event.stopPropagation(); openRawHitInHex(${row.hitIndex})">${escapeHtml(row.values.preview)}</td>
+        <td class="mono tiny offset-link-cell" title="${escapeAttr(openTitle)}" onclick="event.stopPropagation(); openRawHitInHex(${row.hitIndex})">${escapeHtml(row.values.ascii)}</td>
       </tr>`;
     }
 
@@ -19484,6 +20474,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         sizeBytes: prov.total_size != null ? Number(prov.total_size) : (evidence && evidence.size_bytes != null ? evidence.size_bytes : null)
       };
       $("viewerMode").value = "hex";
+      // Save the expensive search before leaving its view. Returning through
+      // the app tabs or browser history can then restore it without rescanning.
+      persistDeepSearchSession();
       switchView("analyzeView");
       try {
         await fetchEntryBytes();
@@ -19507,6 +20500,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!container || !count) {
         return;
       }
+      renderSearchSelectionCount();
       const result = state.rawSearchResult;
       const loadMore = $("loadMoreRawSearchResults");
       if (loadMore) {
@@ -19613,44 +20607,49 @@ const INDEX_HTML: &str = r###"<!doctype html>
       };
     }
 
-    async function bookmarkRawSearchHit(hitIndex) {
-      const result = state.rawSearchResult;
-      const hit = result && result.hits ? result.hits[hitIndex] : null;
-      if (!hit) {
-        setNotice("This bitwise hit is no longer loaded - re-run the search.", true);
-        return;
+    async function bookmarkRawSearchHitRecord(hit, result, refreshAfter = true, casePath = currentCasePath()) {
+      if (!hit || !result) {
+        throw new Error("This bitwise hit is no longer loaded - re-run the search.");
       }
       const prov = hit.search_provenance || (result.provenance || {})[hit.evidence_id];
       if (!prov) {
-        setNotice("No scan provenance is loaded for this hit's evidence - re-run the search.", true);
-        return;
+        throw new Error("No scan provenance is loaded for this hit's evidence - re-run the search.");
       }
       const itemRef = rawSearchHitItemRef(hit, prov);
       const offsetLabel = Number(hit.offset).toLocaleString() + " (0x" + Number(hit.offset).toString(16).toUpperCase() + ")";
       const hashNote = prov.evidence_sha256_hex
         ? ""
         : " WARNING: evidence had no acquisition SHA-256 at search time - hash the evidence before relying on this offset in court.";
-      try {
-        await apiPost("/api/bookmark/quick", {
-          case_path: currentCasePath(),
-          folder_name: "Raw Search Hits",
-          title: "Raw hit: " + (prov.evidence_display_name || "evidence " + hit.evidence_id) + " @ " + offsetLabel,
-          comment: "Whole-disk bitwise hit for query \"" + (prov.query || result.query || "") + "\" (" + hit.encoding + ") at byte offset " + offsetLabel + ", sector " + itemRef.sector + ", " + (itemRef.region || "unclassified region") + "." + hashNote,
-          bookmark_type: "highlighted_data",
-          data_type: "Highlighted Bytes",
-          evidence_id: hit.evidence_id,
-          entry_id: null,
-          display_name: itemRef.display_name,
-          logical_path: itemRef.logical_path,
-          selection_offset: Number(hit.offset) || 0,
-          selection_length: Number(hit.length) || 0,
-          data_preview: hit.data_preview,
-          item_ref_json: itemRef
-        });
+      await apiPost("/api/bookmark/quick", {
+        case_path: casePath,
+        folder_name: "Raw Search Hits",
+        title: "Raw hit: " + (prov.evidence_display_name || "evidence " + hit.evidence_id) + " @ " + offsetLabel,
+        comment: "Whole-disk bitwise hit for query \"" + (prov.query || result.query || "") + "\" (" + hit.encoding + ") at byte offset " + offsetLabel + ", sector " + itemRef.sector + ", " + (itemRef.region || "unclassified region") + "." + hashNote,
+        bookmark_type: "highlighted_data",
+        data_type: "Highlighted Bytes",
+        evidence_id: hit.evidence_id,
+        entry_id: null,
+        display_name: itemRef.display_name,
+        logical_path: itemRef.logical_path,
+        selection_offset: Number(hit.offset) || 0,
+        selection_length: Number(hit.length) || 0,
+        data_preview: hit.data_preview,
+        item_ref_json: itemRef
+      });
+      if (refreshAfter) {
         await refresh();
         setNotice("Bookmarked bitwise hit at offset " + offsetLabel + " into \"Raw Search Hits\"." + hashNote, Boolean(hashNote));
+      }
+      return hashNote;
+    }
+
+    async function bookmarkRawSearchHit(hitIndex) {
+      const result = state.rawSearchResult;
+      const hit = result && result.hits ? result.hits[hitIndex] : null;
+      try {
+        await bookmarkRawSearchHitRecord(hit, result, true);
       } catch (err) {
-        setNotice(err.message, true);
+        setNotice(err.message || String(err), true);
       }
     }
 
@@ -19838,6 +20837,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function rerenderGrid(gridId) {
       if (gridId === "search") {
         renderSearchResults();
+        return;
+      }
+      if (gridId === "rawSearch") {
+        renderRawSearchResults();
         return;
       }
       if (gridId === "bookmarks") {
@@ -20080,6 +21083,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return visibleSearchResultRows().filter((row) => selected.has(row.key));
     }
 
+    function selectedSearchResultRows() {
+      const selected = state.selectedSearchKeys || new Set();
+      const entryMap = loadedSearchEntryMap();
+      return state.searchResults
+        .map((hit, index) => searchResultRow(hit, index, entryMap))
+        .filter((row) => selected.has(row.key));
+    }
+
     function searchResultsTable(rows) {
       const headers = searchResultColumns().map((column) => gridHeaderCell("search", column)).join("");
       return `<table class="search-results-table"><thead><tr>${headers}</tr></thead><tbody>${rows}</tbody></table>`;
@@ -20136,7 +21147,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       if (state.searchResults.length === 0 && state.data && Number(state.data.entry_count || 0) === 0) {
-        $("searchResults").innerHTML = `<div class="analysis-status">This case has no indexed entries; Deep Search only searches processed evidence. Process evidence first, or use the raw find in Live browse.</div>`;
+        $("searchResults").innerHTML = currentSearchMode() === "all"
+          ? `<div class="analysis-status"><strong>Indexed search unavailable:</strong> this case has no processed entries. The independent bitwise whole-disk results appear below and search decoded evidence bytes, including unallocated space and slack.</div>`
+          : `<div class="analysis-status"><strong>Indexed search unavailable:</strong> this case has no processed entries. Process the evidence first, switch to All for a bitwise whole-disk scan, or use raw find in Browse.</div>`;
         renderSearchSelectionCount();
         return;
       }
@@ -20166,7 +21179,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function renderSearchSelectionCount() {
-      $("searchSelectedCount").textContent = selectedVisibleSearchResultRows().length + " selected";
+      const selected = (state.selectedSearchKeys || new Set()).size
+        + (state.selectedRawSearchKeys || new Set()).size;
+      const visible = selectedVisibleSearchResultRows().length
+        + selectedVisibleRawSearchResultRows().length;
+      $("searchSelectedCount").textContent = selected + " selected"
+        + (visible < selected ? " (" + visible + " visible)" : "");
     }
 
     function bookmarksGridColumns() {
@@ -20374,6 +21392,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function handleGlobalKeydown(event) {
       if (event.key === "Escape" && state.viewerFullscreen) {
+        event.preventDefault();
         setViewerFullscreen(false);
         return;
       }
@@ -20398,6 +21417,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function switchView(viewId) {
+      const leavingSearch = $("searchView").classList.contains("active") && viewId !== "searchView";
+      if (leavingSearch) {
+        persistDeepSearchSession();
+      }
       document.querySelectorAll(".tab").forEach((tab) => {
         tab.classList.toggle("active", tab.dataset.view === viewId);
       });
@@ -20542,7 +21565,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
     $("analyzeBack").addEventListener("click", analyzeBack);
     $("analyzeForward").addEventListener("click", analyzeForward);
     $("exportReportFromAnalyze").addEventListener("click", exportReport);
-    $("recategorizeBtn").addEventListener("click", recategorizeCase);
+    const recategorizeButton = $("recategorizeBtn");
+    if (recategorizeButton) {
+      recategorizeButton.addEventListener("click", recategorizeCase);
+    }
     $("openAnalyzeWindow").addEventListener("click", openAnalyzeWindow);
     $("liveBrowse").addEventListener("click", toggleLiveBrowse);
     $("treeModeFilesystem").addEventListener("click", () => setBrowserTreeMode("filesystem"));
@@ -20582,6 +21608,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     });
     document.addEventListener("keydown", handleGlobalKeydown);
+    window.addEventListener("pagehide", persistDeepSearchSession);
+    window.addEventListener("popstate", (event) => {
+      state.viewerFullscreenHistoryPending = false;
+      setViewerFullscreen(Boolean(event.state && event.state.kdftViewerFullscreen), "popstate");
+    });
     bindTabs();
     bindInspectorResize();
     bindHexSelection();

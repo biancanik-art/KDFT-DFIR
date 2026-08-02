@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod identity_network;
+mod ntfs_compression;
 
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 use anyhow::{anyhow, bail, Context, Result};
@@ -14,6 +15,7 @@ use notatin::cell_key_value::CellKeyValueDataTypes as RegistryValueDataType;
 use notatin::cell_value::CellValue as RegistryCellValue;
 use notatin::parser::ParserIterator as RegistryParserIterator;
 use notatin::parser_builder::ParserBuilder as RegistryParserBuilder;
+use ntfs::NtfsReadSeek as _;
 use rayon::prelude::*;
 use rusqlite::{
     named_params, params, Connection, OpenFlags, OptionalExtension, TransactionBehavior,
@@ -26,6 +28,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// A same-directory temporary output that becomes visible at `destination`
 /// only after every byte has been flushed and synced. Publication uses a hard
@@ -22188,6 +22191,90 @@ struct OpenedDiskImage {
     container_finding_count: usize,
 }
 
+/// A cursor over one immutable EWF decoder shared by concurrent evidence
+/// readers. Each worker owns only its cursor position; the potentially large
+/// chunk table and bounded decompression cache live once in `EwfReader`.
+/// `EwfReader::read_at` is positioned and synchronizes its cache internally.
+struct SharedEwfCursor {
+    reader: Arc<ewf::EwfReader>,
+    position: u64,
+}
+
+impl Read for SharedEwfCursor {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self
+            .reader
+            .read_at(buffer, self.position)
+            .map_err(io::Error::other)?;
+        self.position = self
+            .position
+            .checked_add(u64::try_from(read).map_err(io::Error::other)?)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "read position overflow"))?;
+        Ok(read)
+    }
+}
+
+impl Seek for SharedEwfCursor {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let next = match position {
+            SeekFrom::Start(value) => i128::from(value),
+            SeekFrom::End(value) => i128::from(self.reader.total_size()) + i128::from(value),
+            SeekFrom::Current(value) => i128::from(self.position) + i128::from(value),
+        };
+        if !(0..=i128::from(u64::MAX)).contains(&next) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek position is outside the u64 range",
+            ));
+        }
+        self.position = next as u64;
+        Ok(self.position)
+    }
+}
+
+static SHARED_EWF_READERS: OnceLock<Mutex<HashMap<PathBuf, Weak<ewf::EwfReader>>>> =
+    OnceLock::new();
+
+fn shared_ewf_reader(path: &Path) -> Result<Arc<ewf::EwfReader>> {
+    let key = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let cache = SHARED_EWF_READERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| anyhow!("shared EWF reader cache lock was poisoned"))?;
+    if let Some(reader) = cache.get(&key).and_then(Weak::upgrade) {
+        return Ok(reader);
+    }
+
+    // Keep the lock while opening so simultaneous workers cannot each build a
+    // duplicate multi-million-entry chunk index for the same acquisition.
+    let reader = Arc::new(
+        ewf::EwfReader::open(path)
+            .with_context(|| format!("decoding EWF image {}", path.display()))?,
+    );
+    cache.retain(|_, reader| reader.strong_count() > 0);
+    cache.insert(key, Arc::downgrade(&reader));
+    Ok(reader)
+}
+
+fn has_ewf_signature(path: &Path) -> Result<bool> {
+    const EVF2_SIGNATURE: [u8; 8] = [0x45, 0x56, 0x46, 0x32, 0x0d, 0x0a, 0x81, 0x00];
+    const LEF2_SIGNATURE: [u8; 8] = [0x4c, 0x45, 0x46, 0x32, 0x0d, 0x0a, 0x81, 0x00];
+
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("opening image signature from {}", path.display()))?;
+    let mut signature = [0_u8; 8];
+    match file.read_exact(&mut signature) {
+        Ok(()) => Ok(matches!(
+            signature,
+            ewf::EVF_SIGNATURE | EVF2_SIGNATURE | LEF2_SIGNATURE
+        )),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading image signature from {}", path.display()))
+        }
+    }
+}
+
 /// Discovers a split raw acquisition (image.001, image.002, ...) starting from
 /// its first numeric segment. Returns None when `path` is not the `.001`-style
 /// first segment or has no siblings. Like the EWF reader, a gap in the
@@ -25522,6 +25609,19 @@ fn open_disk_image(path: &Path) -> Result<OpenedDiskImage> {
             format: "Vdi".to_string(),
             decoded_size: disk.header.disk_size,
             reader: Box::new(disk),
+            container_finding_count: 0,
+        });
+    }
+    if has_ewf_signature(path)? {
+        let reader = shared_ewf_reader(path)?;
+        let decoded_size = reader.total_size();
+        return Ok(OpenedDiskImage {
+            format: "Ewf".to_string(),
+            decoded_size,
+            reader: Box::new(SharedEwfCursor {
+                reader,
+                position: 0,
+            }),
             container_finding_count: 0,
         });
     }
@@ -28884,6 +28984,16 @@ struct NtfsDataStreamInfo {
     is_sparse: bool,
 }
 
+fn ntfs_stream_read_support(is_compressed: bool, is_encrypted: bool) -> &'static str {
+    if is_encrypted {
+        "metadata only; EFS-encrypted NTFS content requires decryption keys"
+    } else if is_compressed {
+        "readable; native NTFS LZNT1 compression is decoded with strict validation"
+    } else {
+        "readable"
+    }
+}
+
 #[derive(Default)]
 struct NtfsDirChildrenResult {
     children: Vec<NtfsDirChild>,
@@ -29247,7 +29357,7 @@ fn walk_ntfs_volume<T: Read + Seek>(
                             "ntfs_data_stream_compressed": stream.is_compressed,
                             "ntfs_data_stream_encrypted": stream.is_encrypted,
                             "ntfs_data_stream_sparse": stream.is_sparse,
-                            "ntfs_stream_read_support": if stream.is_compressed || stream.is_encrypted { "metadata only; ntfs crate 0.4.0 does not decode compressed/encrypted streams" } else { "readable" },
+                            "ntfs_stream_read_support": ntfs_stream_read_support(stream.is_compressed, stream.is_encrypted),
                             "mft_record_logical_offset": mft_record_logical_offset,
                             "mft_record_physical_offset": mft_record_physical_offset,
                             "file_data_logical_offset": stream.file_data_logical_offset,
@@ -29311,6 +29421,7 @@ const NTFS_DELETED_SCAN_DIAGNOSTIC_LIMIT: usize = 32;
 #[derive(Debug, Default)]
 struct NtfsDeletedScanDiagnostics {
     records_scanned: u64,
+    deleted_record_candidates: u64,
     record_read_error_count: u64,
     record_name_error_count: u64,
     records_without_names: u64,
@@ -29387,28 +29498,79 @@ impl NtfsDeletedScanDiagnostics {
     }
 
     fn record_missing_name(&mut self, record_number: u64) {
-        self.diagnostic_count = self.diagnostic_count.saturating_add(1);
         self.records_without_names = self.records_without_names.saturating_add(1);
         self.omitted_record_count = self.omitted_record_count.saturating_add(1);
         let current = format!("$MFT record {record_number}");
         progress::progress_skip(Some(current));
-        let diagnostic = format!(
-            "record {record_number} [file_name]: no recoverable FILE_NAME attribute was present"
-        );
-        progress::progress_diagnostic(
-            progress::JobDiagnosticKind::ParserDiagnostic,
-            diagnostic.clone(),
-        );
-        if self.samples.len() < NTFS_DELETED_SCAN_DIAGNOSTIC_LIMIT {
-            self.samples.push(diagnostic);
-        } else {
-            self.samples_omitted = self.samples_omitted.saturating_add(1);
-        }
     }
 
     fn is_partial(&self) -> bool {
         self.diagnostic_count > 0
     }
+}
+
+fn ntfs_raw_record_is_deleted_candidate(header: &[u8]) -> bool {
+    header.len() >= 24
+        && &header[..4] == b"FILE"
+        && u16::from_le_bytes([header[22], header[23]]) & 0x0001 == 0
+}
+
+#[cfg(test)]
+mod ntfs_deleted_candidate_tests {
+    use super::ntfs_raw_record_is_deleted_candidate;
+
+    #[test]
+    fn accepts_only_deleted_file_records() {
+        let mut deleted = [0_u8; 24];
+        deleted[..4].copy_from_slice(b"FILE");
+        assert!(ntfs_raw_record_is_deleted_candidate(&deleted));
+
+        let mut allocated = deleted;
+        allocated[22..24].copy_from_slice(&1_u16.to_le_bytes());
+        assert!(!ntfs_raw_record_is_deleted_candidate(&allocated));
+
+        let mut non_file = deleted;
+        non_file[..4].copy_from_slice(b"BAAD");
+        assert!(!ntfs_raw_record_is_deleted_candidate(&non_file));
+        assert!(!ntfs_raw_record_is_deleted_candidate(&deleted[..23]));
+    }
+}
+
+fn ntfs_deleted_candidate_record_numbers<T: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+    record_count: u64,
+) -> Result<Vec<u64>> {
+    let record_size = usize::try_from(ntfs.file_record_size())
+        .context("NTFS file-record size does not fit in memory address space")?;
+    if !(24..=64 * 1024).contains(&record_size) {
+        bail!("NTFS reports an unsafe file-record size of {record_size} bytes");
+    }
+    let mft = ntfs
+        .file(fs, ntfs::KnownNtfsFileRecordNumber::MFT as u64)
+        .context("opening NTFS $MFT while locating deleted records")?;
+    let data = mft
+        .data(fs, "")
+        .context("reading NTFS $MFT data attribute while locating deleted records")?
+        .context("NTFS $MFT has no unnamed data stream")?;
+    let attribute = data
+        .to_attribute()
+        .context("opening NTFS $MFT data attribute while locating deleted records")?;
+    let value = attribute
+        .value(fs)
+        .context("opening NTFS $MFT stream while locating deleted records")?;
+    let mut reader = value.attach(fs);
+    let mut raw_record = vec![0_u8; record_size];
+    let mut candidates = Vec::new();
+    for record_number in 0..record_count {
+        reader.read_exact(&mut raw_record).with_context(|| {
+            format!("reading raw NTFS $MFT record {record_number} while locating deleted records")
+        })?;
+        if record_number >= 16 && ntfs_raw_record_is_deleted_candidate(&raw_record[..24]) {
+            candidates.push(record_number);
+        }
+    }
+    Ok(candidates)
 }
 
 fn process_deleted_ntfs_mft_records<T: Read + Seek>(
@@ -29464,11 +29626,34 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
             ),
         );
     }
-    let scan_limit = record_count;
+    let deleted_candidates = match ntfs_deleted_candidate_record_numbers(ntfs, fs, record_count) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            diagnostics.record_global_error("candidate_scan", &error);
+            progress::progress_truncated(format!(
+                "NTFS deleted-record recovery could not inspect raw $MFT records on partition {partition_index}: {error:#}"
+            ));
+            insert_ntfs_deleted_scan_diagnostic(
+                conn,
+                case_id,
+                evidence_id,
+                job_id,
+                volume_prefix,
+                partition_index,
+                Some(record_count),
+                &diagnostics,
+                indexed,
+                max_entries,
+            )?;
+            return Ok(true);
+        }
+    };
+    diagnostics.records_scanned = record_count.saturating_sub(16);
+    diagnostics.deleted_record_candidates = deleted_candidates.len() as u64;
     let mut truncated = false;
     let recovery_prefix = format!("{volume_prefix}/Recovery/Deleted Files");
 
-    for record_number in 16..scan_limit {
+    for record_number in deleted_candidates {
         if *indexed >= max_entries {
             truncated = true;
             progress::progress_truncated(format!(
@@ -29476,7 +29661,6 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
             ));
             break;
         }
-        diagnostics.records_scanned = diagnostics.records_scanned.saturating_add(1);
         let file = match ntfs.file(fs, record_number) {
             Ok(file) => file,
             Err(error) => {
@@ -29770,6 +29954,7 @@ fn insert_ntfs_deleted_scan_diagnostic(
             "source_path_exact": "$MFT",
             "record_count": record_count,
             "records_scanned": diagnostics.records_scanned,
+            "deleted_record_candidates": diagnostics.deleted_record_candidates,
             "record_read_error_count": diagnostics.record_read_error_count,
             "record_name_error_count": diagnostics.record_name_error_count,
             "records_without_names": diagnostics.records_without_names,
@@ -30799,11 +30984,7 @@ fn merge_mft_summary_into_ntfs_metadata(
             );
             object.insert(
                 "ntfs_stream_read_support".to_string(),
-                serde_json::json!(if compressed || encrypted {
-                    "metadata only; compressed/encrypted NTFS data is not decoded"
-                } else {
-                    "readable"
-                }),
+                serde_json::json!(ntfs_stream_read_support(compressed, encrypted)),
             );
         }
     }
@@ -31423,7 +31604,7 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
                 "ntfs_data_stream_compressed": stream.is_compressed,
                 "ntfs_data_stream_encrypted": stream.is_encrypted,
                 "ntfs_data_stream_sparse": stream.is_sparse,
-                "ntfs_stream_read_support": if stream.is_compressed || stream.is_encrypted { "metadata only; ntfs crate 0.4.0 does not decode compressed/encrypted streams" } else { "readable" },
+                "ntfs_stream_read_support": ntfs_stream_read_support(stream.is_compressed, stream.is_encrypted),
                 "mft_record_logical_offset": mft_record_logical_offset,
                 "mft_record_physical_offset": mft_record_physical_offset,
                 "file_data_logical_offset": stream.file_data_logical_offset,
@@ -31618,6 +31799,45 @@ fn annotate_ntfs_file_record_email<T: Read + Seek>(
         if !attribute_name.is_empty() {
             continue;
         }
+        let flags = data_attribute.flags();
+        if flags.contains(ntfs::NtfsAttributeFlags::ENCRYPTED) {
+            bail!("NTFS email file record {file_record_number} is encrypted");
+        }
+        if flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED) {
+            const MAX_COMPRESSED_EMAIL_BYTES: usize = 512 * 1024 * 1024;
+            let total_size = data_attribute
+                .value(fs)
+                .with_context(|| {
+                    format!("opening NTFS data value for record {file_record_number}")
+                })?
+                .len();
+            let read_len = usize::try_from(total_size)
+                .with_context(|| {
+                    format!("NTFS email file record {file_record_number} is too large")
+                })?
+                .min(MAX_COMPRESSED_EMAIL_BYTES);
+            if total_size > read_len as u64 {
+                bail!(
+                    "compressed NTFS email file record {file_record_number} exceeds the safe {}-byte parser limit",
+                    MAX_COMPRESSED_EMAIL_BYTES
+                );
+            }
+            let logical_path = format!("NTFS file record {file_record_number}");
+            let (bytes, _) = read_ntfs_compressed_attribute_range(
+                ntfs,
+                fs,
+                &data_attribute,
+                &logical_path,
+                0,
+                read_len,
+            )?;
+            return Ok(annotate_email_metadata_from_reader(
+                metadata,
+                email_format,
+                io::Cursor::new(bytes),
+                required_message,
+            ));
+        }
         let data_value = data_attribute
             .value(fs)
             .with_context(|| format!("opening NTFS data value for record {file_record_number}"))?;
@@ -31663,6 +31883,26 @@ fn read_ntfs_file_record_stream_bytes<T: Read + Seek>(
             .to_string_lossy();
         if attribute_name != data_stream_name {
             continue;
+        }
+        let flags = data_attribute.flags();
+        if flags.contains(ntfs::NtfsAttributeFlags::ENCRYPTED) {
+            bail!("NTFS file record {file_record_number} data stream is encrypted");
+        }
+        if flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED) {
+            let logical_path = if data_stream_name.is_empty() {
+                format!("NTFS file record {file_record_number}")
+            } else {
+                format!("NTFS file record {file_record_number}:{data_stream_name}")
+            };
+            let (bytes, _) = read_ntfs_compressed_attribute_range(
+                ntfs,
+                fs,
+                &data_attribute,
+                &logical_path,
+                0,
+                max_bytes,
+            )?;
+            return Ok(bytes);
         }
         let data_value = data_attribute
             .value(fs)
@@ -31941,6 +32181,407 @@ fn is_ntfs_unallocated_entry(entry: &EntryForBytes) -> bool {
         || entry.metadata_json["is_unallocated"].as_bool() == Some(true)
 }
 
+const MAX_NTFS_COMPRESSION_UNIT_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NtfsCompressionHeader {
+    compression_unit_exponent: u8,
+    data_size: u64,
+    initialized_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NtfsCompressionUnitStorage {
+    Sparse,
+    Compressed,
+    Uncompressed,
+}
+
+fn little_endian_u64(bytes: &[u8], offset: usize, field: &str) -> Result<u64> {
+    let end = offset
+        .checked_add(8)
+        .with_context(|| format!("NTFS {field} offset overflow"))?;
+    let raw: [u8; 8] = bytes
+        .get(offset..end)
+        .with_context(|| format!("NTFS attribute header is missing {field}"))?
+        .try_into()
+        .map_err(|_| anyhow!("NTFS attribute header has an invalid {field}"))?;
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn little_endian_u32(bytes: &[u8], offset: usize, field: &str) -> Result<u32> {
+    let end = offset
+        .checked_add(4)
+        .with_context(|| format!("NTFS {field} offset overflow"))?;
+    let raw: [u8; 4] = bytes
+        .get(offset..end)
+        .with_context(|| format!("NTFS attribute header is missing {field}"))?
+        .try_into()
+        .map_err(|_| anyhow!("NTFS attribute header has an invalid {field}"))?;
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn little_endian_u16(bytes: &[u8], offset: usize, field: &str) -> Result<u16> {
+    let end = offset
+        .checked_add(2)
+        .with_context(|| format!("NTFS {field} offset overflow"))?;
+    let raw: [u8; 2] = bytes
+        .get(offset..end)
+        .with_context(|| format!("NTFS attribute header is missing {field}"))?
+        .try_into()
+        .map_err(|_| anyhow!("NTFS attribute header has an invalid {field}"))?;
+    Ok(u16::from_le_bytes(raw))
+}
+
+fn read_ntfs_compression_header<T: Read + Seek>(
+    fs: &mut T,
+    data_attribute: &ntfs::NtfsAttribute<'_, '_>,
+    logical_path: &str,
+) -> Result<NtfsCompressionHeader> {
+    if data_attribute.is_resident() {
+        bail!("compressed NTFS stream is unexpectedly resident: {logical_path}");
+    }
+    let attribute_position = data_attribute
+        .position()
+        .value()
+        .with_context(|| format!("compressed NTFS attribute has no disk position: {logical_path}"))?
+        .get();
+    let saved_position = fs
+        .stream_position()
+        .with_context(|| format!("saving NTFS reader position for {logical_path}"))?;
+    fs.seek(SeekFrom::Start(attribute_position))
+        .with_context(|| format!("seeking compressed NTFS attribute header for {logical_path}"))?;
+    let mut header = [0_u8; 64];
+    let read_result = fs.read_exact(&mut header);
+    let restore_result = fs.seek(SeekFrom::Start(saved_position));
+    read_result
+        .with_context(|| format!("reading compressed NTFS attribute header for {logical_path}"))?;
+    restore_result.with_context(|| format!("restoring NTFS reader position for {logical_path}"))?;
+
+    let attribute_length = little_endian_u32(&header, 4, "attribute length")?;
+    if attribute_length < header.len() as u32 {
+        bail!(
+            "compressed NTFS attribute header is too short ({attribute_length} bytes): {logical_path}"
+        );
+    }
+    if header[8] != 1 {
+        bail!("compressed NTFS attribute is not nonresident: {logical_path}");
+    }
+    let lowest_vcn = little_endian_u64(&header, 16, "lowest VCN")?;
+    if lowest_vcn != 0 {
+        bail!(
+            "compressed NTFS stream begins at continuation VCN {lowest_vcn}; refusing an incomplete stream: {logical_path}"
+        );
+    }
+    let data_runs_offset = u32::from(little_endian_u16(&header, 32, "data-runs offset")?);
+    if data_runs_offset < header.len() as u32 || data_runs_offset >= attribute_length {
+        bail!(
+            "compressed NTFS attribute has invalid data-runs offset {data_runs_offset}: {logical_path}"
+        );
+    }
+    let compression_unit_exponent = header[34];
+    if compression_unit_exponent == 0 {
+        bail!("compressed NTFS attribute has a zero compression-unit exponent: {logical_path}");
+    }
+    let data_size = little_endian_u64(&header, 48, "data size")?;
+    let initialized_size = little_endian_u64(&header, 56, "initialized size")?;
+    if initialized_size > data_size {
+        bail!(
+            "compressed NTFS attribute initialized size {initialized_size} exceeds data size {data_size}: {logical_path}"
+        );
+    }
+    Ok(NtfsCompressionHeader {
+        compression_unit_exponent,
+        data_size,
+        initialized_size,
+    })
+}
+
+fn classify_ntfs_compression_unit(
+    physical_clusters: &[Option<u64>],
+) -> Result<NtfsCompressionUnitStorage> {
+    if physical_clusters.is_empty() {
+        bail!("NTFS compression unit contains no clusters");
+    }
+    let mut physical_count = 0_usize;
+    let mut saw_sparse = false;
+    for cluster in physical_clusters {
+        match cluster {
+            Some(_) if saw_sparse => {
+                bail!("compressed NTFS unit contains physical data after a sparse cluster")
+            }
+            Some(_) => physical_count += 1,
+            None => saw_sparse = true,
+        }
+    }
+    if physical_count == 0 {
+        Ok(NtfsCompressionUnitStorage::Sparse)
+    } else if physical_count == physical_clusters.len() {
+        Ok(NtfsCompressionUnitStorage::Uncompressed)
+    } else {
+        Ok(NtfsCompressionUnitStorage::Compressed)
+    }
+}
+
+#[cfg(test)]
+mod ntfs_compressed_unit_tests {
+    use super::{classify_ntfs_compression_unit, NtfsCompressionUnitStorage};
+
+    #[test]
+    fn classifies_sparse_compressed_and_uncompressed_units() {
+        assert_eq!(
+            classify_ntfs_compression_unit(&[None, None, None, None]).unwrap(),
+            NtfsCompressionUnitStorage::Sparse
+        );
+        assert_eq!(
+            classify_ntfs_compression_unit(&[Some(4096), Some(8192), None, None]).unwrap(),
+            NtfsCompressionUnitStorage::Compressed
+        );
+        assert_eq!(
+            classify_ntfs_compression_unit(&[Some(4096), Some(12288), Some(8192), Some(16384),])
+                .unwrap(),
+            NtfsCompressionUnitStorage::Uncompressed
+        );
+    }
+
+    #[test]
+    fn rejects_physical_clusters_after_sparse_tail() {
+        let error = classify_ntfs_compression_unit(&[Some(4096), None, Some(8192), None])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("physical data after a sparse cluster"));
+    }
+
+    #[test]
+    fn rejects_an_empty_compression_unit() {
+        let error = classify_ntfs_compression_unit(&[]).unwrap_err().to_string();
+        assert!(error.contains("no clusters"));
+    }
+}
+
+fn read_ntfs_physical_cluster<T: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+    physical_offset: u64,
+    cluster_size: usize,
+    logical_path: &str,
+) -> Result<Vec<u8>> {
+    let physical_end = physical_offset
+        .checked_add(cluster_size as u64)
+        .with_context(|| format!("NTFS physical cluster range overflow: {logical_path}"))?;
+    if physical_end > ntfs.size() {
+        bail!(
+            "NTFS physical cluster {}..{} exceeds volume size {}: {}",
+            physical_offset,
+            physical_end,
+            ntfs.size(),
+            logical_path
+        );
+    }
+    fs.seek(SeekFrom::Start(physical_offset))
+        .with_context(|| format!("seeking compressed NTFS cluster for {logical_path}"))?;
+    let mut bytes = vec![0_u8; cluster_size];
+    fs.read_exact(&mut bytes)
+        .with_context(|| format!("reading compressed NTFS cluster for {logical_path}"))?;
+    Ok(bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_ntfs_compression_unit<T: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+    data_value: &mut ntfs::attribute_value::NtfsAttributeValue<'_, '_>,
+    total_size: u64,
+    unit_start: u64,
+    logical_length: usize,
+    initialized_length: usize,
+    cluster_size: usize,
+    clusters_per_unit: usize,
+    logical_path: &str,
+) -> Result<Vec<u8>> {
+    if initialized_length == 0 {
+        return Ok(vec![0_u8; logical_length]);
+    }
+
+    let mut physical_clusters = Vec::with_capacity(clusters_per_unit);
+    for cluster_index in 0..clusters_per_unit {
+        let cluster_delta = (cluster_index as u64)
+            .checked_mul(cluster_size as u64)
+            .with_context(|| format!("NTFS compression-unit cluster overflow: {logical_path}"))?;
+        let logical_offset = unit_start
+            .checked_add(cluster_delta)
+            .with_context(|| format!("NTFS compression-unit offset overflow: {logical_path}"))?;
+        if logical_offset >= total_size {
+            physical_clusters.push(None);
+            continue;
+        }
+        data_value
+            .seek(fs, SeekFrom::Start(logical_offset))
+            .with_context(|| {
+                format!(
+                    "mapping compressed NTFS stream at logical offset {logical_offset}: {logical_path}"
+                )
+            })?;
+        physical_clusters.push(
+            data_value
+                .data_position()
+                .value()
+                .map(|position| position.get()),
+        );
+    }
+
+    let storage = classify_ntfs_compression_unit(&physical_clusters)
+        .with_context(|| format!("classifying compressed NTFS unit for {logical_path}"))?;
+    let mut physical_bytes = Vec::new();
+    for physical_offset in physical_clusters.iter().flatten() {
+        let cluster =
+            read_ntfs_physical_cluster(ntfs, fs, *physical_offset, cluster_size, logical_path)?;
+        physical_bytes.extend_from_slice(&cluster);
+    }
+
+    let mut logical_bytes = match storage {
+        NtfsCompressionUnitStorage::Sparse => vec![0_u8; initialized_length],
+        NtfsCompressionUnitStorage::Uncompressed => {
+            if physical_bytes.len() < initialized_length {
+                bail!(
+                    "uncompressed NTFS unit contains {} physical byte(s), fewer than {} initialized byte(s): {}",
+                    physical_bytes.len(),
+                    initialized_length,
+                    logical_path
+                );
+            }
+            physical_bytes.truncate(initialized_length);
+            physical_bytes
+        }
+        NtfsCompressionUnitStorage::Compressed => {
+            ntfs_compression::decompress_lznt1(&physical_bytes, initialized_length).with_context(
+                || format!("decoding LZNT1-compressed NTFS unit for {logical_path}"),
+            )?
+        }
+    };
+    logical_bytes.resize(logical_length, 0);
+    Ok(logical_bytes)
+}
+
+fn read_ntfs_compressed_attribute_range<T: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+    data_attribute: &ntfs::NtfsAttribute<'_, '_>,
+    logical_path: &str,
+    offset: u64,
+    length: usize,
+) -> Result<(Vec<u8>, u64)> {
+    let header = read_ntfs_compression_header(fs, data_attribute, logical_path)?;
+    let mut data_value = data_attribute
+        .value(fs)
+        .with_context(|| format!("opening compressed NTFS data value {logical_path}"))?;
+    let total_size = data_value.len();
+    if header.data_size != total_size {
+        bail!(
+            "compressed NTFS header data size {} does not match logical stream size {}: {}",
+            header.data_size,
+            total_size,
+            logical_path
+        );
+    }
+
+    let cluster_size = usize::try_from(ntfs.cluster_size())
+        .context("NTFS cluster size does not fit in memory address space")?;
+    if cluster_size == 0 {
+        bail!("NTFS cluster size is zero: {logical_path}");
+    }
+    let clusters_per_unit = 1_usize
+        .checked_shl(u32::from(header.compression_unit_exponent))
+        .with_context(|| {
+            format!(
+                "NTFS compression-unit exponent {} is too large: {}",
+                header.compression_unit_exponent, logical_path
+            )
+        })?;
+    let unit_bytes = (cluster_size as u64)
+        .checked_mul(clusters_per_unit as u64)
+        .with_context(|| format!("NTFS compression-unit size overflow: {logical_path}"))?;
+    if unit_bytes == 0 || unit_bytes > MAX_NTFS_COMPRESSION_UNIT_BYTES {
+        bail!(
+            "NTFS compression-unit size {unit_bytes} is outside the supported safe range: {}",
+            logical_path
+        );
+    }
+
+    let requested_end = offset.saturating_add(length as u64).min(total_size);
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(requested_end.saturating_sub(offset)).unwrap_or(length));
+    if offset < total_size && offset < requested_end {
+        let mut unit_start = (offset / unit_bytes) * unit_bytes;
+        while unit_start < requested_end {
+            let logical_length_u64 = unit_bytes.min(total_size - unit_start);
+            let logical_length = usize::try_from(logical_length_u64)
+                .context("NTFS compression-unit logical length is too large")?;
+            let initialized_length_u64 = header
+                .initialized_size
+                .saturating_sub(unit_start)
+                .min(logical_length_u64);
+            let initialized_length = usize::try_from(initialized_length_u64)
+                .context("NTFS compression-unit initialized length is too large")?;
+            let unit = decode_ntfs_compression_unit(
+                ntfs,
+                fs,
+                &mut data_value,
+                total_size,
+                unit_start,
+                logical_length,
+                initialized_length,
+                cluster_size,
+                clusters_per_unit,
+                logical_path,
+            )?;
+            let copy_start = offset.max(unit_start) - unit_start;
+            let copy_end = requested_end.min(unit_start + logical_length_u64) - unit_start;
+            let copy_start =
+                usize::try_from(copy_start).context("NTFS compressed copy start is too large")?;
+            let copy_end =
+                usize::try_from(copy_end).context("NTFS compressed copy end is too large")?;
+            bytes.extend_from_slice(&unit[copy_start..copy_end]);
+            unit_start = unit_start.checked_add(unit_bytes).with_context(|| {
+                format!("NTFS compression-unit iteration overflow: {logical_path}")
+            })?;
+        }
+    }
+
+    Ok((bytes, total_size))
+}
+
+fn read_mounted_ntfs_compressed_attribute_bytes<T: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+    data_attribute: &ntfs::NtfsAttribute<'_, '_>,
+    entry: &EntryForBytes,
+    offset: u64,
+    length: usize,
+) -> Result<EntryBytes> {
+    let (bytes, total_size) = read_ntfs_compressed_attribute_range(
+        ntfs,
+        fs,
+        data_attribute,
+        &entry.logical_path,
+        offset,
+        length,
+    )?;
+
+    let bytes_read = bytes.len();
+    Ok(EntryBytes {
+        entry_id: entry.entry_id,
+        evidence_id: entry.evidence_id,
+        logical_path: entry.logical_path.clone(),
+        offset,
+        requested_length: length,
+        bytes_read,
+        total_size,
+        eof: offset.saturating_add(bytes_read as u64) >= total_size,
+        bytes,
+    })
+}
+
 fn read_mounted_ntfs_entry_bytes<T: Read + Seek>(
     ntfs: &ntfs::Ntfs,
     fs: &mut T,
@@ -31987,16 +32628,20 @@ fn read_mounted_ntfs_entry_bytes<T: Read + Seek>(
             continue;
         }
         let data_flags = data_attribute.flags();
-        if data_flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED) {
-            bail!(
-                "NTFS data stream is compressed and cannot be decoded safely: {}",
-                entry.logical_path
-            );
-        }
         if data_flags.contains(ntfs::NtfsAttributeFlags::ENCRYPTED) {
             bail!(
                 "NTFS data stream is encrypted and cannot be decoded safely: {}",
                 entry.logical_path
+            );
+        }
+        if data_flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED) {
+            return read_mounted_ntfs_compressed_attribute_bytes(
+                ntfs,
+                fs,
+                &data_attribute,
+                entry,
+                offset,
+                length,
             );
         }
         let data_value = data_attribute
@@ -37299,7 +37944,7 @@ mod tests {
         assert_eq!(metadata["ntfs_data_stream_sparse"].as_bool(), Some(false));
         assert_eq!(
             metadata["ntfs_stream_read_support"].as_str(),
-            Some("metadata only; compressed/encrypted NTFS data is not decoded")
+            Some("metadata only; EFS-encrypted NTFS content requires decryption keys")
         );
     }
 

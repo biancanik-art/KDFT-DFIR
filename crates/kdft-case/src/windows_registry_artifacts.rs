@@ -193,7 +193,10 @@ fn registry_candidates(case_path: &Path, evidence_id: i64) -> Result<Vec<HiveCan
 
 fn is_supported_hive_path(name: &str, path: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    let path = path.replace('\\', "/").to_ascii_lowercase();
+    let path = normalize_windows_path_for_matching(path);
+    if is_winsxs_path(&path) {
+        return false;
+    }
     match name.as_str() {
         "amcache.hve" => path.contains("/windows/appcompat/programs/"),
         "system" | "software" => path.contains("/windows/system32/config/"),
@@ -204,22 +207,46 @@ fn is_supported_hive_path(name: &str, path: &str) -> bool {
     }
 }
 
+fn normalize_windows_path_for_matching(path: &str) -> String {
+    let mut normalized = path.replace('\\', "/").to_ascii_lowercase();
+    if !normalized.starts_with('/') {
+        normalized.insert(0, '/');
+    }
+    normalized
+}
+
+fn is_srum_source_path(path: &str) -> bool {
+    let path = normalize_windows_path_for_matching(path);
+    !is_winsxs_path(&path) && path.contains("/windows/system32/sru/")
+}
+
+fn is_winsxs_path(path: &str) -> bool {
+    normalize_windows_path_for_matching(path).contains("/windows/winsxs/")
+}
+
 fn count_srum_sources(case_path: &Path, evidence_id: i64) -> Result<usize> {
     let conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM filesystem_entries
-         WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
-           AND is_deleted = 0 AND lower(name) = 'srudb.dat'
-           AND lower(replace(COALESCE(
+    let mut statement = conn.prepare(
+        "SELECT COALESCE(
                NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''),
                NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''),
                logical_path
-           ), '\\', '/')) LIKE '%/windows/system32/sru/%'",
-        params![case_id, evidence_id],
-        |row| row.get(0),
+           )
+         FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
+           AND is_deleted = 0 AND lower(name) = 'srudb.dat'",
     )?;
-    usize::try_from(count).context("SRUM source count is negative or too large")
+    let rows = statement.query_map(params![case_id, evidence_id], |row| row.get::<_, String>(0))?;
+    let mut count = 0_usize;
+    for path in rows {
+        if is_srum_source_path(&path?) {
+            count = count
+                .checked_add(1)
+                .context("SRUM source count is too large")?;
+        }
+    }
+    Ok(count)
 }
 
 fn parse_one_hive(
@@ -853,6 +880,53 @@ fn shellbag_parent_path(key_path: &str, decoded_nodes: &HashMap<String, String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_hive_paths_accept_root_relative_and_windows_separators() {
+        assert!(is_supported_hive_path(
+            "SYSTEM",
+            "Windows/System32/config/SYSTEM"
+        ));
+        assert!(is_supported_hive_path(
+            "SOFTWARE",
+            "/Windows/System32/config/SOFTWARE"
+        ));
+        assert!(is_supported_hive_path(
+            "Amcache.hve",
+            r"Windows\appcompat\Programs\Amcache.hve"
+        ));
+        assert!(is_supported_hive_path(
+            "NTUSER.DAT",
+            r"Users\Alice\NTUSER.DAT"
+        ));
+        assert!(is_supported_hive_path(
+            "UsrClass.dat",
+            "/Documents and Settings/Alice/UsrClass.dat"
+        ));
+        assert!(!is_supported_hive_path(
+            "SYSTEM",
+            "Windows/System32/Tasks/SYSTEM"
+        ));
+        assert!(!is_supported_hive_path(
+            "SYSTEM",
+            "Windows/WinSxS/component/Windows/System32/config/SYSTEM"
+        ));
+        assert!(!is_supported_hive_path(
+            "Amcache.hve",
+            r"Windows\WinSxS\component\Windows\appcompat\Programs\Amcache.hve"
+        ));
+    }
+
+    #[test]
+    fn srum_paths_accept_root_relative_and_windows_separators() {
+        assert!(is_srum_source_path("Windows/System32/sru/SRUDB.dat"));
+        assert!(is_srum_source_path("/Windows/System32/sru/SRUDB.dat"));
+        assert!(is_srum_source_path(r"Windows\System32\sru\SRUDB.dat"));
+        assert!(!is_srum_source_path("Windows/System32/config/SRUDB.dat"));
+        assert!(!is_srum_source_path(
+            "Windows/WinSxS/component/Windows/System32/sru/SRUDB.dat"
+        ));
+    }
 
     #[test]
     fn userassist_rot13_and_layout_are_decoded() {

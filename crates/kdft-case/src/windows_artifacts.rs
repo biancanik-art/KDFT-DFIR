@@ -1,13 +1,15 @@
 //! Post-index parsing for Windows execution and activity artifacts recovered from indexed evidence.
 //!
 //! Candidate discovery is snapshot-based (`COUNT(*)` plus `MAX(id)`) and keyset-paged. The pass
-//! never imposes a default candidate or record coverage cap. Each source is recovered by itself,
-//! parsed into a source-scoped SQLite transaction, and then discarded. A successful attempt
-//! atomically replaces only rows derived from that source. A failed attempt rolls the replacement
-//! transaction back before a separate last-attempt diagnostic is committed, preserving the last
-//! known-good derived rows and searchable text segments.
+//! never imposes a default candidate or record coverage cap. Sources are recovered and parsed in
+//! parallel into private, source-scoped staging databases. One coordinator then bulk-imports each
+//! complete staging database through a short SQLite transaction. A successful attempt atomically
+//! replaces only rows derived from that source. A failed attempt never reaches the replacement
+//! transaction; a separate last-attempt diagnostic is committed while the last known-good derived
+//! rows and searchable text segments remain intact.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use rayon::prelude::*;
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -27,14 +29,14 @@ use super::usn::{
     self, UsnFileReference, UsnParseOptions, UsnRecord, UsnSink, UsnTerminalStatus, UsnVersion,
 };
 use super::{
-    active_case_id, add_entry_category, audit_actor, ensure_evidence_source, evtx_channel_hint,
-    evtx_import_entry_from_record, open_existing_case, recover_filesystem_entry_in_session,
-    sanitize_logical_segment, source_path_exact_from_metadata, EvidenceReadSession, EvtxParser,
-    EvtxParserSettings, RecoverEntryOptions, RecoverEntryResult,
+    active_case_id, add_entry_category, audit_actor, available_processing_worker_count,
+    ensure_evidence_source, evtx_channel_hint, evtx_import_entry_from_record, open_existing_case,
+    recover_filesystem_entry_in_session, sanitize_logical_segment, source_path_exact_from_metadata,
+    EvidenceReadSession, EvtxParser, EvtxParserSettings, RecoverEntryOptions, RecoverEntryResult,
 };
 
-const WINDOWS_ARTIFACT_PARSER_NAME: &str = "kdft-windows-artifacts-v1";
-const WINDOWS_ARTIFACT_TEXT_PARSER_NAME: &str = "kdft-windows-artifacts-v1";
+const WINDOWS_ARTIFACT_PARSER_NAME: &str = "kdft-windows-artifacts-v2";
+const WINDOWS_ARTIFACT_TEXT_PARSER_NAME: &str = "kdft-windows-artifacts-v2";
 const CANDIDATE_PAGE_SIZE: i64 = 128;
 const DIAGNOSTIC_SAMPLE_LIMIT: usize = 32;
 const DIAGNOSTIC_TEXT_BYTES: usize = 2_048;
@@ -44,6 +46,14 @@ static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const CANDIDATE_FILTER_SQL: &str = r#"
     AND entry_kind = 'file'
     AND COALESCE(json_extract(metadata_json, '$.windows_artifact_derived'), 0) <> 1
+    AND lower('/' || replace(COALESCE(
+        NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''),
+        NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''),
+        NULLIF(json_extract(metadata_json, '$.fat_path'), ''),
+        NULLIF(json_extract(metadata_json, '$.ext_path'), ''),
+        NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''),
+        logical_path
+    ), '\', '/')) NOT LIKE '%/windows/winsxs/%'
     AND (
         lower(name) LIKE '%.lnk'
         OR lower(name) LIKE '%.pf'
@@ -103,7 +113,7 @@ const CANDIDATE_FILTER_SQL: &str = r#"
             NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''),
             logical_path
         ), '\', '/')) LIKE '%/$usnjrnl:$j'
-        OR lower(replace(COALESCE(
+        OR lower('/' || replace(COALESCE(
             NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''),
             NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''),
             NULLIF(json_extract(metadata_json, '$.fat_path'), ''),
@@ -124,7 +134,7 @@ const PENDING_CANDIDATE_FILTER_SQL: &str = r#"
         COALESCE(json_extract(
             metadata_json,
             '$.windows_artifact_parser_committed.parser_name'
-        ), '') = 'kdft-windows-artifacts-v1'
+        ), '') = 'kdft-windows-artifacts-v2'
         AND COALESCE(json_extract(
             metadata_json,
             '$.windows_artifact_parser_committed.status'
@@ -211,6 +221,8 @@ pub struct WindowsArtifactParseResult {
     pub supported_scope_complete: bool,
     pub safety_bounds: serde_json::Value,
     pub status: String,
+    pub worker_threads: usize,
+    pub worker_queue_capacity: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -312,6 +324,23 @@ struct StagedSourceOutcome {
     cleanup_warning: Option<String>,
 }
 
+struct StagedSourceRecovery {
+    candidate: WindowsArtifactCandidate,
+    staging_directory: Option<PathBuf>,
+    staging_path: Option<PathBuf>,
+    staging_database_path: Option<PathBuf>,
+    parsed: Result<(RecoverEntryResult, SourceParseSummary)>,
+}
+
+fn order_staged_sources_for_commit(staged: &mut [StagedSourceRecovery]) {
+    staged.sort_unstable_by_key(|source| source.candidate.entry_id);
+}
+
+enum WindowsWorkerReadSession {
+    Ready(EvidenceReadSession),
+    Failed(String),
+}
+
 #[derive(Debug)]
 struct SourceAttemptFailure {
     message: String,
@@ -396,6 +425,8 @@ pub fn parse_windows_artifacts(
     evidence_id: i64,
 ) -> Result<WindowsArtifactParseResult> {
     let snapshot = candidate_snapshot(case_path, evidence_id)?;
+    let worker_threads = available_processing_worker_count();
+    let worker_queue_capacity = worker_threads.saturating_mul(2).max(1);
     super::progress::progress_set_unit("Windows artifact sources");
     super::progress::progress_set_total(Some(snapshot.count));
 
@@ -421,13 +452,16 @@ pub fn parse_windows_artifacts(
         supported_scope_complete: true,
         safety_bounds: pass_safety_bounds(),
         status: "completed".to_string(),
+        worker_threads,
+        worker_queue_capacity,
     };
     let mut diagnostics = DiagnosticAccumulator::default();
     let mut after_entry_id = i64::MIN;
-    // Keep the decoded evidence container and its EWF chunk cache alive for
-    // the complete pass. Previously every LNK/Prefetch/EVTX recovery rebuilt
-    // the E01 chunk table, and large files repeated that work per 64 KiB.
-    let mut read_session = EvidenceReadSession::open(case_path)?;
+    let worker_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_threads)
+        .thread_name(|index| format!("kdft-windows-worker-{index}"))
+        .build()
+        .context("creating the Windows artifact worker pool")?;
 
     if let Some(max_entry_id) = snapshot.max_entry_id {
         loop {
@@ -442,15 +476,48 @@ pub fn parse_windows_artifacts(
             if candidates.is_empty() {
                 break;
             }
-            for candidate in candidates {
-                after_entry_id = candidate.entry_id;
+            after_entry_id = candidates
+                .last()
+                .map(|candidate| candidate.entry_id)
+                .unwrap_or(after_entry_id);
+            let expected_results = candidates.len();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(worker_queue_capacity);
+            let worker_case_path = case_path.to_path_buf();
+            worker_pool.spawn(move || {
+                candidates.into_par_iter().for_each_init(
+                    || match EvidenceReadSession::open_worker_read_only(&worker_case_path) {
+                        Ok(session) => WindowsWorkerReadSession::Ready(session),
+                        Err(error) => WindowsWorkerReadSession::Failed(format!("{error:#}")),
+                    },
+                    |session, candidate| {
+                        let staged = stage_one_source(session, candidate);
+                        let _ = sender.send(staged);
+                    },
+                );
+            });
+
+            let mut staged_sources = Vec::with_capacity(expected_results);
+            for _ in 0..expected_results {
+                staged_sources.push(
+                    receiver.recv().context(
+                        "Windows artifact workers stopped before returning every source",
+                    )?,
+                );
+            }
+            // Worker completion order depends on source size and scheduler timing. Commit in the
+            // candidate keyset order so row IDs, bounded diagnostics, audit records, and progress
+            // are reproducible across runs while parsing remains parallel.
+            order_staged_sources_for_commit(&mut staged_sources);
+
+            for staged in staged_sources {
+                let candidate = staged.candidate.clone();
                 result.candidates_seen = result.candidates_seen.saturating_add(1);
                 let kind_key = candidate.kind.key().to_string();
                 let kind_counts = result.per_kind.entry(kind_key).or_default();
                 kind_counts.candidates_seen = kind_counts.candidates_seen.saturating_add(1);
                 super::progress::progress_current(candidate.source_path_exact.clone());
 
-                match parse_one_source(case_path, &mut read_session, &candidate) {
+                match commit_staged_source(case_path, staged) {
                     Ok(outcome) => {
                         let summary = outcome.parsed;
                         result.parsed_sources = result.parsed_sources.saturating_add(1);
@@ -724,7 +791,7 @@ fn classify_windows_source(
     metadata: &serde_json::Value,
 ) -> Option<WindowsArtifactKind> {
     let name = name.to_ascii_lowercase();
-    let path = source_path_exact.replace('\\', "/").to_ascii_lowercase();
+    let path = normalize_windows_path_for_matching(source_path_exact);
     let base_name = metadata
         .get("ntfs_base_name")
         .and_then(serde_json::Value::as_str)
@@ -736,7 +803,9 @@ fn classify_windows_source(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if path.contains("/windows/system32/tasks/") {
+    if is_winsxs_path(&path) {
+        None
+    } else if is_scheduled_task_path(&path) {
         Some(WindowsArtifactKind::ScheduledTask)
     } else if name.ends_with(".automaticdestinations-ms")
         || path.ends_with(".automaticdestinations-ms")
@@ -760,6 +829,23 @@ fn classify_windows_source(
     }
 }
 
+fn normalize_windows_path_for_matching(path: &str) -> String {
+    let mut normalized = path.replace('\\', "/").to_ascii_lowercase();
+    if !normalized.starts_with('/') {
+        normalized.insert(0, '/');
+    }
+    normalized
+}
+
+fn is_scheduled_task_path(path: &str) -> bool {
+    let path = normalize_windows_path_for_matching(path);
+    !is_winsxs_path(&path) && path.contains("/windows/system32/tasks/")
+}
+
+fn is_winsxs_path(path: &str) -> bool {
+    normalize_windows_path_for_matching(path).contains("/windows/winsxs/")
+}
+
 fn pass_safety_bounds() -> serde_json::Value {
     let lnk = LnkParserOptions::default();
     // Use Default rather than listing fields so the parser's MAM decompression safety extensions
@@ -767,12 +853,16 @@ fn pass_safety_bounds() -> serde_json::Value {
     let prefetch = PrefetchParserOptions::default();
     let usn = UsnParseOptions::default();
     let jump = JumpListParseOptions::default();
+    let worker_threads = available_processing_worker_count();
     serde_json::json!({
         "default_coverage_cap": null,
         "candidate_snapshot": "exact COUNT(*) plus MAX(id) over the supported source predicate",
-        "resume_checkpoint": "sources successfully committed by this parser version are skipped; partial and failed sources remain pending; filesystem re-indexing forces a complete rerun",
+        "resume_checkpoint": "sources committed as parsed or explicitly partial by this parser version are skipped; failed sources remain pending; filesystem re-indexing forces a complete rerun",
         "candidate_page_rows": CANDIDATE_PAGE_SIZE,
-        "source_recovery": "one indexed source at a time, including deleted entries when their indexed recovery metadata remains usable; no source-size coverage cap",
+        "worker_threads": worker_threads,
+        "worker_queue_capacity": worker_threads.saturating_mul(2).max(1),
+        "source_recovery": "bounded parallel recovery/decompression with one read-only evidence session per worker and one shared EWF decoder/chunk cache per acquisition, including deleted entries when their indexed recovery metadata remains usable; no source-size coverage cap",
+        "source_parse_and_database_write": "per-source parsers run concurrently into disk-backed private SQLite spools; one coordinator bulk-imports each completed spool through a short source-scoped replacement transaction",
         "lnk_max_file_size_bytes": lnk.max_file_size,
         "prefetch_max_file_size_bytes": prefetch.max_file_size,
         "prefetch_max_decompressed_size_bytes": prefetch.max_decompressed_size,
@@ -794,16 +884,16 @@ fn source_supported_scope(kind: WindowsArtifactKind) -> &'static str {
             "One indexed, recoverable Shell Link source parsed by the bounded KDFT LNK parser; unsupported or malformed structures are disclosed by status and exact warning counters"
         }
         WindowsArtifactKind::Prefetch => {
-            "One indexed, recoverable Windows Prefetch source parsed by the bounded KDFT Prefetch parser; parser-declared compression/version limitations remain explicit"
+            "One indexed, recoverable Windows Prefetch source parsed by the bounded KDFT Prefetch parser; a structurally valid recovered SCCA prefix may be retained as explicitly partial when MAM output is short, without fabricated padding"
         }
         WindowsArtifactKind::Evtx => {
             "All records yielded by evtx 0.12.2 are streamed; unreadable records are counted exactly and sampled diagnostics are bounded; ETL and provider message-template expansion are outside scope"
         }
         WindowsArtifactKind::AutomaticJumpList => {
-            "Indexed, recoverable CFB streams and DestList summary supported by the KDFT AutomaticDestinations parser; every emitted embedded LNK is parsed through one bounded temporary spool"
+            "Indexed, recoverable CFB streams and DestList summary supported by the KDFT AutomaticDestinations parser; valid zero-length DestList streams require no MiniFAT chain, auxiliary property-store streams are identified separately, and every emitted embedded LNK is parsed through one bounded temporary spool"
         }
         WindowsArtifactKind::CustomJumpList => {
-            "All signatures found by the KDFT CustomDestinations streaming parser; heuristic boundaries and damaged/omitted payloads are explicitly partial"
+            "All signatures found by the KDFT CustomDestinations streaming parser; canonical empty containers are valid zero-entry sources, while heuristic boundaries and damaged/omitted payloads are explicitly partial"
         }
         WindowsArtifactKind::UsnJournal => {
             "The complete recovered $UsnJrnl:$J byte stream is parsed incrementally for USN V2/V3; unsupported V4/unknown versions and damaged records are counted explicitly"
@@ -814,19 +904,30 @@ fn source_supported_scope(kind: WindowsArtifactKind) -> &'static str {
     }
 }
 
-fn parse_one_source(
-    case_path: &Path,
-    read_session: &mut EvidenceReadSession,
-    candidate: &WindowsArtifactCandidate,
-) -> Result<StagedSourceOutcome> {
-    let (staging_directory, staging_path) = create_unique_recovery_destination(
+fn stage_one_source(
+    read_session: &mut WindowsWorkerReadSession,
+    candidate: WindowsArtifactCandidate,
+) -> StagedSourceRecovery {
+    let (staging_directory, staging_path) = match create_unique_recovery_destination(
         "kdft-windows-source",
         candidate.entry_id,
         candidate.kind.staging_suffix(),
-    )?;
-    let parsed = (|| -> Result<SourceParseSummary> {
-        let recovery = recover_filesystem_entry_in_session(
-            read_session,
+    ) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return StagedSourceRecovery {
+                candidate,
+                staging_directory: None,
+                staging_path: None,
+                staging_database_path: None,
+                parsed: Err(error),
+            };
+        }
+    };
+    let staging_database_path = staging_directory.join("parsed.sqlite");
+    let recovered = match read_session {
+        WindowsWorkerReadSession::Ready(session) => recover_filesystem_entry_in_session(
+            session,
             RecoverEntryOptions {
                 entry_id: candidate.entry_id,
                 output_path: staging_path.clone(),
@@ -838,36 +939,82 @@ fn parse_one_source(
                 candidate.kind.key(),
                 candidate.source_path_exact
             )
-        })?;
-        replace_source_transaction(case_path, candidate, &staging_path, &recovery).with_context(
-            || {
+        }),
+        WindowsWorkerReadSession::Failed(reason) => Err(anyhow!(
+            "opening a worker-local evidence read session failed: {reason}"
+        )),
+    };
+    let parsed = recovered.and_then(|recovery| {
+        parse_source_to_staging_database(&candidate, &staging_path, &staging_database_path)
+            .with_context(|| {
                 format!(
                     "parsing recovered source after status {:?} wrote {} of {} byte(s)",
                     recovery.status, recovery.bytes_written, recovery.total_size
                 )
-            },
-        )
-    })();
+            })
+            .map(|summary| (recovery, summary))
+    });
+    StagedSourceRecovery {
+        candidate,
+        staging_directory: Some(staging_directory),
+        staging_path: Some(staging_path),
+        staging_database_path: Some(staging_database_path),
+        parsed,
+    }
+}
 
-    let file_cleanup = if staging_path.exists() {
-        fs::remove_file(&staging_path).with_context(|| {
+fn commit_staged_source(
+    case_path: &Path,
+    staged: StagedSourceRecovery,
+) -> Result<StagedSourceOutcome> {
+    let StagedSourceRecovery {
+        candidate,
+        staging_directory,
+        staging_path,
+        staging_database_path,
+        parsed,
+    } = staged;
+    let parsed = match (parsed, staging_database_path.as_deref()) {
+        (Ok((recovery, summary)), Some(database_path)) => {
+            replace_source_transaction(case_path, &candidate, database_path, &recovery, summary)
+        }
+        (Err(error), _) => Err(error),
+        (Ok(_), None) => Err(anyhow!(
+            "Windows artifact parsing succeeded without a staging database"
+        )),
+    };
+
+    let file_cleanup = match staging_path.as_deref() {
+        Some(path) if path.exists() => fs::remove_file(path).with_context(|| {
             format!(
                 "removing temporary {} source {}",
                 candidate.kind.key(),
-                staging_path.display()
+                path.display()
             )
-        })
-    } else {
-        Ok(())
+        }),
+        _ => Ok(()),
     };
-    let directory_cleanup = fs::remove_dir(&staging_directory).with_context(|| {
-        format!(
-            "removing temporary {} source directory {}",
-            candidate.kind.key(),
-            staging_directory.display()
-        )
-    });
-    let cleanup = file_cleanup.and(directory_cleanup);
+    let database_cleanup = match staging_database_path.as_deref() {
+        Some(path) if path.exists() => fs::remove_file(path).with_context(|| {
+            format!(
+                "removing temporary {} parse database {}",
+                candidate.kind.key(),
+                path.display()
+            )
+        }),
+        _ => Ok(()),
+    };
+    let directory_cleanup = match staging_directory.as_deref() {
+        Some(path) if path.exists() => fs::remove_dir(path).with_context(|| {
+            format!(
+                "removing temporary {} source directory {}",
+                candidate.kind.key(),
+                path.display()
+            )
+        }),
+        _ => Ok(()),
+    };
+    let cleanup = file_cleanup.and(database_cleanup).and(directory_cleanup);
 
     match (parsed, cleanup) {
         (Ok(parsed), Ok(())) => Ok(StagedSourceOutcome {
@@ -925,32 +1072,120 @@ fn create_unique_recovery_destination(
     )
 }
 
+/// Parse one recovered source on its worker into an isolated SQLite spool.
+/// The spool uses the same two row shapes as the case database, so even very
+/// large EVTX/USN outputs stay disk-backed rather than becoming an unbounded
+/// in-memory vector. It is disposable until the coordinator atomically imports
+/// it; relaxed durability here cannot affect the case or original evidence.
+fn parse_source_to_staging_database(
+    candidate: &WindowsArtifactCandidate,
+    recovered_source: &Path,
+    staging_database_path: &Path,
+) -> Result<SourceParseSummary> {
+    let mut conn = Connection::open(staging_database_path).with_context(|| {
+        format!(
+            "creating source parse database {}",
+            staging_database_path.display()
+        )
+    })?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = OFF;
+         PRAGMA synchronous = OFF;
+         PRAGMA temp_store = MEMORY;
+         CREATE TABLE filesystem_entries (
+             id INTEGER PRIMARY KEY,
+             case_id INTEGER NOT NULL,
+             evidence_id INTEGER NOT NULL,
+             parent_id INTEGER,
+             logical_path TEXT NOT NULL,
+             name TEXT NOT NULL,
+             entry_kind TEXT NOT NULL,
+             size_bytes INTEGER,
+             is_deleted INTEGER NOT NULL DEFAULT 0,
+             metadata_json TEXT NOT NULL DEFAULT '{}',
+             content_head BLOB,
+             discovered_by_job_id INTEGER
+         );
+         CREATE TABLE filesystem_entry_text_segments (
+             entry_id INTEGER NOT NULL,
+             parser_name TEXT NOT NULL,
+             segment_index INTEGER NOT NULL,
+             part_name TEXT NOT NULL,
+             content BLOB NOT NULL,
+             content_encoding TEXT NOT NULL,
+             PRIMARY KEY(entry_id, parser_name, segment_index)
+         );",
+    )
+    .context("creating Windows artifact source spool schema")?;
+    conn.execute(
+        "INSERT INTO filesystem_entries(
+             id, case_id, evidence_id, logical_path, name, entry_kind,
+             is_deleted, metadata_json, discovered_by_job_id
+         ) VALUES (?1, 1, ?2, ?3, ?4, 'file', ?5, '{}', ?6)",
+        params![
+            candidate.entry_id,
+            candidate.evidence_id,
+            candidate.logical_path,
+            candidate.name,
+            candidate.is_deleted,
+            candidate.source_job_id
+        ],
+    )?;
+
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let summary = match candidate.kind {
+        WindowsArtifactKind::ShellLink => parse_lnk_source(&tx, candidate, recovered_source)?,
+        WindowsArtifactKind::Prefetch => parse_prefetch_source(&tx, candidate, recovered_source)?,
+        WindowsArtifactKind::Evtx => parse_evtx_source(&tx, candidate, recovered_source)?,
+        WindowsArtifactKind::AutomaticJumpList | WindowsArtifactKind::CustomJumpList => {
+            parse_jumplist_source(&tx, candidate, recovered_source)?
+        }
+        WindowsArtifactKind::UsnJournal => parse_usn_source(&tx, candidate, recovered_source)?,
+        WindowsArtifactKind::ScheduledTask => {
+            parse_scheduled_task_source(&tx, candidate, recovered_source)?
+        }
+    };
+    tx.commit()
+        .context("committing private Windows artifact source spool")?;
+    Ok(summary)
+}
+
 fn replace_source_transaction(
     case_path: &Path,
     candidate: &WindowsArtifactCandidate,
-    staging_path: &Path,
+    staging_database_path: &Path,
     recovery: &RecoverEntryResult,
+    mut summary: SourceParseSummary,
 ) -> Result<SourceParseSummary> {
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     ensure_evidence_source(&conn, case_id, candidate.evidence_id)?;
     let actor = audit_actor(&conn, case_id)?;
+    conn.execute(
+        "ATTACH DATABASE ?1 AS windows_source_stage",
+        [staging_database_path.to_string_lossy().as_ref()],
+    )
+    .with_context(|| {
+        format!(
+            "attaching Windows artifact source spool {}",
+            staging_database_path.display()
+        )
+    })?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (previous_entries, previous_segments) = source_derived_counts(&tx, candidate.entry_id)?;
     delete_source_derived(&tx, case_id, candidate.evidence_id, candidate.entry_id)?;
 
-    let mut summary = match candidate.kind {
-        WindowsArtifactKind::ShellLink => parse_lnk_source(&tx, candidate, staging_path)?,
-        WindowsArtifactKind::Prefetch => parse_prefetch_source(&tx, candidate, staging_path)?,
-        WindowsArtifactKind::Evtx => parse_evtx_source(&tx, candidate, staging_path)?,
-        WindowsArtifactKind::AutomaticJumpList | WindowsArtifactKind::CustomJumpList => {
-            parse_jumplist_source(&tx, candidate, staging_path)?
-        }
-        WindowsArtifactKind::UsnJournal => parse_usn_source(&tx, candidate, staging_path)?,
-        WindowsArtifactKind::ScheduledTask => {
-            parse_scheduled_task_source(&tx, candidate, staging_path)?
-        }
-    };
+    let (imported_entries, imported_segments) =
+        import_staged_source_rows(&tx, case_id, candidate.evidence_id, candidate.entry_id)?;
+    let expected_entries = usize::try_from(summary.derived_entries)
+        .context("Windows artifact derived entry count exceeds usize")?;
+    let expected_segments = usize::try_from(summary.text_segments)
+        .context("Windows artifact text segment count exceeds usize")?;
+    if imported_entries != expected_entries || imported_segments != expected_segments {
+        bail!(
+            "source spool import count mismatch: imported {imported_entries}/{expected_entries} derived entries and {imported_segments}/{expected_segments} text segments"
+        );
+    }
 
     let recovery_complete =
         recovery.status == "completed" && recovery.bytes_written == recovery.total_size;
@@ -1033,6 +1268,44 @@ fn replace_source_transaction(
     )?;
     tx.commit()?;
     Ok(summary)
+}
+
+fn import_staged_source_rows(
+    tx: &Transaction<'_>,
+    case_id: i64,
+    evidence_id: i64,
+    source_entry_id: i64,
+) -> Result<(usize, usize)> {
+    let imported_entries = tx.execute(
+        "INSERT INTO filesystem_entries(
+             case_id, evidence_id, parent_id, logical_path, name, entry_kind,
+             size_bytes, is_deleted, metadata_json, content_head, discovered_by_job_id
+         )
+         SELECT ?1, ?2, NULL, logical_path, name, entry_kind,
+                size_bytes, is_deleted, metadata_json, content_head, discovered_by_job_id
+         FROM windows_source_stage.filesystem_entries
+         WHERE id <> ?3
+         ORDER BY id",
+        params![case_id, evidence_id, source_entry_id],
+    )?;
+    let imported_segments = tx.execute(
+        "INSERT INTO filesystem_entry_text_segments(
+             entry_id, parser_name, segment_index, part_name, content, content_encoding
+         )
+         SELECT destination.id, segment.parser_name, segment.segment_index,
+                segment.part_name, segment.content, segment.content_encoding
+         FROM windows_source_stage.filesystem_entry_text_segments AS segment
+         JOIN windows_source_stage.filesystem_entries AS staged_entry
+           ON staged_entry.id = segment.entry_id
+         JOIN filesystem_entries AS destination
+           ON destination.case_id = ?1
+          AND destination.evidence_id = ?2
+          AND destination.logical_path = staged_entry.logical_path
+         WHERE staged_entry.id <> ?3
+         ORDER BY staged_entry.id, segment.segment_index",
+        params![case_id, evidence_id, source_entry_id],
+    )?;
+    Ok((imported_entries, imported_segments))
 }
 
 fn create_unique_temporary_file(
@@ -1972,6 +2245,7 @@ fn parse_jumplist_source(
             "jumplist_lnk_streams_emitted": parsed.stats.lnk_streams_emitted,
             "jumplist_lnk_bytes_emitted": parsed.stats.lnk_bytes_emitted,
             "jumplist_dest_list_streams": parsed.stats.dest_list_streams,
+            "jumplist_auxiliary_streams": parsed.stats.auxiliary_streams,
             "jumplist_corrupt_streams": parsed.stats.corrupt_streams,
             "jumplist_incomplete_streams": parsed.stats.incomplete_streams,
             "jumplist_omitted_lnk_streams": parsed.stats.omitted_lnk_streams,
@@ -2530,6 +2804,111 @@ mod tests {
             ),
             Some(WindowsArtifactKind::ScheduledTask)
         );
+        assert_eq!(
+            classify_windows_source(
+                "component.lnk",
+                "C:\\Windows\\WinSxS\\component\\component.lnk",
+                &empty,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn scheduled_task_candidates_accept_root_relative_and_windows_separators() -> Result<()> {
+        let conn = test_connection()?;
+        insert_source(
+            &conn,
+            1,
+            "/image/task-root-relative",
+            "Root relative",
+            serde_json::json!({
+                "source_path_exact": "Windows/System32/Tasks/KDFT/Root relative"
+            }),
+        )?;
+        insert_source(
+            &conn,
+            2,
+            "/image/task-leading-slash",
+            "Leading slash",
+            serde_json::json!({
+                "source_path_exact": "/Windows/System32/Tasks/KDFT/Leading slash"
+            }),
+        )?;
+        insert_source(
+            &conn,
+            3,
+            "/image/task-backslashes",
+            "Backslashes",
+            serde_json::json!({
+                "source_path_exact": r"Windows\System32\Tasks\KDFT\Backslashes"
+            }),
+        )?;
+        insert_source(
+            &conn,
+            4,
+            "/image/task-near-match",
+            "Near match",
+            serde_json::json!({
+                "source_path_exact": "Windows/System32/TaskScheduler/Near match"
+            }),
+        )?;
+        insert_source(
+            &conn,
+            5,
+            "/image/task-winsxs-copy",
+            "Component task copy",
+            serde_json::json!({
+                "source_path_exact": "Windows/WinSxS/component/Windows/System32/Tasks/KDFT/Component task copy"
+            }),
+        )?;
+
+        let snapshot = candidate_snapshot_conn(&conn, 1, 7, false)?;
+        assert_eq!(snapshot.supported_count, 3);
+        assert_eq!(snapshot.count, 3);
+        assert_eq!(snapshot.max_entry_id, Some(3));
+
+        let candidates = candidate_page_conn(&conn, 1, 7, i64::MIN, 3, 8, false)?;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.entry_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.kind == WindowsArtifactKind::ScheduledTask));
+        Ok(())
+    }
+
+    #[test]
+    fn parallel_staging_results_are_ordered_by_source_entry_before_commit() {
+        let mut staged = [30_i64, 10, 20]
+            .into_iter()
+            .map(|entry_id| StagedSourceRecovery {
+                candidate: candidate(
+                    entry_id,
+                    &format!("/image/{entry_id}.lnk"),
+                    &format!("{entry_id}.lnk"),
+                    &format!("Users\\Alice\\{entry_id}.lnk"),
+                    WindowsArtifactKind::ShellLink,
+                ),
+                staging_directory: None,
+                staging_path: None,
+                staging_database_path: None,
+                parsed: Err(anyhow::Error::msg("synthetic uncommitted stage")),
+            })
+            .collect::<Vec<_>>();
+
+        order_staged_sources_for_commit(&mut staged);
+        assert_eq!(
+            staged
+                .iter()
+                .map(|source| source.candidate.entry_id)
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
     }
 
     #[test]
@@ -2798,6 +3177,79 @@ mod tests {
         let searchable = String::from_utf8(searchable)?;
         assert!(searchable.contains("link_clsid"));
         assert!(searchable.contains("00021401-0000-0000-C000-000000000046"));
+        Ok(())
+    }
+
+    #[test]
+    fn private_source_spool_bulk_imports_entries_and_text_exactly_once() -> Result<()> {
+        let mut conn = test_connection()?;
+        let canonical = "Users\\Alice\\Recent\\Target.LNK";
+        insert_source(
+            &conn,
+            30,
+            "/image/Users/Alice/Recent/Target.LNK",
+            "Target.LNK",
+            serde_json::json!({"ntfs_path": canonical}),
+        )?;
+        let candidate = candidate(
+            30,
+            "/image/Users/Alice/Recent/Target.LNK",
+            "Target.LNK",
+            canonical,
+            WindowsArtifactKind::ShellLink,
+        );
+        let (directory, source_path) =
+            create_unique_recovery_destination("kdft-windows-spool-test", 30, "lnk")?;
+        let database_path = directory.join("parsed.sqlite");
+        let mut source = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&source_path)?;
+        let mut bytes = vec![0_u8; 128];
+        bytes[0..4].copy_from_slice(&0x4C_u32.to_le_bytes());
+        bytes[4..20].copy_from_slice(&LnkParser::SHELL_LINK_CLSID);
+        bytes[20..24].copy_from_slice(&0x80_u32.to_le_bytes());
+        bytes[52..56].copy_from_slice(&1024_u32.to_le_bytes());
+        bytes[60..64].copy_from_slice(&1_u32.to_le_bytes());
+        source.write_all(&bytes)?;
+        source.flush()?;
+        drop(source);
+
+        let summary = parse_source_to_staging_database(&candidate, &source_path, &database_path)?;
+        assert_eq!(summary.derived_entries, 1);
+        assert_eq!(summary.text_segments, 1);
+
+        let database_path_text = database_path.to_string_lossy().into_owned();
+        conn.execute(
+            "ATTACH DATABASE ?1 AS windows_source_stage",
+            [database_path_text],
+        )?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let imported = import_staged_source_rows(&tx, 1, 7, candidate.entry_id)?;
+        assert_eq!(imported, (1, 1));
+        tx.commit()?;
+
+        let count_tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let (derived_entries, text_segments) =
+            source_derived_counts(&count_tx, candidate.entry_id)?;
+        assert_eq!(derived_entries, 1);
+        assert_eq!(text_segments, 1);
+        count_tx.commit()?;
+        let (source_path_exact, searchable): (String, Vec<u8>) = conn.query_row(
+            "SELECT json_extract(entry.metadata_json, '$.source_path_exact'), segment.content
+             FROM filesystem_entries AS entry
+             JOIN filesystem_entry_text_segments AS segment ON segment.entry_id = entry.id
+             WHERE json_extract(entry.metadata_json, '$.windows_artifact_derived') = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(source_path_exact, canonical);
+        assert!(String::from_utf8(searchable)?.contains("link_clsid"));
+
+        conn.execute_batch("DETACH DATABASE windows_source_stage")?;
+        fs::remove_file(source_path)?;
+        fs::remove_file(database_path)?;
+        fs::remove_dir(directory)?;
         Ok(())
     }
 

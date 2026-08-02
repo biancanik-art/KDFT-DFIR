@@ -1426,6 +1426,7 @@ dependencies = [
  "codepage-strings",
  "disk-forensic",
  "evtx",
+ "ewf",
  "ext4",
  "fatfs",
  "mft",

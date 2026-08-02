@@ -807,13 +807,17 @@ mod tests {
         assert_eq!(reader.chunk_count(), 1);
     }
 
-    /// Smoke test against real E01 image (requires test-data/).
+    /// Smoke test against a real E01 image.
+    ///
+    /// Set `KDFT_EWF_TEST_IMAGE` to exercise a local acquisition. The fallback
+    /// path preserves the upstream development-corpus convention.
     #[test]
     #[ignore = "requires local test data not in CI"]
     fn ewf_reader_opens_real_e01() {
-        let path = std::path::Path::new(
-            "../usnjrnl-forensic/tests/data/20200918_0417_DESKTOP-SDN1RPT.E01",
-        );
+        let configured = std::env::var_os("KDFT_EWF_TEST_IMAGE").map(std::path::PathBuf::from);
+        let path = configured.as_deref().unwrap_or_else(|| {
+            std::path::Path::new("../usnjrnl-forensic/tests/data/20200918_0417_DESKTOP-SDN1RPT.E01")
+        });
         assert!(path.exists(), "Test image not found at {}", path.display());
         let mut reader = EwfReader::open(path).unwrap();
         assert!(reader.total_size() > 0);

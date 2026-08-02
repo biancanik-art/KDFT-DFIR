@@ -231,6 +231,11 @@ impl UnicodePstFile {
         Ok(Self { inner })
     }
 
+    /// Open a PST for read-only access without acquiring a writable file handle.
+    pub fn open_read_only(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::read_from(Box::new(File::open(path)?))
+    }
+
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let inner = PstFileInner::open(path)?;
         Ok(Self { inner })
@@ -324,6 +329,11 @@ impl AnsiPstFile {
     pub fn read_from(reader: Box<dyn PstReader>) -> io::Result<Self> {
         let inner = PstFileInner::read_from(reader)?;
         Ok(Self { inner })
+    }
+
+    /// Open a PST for read-only access without acquiring a writable file handle.
+    pub fn open_read_only(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::read_from(Box::new(File::open(path)?))
     }
 
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
@@ -1219,4 +1229,124 @@ fn is_ansi_version_error(error: &io::Error) -> bool {
         .get_ref()
         .and_then(|source| source.downcast_ref::<NdbError>())
         .is_some_and(|source| matches!(source, NdbError::AnsiPstVersion(_)))
+}
+
+#[cfg(test)]
+mod read_only_tests {
+    use super::*;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct TempPst {
+        path: PathBuf,
+        original_permissions: fs::Permissions,
+    }
+
+    impl TempPst {
+        fn create_unicode() -> Self {
+            let path = unique_temp_path("unicode");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("reserve Unicode PST test fixture");
+            let root = UnicodeRoot::new(
+                UnicodeByteIndex::new(1_536),
+                UnicodeByteIndex::new(0),
+                UnicodeByteIndex::new(0),
+                UnicodeByteIndex::new(0),
+                UnicodePageRef::new(UnicodePageId::from(1), UnicodeByteIndex::new(512)),
+                UnicodePageRef::new(UnicodePageId::from(2), UnicodeByteIndex::new(1_024)),
+                AmapStatus::Valid2,
+            );
+            let header = UnicodeHeader::new(root, NdbCryptMethod::None);
+            <UnicodeHeader as HeaderReadWrite<UnicodePstFile>>::write(&header, &mut file)
+                .expect("write Unicode PST header");
+            file.set_len(1_536).expect("size Unicode PST fixture");
+            drop(file);
+            Self::make_read_only(path)
+        }
+
+        fn create_ansi() -> Self {
+            let path = unique_temp_path("ansi");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("reserve ANSI PST test fixture");
+            let root = AnsiRoot::new(
+                AnsiByteIndex::new(1_536),
+                AnsiByteIndex::new(0),
+                AnsiByteIndex::new(0),
+                AnsiByteIndex::new(0),
+                AnsiPageRef::new(AnsiPageId::from(1), AnsiByteIndex::new(512)),
+                AnsiPageRef::new(AnsiPageId::from(2), AnsiByteIndex::new(1_024)),
+                AmapStatus::Valid2,
+            );
+            let header = AnsiHeader::new(root, NdbCryptMethod::None);
+            <AnsiHeader as HeaderReadWrite<AnsiPstFile>>::write(&header, &mut file)
+                .expect("write ANSI PST header");
+            file.set_len(1_536).expect("size ANSI PST fixture");
+            drop(file);
+            Self::make_read_only(path)
+        }
+
+        fn make_read_only(path: PathBuf) -> Self {
+            let original_permissions = fs::metadata(&path)
+                .expect("read PST fixture metadata")
+                .permissions();
+            let mut read_only_permissions = original_permissions.clone();
+            read_only_permissions.set_readonly(true);
+            fs::set_permissions(&path, read_only_permissions).expect("make PST fixture read-only");
+            assert!(fs::metadata(&path)
+                .expect("re-read PST fixture metadata")
+                .permissions()
+                .readonly());
+            Self {
+                path,
+                original_permissions,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempPst {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.path, self.original_permissions.clone());
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn unique_temp_path(format: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "outlook-pst-read-only-{format}-{}-{nonce}.pst",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn path_constructors_open_read_only_unicode_and_ansi_pst_files() {
+        let unicode_fixture = TempPst::create_unicode();
+        let unicode = UnicodePstFile::open_read_only(unicode_fixture.path())
+            .expect("open read-only Unicode PST fixture");
+        assert!(matches!(
+            &unicode.inner.writer,
+            Err(PstError::OpenedReadOnly)
+        ));
+
+        let ansi_fixture = TempPst::create_ansi();
+        let ansi = AnsiPstFile::open_read_only(ansi_fixture.path())
+            .expect("open read-only ANSI PST fixture");
+        assert!(matches!(&ansi.inner.writer, Err(PstError::OpenedReadOnly)));
+    }
 }

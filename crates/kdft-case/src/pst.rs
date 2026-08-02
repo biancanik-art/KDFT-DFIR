@@ -470,7 +470,7 @@ impl PstParserAdapter {
         telemetry.encoding_format = format;
 
         match format {
-            PstEncodingFormat::Unicode => match UnicodePstFile::open(path) {
+            PstEncodingFormat::Unicode => match UnicodePstFile::open_read_only(path) {
                 Ok(unicode_pst) => {
                     Self::process_unicode_pst(unicode_pst, sink, options, &mut telemetry)?;
                 }
@@ -479,7 +479,7 @@ impl PstParserAdapter {
                     telemetry.status = PstStatus::Failed;
                 }
             },
-            PstEncodingFormat::Ansi => match AnsiPstFile::open(path) {
+            PstEncodingFormat::Ansi => match AnsiPstFile::open_read_only(path) {
                 Ok(ansi_pst) => {
                     Self::process_ansi_pst(ansi_pst, sink, options, &mut telemetry)?;
                 }

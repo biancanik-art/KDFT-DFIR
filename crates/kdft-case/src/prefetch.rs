@@ -311,16 +311,65 @@ impl PrefetchParser {
                 }
 
                 match xpress_huffman::decompress(&data[8..], declared_size) {
+                    Ok(decompressed) if decompressed.len() > options.max_decompressed_size => {
+                        record_warning(
+                            &mut warnings,
+                            &mut warnings_omitted,
+                            format!(
+                                "MAM decompression produced {} bytes, exceeding protective maximum {}",
+                                decompressed.len(),
+                                options.max_decompressed_size
+                            ),
+                        );
+                        return PrefetchParseResult {
+                            status: PrefetchStatus::ResourceLimitExceeded,
+                            is_mam_compressed: true,
+                            mam_uncompressed_size: Some(uncompressed_size),
+                            header: None,
+                            referenced_filenames: Vec::new(),
+                            volumes: Vec::new(),
+                            source_offsets,
+                            total_referenced_files: 0,
+                            total_volumes: 0,
+                            warnings,
+                            warnings_omitted,
+                            is_complete: false,
+                        };
+                    }
                     Ok(decompressed)
-                        if decompressed.len() == declared_size
-                            && decompressed.get(4..8) == Some(Self::SCCA_MAGIC.as_slice()) =>
+                        if decompressed.get(4..8) == Some(Self::SCCA_MAGIC.as_slice()) =>
                     {
                         let mut raw_options = options.clone();
-                        raw_options.max_file_size =
-                            options.max_file_size.max(options.max_decompressed_size);
+                        raw_options.max_file_size = options.max_decompressed_size;
                         let mut parsed = Self::parse_with_options(&decompressed, &raw_options);
                         parsed.is_mam_compressed = true;
                         parsed.mam_uncompressed_size = Some(uncompressed_size);
+                        if decompressed.len() != declared_size {
+                            let discrepancy = if decompressed.len() < declared_size {
+                                format!(
+                                    "{} byte shortfall",
+                                    declared_size.saturating_sub(decompressed.len())
+                                )
+                            } else {
+                                format!(
+                                    "{} bytes beyond the declaration",
+                                    decompressed.len().saturating_sub(declared_size)
+                                )
+                            };
+                            record_warning(
+                                &mut parsed.warnings,
+                                &mut parsed.warnings_omitted,
+                                format!(
+                                    "MAM decompression recovered {} bytes for a {}-byte declaration ({discrepancy}); the structurally valid SCCA payload was parsed without padding, truncation, or fabricated bytes",
+                                    decompressed.len(),
+                                    declared_size
+                                ),
+                            );
+                            parsed.is_complete = false;
+                            if parsed.status == PrefetchStatus::Success {
+                                parsed.status = PrefetchStatus::Partial;
+                            }
+                        }
                         return parsed;
                     }
                     Ok(decompressed) => {
@@ -328,7 +377,7 @@ impl PrefetchParser {
                             &mut warnings,
                             &mut warnings_omitted,
                             format!(
-                                "MAM decompression produced {} bytes (declared {}) or a non-SCCA payload",
+                                "MAM decompression produced {} bytes (declared {}) but the payload is not a structurally recognizable SCCA Prefetch file",
                                 decompressed.len(), declared_size
                             ),
                         );
@@ -784,12 +833,24 @@ impl PrefetchParser {
                                     );
                                     break;
                                 };
+                                if char_count == 0 {
+                                    has_corrupt_section_offsets = true;
+                                    record_warning(
+                                        &mut warnings,
+                                        &mut warnings_omitted,
+                                        format!(
+                                            "Volume {} directory {} declares a zero-character record",
+                                            i, directory_index
+                                        ),
+                                    );
+                                    break;
+                                }
                                 let string_start = curr_dir_off + 2;
                                 let string_end = char_count
                                     .checked_mul(2)
                                     .and_then(|byte_len| string_start.checked_add(byte_len));
-                                let Some(string_end) = string_end
-                                    .filter(|end| end.saturating_add(2) <= sec_d_bytes.len())
+                                let Some(string_end) =
+                                    string_end.filter(|end| *end <= sec_d_bytes.len())
                                 else {
                                     has_corrupt_section_offsets = true;
                                     record_warning(
@@ -802,28 +863,45 @@ impl PrefetchParser {
                                     );
                                     break;
                                 };
-                                let u16s: Vec<u16> = sec_d_bytes[string_start..string_end]
+                                let encoded_units: Vec<u16> = sec_d_bytes[string_start..string_end]
                                     .chunks_exact(2)
                                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                                     .collect();
+                                // The Prefetch directory-record length includes the
+                                // terminating UTF-16 NUL. Accept older/noncanonical
+                                // samples that exclude it, but disclose that variant
+                                // and consume the following terminator exactly once.
+                                let (u16s, next_dir_off) = if encoded_units.last() == Some(&0) {
+                                    (&encoded_units[..encoded_units.len() - 1], string_end)
+                                } else if get_u16_le(sec_d_bytes, string_end) == Some(0) {
+                                    record_warning(
+                                        &mut warnings,
+                                        &mut warnings_omitted,
+                                        format!(
+                                            "Volume {} directory {} length excludes its UTF-16 NUL terminator; accepted as a noncanonical record",
+                                            i, directory_index
+                                        ),
+                                    );
+                                    (&encoded_units[..], string_end + 2)
+                                } else {
+                                    record_warning(
+                                        &mut warnings,
+                                        &mut warnings_omitted,
+                                        format!(
+                                            "Volume {} directory {} has no UTF-16 NUL terminator; the bounded string was retained",
+                                            i, directory_index
+                                        ),
+                                    );
+                                    (&encoded_units[..], string_end)
+                                };
                                 let dir_path = decode_utf16_with_warning(
-                                    &u16s,
+                                    u16s,
                                     &format!("Volume {i} directory {directory_index}"),
                                     &mut warnings,
                                     &mut warnings_omitted,
                                 );
                                 directory_paths.push(dir_path);
-                                if get_u16_le(sec_d_bytes, string_end) != Some(0) {
-                                    record_warning(
-                                        &mut warnings,
-                                        &mut warnings_omitted,
-                                        format!(
-                                            "Volume {} directory {} is not followed by a UTF-16 NUL terminator",
-                                            i, directory_index
-                                        ),
-                                    );
-                                }
-                                curr_dir_off = string_end + 2;
+                                curr_dir_off = next_dir_off;
                             }
                         } else {
                             has_corrupt_section_offsets = true;
@@ -988,6 +1066,41 @@ mod tests {
         assert_eq!(limited.status, PrefetchStatus::ResourceLimitExceeded);
         assert!(!limited.is_complete);
         assert!(limited.header.is_none());
+    }
+
+    #[test]
+    fn test_prefetch_mam_three_byte_declared_shortfall_is_retained_as_partial() {
+        let mut raw = vec![0u8; 305];
+        let raw_len = raw.len();
+        raw[0..4].copy_from_slice(&26u32.to_le_bytes());
+        raw[4..8].copy_from_slice(b"SCCA");
+        raw[12..16].copy_from_slice(&(raw_len as u32).to_le_bytes());
+        raw[208..212].copy_from_slice(&11u32.to_le_bytes());
+
+        let mut wrapped = mam_wrap_literal_prefetch(&raw);
+        // With a larger requested output this deliberately literal fixture
+        // exhausts after 307 bytes. Declare 310 to reproduce the observed
+        // three-byte MAM shortfall while retaining the complete SCCA prefix.
+        let declared_size = raw_len as u32 + 5;
+        wrapped[4..8].copy_from_slice(&declared_size.to_le_bytes());
+
+        let parsed = PrefetchParser::parse(&wrapped);
+        assert_eq!(parsed.status, PrefetchStatus::Partial);
+        assert!(!parsed.is_complete);
+        assert!(parsed.is_mam_compressed);
+        assert_eq!(parsed.mam_uncompressed_size, Some(declared_size));
+        assert_eq!(
+            parsed.header.as_ref().map(|header| header.run_count),
+            Some(11)
+        );
+        assert!(
+            parsed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("3 byte shortfall")),
+            "{:?}",
+            parsed.warnings
+        );
     }
 
     #[test]
@@ -1160,16 +1273,16 @@ mod tests {
 
         let dir_strings_off = 160u32;
         let num_dir_strings = 1u32;
-        let dir1_u16: Vec<u16> = "\\WINDOWS\\SYSTEM32".encode_utf16().collect();
+        let dir1_u16: Vec<u16> = "\\WINDOWS\\SYSTEM32"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let dir_absolute = sec_d_off as usize + dir_strings_off as usize;
         buf[dir_absolute..dir_absolute + 2].copy_from_slice(&(dir1_u16.len() as u16).to_le_bytes());
         for (i, &u) in dir1_u16.iter().enumerate() {
             let absolute = dir_absolute + 2 + (i * 2);
             buf[absolute..absolute + 2].copy_from_slice(&u.to_le_bytes());
         }
-        let terminator = dir_absolute + 2 + (dir1_u16.len() * 2);
-        buf[terminator..terminator + 2].copy_from_slice(&0u16.to_le_bytes());
-
         let vol_entry_start = sec_d_off as usize;
         buf[vol_entry_start..vol_entry_start + 4].copy_from_slice(&dev_path_off.to_le_bytes());
         buf[vol_entry_start + 4..vol_entry_start + 8].copy_from_slice(&dev_path_len.to_le_bytes());
@@ -1215,6 +1328,45 @@ mod tests {
         assert_eq!(vol.serial_number_hex, "1234-5678");
         assert_eq!(vol.directory_paths.len(), 1);
         assert_eq!(vol.directory_paths[0], "\\WINDOWS\\SYSTEM32");
+    }
+
+    #[test]
+    fn malformed_directory_record_is_one_warning_and_preserves_the_source() {
+        for (char_count, expected) in [(0_u16, "zero-character"), (u16::MAX, "exceeds")] {
+            let mut data = vec![0_u8; 504];
+            let file_size = data.len() as u32;
+            data[0..4].copy_from_slice(&30_u32.to_le_bytes());
+            data[4..8].copy_from_slice(b"SCCA");
+            data[12..16].copy_from_slice(&file_size.to_le_bytes());
+            data[84..88].copy_from_slice(&304_u32.to_le_bytes());
+
+            let section_d_offset = 304_u32;
+            let section_d_size = 200_u32;
+            data[108..112].copy_from_slice(&section_d_offset.to_le_bytes());
+            data[112..116].copy_from_slice(&1_u32.to_le_bytes());
+            data[116..120].copy_from_slice(&section_d_size.to_le_bytes());
+
+            let volume = section_d_offset as usize;
+            data[volume + 20..volume + 24].copy_from_slice(&190_u32.to_le_bytes());
+            data[volume + 24..volume + 28].copy_from_slice(&u32::MAX.to_le_bytes());
+            let directory = volume + 190;
+            data[directory..directory + 2].copy_from_slice(&char_count.to_le_bytes());
+
+            let parsed = PrefetchParser::parse(&data);
+            assert_eq!(parsed.status, PrefetchStatus::CorruptSectionOffsets);
+            assert!(!parsed.is_complete);
+            assert!(parsed.header.is_some());
+            assert_eq!(parsed.volumes.len(), 1);
+            assert!(parsed.volumes[0].directory_paths.is_empty());
+            let directory_warnings = parsed
+                .warnings
+                .iter()
+                .filter(|warning| warning.contains("Volume 0 directory"))
+                .collect::<Vec<_>>();
+            assert_eq!(directory_warnings.len(), 1, "{:?}", parsed.warnings);
+            assert!(directory_warnings[0].contains(expected));
+            assert_eq!(parsed.warnings_omitted, 0);
+        }
     }
 
     #[test]

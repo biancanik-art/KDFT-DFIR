@@ -208,6 +208,70 @@ fn v1_section_data_range(desc: &SectionDescriptor, file_len: u64) -> Result<(u64
     Ok((data_start, section_end))
 }
 
+/// Resolve the next EWF v1 descriptor offset without mistaking the format's
+/// terminal sentinel for a malicious linked-list cycle.
+///
+/// EWF v1 deliberately makes the final `next` descriptor of every non-final
+/// segment and the final `done` descriptor of the acquisition point to itself.
+/// Accept that sentinel only when the marker is the last complete section in
+/// the segment. Self-references from data-bearing sections, terminal markers
+/// before EOF, and all backward links remain corruption errors.
+fn v1_next_descriptor_offset(desc: &SectionDescriptor, file_len: u64) -> Result<Option<u64>> {
+    if desc.next == 0 {
+        return Ok(None);
+    }
+
+    if desc.next == desc.offset && matches!(desc.section_type.as_str(), "next" | "done") {
+        let (_, section_end) = v1_section_data_range(desc, file_len)?;
+        if section_end == file_len {
+            return Ok(None);
+        }
+        return Err(EwfError::Parse(format!(
+            "EWF terminal section '{}' at {:#x} does not end at segment length {file_len:#x}",
+            desc.section_type, desc.offset
+        )));
+    }
+
+    if desc.next <= desc.offset {
+        return Err(EwfError::Parse(format!(
+            "EWF next section offset {:#x} does not advance from {:#x}",
+            desc.next, desc.offset
+        )));
+    }
+
+    Ok(Some(desc.next))
+}
+
+/// Match one EWF v1 offset table to the `sectors` section that owns its chunk
+/// payloads. A segment may contain several sectors/table/table2 groups, so a
+/// segment-wide "first sectors section" is not authoritative.
+fn v1_table_sectors_range(
+    offsets: &[u64],
+    sectors_ranges: &[(u64, u64)],
+) -> Result<Option<(u64, u64)>> {
+    if offsets.is_empty() || sectors_ranges.is_empty() {
+        return Ok(None);
+    }
+
+    let first = offsets[0];
+    let last = offsets[offsets.len() - 1];
+    let mut matches = sectors_ranges
+        .iter()
+        .copied()
+        .filter(|(start, end)| first >= *start && last < *end);
+    let selected = matches.next().ok_or_else(|| {
+        EwfError::Parse(format!(
+            "EWF table chunk range {first:#x}..={last:#x} is outside every sectors data range"
+        ))
+    })?;
+    if matches.next().is_some() {
+        return Err(EwfError::Parse(format!(
+            "EWF table chunk range {first:#x}..={last:#x} matches multiple sectors sections"
+        )));
+    }
+    Ok(Some(selected))
+}
+
 #[cfg(test)]
 mod kdft_large_acquisition_tests {
     use super::MAX_CHUNK_COUNT;
@@ -276,6 +340,58 @@ mod hardening_tests {
             ..done
         };
         assert!(v1_section_data_range(&table, 176).is_err());
+    }
+
+    #[test]
+    fn accepts_self_referential_next_and_done_markers_at_segment_end() {
+        for section_type in ["next", "done"] {
+            let descriptor = SectionDescriptor {
+                section_type: section_type.to_string(),
+                next: 100,
+                section_size: SECTION_DESCRIPTOR_SIZE as u64,
+                offset: 100,
+            };
+            assert_eq!(v1_next_descriptor_offset(&descriptor, 176).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn rejects_self_references_that_are_not_valid_terminal_markers() {
+        let data_section = SectionDescriptor {
+            section_type: "table".to_string(),
+            next: 100,
+            section_size: SECTION_DESCRIPTOR_SIZE as u64,
+            offset: 100,
+        };
+        assert!(v1_next_descriptor_offset(&data_section, 176).is_err());
+
+        let early_terminal = SectionDescriptor {
+            section_type: "next".to_string(),
+            ..data_section
+        };
+        let error = v1_next_descriptor_offset(&early_terminal, 200).unwrap_err();
+        assert!(error.to_string().contains("does not end at segment length"));
+    }
+
+    #[test]
+    fn rejects_backward_v1_descriptor_links() {
+        let descriptor = SectionDescriptor {
+            section_type: "table".to_string(),
+            next: 99,
+            section_size: SECTION_DESCRIPTOR_SIZE as u64,
+            offset: 100,
+        };
+        assert!(v1_next_descriptor_offset(&descriptor, 176).is_err());
+    }
+
+    #[test]
+    fn matches_each_v1_table_to_its_own_sectors_section() {
+        let ranges = [(100, 200), (300, 400)];
+        assert_eq!(
+            v1_table_sectors_range(&[310, 350, 399], &ranges).unwrap(),
+            Some((300, 400))
+        );
+        assert!(v1_table_sectors_range(&[190, 310], &ranges).is_err());
     }
 }
 
@@ -595,11 +711,19 @@ fn validate_chunk_layout(
         .checked_add(compressed_overhead)
         .ok_or_else(|| EwfError::Parse("stored chunk size limit overflow".to_string()))?;
 
+    // Query each segment length once. A large acquisition can contain millions
+    // of chunks; calling File::metadata for every chunk turns EWF open into
+    // millions of filesystem syscalls before the first evidence byte is read.
+    let segment_lengths = segments
+        .iter()
+        .map(|file| file.metadata().map(|metadata| metadata.len()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+
     for (chunk_id, chunk) in chunks.iter().enumerate() {
         if matches!(chunk.encoding, ChunkEncoding::Pattern(_)) {
             continue;
         }
-        let file = segments.get(chunk.segment_idx).ok_or_else(|| {
+        let file_len = segment_lengths.get(chunk.segment_idx).ok_or_else(|| {
             EwfError::Parse(format!(
                 "chunk {chunk_id} references missing segment {}",
                 chunk.segment_idx
@@ -631,8 +755,7 @@ fn validate_chunk_layout(
             .offset
             .checked_add(chunk.size)
             .ok_or_else(|| EwfError::Parse(format!("chunk {chunk_id} file range overflows")))?;
-        let file_len = file.metadata()?.len();
-        if end > file_len {
+        if end > *file_len {
             return Err(EwfError::Parse(format!(
                 "chunk {chunk_id} range {}..{end} exceeds segment length {file_len}",
                 chunk.offset
@@ -786,31 +909,27 @@ impl EwfReader {
                 file.read_exact(&mut desc_buf)?;
                 let desc = SectionDescriptor::parse(&desc_buf, desc_offset)?;
                 v1_section_data_range(&desc, file_len)?;
-                let next = desc.next;
+                let next = v1_next_descriptor_offset(&desc, file_len)?;
                 descriptors.push(desc);
 
-                if next == 0 {
-                    break;
+                match next {
+                    Some(next_offset) => desc_offset = next_offset,
+                    None => break,
                 }
-                if next <= desc_offset {
-                    return Err(EwfError::Parse(format!(
-                        "EWF next section offset {next:#x} does not advance from {desc_offset:#x}"
-                    )));
-                }
-                desc_offset = next;
             }
 
             // Prefer "table" over "table2"
             let has_table = descriptors.iter().any(|d| d.section_type == "table");
             let table_type = if has_table { "table" } else { "table2" };
 
-            // Find the sectors data range for table-offset validation and final
-            // compressed-chunk size recovery.
-            let sectors_data_range = descriptors
+            // A segment can contain several sectors/table/table2 groups. Keep
+            // every payload range and associate each selected table by its
+            // actual chunk offsets below.
+            let sectors_data_ranges = descriptors
                 .iter()
-                .find(|d| d.section_type == "sectors")
+                .filter(|d| d.section_type == "sectors")
                 .map(|d| v1_section_data_range(d, file_len))
-                .transpose()?;
+                .collect::<Result<Vec<_>>>()?;
 
             for desc in &descriptors {
                 match desc.section_type.as_str() {
@@ -914,7 +1033,8 @@ impl EwfReader {
                         let mut entries_buf = vec![0u8; entries_bytes];
                         file.read_exact(&mut entries_buf)?;
 
-                        let table_first_chunk = chunks.len();
+                        let mut parsed_entries = Vec::with_capacity(entry_count);
+                        let mut table_offsets = Vec::with_capacity(entry_count);
                         let mut prev_offset: Option<u64> = None;
                         for i in 0..entry_count {
                             let entry = TableEntry::parse(&entries_buf[i * 4..(i + 1) * 4])?;
@@ -923,20 +1043,25 @@ impl EwfReader {
                                 .ok_or_else(|| {
                                     EwfError::Parse("EWF table chunk offset overflow".to_string())
                                 })?;
-                            if let Some((sectors_start, sectors_end)) = sectors_data_range {
-                                if abs_offset < sectors_start || abs_offset >= sectors_end {
-                                    return Err(EwfError::Parse(format!(
-                                        "EWF table chunk offset {abs_offset:#x} is outside sectors data range {sectors_start:#x}..{sectors_end:#x}"
-                                    )));
-                                }
-                            }
-
                             if let Some(po) = prev_offset {
                                 if abs_offset <= po {
                                     return Err(EwfError::Parse(format!(
                                         "EWF table chunk offsets are not strictly increasing: {po} then {abs_offset}"
                                     )));
                                 }
+                            }
+
+                            parsed_entries.push(entry);
+                            table_offsets.push(abs_offset);
+                            prev_offset = Some(abs_offset);
+                        }
+
+                        let sectors_data_range =
+                            v1_table_sectors_range(&table_offsets, &sectors_data_ranges)?;
+                        let table_first_chunk = chunks.len();
+                        prev_offset = None;
+                        for (entry, abs_offset) in parsed_entries.into_iter().zip(table_offsets) {
+                            if let Some(po) = prev_offset {
                                 if let Some(prev_chunk) = chunks.last_mut() {
                                     if prev_chunk.compressed {
                                         prev_chunk.size = abs_offset - po;

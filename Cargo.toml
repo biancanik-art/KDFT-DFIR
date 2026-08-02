@@ -26,6 +26,7 @@ clap = { version = "4.5", features = ["derive"] }
 codepage-strings = "1"
 disk-forensic = "0.8.6"
 evtx = { version = "0.12.2", default-features = false }
+ewf = "0.2.3"
 # Vendored, not crates.io: see the notice at the top of crates/ext4-vendored/src/lib.rs
 # for why (upstream 0.9.0 rejects CSUM_SEED, which real-world modern ext4 filesystems set).
 ext4 = { path = "crates/ext4-vendored" }
