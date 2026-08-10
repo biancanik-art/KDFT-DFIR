@@ -5307,6 +5307,42 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_ui_discloses_native_boundary_and_attempt_metadata() {
+        for disclosure in [
+            "PST/OST/NST",
+            "ANSI v14/v15",
+            "classic Unicode v23",
+            "Unicode v36 (4K)",
+            "v37 (WIP-capable; protection not determined)",
+        ] {
+            assert!(INDEX_HTML.contains(disclosure), "missing {disclosure}");
+        }
+        for key in [
+            "pff_client_signature",
+            "pst_header_version",
+            "pst_page_size_bytes",
+            "pst_native_reader_supported",
+            "pst_embedded_magic_offset",
+            "pst_header_first_32_bytes_hex",
+            "email_parser_last_attempt_status",
+            "email_parser_last_attempt_pst_variant",
+            "email_parser_last_attempt_pff_client_signature",
+            "email_parser_last_attempt_pst_header_version",
+            "email_parser_last_attempt_pst_page_size_bytes",
+            "email_parser_last_attempt_pst_native_reader_supported",
+            "email_parser_last_attempt_pst_embedded_magic_offset",
+            "email_parser_last_attempt_pst_header_first_32_bytes_hex",
+            "email_parser_replacement_committed",
+            "email_parser_replacement_rolled_back",
+            "email_parser_previous_records_preserved",
+            "email_parser_retained_record_count",
+            "email_parser_error",
+        ] {
+            assert!(INDEX_HTML.contains(key), "missing {key}");
+        }
+    }
+
+    #[test]
     fn every_main_category_has_an_independent_expand_collapse_toggle() {
         assert!(INDEX_HTML.contains("collapsedCategoryMains: new Set()"));
         assert!(INDEX_HTML.contains("function toggleCategoryMain(mainName)"));
@@ -9070,7 +9106,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <div class="processing-options-grid">
                   <label class="check-option" title="Re-read the evidence file system and replace the existing indexed snapshot before running the selected processors. Leave this OFF to add or rerun processors without deleting previously indexed files or other processor results."><input type="checkbox" id="optReindexFilesystem"> Re-index filesystem (rebuild snapshot)</label>
                   <label class="check-option" title="Read each file's leading bytes into the case for Deep Search content matching. Turning this OFF gives a much faster metadata-only index (names, paths, timestamps, sizes, offsets) - content search then reports 'not indexed' for this evidence until re-processed with content on."><input type="checkbox" id="optCaptureContent" checked> Capture file content for search</label>
-                  <label class="check-option" title="Stream every indexed .eml / RFC-822 candidate without a file-size cap and parse embedded PST/OST mailboxes into message metadata. MIME body/attachment decoding remains separately disclosed."><input type="checkbox" id="optParseEmails" checked> Email messages</label>
+                  <label class="check-option" title="Stream every indexed .eml / RFC-822 candidate without a file-size cap and parse PFF-compatible PST/OST/NST mailboxes. The native reader supports ANSI v14/v15 and classic Unicode v23. Unicode v36 (4K) and v37 (WIP-capable; protection not determined) are recognized and reported as unsupported, never decoded as classic. MIME body/attachment decoding remains separately disclosed."><input type="checkbox" id="optParseEmails" checked> Email messages</label>
                   <label class="check-option" title="Compute the evidence SHA-256 over the decoded logical media after indexing (full read of the media - can take long on large images). Also records the acquisition segment manifest."><input type="checkbox" id="optRunHash"> Compute evidence hash</label>
                   <label class="check-option" title="Compute a SHA-256 for EVERY indexed file's complete reconstructed content and stamp it into the entry metadata. Reads every file - can take long on large or compressed images. Files that cannot be fully reconstructed get a disclosed skip reason instead of a partial-content hash."><input type="checkbox" id="optRunFileHash"> Hash files (SHA-256 per file)</label>
                   <label class="check-option" title="Verify file types by content signature after indexing and stamp match/mismatch/alias per entry. Enabled by default so renamed files are visible in new analyses."><input type="checkbox" id="optRunSignatures" checked> Verify file types (signatures)</label>
@@ -18471,7 +18507,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function emailPreview(entry) {
       const metadata = entry.metadata_json || {};
       if (metadata.artifact_kind === "email_store") {
-        return compactParts([metadata.email_format ? String(metadata.email_format).toUpperCase() + " mailbox store" : "Mailbox store", metadata.email_parser_status]);
+        const committedStatus = firstText(metadata.email_parser_status);
+        const attemptStatus = firstText(metadata.email_parser_last_attempt_status);
+        return compactParts([
+          metadata.email_format ? String(metadata.email_format).toUpperCase() + " mailbox store" : "Mailbox store",
+          committedStatus,
+          attemptStatus && attemptStatus !== committedStatus ? "Last attempt: " + attemptStatus : ""
+        ]);
       }
       return compactParts([
         metadata.email_date,
@@ -18508,10 +18550,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
         metadata: reportMetadata(metadata)
       };
       [
-        "email_format", "email_parser", "email_parser_status", "email_parser_error",
+        "email_format", "email_parser", "email_parser_status", "email_parser_last_attempt_status", "email_parser_error",
+        "email_parser_last_attempt_pst_variant", "email_parser_last_attempt_pff_client_signature",
+        "email_parser_last_attempt_pst_header_version", "email_parser_last_attempt_pst_page_size_bytes",
+        "email_parser_last_attempt_pst_native_reader_supported", "email_parser_last_attempt_pst_embedded_magic_offset",
+        "email_parser_last_attempt_pst_header_first_32_bytes_hex",
+        "email_parser_replacement_committed", "email_parser_replacement_rolled_back",
+        "email_parser_previous_records_preserved", "email_parser_retained_record_count",
         "email_from", "email_to", "email_cc", "email_bcc", "email_subject",
         "email_date", "email_message_id", "email_reply_to", "email_in_reply_to",
-        "email_body_preview", "email_attachment_names", "pst_folder_path", "pst_parser_scope",
+        "email_body_preview", "email_attachment_names", "pst_folder_path", "pst_parser_scope", "pst_variant",
+        "pff_client_signature", "pst_header_version", "pst_page_size_bytes",
+        "pst_native_reader_supported", "pst_embedded_magic_offset", "pst_header_first_32_bytes_hex",
         "pst_attachment_content_extraction", "pst_deleted_recovery", "source_entry_name", "filesystem_parser", "ntfs_path",
         "fat_path", "ntfs_standard_modification_time_utc", "ntfs_modification_time_utc"
       ].forEach((key) => {
@@ -20183,6 +20233,26 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return detailSection("Email Store", [
           ["Format", metadata.email_format],
           ["Parser Status", metadata.email_parser_status],
+          ["Last Attempt", metadata.email_parser_last_attempt_status],
+          ["Last Attempt PFF Client Signature", metadata.email_parser_last_attempt_pff_client_signature],
+          ["Last Attempt PFF Variant", metadata.email_parser_last_attempt_pst_variant],
+          ["Last Attempt Header Version", metadata.email_parser_last_attempt_pst_header_version],
+          ["Last Attempt Page Size", formatByteCountValue(metadata.email_parser_last_attempt_pst_page_size_bytes)],
+          ["Last Attempt Native Reader Supported", metadata.email_parser_last_attempt_pst_native_reader_supported],
+          ["Last Attempt Embedded Magic Offset", metadata.email_parser_last_attempt_pst_embedded_magic_offset],
+          ["Last Attempt Header First 32 Bytes", metadata.email_parser_last_attempt_pst_header_first_32_bytes_hex],
+          ["PFF Client Signature", metadata.pff_client_signature],
+          ["PFF Variant", metadata.pst_variant],
+          ["Header Version", metadata.pst_header_version],
+          ["Page Size", formatByteCountValue(metadata.pst_page_size_bytes)],
+          ["Native Reader Supported", metadata.pst_native_reader_supported],
+          ["Embedded Magic Offset", metadata.pst_embedded_magic_offset],
+          ["Header First 32 Bytes", metadata.pst_header_first_32_bytes_hex],
+          ["Replacement Committed", metadata.email_parser_replacement_committed],
+          ["Replacement Rolled Back", metadata.email_parser_replacement_rolled_back],
+          ["Previous Records Preserved", metadata.email_parser_previous_records_preserved],
+          ["Retained Records", metadata.email_parser_retained_record_count],
+          ["Parser Error", metadata.email_parser_error],
           ["Path", entry.logical_path],
           ["Size", entry.size_bytes == null ? "" : formatBytes(entry.size_bytes)]
         ]);

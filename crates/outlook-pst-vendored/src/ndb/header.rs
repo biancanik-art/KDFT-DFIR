@@ -12,7 +12,15 @@ use crate::{crc::compute_crc, AnsiPstFile, PstFile, UnicodePstFile};
 /// [Header]
 const HEADER_MAGIC: u32 = u32::from_be_bytes(*b"NDB!");
 
-const HEADER_MAGIC_CLIENT: u16 = u16::from_be_bytes(*b"MS");
+/// Canonical PST client signature. The little-endian on-disk bytes are `SM`.
+const HEADER_MAGIC_CLIENT: u16 = u16::from_le_bytes(*b"SM");
+
+/// Offline Storage Table client signature. The little-endian on-disk bytes are `SO`.
+const HEADER_MAGIC_CLIENT_OST: u16 = u16::from_le_bytes(*b"SO");
+
+fn is_supported_header_magic_client(value: u16) -> bool {
+    value == HEADER_MAGIC_CLIENT || value == HEADER_MAGIC_CLIENT_OST
+}
 
 /// `wVer`
 ///
@@ -179,7 +187,7 @@ impl HeaderReadWrite<UnicodePstFile> for UnicodeHeader {
 
         // wMagicClient
         let magic = cursor.read_u16::<LittleEndian>()?;
-        if magic != HEADER_MAGIC_CLIENT {
+        if !is_supported_header_magic_client(magic) {
             return Err(NdbError::InvalidNdbHeaderMagicClientValue(magic).into());
         }
 
@@ -460,7 +468,7 @@ impl HeaderReadWrite<AnsiPstFile> for AnsiHeader {
 
         // wMagicClient
         let magic = cursor.read_u16::<LittleEndian>()?;
-        if magic != HEADER_MAGIC_CLIENT {
+        if !is_supported_header_magic_client(magic) {
             return Err(NdbError::InvalidNdbHeaderMagicClientValue(magic).into());
         }
 
@@ -631,10 +639,83 @@ impl HeaderReadWrite<AnsiPstFile> for AnsiHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AnsiByteIndex, AnsiPageRef, UnicodeByteIndex, UnicodePageRef};
+
+    fn unicode_header() -> UnicodeHeader {
+        let root = UnicodeRoot::new(
+            UnicodeByteIndex::new(1_536),
+            UnicodeByteIndex::new(0),
+            UnicodeByteIndex::new(0),
+            UnicodeByteIndex::new(0),
+            UnicodePageRef::new(UnicodePageId::from(1), UnicodeByteIndex::new(512)),
+            UnicodePageRef::new(UnicodePageId::from(2), UnicodeByteIndex::new(1_024)),
+            AmapStatus::Valid2,
+        );
+        UnicodeHeader::new(root, NdbCryptMethod::None)
+    }
+
+    fn ansi_header() -> AnsiHeader {
+        let root = AnsiRoot::new(
+            AnsiByteIndex::new(1_536),
+            AnsiByteIndex::new(0),
+            AnsiByteIndex::new(0),
+            AnsiByteIndex::new(0),
+            AnsiPageRef::new(AnsiPageId::from(1), AnsiByteIndex::new(512)),
+            AnsiPageRef::new(AnsiPageId::from(2), AnsiByteIndex::new(1_024)),
+            AmapStatus::Valid2,
+        );
+        AnsiHeader::new(root, NdbCryptMethod::None)
+    }
+
+    fn set_magic_client_and_partial_crc(bytes: &mut [u8], magic: &[u8; 2]) {
+        bytes[8..10].copy_from_slice(magic);
+        let crc_partial = compute_crc(0, &bytes[8..8 + 471]);
+        bytes[4..8].copy_from_slice(&crc_partial.to_le_bytes());
+    }
 
     #[test]
     fn test_magic_values() {
         assert_eq!(HEADER_MAGIC, 0x4E444221);
         assert_eq!(HEADER_MAGIC_CLIENT, 0x4D53);
+        assert_eq!(HEADER_MAGIC_CLIENT_OST, 0x4F53);
+        assert!(is_supported_header_magic_client(u16::from_le_bytes(*b"SM")));
+        assert!(is_supported_header_magic_client(u16::from_le_bytes(*b"SO")));
+        assert!(!is_supported_header_magic_client(u16::from_le_bytes(
+            *b"XX"
+        )));
+    }
+
+    #[test]
+    fn unicode_header_reads_ost_signature_and_keeps_pst_write_signature() {
+        let header = unicode_header();
+        let mut bytes = Vec::new();
+        <UnicodeHeader as HeaderReadWrite<UnicodePstFile>>::write(&header, &mut bytes)
+            .expect("write Unicode header");
+        assert_eq!(&bytes[8..10], b"SM");
+
+        set_magic_client_and_partial_crc(&mut bytes, b"SO");
+        let crc_full = compute_crc(0, &bytes[8..8 + 516]);
+        bytes[8 + 516..8 + 516 + 4].copy_from_slice(&crc_full.to_le_bytes());
+
+        let mut reader = Cursor::new(bytes);
+        let parsed = <UnicodeHeader as HeaderReadWrite<UnicodePstFile>>::read(&mut reader)
+            .expect("read Unicode OST header");
+        assert_eq!(parsed.version(), NdbVersion::Unicode);
+    }
+
+    #[test]
+    fn ansi_header_reads_ost_signature_and_keeps_pst_write_signature() {
+        let header = ansi_header();
+        let mut bytes = Vec::new();
+        <AnsiHeader as HeaderReadWrite<AnsiPstFile>>::write(&header, &mut bytes)
+            .expect("write ANSI header");
+        assert_eq!(&bytes[8..10], b"SM");
+
+        set_magic_client_and_partial_crc(&mut bytes, b"SO");
+
+        let mut reader = Cursor::new(bytes);
+        let parsed = <AnsiHeader as HeaderReadWrite<AnsiPstFile>>::read(&mut reader)
+            .expect("read ANSI OST header");
+        assert_eq!(parsed.version(), NdbVersion::Ansi);
     }
 }

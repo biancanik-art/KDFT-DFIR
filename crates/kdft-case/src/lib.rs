@@ -4354,7 +4354,7 @@ fn embedded_mailbox_candidate_snapshot(
          WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
            AND is_deleted = 0
            AND json_extract(metadata_json, '$.artifact_kind') = 'email_store'
-           AND lower(COALESCE(json_extract(metadata_json, '$.email_format'), '')) IN ('pst','ost')",
+           AND lower(COALESCE(json_extract(metadata_json, '$.email_format'), '')) IN ('pst','ost','nst')",
         params![case_id, evidence_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -4379,7 +4379,7 @@ fn embedded_mailbox_candidate_page(
          WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
            AND is_deleted = 0
            AND json_extract(metadata_json, '$.artifact_kind') = 'email_store'
-           AND lower(COALESCE(json_extract(metadata_json, '$.email_format'), '')) IN ('pst','ost')
+           AND lower(COALESCE(json_extract(metadata_json, '$.email_format'), '')) IN ('pst','ost','nst')
            AND id > ?3 AND id <= ?4
          ORDER BY id
          LIMIT ?5",
@@ -4405,7 +4405,7 @@ fn embedded_mailbox_candidate_page(
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// Parses allocated PST/OST files discovered inside an already-indexed image
+/// Parses allocated PFF-compatible PST/OST/NST files discovered inside an already-indexed image
 /// or folder. The source stream is exported read-only to a short-lived staging
 /// file because `outlook-pst` requires `Read + Seek`; derived records stay in
 /// the original evidence and retain the exact source entry/path provenance.
@@ -4460,12 +4460,17 @@ pub fn parse_embedded_mailboxes(
                     max_messages,
                 ) {
                     Ok(import) => {
-                        if import.telemetry.status != pst::PstStatus::Failed {
+                        if import.replacement_committed
+                            && import.telemetry.status != pst::PstStatus::Failed
+                        {
                             result.mailboxes_parsed = result.mailboxes_parsed.saturating_add(1);
                         }
-                        result.messages_indexed = result.messages_indexed.saturating_add(
-                            usize::try_from(import.telemetry.total_messages).unwrap_or(usize::MAX),
-                        );
+                        if import.replacement_committed {
+                            result.messages_indexed = result.messages_indexed.saturating_add(
+                                usize::try_from(import.telemetry.total_messages)
+                                    .unwrap_or(usize::MAX),
+                            );
+                        }
                         result.entries_indexed = result
                             .entries_indexed
                             .saturating_add(import.entries_indexed);
@@ -4539,7 +4544,7 @@ pub fn parse_embedded_mailboxes(
     }
     if candidates_seen != snapshot.count {
         let message = format!(
-            "PST/OST candidate snapshot contained {} item(s), but keyset paging observed {}; the evidence index changed during parsing",
+            "PST/OST/NST candidate snapshot contained {} item(s), but keyset paging observed {}; the evidence index changed during parsing",
             snapshot.count, candidates_seen
         );
         result.parse_error_count = result.parse_error_count.saturating_add(1);
@@ -4582,6 +4587,7 @@ fn parse_one_embedded_mailbox(
         nonce,
         candidate.email_format
     ));
+    let mut detected_header = None;
     let parsed = (|| -> Result<PstStreamImportSummary> {
         recover_filesystem_entry_in_session(
             read_session,
@@ -4592,9 +4598,11 @@ fn parse_one_embedded_mailbox(
         )
         .with_context(|| format!("exporting embedded mailbox {}", candidate.logical_path))?;
         let header = detect_pst_header(&staging_path)?;
+        detected_header = Some(header.clone());
         if matches!(header.kind, PstHeaderKind::Unsupported) {
             bail!(
-                "unsupported PST/OST: {}",
+                "PFF mailbox cannot be decoded ({}): {}",
+                header.status,
                 header.reason.as_deref().unwrap_or("unrecognized header")
             );
         }
@@ -4606,6 +4614,17 @@ fn parse_one_embedded_mailbox(
             candidate.entry_id,
             sanitize_logical_segment(&candidate.name)
         );
+        let previous_records: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_extract(metadata_json, '$.derived_from_entry_id') = ?3",
+            params![case_id, evidence_id, candidate.entry_id],
+            |row| row.get(0),
+        )?;
+        let preserve_prior_on_partial = previous_records > 0;
+        if preserve_prior_on_partial {
+            tx.execute_batch("SAVEPOINT kdft_embedded_mailbox_reprocess")?;
+        }
         tx.execute(
             "DELETE FROM filesystem_entries
              WHERE case_id = ?1 AND evidence_id = ?2
@@ -4614,7 +4633,7 @@ fn parse_one_embedded_mailbox(
         )?;
         let requested_message_limit =
             (max_messages != usize::MAX).then(|| u64::try_from(max_messages).unwrap_or(u64::MAX));
-        let summary = stream_pst_mailbox_into_database(
+        let mut summary = stream_pst_mailbox_into_database(
             &tx,
             &staging_path,
             case_id,
@@ -4631,40 +4650,68 @@ fn parse_one_embedded_mailbox(
         if summary.telemetry.status == pst::PstStatus::Failed {
             bail!("{}", pst_failure_summary(&summary.telemetry));
         }
+        if should_preserve_prior_mailbox_reprocess(previous_records, &summary.telemetry) {
+            tx.execute_batch(
+                "ROLLBACK TO SAVEPOINT kdft_embedded_mailbox_reprocess;
+                 RELEASE SAVEPOINT kdft_embedded_mailbox_reprocess;",
+            )?;
+            let reason = pst_truncation_summary(&summary.telemetry);
+            patch_embedded_mailbox_attempt_metadata(
+                &tx,
+                case_id,
+                evidence_id,
+                candidate,
+                Some(&header),
+                "partial",
+                &reason,
+                previous_records,
+            )?;
+            tx.commit()?;
+            summary.entries_indexed = 0;
+            summary.replacement_committed = false;
+            return Ok(summary);
+        }
+        if preserve_prior_on_partial {
+            tx.execute_batch("RELEASE SAVEPOINT kdft_embedded_mailbox_reprocess")?;
+        }
         let source_status = match summary.telemetry.status {
             pst::PstStatus::Recognized => "parsed",
             pst::PstStatus::Partial => "partial",
             pst::PstStatus::Failed => "failed",
         };
+        let mut metadata_patch = serde_json::json!({
+            "email_parser": PST_PARSER_NAME,
+            "email_parser_status": source_status,
+            "email_parser_last_attempt_status": source_status,
+            "email_parser_error": serde_json::Value::Null,
+            "email_parser_last_attempt_error": serde_json::Value::Null,
+            "email_parser_replacement_committed": true,
+            "email_parser_replacement_rolled_back": false,
+            "email_parser_previous_records_preserved": false,
+            "email_parser_previous_records_replaced": previous_records,
+            "email_parser_retained_record_count": summary.entries_indexed,
+            "pst_messages_indexed": summary.telemetry.total_messages,
+            "pst_folders_indexed": summary.telemetry.total_folders,
+            "pst_recipients_indexed": summary.telemetry.total_recipients,
+            "pst_attachments_indexed": summary.telemetry.total_attachments,
+            "pst_parse_error_count": summary.telemetry.total_errors,
+            "pst_skipped_items": summary.telemetry.skipped_items,
+            "pst_message_limit_reached": summary.telemetry.message_limit_reached,
+            "pst_derived_root": prefix,
+        });
+        if let Some(object) = metadata_patch.as_object_mut() {
+            apply_pst_header_metadata(object, &header);
+            apply_pst_attempt_header_metadata(object, Some(&header));
+        }
         tx.execute(
             "UPDATE filesystem_entries
-             SET metadata_json = json_set(metadata_json,
-                 '$.email_parser', ?1,
-                 '$.email_parser_status', ?2,
-                 '$.pst_messages_indexed', ?3,
-                 '$.pst_folders_indexed', ?4,
-                 '$.pst_recipients_indexed', ?5,
-                 '$.pst_attachments_indexed', ?6,
-                 '$.pst_parse_error_count', ?7,
-                 '$.pst_skipped_items', ?8,
-                 '$.pst_message_limit_reached',
-                     json(CASE WHEN ?9 <> 0 THEN 'true' ELSE 'false' END),
-                 '$.pst_derived_root', ?10)
-             WHERE case_id = ?11 AND evidence_id = ?12 AND id = ?13",
+             SET metadata_json = json_patch(COALESCE(metadata_json, '{}'), json(?1))
+             WHERE case_id = ?2 AND evidence_id = ?3 AND id = ?4",
             params![
-                PST_PARSER_NAME,
-                source_status,
-                i64::try_from(summary.telemetry.total_messages).unwrap_or(i64::MAX),
-                i64::try_from(summary.telemetry.total_folders).unwrap_or(i64::MAX),
-                i64::try_from(summary.telemetry.total_recipients).unwrap_or(i64::MAX),
-                i64::try_from(summary.telemetry.total_attachments).unwrap_or(i64::MAX),
-                i64::try_from(summary.telemetry.total_errors).unwrap_or(i64::MAX),
-                i64::try_from(summary.telemetry.skipped_items).unwrap_or(i64::MAX),
-                summary.telemetry.message_limit_reached,
-                prefix,
+                metadata_patch.to_string(),
                 case_id,
                 evidence_id,
-                candidate.entry_id
+                candidate.entry_id,
             ],
         )?;
         tx.commit()?;
@@ -4682,6 +4729,21 @@ fn parse_one_embedded_mailbox(
             Ok(summary)
         }
         Err(error) => {
+            let attempt_error = format!("{error:#}");
+            let record_result = record_embedded_mailbox_attempt_failure(
+                case_path,
+                evidence_id,
+                candidate,
+                detected_header.as_ref(),
+                &attempt_error,
+            );
+            let error = if let Err(record_error) = record_result {
+                error.context(format!(
+                    "recording the rolled-back mailbox attempt also failed: {record_error:#}"
+                ))
+            } else {
+                error
+            };
             if let Some(warning) = cleanup_warning {
                 Err(error.context(warning))
             } else {
@@ -4689,6 +4751,92 @@ fn parse_one_embedded_mailbox(
             }
         }
     }
+}
+
+fn record_embedded_mailbox_attempt_failure(
+    case_path: &Path,
+    evidence_id: i64,
+    candidate: &EmbeddedMailboxCandidate,
+    header: Option<&PstHeaderStatus>,
+    error: &str,
+) -> Result<()> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let retained_record_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2
+           AND json_extract(metadata_json, '$.derived_from_entry_id') = ?3",
+        params![case_id, evidence_id, candidate.entry_id],
+        |row| row.get(0),
+    )?;
+    let attempt_status = failed_mailbox_attempt_status(header);
+    patch_embedded_mailbox_attempt_metadata(
+        &tx,
+        case_id,
+        evidence_id,
+        candidate,
+        header,
+        attempt_status,
+        error,
+        retained_record_count,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn patch_embedded_mailbox_attempt_metadata(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+    candidate: &EmbeddedMailboxCandidate,
+    header: Option<&PstHeaderStatus>,
+    attempt_status: &str,
+    error: &str,
+    retained_record_count: i64,
+) -> Result<()> {
+    let bounded_error = error.chars().take(2_000).collect::<String>();
+    let mut metadata_patch = serde_json::json!({
+        "email_parser": PST_PARSER_NAME,
+        "email_parser_last_attempt_status": attempt_status,
+        "email_parser_last_attempt_error": bounded_error,
+        "email_parser_replacement_committed": false,
+        "email_parser_replacement_rolled_back": true,
+        "email_parser_previous_records_preserved": retained_record_count > 0,
+        "email_parser_retained_record_count": retained_record_count,
+    });
+    if let Some(object) = metadata_patch.as_object_mut() {
+        if retained_record_count == 0 {
+            object.insert(
+                "email_parser_status".to_string(),
+                serde_json::json!(attempt_status),
+            );
+            object.insert(
+                "email_parser_error".to_string(),
+                serde_json::json!(error.chars().take(2_000).collect::<String>()),
+            );
+        }
+        apply_pst_attempt_header_metadata(object, header);
+    }
+    let updated = conn.execute(
+        "UPDATE filesystem_entries
+         SET metadata_json = json_patch(COALESCE(metadata_json, '{}'), json(?1))
+         WHERE case_id = ?2 AND evidence_id = ?3 AND id = ?4",
+        params![
+            metadata_patch.to_string(),
+            case_id,
+            evidence_id,
+            candidate.entry_id,
+        ],
+    )?;
+    if updated == 0 {
+        bail!(
+            "embedded mailbox source entry no longer exists: {}",
+            candidate.entry_id
+        );
+    }
+    Ok(())
 }
 
 /// Detects browser profiles among an evidence's INDEXED entries by their
@@ -5528,6 +5676,77 @@ pub fn process_evidence(
     process_evidence_with_profile(case_path, options, ProcessingProfile::default())
 }
 
+fn record_standalone_mailbox_failed_attempt(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    error: &str,
+) -> Result<()> {
+    let path = Path::new(&evidence.source_path);
+    let is_pff_mailbox = extension_lower(&evidence.display_name)
+        .or_else(|| extension_lower(path.to_string_lossy().as_ref()))
+        .as_deref()
+        .is_some_and(is_pff_store_extension);
+    if !is_pff_mailbox {
+        return Ok(());
+    }
+    let header = detect_pst_header(path).ok();
+    let attempt_status = failed_mailbox_attempt_status(header.as_ref());
+    record_standalone_mailbox_preserved_attempt(
+        conn,
+        case_id,
+        evidence,
+        attempt_status,
+        error,
+        header.as_ref(),
+    )
+}
+
+fn record_standalone_mailbox_preserved_attempt(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    attempt_status: &str,
+    error: &str,
+    header: Option<&PstHeaderStatus>,
+) -> Result<()> {
+    let retained_record_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+        params![case_id, evidence.id],
+        |row| row.get(0),
+    )?;
+    if retained_record_count == 0 {
+        return Ok(());
+    }
+    let mut metadata_patch = serde_json::json!({
+        "email_parser": PST_PARSER_NAME,
+        "email_parser_last_attempt_status": attempt_status,
+        "email_parser_last_attempt_error": error,
+        "email_parser_replacement_committed": false,
+        "email_parser_replacement_rolled_back": true,
+        "email_parser_previous_records_preserved": true,
+        "email_parser_retained_record_count": retained_record_count,
+    });
+    if let Some(object) = metadata_patch.as_object_mut() {
+        apply_pst_attempt_header_metadata(object, header);
+    }
+    conn.execute(
+        "UPDATE filesystem_entries
+         SET metadata_json = json_patch(COALESCE(metadata_json, '{}'), json(?1))
+         WHERE id = (
+             SELECT id FROM filesystem_entries
+             WHERE case_id = ?2 AND evidence_id = ?3
+             ORDER BY CASE
+                 WHEN json_extract(metadata_json, '$.artifact_kind') = 'email_store' THEN 0
+                 ELSE 1
+             END, id
+             LIMIT 1
+         )",
+        params![metadata_patch.to_string(), case_id, evidence.id],
+    )?;
+    Ok(())
+}
+
 /// Retains the terminal telemetry on the existing evidence job rather than
 /// creating a second durable job/progress table. Live snapshots remain
 /// transient, while the final elapsed and per-stage times travel with the
@@ -5685,6 +5904,19 @@ fn process_evidence_with_profile_inner(
             )?;
             let failed_job_id = failed_tx.last_insert_rowid();
             progress::progress_replace_job_id(failed_job_id);
+            if let Err(record_error) = record_standalone_mailbox_failed_attempt(
+                &failed_tx,
+                case_id,
+                &evidence,
+                &error_message,
+            ) {
+                progress::progress_diagnostic(
+                    progress::JobDiagnosticKind::ParserDiagnostic,
+                    format!(
+                        "failed to retain mailbox reprocessing-attempt metadata: {record_error:#}"
+                    ),
+                );
+            }
             failed_tx.execute(
                 "INSERT INTO audit_events(
                      case_id, event_type, actor, object_type, object_id, details_json
@@ -11756,11 +11988,14 @@ fn reserve_unique_browser_spool_path(prefix: &str, source_hint: &Path) -> Result
             std::process::id(),
             sanitize_logical_segment(source_name)
         ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
             Ok(file) => {
                 drop(file);
                 return Ok(path);
@@ -18060,10 +18295,23 @@ fn mark_email_store(metadata: &mut serde_json::Value, email_format: &str) {
             "email_format".to_string(),
             serde_json::Value::String(email_format.to_string()),
         );
+        let native_candidate = is_pff_store_extension(email_format);
         object.insert(
             "email_parser_status".to_string(),
-            serde_json::Value::String("pending mailbox store parser".to_string()),
+            serde_json::Value::String(if native_candidate {
+                "pending".to_string()
+            } else {
+                "skipped".to_string()
+            }),
         );
+        if !native_candidate {
+            object.insert(
+                "email_parser_error".to_string(),
+                serde_json::Value::String(format!(
+                    "native mailbox decoding is not available for {email_format}; the source file remains available for export"
+                )),
+            );
+        }
     }
 }
 
@@ -19573,53 +19821,277 @@ enum PstHeaderKind {
     Unsupported,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PstHeaderStatus {
     kind: PstHeaderKind,
+    status: &'static str,
     reason: Option<String>,
+    client_signature: Option<String>,
+    version: Option<u16>,
+    classification: String,
+    page_size_bytes: Option<u32>,
+    first_32_bytes_hex: String,
+    embedded_magic_offset: Option<u64>,
+    native_supported: bool,
 }
 
-fn is_pst_ost_extension(ext: &str) -> bool {
-    matches!(ext, "pst" | "ost")
+fn is_pff_store_extension(ext: &str) -> bool {
+    matches!(ext, "pst" | "ost" | "nst")
+}
+
+fn failed_mailbox_attempt_status(header: Option<&PstHeaderStatus>) -> &'static str {
+    header
+        .filter(|value| !value.native_supported)
+        .map_or("failed", |value| value.status)
 }
 
 fn detect_pst_header(path: &Path) -> Result<PstHeaderStatus> {
-    let mut file =
+    let file =
         fs::File::open(path).with_context(|| format!("opening mailbox {}", path.display()))?;
-    let mut header = [0_u8; 12];
-    let read = file
-        .read(&mut header)
-        .with_context(|| format!("reading PST/OST header {}", path.display()))?;
-    if read < header.len() {
+    let mut header = Vec::with_capacity(4096);
+    file.take(4096)
+        .read_to_end(&mut header)
+        .with_context(|| format!("reading PST/OST/NST header {}", path.display()))?;
+    let first_32_bytes_hex = header
+        .iter()
+        .take(32)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let embedded_magic_offset = header
+        .windows(4)
+        .position(|window| window == b"!BDN")
+        .and_then(|offset| u64::try_from(offset).ok());
+    if header.len() < 12 {
         return Ok(PstHeaderStatus {
             kind: PstHeaderKind::Unsupported,
-            reason: Some("PST/OST header is shorter than 12 bytes".to_string()),
+            status: "truncated_header",
+            reason: Some("PST/OST/NST header is shorter than 12 bytes".to_string()),
+            client_signature: None,
+            version: None,
+            classification: "truncated-header".to_string(),
+            page_size_bytes: None,
+            first_32_bytes_hex,
+            embedded_magic_offset,
+            native_supported: false,
         });
     }
     if &header[0..4] != b"!BDN" {
+        let (status, classification, reason) = if embedded_magic_offset.is_some() {
+            (
+                "recovery_required",
+                "embedded-pff-header",
+                "PFF NDB magic !BDN was found inside the first 4096 bytes but not at offset 0; recovery is required",
+            )
+        } else {
+            (
+                "not_pff",
+                "not-pff",
+                "PFF NDB magic !BDN was not found in the first 4096 bytes",
+            )
+        };
         return Ok(PstHeaderStatus {
             kind: PstHeaderKind::Unsupported,
-            reason: Some("PST/OST NDB magic !BDN was not found at offset 0".to_string()),
+            status,
+            reason: Some(reason.to_string()),
+            client_signature: None,
+            version: None,
+            classification: classification.to_string(),
+            page_size_bytes: None,
+            first_32_bytes_hex,
+            embedded_magic_offset,
+            native_supported: false,
         });
     }
 
     // MS-PST header layout: dwMagic(0), dwCRCPartial(4), wMagicClient(8), wVer(10).
+    let client_signature = match &header[8..10] {
+        b"SM" => "SM",
+        b"SO" => "SO",
+        other => {
+            return Ok(PstHeaderStatus {
+                kind: PstHeaderKind::Unsupported,
+                status: "unsupported_client",
+                reason: Some(format!(
+                    "PFF client signature 0x{:02X}{:02X} is not the supported PST SM or OST SO signature",
+                    other[0], other[1]
+                )),
+                client_signature: Some(format!("0x{:02X}{:02X}", other[0], other[1])),
+                version: Some(u16::from_le_bytes([header[10], header[11]])),
+                classification: "unsupported-client".to_string(),
+                page_size_bytes: None,
+                first_32_bytes_hex,
+                embedded_magic_offset,
+                native_supported: false,
+            });
+        }
+    };
     let version = u16::from_le_bytes([header[10], header[11]]);
     match version {
-        23 | 36 => Ok(PstHeaderStatus {
+        23 => Ok(PstHeaderStatus {
             kind: PstHeaderKind::Unicode { version },
+            status: "parsed",
             reason: None,
+            client_signature: Some(client_signature.to_string()),
+            version: Some(version),
+            classification: "unicode-classic-v23".to_string(),
+            page_size_bytes: Some(512),
+            first_32_bytes_hex,
+            embedded_magic_offset,
+            native_supported: true,
         }),
         14 | 15 => Ok(PstHeaderStatus {
             kind: PstHeaderKind::Ansi { version },
+            status: "parsed",
             reason: None,
+            client_signature: Some(client_signature.to_string()),
+            version: Some(version),
+            classification: format!("ansi-classic-v{version}"),
+            page_size_bytes: Some(512),
+            first_32_bytes_hex,
+            embedded_magic_offset,
+            native_supported: true,
+        }),
+        36 => Ok(PstHeaderStatus {
+            kind: PstHeaderKind::Unsupported,
+            status: "unsupported_variant",
+            reason: Some(
+                "Unicode 4K PFF version 36 is recognized but is not decoded by the native reader"
+                    .to_string(),
+            ),
+            client_signature: Some(client_signature.to_string()),
+            version: Some(version),
+            classification: "unicode-4k-v36".to_string(),
+            page_size_bytes: Some(4096),
+            first_32_bytes_hex,
+            embedded_magic_offset,
+            native_supported: false,
+        }),
+        37 => Ok(PstHeaderStatus {
+            kind: PstHeaderKind::Unsupported,
+            status: "unsupported_variant",
+            reason: Some(
+                "Unicode PFF version 37 is WIP-capable; protection may or may not be present and is not determined by this header check, and the native reader does not decode this version"
+                    .to_string(),
+            ),
+            client_signature: Some(client_signature.to_string()),
+            version: Some(version),
+            classification: "unicode-wip-v37".to_string(),
+            page_size_bytes: None,
+            first_32_bytes_hex,
+            embedded_magic_offset,
+            native_supported: false,
         }),
         _ => Ok(PstHeaderStatus {
             kind: PstHeaderKind::Unsupported,
+            status: "unsupported_variant",
             reason: Some(format!(
-                "PST/OST header version {version} is not one of the supported ANSI (14/15) or Unicode (23/36) versions"
+                "PFF header version {version} is not one of the natively supported ANSI (14/15) or classic Unicode (23) versions"
             )),
+            client_signature: Some(client_signature.to_string()),
+            version: Some(version),
+            classification: format!("unsupported-v{version}"),
+            page_size_bytes: None,
+            first_32_bytes_hex,
+            embedded_magic_offset,
+            native_supported: false,
         }),
+    }
+}
+
+fn apply_pst_header_metadata(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    header: &PstHeaderStatus,
+) {
+    object.insert(
+        "pst_variant".to_string(),
+        serde_json::json!(&header.classification),
+    );
+    object.insert(
+        "pst_native_reader_supported".to_string(),
+        serde_json::json!(header.native_supported),
+    );
+    object.insert(
+        "pst_header_first_32_bytes_hex".to_string(),
+        serde_json::json!(&header.first_32_bytes_hex),
+    );
+    if let Some(signature) = header.client_signature.as_ref() {
+        object.insert(
+            "pff_client_signature".to_string(),
+            serde_json::json!(signature),
+        );
+    }
+    if let Some(version) = header.version {
+        object.insert("pst_header_version".to_string(), serde_json::json!(version));
+    }
+    if let Some(page_size) = header.page_size_bytes {
+        object.insert(
+            "pst_page_size_bytes".to_string(),
+            serde_json::json!(page_size),
+        );
+    }
+    if let Some(offset) = header.embedded_magic_offset {
+        object.insert(
+            "pst_embedded_magic_offset".to_string(),
+            serde_json::json!(offset),
+        );
+    }
+}
+
+fn apply_pst_attempt_header_metadata(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    header: Option<&PstHeaderStatus>,
+) {
+    let fields = [
+        "email_parser_last_attempt_pst_variant",
+        "email_parser_last_attempt_pst_native_reader_supported",
+        "email_parser_last_attempt_pst_header_first_32_bytes_hex",
+        "email_parser_last_attempt_pff_client_signature",
+        "email_parser_last_attempt_pst_header_version",
+        "email_parser_last_attempt_pst_page_size_bytes",
+        "email_parser_last_attempt_pst_embedded_magic_offset",
+    ];
+    for field in fields {
+        object.insert(field.to_string(), serde_json::Value::Null);
+    }
+    let Some(header) = header else {
+        return;
+    };
+    object.insert(
+        "email_parser_last_attempt_pst_variant".to_string(),
+        serde_json::json!(&header.classification),
+    );
+    object.insert(
+        "email_parser_last_attempt_pst_native_reader_supported".to_string(),
+        serde_json::json!(header.native_supported),
+    );
+    object.insert(
+        "email_parser_last_attempt_pst_header_first_32_bytes_hex".to_string(),
+        serde_json::json!(&header.first_32_bytes_hex),
+    );
+    if let Some(signature) = header.client_signature.as_ref() {
+        object.insert(
+            "email_parser_last_attempt_pff_client_signature".to_string(),
+            serde_json::json!(signature),
+        );
+    }
+    if let Some(version) = header.version {
+        object.insert(
+            "email_parser_last_attempt_pst_header_version".to_string(),
+            serde_json::json!(version),
+        );
+    }
+    if let Some(page_size) = header.page_size_bytes {
+        object.insert(
+            "email_parser_last_attempt_pst_page_size_bytes".to_string(),
+            serde_json::json!(page_size),
+        );
+    }
+    if let Some(offset) = header.embedded_magic_offset {
+        object.insert(
+            "email_parser_last_attempt_pst_embedded_magic_offset".to_string(),
+            serde_json::json!(offset),
+        );
     }
 }
 
@@ -19628,6 +20100,7 @@ struct PstStreamImportSummary {
     entries_indexed: usize,
     telemetry: pst::PstTelemetry,
     cleanup_warning: Option<String>,
+    replacement_committed: bool,
 }
 
 #[derive(Debug)]
@@ -20206,9 +20679,34 @@ fn pst_failure_summary(telemetry: &pst::PstTelemetry) -> String {
         telemetry.error_samples.join("; ")
     };
     format!(
-        "PST/OST parser failed after {} message(s): {} error(s), {} diagnostic(s) omitted; {samples}",
+        "PST/OST/NST parser failed after {} message(s): {} error(s), {} diagnostic(s) omitted; {samples}",
         telemetry.total_messages, telemetry.total_errors, telemetry.errors_omitted
     )
+}
+
+fn pst_truncation_summary(telemetry: &pst::PstTelemetry) -> String {
+    if telemetry.message_limit_reached {
+        format!(
+            "PST/OST/NST examiner-requested message limit reached after {} message(s)",
+            telemetry.total_messages
+        )
+    } else {
+        format!(
+            "PST/OST/NST parser reported {:?}: {} error(s), {} skipped item(s), {} skipped byte(s)",
+            telemetry.status,
+            telemetry.total_errors,
+            telemetry.skipped_items,
+            telemetry.skipped_bytes
+        )
+    }
+}
+
+fn should_preserve_prior_mailbox_reprocess(
+    previous_records: i64,
+    telemetry: &pst::PstTelemetry,
+) -> bool {
+    previous_records > 0
+        && (telemetry.status != pst::PstStatus::Recognized || telemetry.message_limit_reached)
 }
 
 fn filesystem_entry_id_for_path(
@@ -20268,6 +20766,7 @@ fn stream_pst_mailbox_into_database(
         entries_indexed,
         telemetry,
         cleanup_warning: None,
+        replacement_committed: true,
     })
 }
 
@@ -20375,9 +20874,6 @@ fn process_pst_mailbox_evidence(
         .unwrap_or_else(|| "pst".to_string());
     let header = detect_pst_header(&path)?;
     if matches!(header.kind, PstHeaderKind::Unsupported) {
-        let reason = header
-            .reason
-            .unwrap_or_else(|| "unsupported PST/OST variant".to_string());
         return persist_unsupported_mailbox_status(
             conn,
             case_id,
@@ -20385,11 +20881,19 @@ fn process_pst_mailbox_evidence(
             job_id,
             metadata.len(),
             &email_format,
-            &header.kind,
-            &reason,
+            &header,
         );
     }
 
+    let previous_records: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+        params![case_id, evidence.id],
+        |row| row.get(0),
+    )?;
+    let preserve_prior_on_partial = previous_records > 0;
+    if preserve_prior_on_partial {
+        conn.execute_batch("SAVEPOINT kdft_standalone_mailbox_reprocess")?;
+    }
     conn.execute(
         "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
         params![case_id, evidence.id],
@@ -20413,27 +20917,71 @@ fn process_pst_mailbox_evidence(
     if summary.telemetry.status == pst::PstStatus::Failed {
         bail!("{}", pst_failure_summary(&summary.telemetry));
     }
+    let truncated = summary.telemetry.status != pst::PstStatus::Recognized
+        || summary.telemetry.message_limit_reached;
+    if should_preserve_prior_mailbox_reprocess(previous_records, &summary.telemetry) {
+        conn.execute_batch(
+            "ROLLBACK TO SAVEPOINT kdft_standalone_mailbox_reprocess;
+             RELEASE SAVEPOINT kdft_standalone_mailbox_reprocess;",
+        )?;
+        let reason = pst_truncation_summary(&summary.telemetry);
+        record_standalone_mailbox_preserved_attempt(
+            conn,
+            case_id,
+            evidence,
+            "partial",
+            &reason,
+            Some(&header),
+        )?;
+        progress::progress_error(Some(evidence.source_path.clone()));
+        progress::progress_truncated(format!(
+            "{reason}; the prior committed mailbox index ({previous_records} record(s)) was preserved"
+        ));
+        return Ok((0, true));
+    }
+    if preserve_prior_on_partial {
+        conn.execute_batch("RELEASE SAVEPOINT kdft_standalone_mailbox_reprocess")?;
+    }
+    let source_status = match summary.telemetry.status {
+        pst::PstStatus::Recognized => "parsed",
+        pst::PstStatus::Partial => "partial",
+        pst::PstStatus::Failed => "failed",
+    };
+    let mut metadata_patch = serde_json::json!({
+        "email_parser": PST_PARSER_NAME,
+        "email_parser_status": source_status,
+        "email_parser_last_attempt_status": source_status,
+        "email_parser_error": serde_json::Value::Null,
+        "email_parser_last_attempt_error": serde_json::Value::Null,
+        "email_parser_replacement_committed": true,
+        "email_parser_replacement_rolled_back": false,
+        "email_parser_previous_records_preserved": false,
+        "email_parser_previous_records_replaced": previous_records,
+        "email_parser_retained_record_count": summary.entries_indexed,
+    });
+    if let Some(object) = metadata_patch.as_object_mut() {
+        apply_pst_header_metadata(object, &header);
+        apply_pst_attempt_header_metadata(object, Some(&header));
+    }
+    conn.execute(
+        "UPDATE filesystem_entries
+         SET metadata_json = json_patch(COALESCE(metadata_json, '{}'), json(?1))
+         WHERE id = (
+             SELECT id FROM filesystem_entries
+             WHERE case_id = ?2 AND evidence_id = ?3
+             ORDER BY CASE
+                 WHEN json_extract(metadata_json, '$.artifact_kind') = 'email_store' THEN 0
+                 ELSE 1
+             END, id
+             LIMIT 1
+         )",
+        params![metadata_patch.to_string(), case_id, evidence.id],
+    )?;
     if summary.telemetry.total_errors > 0 {
         progress::progress_error(Some(evidence.source_path.clone()));
     }
-    let truncated = summary.telemetry.status != pst::PstStatus::Recognized
-        || summary.telemetry.message_limit_reached;
     if truncated {
-        let reason = if summary.telemetry.message_limit_reached {
-            format!(
-                "PST/OST examiner-requested message limit reached after {} message(s)",
-                summary.telemetry.total_messages
-            )
-        } else {
-            format!(
-                "PST/OST parser reported {:?}: {} error(s), {} skipped item(s), {} skipped byte(s)",
-                summary.telemetry.status,
-                summary.telemetry.total_errors,
-                summary.telemetry.skipped_items,
-                summary.telemetry.skipped_bytes
-            )
-        };
-        progress::progress_truncated(reason);
+        progress::progress_truncated(pst_truncation_summary(&summary.telemetry));
     }
     Ok((summary.entries_indexed, truncated))
 }
@@ -20445,38 +20993,71 @@ fn persist_unsupported_mailbox_status(
     job_id: i64,
     size_bytes: u64,
     email_format: &str,
-    header_kind: &PstHeaderKind,
-    reason: &str,
+    header: &PstHeaderStatus,
 ) -> Result<(usize, bool)> {
-    conn.execute(
-        "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+    let reason = header
+        .reason
+        .as_deref()
+        .unwrap_or("PFF header is not supported by the native mailbox reader");
+    let retained_record_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
         params![case_id, evidence.id],
+        |row| row.get(0),
     )?;
+    if retained_record_count > 0 {
+        let mut metadata_patch = serde_json::json!({
+            "email_parser": PST_PARSER_NAME,
+            "email_parser_last_attempt_status": header.status,
+            "email_parser_last_attempt_error": reason,
+            "email_parser_replacement_committed": false,
+            "email_parser_replacement_rolled_back": true,
+            "email_parser_previous_records_preserved": true,
+            "email_parser_retained_record_count": retained_record_count,
+        });
+        if let Some(object) = metadata_patch.as_object_mut() {
+            apply_pst_attempt_header_metadata(object, Some(header));
+        }
+        conn.execute(
+            "UPDATE filesystem_entries
+             SET metadata_json = json_patch(COALESCE(metadata_json, '{}'), json(?1))
+             WHERE id = (
+                 SELECT id FROM filesystem_entries
+                 WHERE case_id = ?2 AND evidence_id = ?3
+                 ORDER BY CASE
+                     WHEN json_extract(metadata_json, '$.artifact_kind') = 'email_store' THEN 0
+                     ELSE 1
+                 END, id
+                 LIMIT 1
+             )",
+            params![metadata_patch.to_string(), case_id, evidence.id],
+        )?;
+        progress::progress_error(Some(evidence.source_path.clone()));
+        progress::progress_truncated(format!(
+            "PFF mailbox reprocessing could not replace the prior committed results ({}); {} record(s) were preserved",
+            reason, retained_record_count
+        ));
+        return Ok((0, true));
+    }
     let logical_path = format!("/{}", sanitize_logical_segment(&evidence.display_name));
     let mut metadata = serde_json::json!({
         "artifact_kind": "email_store",
         "email_format": email_format,
         "email_parser": PST_PARSER_NAME,
-        "email_parser_status": "unsupported",
+        "email_parser_status": header.status,
+        "email_parser_last_attempt_status": header.status,
         "email_parser_error": reason,
+        "email_parser_last_attempt_error": reason,
+        "email_parser_replacement_committed": true,
+        "email_parser_replacement_rolled_back": false,
+        "email_parser_previous_records_preserved": false,
+        "email_parser_retained_record_count": 0,
         "pst_parser_scope": pst_parser_scope_text(),
         "pst_deleted_recovery": "folder-visible Deleted Items are included; orphaned/deallocated PST node recovery is not attempted",
-        "pst_attachment_content_extraction": "not attempted because the PST/OST parser could not open this store",
+        "pst_attachment_content_extraction": "not attempted because the PFF mailbox reader could not open this store",
     });
     if let Some(object) = metadata.as_object_mut() {
-        match header_kind {
-            PstHeaderKind::Unicode { version } => {
-                object.insert("pst_variant".to_string(), serde_json::json!("unicode"));
-                object.insert("pst_header_version".to_string(), serde_json::json!(version));
-            }
-            PstHeaderKind::Ansi { version } => {
-                object.insert("pst_variant".to_string(), serde_json::json!("ansi"));
-                object.insert("pst_header_version".to_string(), serde_json::json!(version));
-            }
-            PstHeaderKind::Unsupported => {
-                object.insert("pst_variant".to_string(), serde_json::json!("unsupported"));
-            }
-        }
+        apply_pst_header_metadata(object, header);
+        apply_pst_attempt_header_metadata(object, Some(header));
     }
     add_entry_category(&mut metadata, &logical_path, &evidence.display_name, "file");
     upsert_filesystem_entry(
@@ -20491,12 +21072,15 @@ fn persist_unsupported_mailbox_status(
         job_id,
     )?;
     progress::progress_error(Some(evidence.source_path.clone()));
-    progress::progress_truncated(format!("PST/OST parser could not open the store: {reason}"));
+    progress::progress_truncated(format!(
+        "PFF mailbox reader recorded {}: {reason}",
+        header.status
+    ));
     Ok((1, true))
 }
 
 fn pst_parser_scope_text() -> &'static str {
-    "ANSI and Unicode PST/OST folders, message headers and known MAPI fields, recipients, complete plain/HTML body text segments, and readable attachment payloads with SHA-256; RTF rendering, encrypted stores, embedded-message recursion, and orphaned/deallocated PST node recovery remain explicitly unsupported"
+    "PFF-compatible PST/OST/NST stores using ANSI versions 14/15 or classic Unicode version 23: folders, message headers and known MAPI fields, recipients, complete plain/HTML body text segments, and readable attachment payloads with SHA-256; Unicode 4K version 36 and WIP-capable version 37 are recognized and explicitly reported but not decoded, and a version-37 header alone does not establish that protection is present; RTF rendering, encrypted stores, embedded-message recursion, and orphaned/deallocated PFF node recovery remain unsupported"
 }
 
 fn pst_filetime_to_rfc3339(filetime_100ns: i64) -> Option<String> {
@@ -21265,7 +21849,7 @@ fn process_file_evidence(
     if extension_lower(&evidence.display_name)
         .or_else(|| extension_lower(path.to_string_lossy().as_ref()))
         .as_deref()
-        .is_some_and(is_pst_ost_extension)
+        .is_some_and(is_pff_store_extension)
     {
         return process_pst_mailbox_evidence(conn, case_id, evidence, job_id, max_entries);
     }
@@ -39563,16 +40147,30 @@ mod tests {
 
         let mut unicode_header = vec![0_u8; 12];
         unicode_header[0..4].copy_from_slice(b"!BDN");
+        unicode_header[8..10].copy_from_slice(b"SM");
         unicode_header[10..12].copy_from_slice(&23_u16.to_le_bytes());
         let unicode_path = dir.join("unicode.pst");
         fs::write(&unicode_path, &unicode_header)?;
-        assert_eq!(
-            detect_pst_header(&unicode_path)?.kind,
-            PstHeaderKind::Unicode { version: 23 }
-        );
+        let unicode_status = detect_pst_header(&unicode_path)?;
+        assert_eq!(unicode_status.kind, PstHeaderKind::Unicode { version: 23 });
+        assert_eq!(unicode_status.status, "parsed");
+        assert_eq!(unicode_status.client_signature.as_deref(), Some("SM"));
+        assert_eq!(unicode_status.classification, "unicode-classic-v23");
+        assert_eq!(unicode_status.page_size_bytes, Some(512));
+        assert!(unicode_status.native_supported);
+
+        let mut ost_header = unicode_header.clone();
+        ost_header[8..10].copy_from_slice(b"SO");
+        let ost_path = dir.join("unicode.ost");
+        fs::write(&ost_path, &ost_header)?;
+        let ost_status = detect_pst_header(&ost_path)?;
+        assert_eq!(ost_status.kind, PstHeaderKind::Unicode { version: 23 });
+        assert_eq!(ost_status.client_signature.as_deref(), Some("SO"));
+        assert_eq!(ost_status.classification, "unicode-classic-v23");
 
         let mut ansi_header = vec![0_u8; 12];
         ansi_header[0..4].copy_from_slice(b"!BDN");
+        ansi_header[8..10].copy_from_slice(b"SM");
         ansi_header[10..12].copy_from_slice(&14_u16.to_le_bytes());
         let ansi_path = dir.join("ansi.pst");
         fs::write(&ansi_path, &ansi_header)?;
@@ -39580,10 +40178,32 @@ mod tests {
         assert_eq!(ansi_status.kind, PstHeaderKind::Ansi { version: 14 });
         assert!(ansi_status.reason.is_none());
 
+        let mut unicode_4k_header = unicode_header.clone();
+        unicode_4k_header[10..12].copy_from_slice(&36_u16.to_le_bytes());
+        let unicode_4k_path = dir.join("unicode-4k.ost");
+        fs::write(&unicode_4k_path, &unicode_4k_header)?;
+        let unicode_4k_status = detect_pst_header(&unicode_4k_path)?;
+        assert_eq!(unicode_4k_status.kind, PstHeaderKind::Unsupported);
+        assert_eq!(unicode_4k_status.status, "unsupported_variant");
+        assert_eq!(unicode_4k_status.classification, "unicode-4k-v36");
+        assert_eq!(unicode_4k_status.page_size_bytes, Some(4096));
+        assert!(!unicode_4k_status.native_supported);
+        assert_eq!(
+            failed_mailbox_attempt_status(Some(&unicode_status)),
+            "failed"
+        );
+        assert_eq!(
+            failed_mailbox_attempt_status(Some(&unicode_4k_status)),
+            "unsupported_variant"
+        );
+        assert_eq!(failed_mailbox_attempt_status(None), "failed");
+
         let wrong_magic_path = dir.join("wrong-magic.pst");
         fs::write(&wrong_magic_path, b"NOTAPSTFILE!")?;
         let wrong_magic_status = detect_pst_header(&wrong_magic_path)?;
         assert_eq!(wrong_magic_status.kind, PstHeaderKind::Unsupported);
+        assert_eq!(wrong_magic_status.status, "not_pff");
+        assert_eq!(wrong_magic_status.classification, "not-pff");
         assert!(wrong_magic_status
             .reason
             .unwrap_or_default()
@@ -39593,6 +40213,7 @@ mod tests {
         fs::write(&short_path, b"short")?;
         let short_status = detect_pst_header(&short_path)?;
         assert_eq!(short_status.kind, PstHeaderKind::Unsupported);
+        assert_eq!(short_status.status, "truncated_header");
         assert!(short_status
             .reason
             .unwrap_or_default()
@@ -39600,6 +40221,43 @@ mod tests {
 
         let _ = fs::remove_dir_all(dir);
         Ok(())
+    }
+
+    #[test]
+    fn partial_mailbox_reprocessing_preserves_prior_committed_rows() {
+        let complete = pst::PstTelemetry::default();
+        assert!(!should_preserve_prior_mailbox_reprocess(1, &complete));
+
+        let mut parser_partial = complete.clone();
+        parser_partial.status = pst::PstStatus::Partial;
+        assert!(should_preserve_prior_mailbox_reprocess(1, &parser_partial));
+        assert!(!should_preserve_prior_mailbox_reprocess(0, &parser_partial));
+
+        let mut limited = complete;
+        limited.message_limit_reached = true;
+        assert!(should_preserve_prior_mailbox_reprocess(1, &limited));
+        assert!(!should_preserve_prior_mailbox_reprocess(0, &limited));
+    }
+
+    #[test]
+    fn mark_email_store_routes_only_pff_compatible_mailboxes_to_native_parsing() {
+        for extension in ["pst", "ost", "nst"] {
+            let mut metadata = serde_json::json!({});
+            mark_email_store(&mut metadata, extension);
+            assert_eq!(metadata["artifact_kind"].as_str(), Some("email_store"));
+            assert_eq!(metadata["email_format"].as_str(), Some(extension));
+            assert_eq!(metadata["email_parser_status"].as_str(), Some("pending"));
+            assert!(metadata.get("email_parser_error").is_none());
+        }
+
+        for extension in ["msg", "mbox", "olm", "dbx", "nsf"] {
+            let mut metadata = serde_json::json!({});
+            mark_email_store(&mut metadata, extension);
+            assert_eq!(metadata["email_parser_status"].as_str(), Some("skipped"));
+            assert!(metadata["email_parser_error"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("available for export")));
+        }
     }
 
     #[test]
@@ -40649,7 +41307,7 @@ mod tests {
     }
 
     #[test]
-    fn process_pst_mailbox_evidence_reports_wrong_magic_as_unsupported() -> Result<()> {
+    fn process_pst_mailbox_evidence_reports_wrong_magic_as_not_pff() -> Result<()> {
         let case_path = unique_case_path("pst-wrong-magic");
         create_test_case(&case_path)?;
         let dir = unique_temp_dir("pst-wrong-magic-source");
@@ -40662,11 +41320,12 @@ mod tests {
         );
         assert_eq!(
             entry.metadata_json["email_parser_status"].as_str(),
-            Some("unsupported")
+            Some("not_pff")
         );
+        assert_eq!(entry.metadata_json["pst_variant"].as_str(), Some("not-pff"));
         assert_eq!(
-            entry.metadata_json["pst_variant"].as_str(),
-            Some("unsupported")
+            entry.metadata_json["email_parser_last_attempt_status"].as_str(),
+            Some("not_pff")
         );
 
         cleanup_case_path(&case_path);
@@ -40700,11 +41359,12 @@ mod tests {
         assert_eq!(prior.len(), 1);
         assert_eq!(
             prior[0].metadata_json["email_parser_status"].as_str(),
-            Some("unsupported")
+            Some("not_pff")
         );
 
         let mut ansi_header = vec![0_u8; 12];
         ansi_header[0..4].copy_from_slice(b"!BDN");
+        ansi_header[8..10].copy_from_slice(b"SM");
         ansi_header[10..12].copy_from_slice(&14_u16.to_le_bytes());
         fs::write(&path, &ansi_header)?;
         let error = process_evidence(
@@ -40719,7 +41379,46 @@ mod tests {
         let retained = list_filesystem_entries(&case_path, Some(evidence_id))?;
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].id, prior[0].id);
-        assert_eq!(retained[0].metadata_json, prior[0].metadata_json);
+        assert_eq!(
+            retained[0].metadata_json["email_parser_status"].as_str(),
+            Some("not_pff")
+        );
+        assert_eq!(
+            retained[0].metadata_json["email_parser_last_attempt_status"].as_str(),
+            Some("failed")
+        );
+        assert_eq!(
+            retained[0].metadata_json["pst_variant"].as_str(),
+            Some("not-pff"),
+            "failed reprocessing must not overwrite committed PFF provenance"
+        );
+        assert_eq!(
+            retained[0].metadata_json["email_parser_last_attempt_pst_variant"].as_str(),
+            Some("ansi-classic-v14")
+        );
+        assert_eq!(
+            retained[0].metadata_json["email_parser_last_attempt_pst_header_version"].as_u64(),
+            Some(14)
+        );
+        assert_eq!(
+            retained[0].metadata_json["email_parser_replacement_committed"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            retained[0].metadata_json["email_parser_replacement_rolled_back"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            retained[0].metadata_json["email_parser_previous_records_preserved"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            retained[0].metadata_json["email_parser_retained_record_count"].as_i64(),
+            Some(1)
+        );
+        assert!(retained[0].metadata_json["email_parser_last_attempt_error"]
+            .as_str()
+            .is_some_and(|message| message.contains("ANSI PST open error")));
         assert_eq!(
             list_evidence(&case_path)?[0].last_job_status.as_deref(),
             Some("failed")
@@ -40741,6 +41440,7 @@ mod tests {
         let dir = unique_temp_dir("pst-unicode-corrupt-source");
         let mut bytes = vec![0_u8; 4096];
         bytes[0..4].copy_from_slice(b"!BDN");
+        bytes[8..10].copy_from_slice(b"SM");
         bytes[10..12].copy_from_slice(&23_u16.to_le_bytes());
         let path = write_pst_fixture(&dir, "mail.pst", &bytes)?;
         let evidence_id = add_evidence(
@@ -40762,6 +41462,100 @@ mod tests {
         .expect_err("corrupt Unicode PST must fail the processing job");
         assert!(format!("{error:#}").contains("Unicode PST open error"));
         assert!(list_filesystem_entries(&case_path, Some(evidence_id))?.is_empty());
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn process_nst_mailbox_evidence_records_explicit_not_pff_status() -> Result<()> {
+        let case_path = unique_case_path("nst-not-pff");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("nst-not-pff-source");
+        let path = write_pst_fixture(&dir, "mail.nst", b"NOT-A-PFF-NST-FILE")?;
+
+        let entry = pst_evidence_entry(&case_path, path)?;
+        assert_eq!(entry.metadata_json["email_format"].as_str(), Some("nst"));
+        assert_eq!(
+            entry.metadata_json["email_parser_status"].as_str(),
+            Some("not_pff")
+        );
+        assert_eq!(entry.metadata_json["pst_variant"].as_str(), Some("not-pff"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn process_pff_v36_records_recognized_unsupported_variant() -> Result<()> {
+        let case_path = unique_case_path("pff-v36-unsupported");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("pff-v36-unsupported-source");
+        let mut bytes = vec![0_u8; 32];
+        bytes[0..4].copy_from_slice(b"!BDN");
+        bytes[8..10].copy_from_slice(b"SO");
+        bytes[10..12].copy_from_slice(&36_u16.to_le_bytes());
+        let path = write_pst_fixture(&dir, "mail.ost", &bytes)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let first = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        assert_eq!(first.entries_indexed, 1);
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.metadata_json["email_format"].as_str(), Some("ost"));
+        assert_eq!(
+            entry.metadata_json["email_parser_status"].as_str(),
+            Some("unsupported_variant")
+        );
+        assert_eq!(
+            entry.metadata_json["pst_variant"].as_str(),
+            Some("unicode-4k-v36")
+        );
+        assert_eq!(
+            entry.metadata_json["pst_page_size_bytes"].as_u64(),
+            Some(4096)
+        );
+        assert_eq!(
+            entry.metadata_json["pst_native_reader_supported"].as_bool(),
+            Some(false)
+        );
+
+        let second = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        assert_eq!(second.entries_indexed, 0);
+        assert!(second.truncated);
+        let retained = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].id, entry.id);
+        assert_eq!(
+            retained[0].metadata_json["email_parser_retained_record_count"].as_i64(),
+            Some(1)
+        );
+        assert_eq!(
+            retained[0].metadata_json["email_parser_previous_records_preserved"].as_bool(),
+            Some(true)
+        );
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(dir);
@@ -46766,6 +47560,12 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.is_file());
         assert!(second.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&first)?.permissions().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&second)?.permissions().mode() & 0o777, 0o600);
+        }
         fs::remove_file(first)?;
         fs::remove_file(second)?;
         Ok(())

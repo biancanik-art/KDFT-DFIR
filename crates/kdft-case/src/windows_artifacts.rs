@@ -1050,7 +1050,14 @@ fn create_unique_recovery_destination(
             "{prefix}-{}-{entry_id}-{sequence}",
             std::process::id()
         ));
-        match fs::create_dir(&directory) {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&directory) {
             Ok(()) => {
                 let destination = directory.join(format!("source.{suffix}"));
                 return Ok((directory, destination));
@@ -1320,12 +1327,14 @@ fn create_unique_temporary_file(
             "{prefix}-{}-{entry_id}-{sequence}.{suffix}",
             std::process::id()
         ));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
             Err(error) => {
@@ -2917,7 +2926,29 @@ mod tests {
             create_unique_recovery_destination("kdft-recovery-test", 41, "xml")?;
         assert!(directory.is_dir());
         assert!(!destination.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&directory)?.permissions().mode() & 0o777,
+                0o700
+            );
+        }
         fs::remove_dir(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn temporary_spool_file_is_exclusively_reserved() -> Result<()> {
+        let (path, file) = create_unique_temporary_file("kdft-spool-test", 42, "bin")?;
+        assert!(path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        }
+        drop(file);
+        fs::remove_file(path)?;
         Ok(())
     }
 

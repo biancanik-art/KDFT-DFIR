@@ -406,7 +406,8 @@ pub struct PstParserAdapter;
 
 impl PstParserAdapter {
     /// Detect PST file encoding format from magic and version in header.
-    /// Strictly rejects undocumented versions to prevent false-complete Unicode mislabeling.
+    /// Strictly rejects versions unsupported by the vendored reader to prevent
+    /// false-complete Unicode mislabeling.
     pub fn detect_format(file_bytes: &[u8]) -> PstEncodingFormat {
         if file_bytes.len() < 12 {
             return PstEncodingFormat::Unknown;
@@ -417,7 +418,7 @@ impl PstParserAdapter {
         let ver = u16::from_le_bytes([file_bytes[10], file_bytes[11]]);
         match ver {
             14 | 15 => PstEncodingFormat::Ansi,
-            23 | 36 => PstEncodingFormat::Unicode,
+            23 => PstEncodingFormat::Unicode,
             _ => PstEncodingFormat::Unknown,
         }
     }
@@ -1861,6 +1862,17 @@ mod tests {
         assert_eq!(
             PstParserAdapter::detect_format(&header),
             PstEncodingFormat::Unicode
+        );
+    }
+
+    #[test]
+    fn test_pst_format_detection_version_36_rejected_until_supported() {
+        let mut header = vec![0u8; 64];
+        header[0..4].copy_from_slice(b"!BDN");
+        header[10..12].copy_from_slice(&36_u16.to_le_bytes());
+        assert_eq!(
+            PstParserAdapter::detect_format(&header),
+            PstEncodingFormat::Unknown
         );
     }
 
