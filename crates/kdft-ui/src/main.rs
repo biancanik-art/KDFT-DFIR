@@ -5177,6 +5177,167 @@ mod tests {
     }
 
     #[test]
+    fn deep_search_ui_aggregates_examiner_batches_through_protected_api_pages() {
+        assert!(INDEX_HTML.contains("const SEARCH_API_PAGE_MAX = 1000;"));
+        assert!(INDEX_HTML.contains("const SEARCH_BATCH_MAX = 10000;"));
+        assert!(INDEX_HTML.contains("onchange=\"normalizeSearchBatchSizeOnChange()\""));
+        assert!(INDEX_HTML.contains("KDFT transparently retrieves this batch"));
+
+        let value_normalizer = INDEX_HTML
+            .split_once("function normalizedSearchBatchSizeValue(")
+            .expect("Deep Search batch-size value normalizer")
+            .1
+            .split_once("function normalizeSearchBatchSizeInput(")
+            .expect("end of Deep Search batch-size value normalizer")
+            .0;
+        assert!(value_normalizer.contains("Math.min(SEARCH_BATCH_MAX"));
+        assert!(!value_normalizer.contains("throw new Error"));
+
+        let input_normalizer = INDEX_HTML
+            .split_once("function normalizeSearchBatchSizeInput(")
+            .expect("Deep Search page-size normalizer")
+            .1
+            .split_once("function normalizeSearchBatchSizeOnChange()")
+            .expect("end of Deep Search page-size normalizer")
+            .0;
+        assert!(input_normalizer.contains("field.value = String(normalized)"));
+        assert!(!input_normalizer.contains("throw new Error"));
+
+        let indexed_batch = INDEX_HTML
+            .split_once("async function fetchIndexedSearchBatch(")
+            .expect("indexed batch aggregator")
+            .1
+            .split_once("async function loadMoreSearchResults()")
+            .expect("end of indexed batch aggregator")
+            .0;
+        assert!(indexed_batch.contains("while (batch.results.length < requestedCount"));
+        assert!(indexed_batch.contains("Math.min(SEARCH_API_PAGE_MAX, remaining)"));
+        assert!(indexed_batch.contains("batch.next_cursor = nextCursor"));
+        assert!(indexed_batch.contains("pagesFetched: 0"));
+        assert!(indexed_batch.contains("batch.error = err.message || String(err)"));
+        assert!(indexed_batch.contains("searchRunIsCurrent(scope, generation)"));
+        assert!(indexed_batch.contains("Indexed-search continuation did not advance"));
+
+        let raw_batch = INDEX_HTML
+            .split_once("async function fetchRawSearchBatch(")
+            .expect("bitwise batch aggregator")
+            .1
+            .split_once("async function runBitwiseForUnifiedSearch(scope, generation)")
+            .expect("end of bitwise batch aggregator")
+            .0;
+        assert!(raw_batch.contains("while (batch.hits.length < requestedCount"));
+        assert!(raw_batch.contains("Math.min(SEARCH_API_PAGE_MAX, Math.max(1, remaining))"));
+        assert!(raw_batch.contains("batch.next_cursor = nextCursor"));
+        assert!(raw_batch.contains("pagesFetched: 0"));
+        assert!(raw_batch.contains("async function fetchRawSearchAggregateBatch("));
+        assert!(
+            raw_batch.contains("let remaining = normalizedSearchBatchSizeValue(requestedCount)")
+        );
+        assert!(raw_batch.contains("remaining -= batch.hits.length"));
+        assert!(raw_batch.contains("if (remaining <= 0)"));
+        assert!(raw_batch.contains("searchRunIsCurrent(scope, generation)"));
+        assert!(raw_batch.contains("Bitwise-search continuation did not advance"));
+
+        assert!(INDEX_HTML.contains("Search criteria changed after this result set was created"));
+        assert!(INDEX_HTML
+            .contains("Search criteria changed after this bitwise result set was created"));
+        assert!(INDEX_HTML.contains("Bitwise pass was not started: "));
+
+        let restore = INDEX_HTML
+            .split_once("function restoreDeepSearchSession() {")
+            .expect("Deep Search restore function")
+            .1
+            .split_once("function newLiveBrowseState()")
+            .expect("end of Deep Search restore function")
+            .0;
+        assert!(
+            restore.contains("normalizeSearchBatchSizeInput({ announce: false, persist: false })")
+        );
+    }
+
+    #[test]
+    fn deep_search_results_are_revision_bound_and_freeze_on_scope_edits() {
+        assert!(INDEX_HTML.contains("kdft.deepSearch.v2:"));
+        assert!(INDEX_HTML.contains("function deepSearchCaseRevision("));
+        assert!(INDEX_HTML.contains("data.case.created_at"));
+        assert!(INDEX_HTML.contains("snapshot.caseRevision !== caseRevision"));
+        assert!(INDEX_HTML.contains(
+            "Discarded saved Deep Search results because the case or evidence index changed"
+        ));
+        assert!(INDEX_HTML.contains("scope.caseRevision === deepSearchCaseRevision()"));
+        assert!(INDEX_HTML.contains("function handleDeepSearchCriteriaEdited("));
+        assert!(INDEX_HTML.contains("Existing results are frozen"));
+        assert!(INDEX_HTML.contains("requireCurrentDeepSearchResults(\"bookmarking\")"));
+        assert!(INDEX_HTML
+            .contains("fetchRawSearchAggregateBatch(merged, scope, batchSize, generation)"));
+
+        let bindings = INDEX_HTML
+            .split_once("\"searchQuery\",")
+            .expect("Deep Search criteria binding list")
+            .1
+            .split_once("$(\"selectAllSearchResults\")")
+            .expect("end of Deep Search criteria bindings")
+            .0;
+        assert!(bindings.contains("\"searchEvidence\""));
+        assert!(bindings.contains("\"maxResults\""));
+        assert!(bindings.contains("handleDeepSearchCriteriaEdited"));
+    }
+
+    #[test]
+    fn deep_search_final_scope_edges_are_truthful_and_recoverable() {
+        let revision_clear = INDEX_HTML
+            .split_once("function clearDeepSearchResultsForRevisionChange() {")
+            .expect("Deep Search revision-clear function")
+            .1
+            .split_once("function sameEvidenceIdentity(")
+            .expect("end of Deep Search revision-clear function")
+            .0;
+        assert!(revision_clear.contains("runButton.disabled = false"));
+        assert!(revision_clear.contains("runButton.textContent = \"Run Search\""));
+
+        let bitwise_run = INDEX_HTML
+            .split_once("async function runBitwiseForUnifiedSearch(scope, generation) {")
+            .expect("unified bitwise function")
+            .1
+            .split_once("async function loadMoreRawSearchResults()")
+            .expect("end of unified bitwise function")
+            .0;
+        assert!(bitwise_run.contains("if (!targets.length)"));
+        assert!(bitwise_run
+            .contains("merged.attempt_error = \"the selected evidence has no raw byte stream"));
+        assert!(bitwise_run.contains("persistDeepSearchSession()"));
+
+        let run_search = INDEX_HTML
+            .split_once("async function runSearch() {")
+            .expect("Deep Search run function")
+            .1
+            .split_once("function bitwiseEvidenceTargets(")
+            .expect("end of Deep Search run function")
+            .0;
+        assert!(run_search.contains("if (!err.kdftStaleSearch)"));
+        assert!(run_search.contains("Bitwise search failed:"));
+
+        let stop_reason = INDEX_HTML
+            .split_once("function bitwiseStopReasonNote(merged) {")
+            .expect("bitwise stop-reason function")
+            .1
+            .split_once("async function goToSearchResult(")
+            .expect("end of bitwise stop-reason function")
+            .0;
+        assert!(stop_reason.contains("coverage incomplete; continuation/retry available"));
+        assert!(!stop_reason.contains("more matches available"));
+
+        let metadata_warning = INDEX_HTML
+            .split_once("function metadataOnlySearchWarningHtml() {")
+            .expect("metadata-only warning function")
+            .1
+            .split_once("function indexedSearchCoverageHtml()")
+            .expect("end of metadata-only warning function")
+            .0;
+        assert!(metadata_warning.contains("state.searchScope.evidenceId"));
+    }
+
+    #[test]
     fn case_refresh_ignores_out_of_order_responses() {
         let refresh = INDEX_HTML
             .split_once("async function refresh() {")
@@ -9271,7 +9432,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
               <label>Evidence<select id="searchEvidence"><option value="">All evidence</option></select></label>
               <div class="row">
                 <label>Include content<select id="includeContent"><option value="true">yes</option><option value="false">no</option></select></label>
-                <label>Results per page<input id="maxResults" type="number" min="1" max="1000" value="200" title="Protective response-page range: 1-1,000. This never caps total search coverage; cursors and Load more continue until complete. Larger values are rejected, not silently clamped."></label>
+                <label>Results per batch<input id="maxResults" type="number" min="1" max="10000" value="200" onchange="normalizeSearchBatchSizeOnChange()" title="Examiner-visible batch range: 1-10,000. KDFT transparently retrieves this batch through protected API pages of at most 1,000 results; Load more continues with the next batch until coverage is complete."></label>
               </div>
               <label>Max file bytes<input id="maxFileBytes" type="number" min="1" max="4096" value="4096" title="Indexed content search only has each file's first 4,096 bytes available (indexed at Read File System time) - this can only narrow that window, not widen it. The bitwise pass in All mode has no such limit."></label>
               <div class="row">
@@ -9411,6 +9572,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       searchComplete: true,
       searchPageLoading: false,
       searchCoverage: null,
+      searchScope: null,
+      searchGeneration: 0,
+      searchRunning: false,
+      searchError: null,
+      searchPageError: null,
+      rawSearchResult: null,
+      rawSearchRunning: false,
+      rawSearchAttempted: false,
       selectedSearchKeys: new Set(),
       selectedRawSearchKeys: new Set(),
       lastRawSearchKey: null,
@@ -9530,7 +9699,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function deepSearchSessionKey(casePath = deepSearchSessionCasePath()) {
-      return "kdft.deepSearch.v1:" + String(casePath || "");
+      return "kdft.deepSearch.v2:" + String(casePath || "");
     }
 
     function deepSearchFormSnapshot() {
@@ -9556,8 +9725,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return false;
       }
       const snapshot = {
-        version: 1,
+        version: 2,
         casePath,
+        caseRevision: deepSearchCaseRevision(),
         savedAt: new Date().toISOString(),
         form: deepSearchFormSnapshot(),
         searchResults: state.searchResults || [],
@@ -9565,7 +9735,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         searchComplete: Boolean(state.searchComplete),
         searchCoverage: state.searchCoverage || null,
         searchError: state.searchError || null,
+        searchPageError: state.searchPageError || null,
+        searchScope: state.searchScope || null,
         rawSearchResult: state.rawSearchResult || null,
+        rawSearchAttempted: Boolean(state.rawSearchAttempted),
         selectedSearchKeys: Array.from(state.selectedSearchKeys || []),
         selectedRawSearchKeys: Array.from(state.selectedRawSearchKeys || []),
         gridViews: {
@@ -9581,8 +9754,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         // rather than allowing a large result page to erase everything.
         try {
           sessionStorage.setItem(deepSearchSessionKey(casePath), JSON.stringify({
-            version: 1,
+            version: 2,
             casePath,
+            caseRevision: snapshot.caseRevision,
             savedAt: snapshot.savedAt,
             form: snapshot.form,
             storageWarning: "Result page exceeded browser session storage. Re-run the search to reload hits."
@@ -9606,7 +9780,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       } catch (err) {
         return false;
       }
-      if (!snapshot || snapshot.version !== 1 || snapshot.casePath !== casePath || !snapshot.form) {
+      const caseRevision = deepSearchCaseRevision();
+      if (!snapshot || snapshot.version !== 2 || snapshot.casePath !== casePath || !snapshot.form) {
+        return false;
+      }
+      if (!caseRevision || snapshot.caseRevision !== caseRevision) {
+        sessionStorage.removeItem(deepSearchSessionKey(casePath));
+        setNotice("Discarded saved Deep Search results because the case or evidence index changed.", true);
         return false;
       }
       const form = snapshot.form;
@@ -9615,6 +9795,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       $("searchEvidence").value = String(form.evidence || "");
       $("includeContent").value = form.includeContent === "false" ? "false" : "true";
       $("maxResults").value = String(form.maxResults || "200");
+      // Normalize stale/malformed per-tab state, but retain valid examiner
+      // batches above the protected single-response maximum (for example
+      // 2,000). The client transparently aggregates 1,000-result API pages.
+      normalizeSearchBatchSizeInput({ announce: false, persist: false });
       $("maxFileBytes").value = String(form.maxFileBytes || "4096");
       $("searchCategory").value = String(form.category || "");
       $("searchFileTypes").value = String(form.fileTypes || "");
@@ -9623,9 +9807,21 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.searchComplete = snapshot.searchComplete !== false;
       state.searchCoverage = snapshot.searchCoverage || null;
       state.searchError = snapshot.searchError || null;
+      state.searchPageError = snapshot.searchPageError || null;
+      state.searchScope = snapshot.searchScope
+          && snapshot.searchScope.casePath === casePath
+          && snapshot.searchScope.caseRevision === caseRevision
+        ? Object.freeze({
+            ...snapshot.searchScope,
+            caseRevision,
+            generation: state.searchGeneration,
+            batchSize: normalizedSearchBatchSizeValue(snapshot.searchScope.batchSize)
+          })
+        : captureDeepSearchScope({ announceBatch: false });
       state.rawSearchResult = snapshot.rawSearchResult && Array.isArray(snapshot.rawSearchResult.hits)
-        ? snapshot.rawSearchResult
+        ? { ...snapshot.rawSearchResult, scope: { ...state.searchScope } }
         : null;
+      state.rawSearchAttempted = Boolean(snapshot.rawSearchAttempted || state.rawSearchResult);
       state.searchRunning = false;
       state.rawSearchRunning = false;
       state.selectedSearchKeys = new Set(Array.isArray(snapshot.selectedSearchKeys) ? snapshot.selectedSearchKeys : []);
@@ -9675,6 +9871,71 @@ const INDEX_HTML: &str = r###"<!doctype html>
         .join("|");
     }
 
+    // Stable identity plus index revision for persisted/async Deep Search
+    // results. A case database can be replaced in-place, so its path alone is
+    // never sufficient. Index timestamps/status and entry_count also prevent
+    // cursor pages from spanning a re-process of the same evidence rows.
+    function deepSearchCaseRevision(data = state.data) {
+      if (!data || !data.case || !data.case.created_at) {
+        return "";
+      }
+      const evidenceRevision = (data.evidence || [])
+        .map((item) => [
+          Number(item.id),
+          Number(item.case_id),
+          item.source_kind || "",
+          item.source_path || "",
+          item.attached_at || "",
+          item.indexed_at || "",
+          item.last_job_status || "",
+          item.content_indexed === true ? 1 : (item.content_indexed === false ? 0 : null),
+          item.sha256_hex || "",
+          item.hashed_at || ""
+        ])
+        .sort((left, right) => left[0] - right[0]);
+      return JSON.stringify([
+        Number(data.case.id),
+        data.case.created_at,
+        Number(data.entry_count || 0),
+        evidenceRevision
+      ]);
+    }
+
+    function clearDeepSearchResultsForRevisionChange() {
+      state.searchGeneration += 1;
+      state.searchResults = [];
+      state.searchCursor = null;
+      state.searchComplete = true;
+      state.searchPageLoading = false;
+      state.searchCoverage = null;
+      state.searchError = null;
+      state.searchPageError = null;
+      state.searchScope = null;
+      state.searchRunning = false;
+      state.rawSearchResult = null;
+      state.rawSearchRunning = false;
+      state.rawSearchAttempted = false;
+      state.selectedSearchKeys = new Set();
+      state.selectedRawSearchKeys = new Set();
+      state.lastRawSearchKey = null;
+      state.searchSessionRestoredCasePath = null;
+      resetGridView("search");
+      resetGridView("rawSearch");
+      const runButton = $("runSearch");
+      if (runButton) {
+        runButton.disabled = false;
+        runButton.textContent = "Run Search";
+      }
+      try {
+        sessionStorage.removeItem(deepSearchSessionKey());
+      } catch (ignored) {
+        // A locked-down browser may disable sessionStorage; in-memory results
+        // are still cleared and cannot be bookmarked.
+      }
+      renderSearchResults();
+      renderRawSearchResults();
+    }
+
     function sameEvidenceIdentity(left, right) {
       return Boolean(left && right)
         && Number(left.id) === Number(right.id)
@@ -9721,10 +9982,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       // state.data, and otherwise retain rows belonging to removed evidence.
       state.lookupEntries = new Map();
       state.searchResults = [];
+      state.searchGeneration += 1;
+      state.searchScope = null;
+      state.searchPageError = null;
       state.selectedSearchKeys = new Set();
       state.selectedRawSearchKeys = new Set();
       state.lastRawSearchKey = null;
       state.rawSearchResult = null;
+      state.rawSearchAttempted = false;
       state.timeline = newTimelineState();
       state.timeline.casePath = state.casePath;
       updateAnalyzeNavButtons();
@@ -9889,9 +10154,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.searchPageLoading = false;
       state.searchCoverage = null;
       state.searchError = null;
+      state.searchPageError = null;
       state.searchRunning = false;
+      state.searchGeneration += 1;
+      state.searchScope = null;
       state.rawSearchResult = null;
       state.rawSearchRunning = false;
+      state.rawSearchAttempted = false;
       state.selectedSearchKeys = new Set();
       state.selectedRawSearchKeys = new Set();
       state.lastRawSearchKey = null;
@@ -10149,8 +10418,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
             setNotice("");
           }
         }
+        const priorSearchRevision = state.searchScope && state.searchScope.caseRevision;
         state.data = nextData;
         state.loadedCasePath = casePath;
+        const currentSearchRevision = deepSearchCaseRevision(nextData);
+        const searchRevisionChanged = Boolean(
+          priorSearchRevision && priorSearchRevision !== currentSearchRevision
+        );
+        if (searchRevisionChanged) {
+          clearDeepSearchResultsForRevisionChange();
+        }
         renderState();
         await applyPendingAnalysisSelection();
         if (!refreshRequestIsCurrent(casePath, generation)) {
@@ -10161,7 +10438,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
         if (localStorage.getItem("kdft.sidebarCollapsed") !== "0") {
           document.querySelector(".app").classList.add("sidebar-collapsed");
         }
-        setNotice("Loaded " + state.data.case.name + ".");
+        setNotice(
+          "Loaded " + state.data.case.name + "." +
+            (searchRevisionChanged
+              ? " Deep Search results were cleared because the case or evidence index changed."
+              : ""),
+          searchRevisionChanged
+        );
         restoreDeepSearchSession();
         return true;
       } catch (err) {
@@ -12271,25 +12554,20 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return el && el.value === "all" ? "all" : "indexed";
     }
 
-    // Show the bitwise-only controls and clear any stale bitwise results when
-    // the examiner flips the single search window between Indexed and All.
+    // Show the bitwise-only controls without silently discarding an expensive
+    // completed scan. Changing mode freezes the old scoped results until the
+    // examiner explicitly runs the new scope.
     function updateSearchModeUi() {
       const mode = currentSearchMode();
       const controls = $("bitwiseControls");
       if (controls) {
         controls.hidden = mode !== "all";
       }
-      if (mode !== "all") {
-        state.rawSearchResult = null;
-        state.selectedRawSearchKeys = new Set();
-        state.lastRawSearchKey = null;
-        const section = $("rawSearchSection");
-        if (section) {
-          section.hidden = true;
-        }
-        renderRawSearchResults();
+      const section = $("rawSearchSection");
+      if (section) {
+        section.hidden = mode !== "all";
       }
-      persistDeepSearchSession();
+      handleDeepSearchCriteriaEdited({ persist: true });
     }
 
     // One-line summary of how the indexed pass ended, reused by every notice
@@ -12299,47 +12577,250 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (state.searchError) {
         return "Indexed pass FAILED (" + state.searchError + ")";
       }
+      if (state.searchPageError) {
+        return "Indexed: " + state.searchResults.length + " result" +
+          (state.searchResults.length === 1 ? "" : "s") +
+          " loaded; paging paused (" + state.searchPageError + ")";
+      }
       return "Indexed: " + state.searchResults.length + " result" + (state.searchResults.length === 1 ? "" : "s") +
         (state.searchComplete ? " (complete)" : " loaded (more available)");
     }
 
-    function searchPageSize() {
+    const SEARCH_API_PAGE_MAX = 1000;
+    const SEARCH_BATCH_MAX = 10000;
+    const SEARCH_BATCH_DEFAULT = 200;
+
+    function normalizedSearchBatchSizeValue(rawValue) {
+      const raw = String(rawValue == null ? "" : rawValue).trim();
+      const requested = raw ? Number(raw) : Number.NaN;
+      return Number.isFinite(requested)
+        ? Math.min(SEARCH_BATCH_MAX, Math.max(1, Math.trunc(requested)))
+        : SEARCH_BATCH_DEFAULT;
+    }
+
+    function normalizeSearchBatchSizeInput({ announce = false, persist = true } = {}) {
       const field = $("maxResults");
-      const value = Number(field.value);
-      if (!Number.isSafeInteger(value) || value < 1) {
-        throw new Error("Results per page must be a whole number from 1 to 1,000.");
+      const rawValue = field ? String(field.value || "").trim() : "";
+      const requested = rawValue ? Number(rawValue) : Number.NaN;
+      const normalized = normalizedSearchBatchSizeValue(rawValue);
+      const changed = !Number.isSafeInteger(requested) || requested !== normalized;
+      if (field && (changed || field.value !== String(normalized))) {
+        field.value = String(normalized);
+        if (announce) {
+          setNotice(
+            "Results per batch normalized to " + normalized.toLocaleString() +
+            " (allowed range 1-" + SEARCH_BATCH_MAX.toLocaleString() + ")."
+          );
+        }
+        if (persist) {
+          persistDeepSearchSession();
+        }
       }
-      if (value > 1000) {
-        throw new Error("Results per page exceeds the protective maximum of 1,000. This is only a response-page bound; use Load more for complete coverage.");
+      return normalized;
+    }
+
+    function normalizeSearchBatchSizeOnChange() {
+      normalizeSearchBatchSizeInput({ announce: true });
+    }
+
+    function captureDeepSearchScope({ announceBatch = true, generation = state.searchGeneration } = {}) {
+      return Object.freeze({
+        casePath: currentCasePath(),
+        caseRevision: deepSearchCaseRevision(),
+        generation,
+        query: $("searchQuery").value,
+        evidenceId: $("searchEvidence").value ? Number($("searchEvidence").value) : null,
+        includeContent: $("includeContent").value === "true",
+        maxFileBytes: boundedNumberValue("maxFileBytes", 4096, 1, 4096),
+        category: $("searchCategory").value || null,
+        fileTypes: $("searchFileTypes").value || null,
+        mode: currentSearchMode(),
+        batchSize: normalizeSearchBatchSizeInput({ announce: announceBatch, persist: false })
+      });
+    }
+
+    function searchRunIsCurrent(scope, generation) {
+      return Boolean(scope)
+        && generation === state.searchGeneration
+        && scope.generation === generation
+        && normalizePathInput(state.loadedCasePath || state.casePath || "") === scope.casePath
+        && normalizePathInput($("casePath").value) === scope.casePath
+        && scope.caseRevision === deepSearchCaseRevision()
+        && deepSearchFormMatchesScope(scope);
+    }
+
+    function deepSearchFormMatchesScope(scope) {
+      if (!scope) {
+        return false;
       }
-      return value;
+      const evidenceId = $("searchEvidence").value ? Number($("searchEvidence").value) : null;
+      return $("searchQuery").value === scope.query
+        && evidenceId === scope.evidenceId
+        && ($("includeContent").value === "true") === scope.includeContent
+        && boundedNumberValue("maxFileBytes", 4096, 1, 4096) === scope.maxFileBytes
+        && ($("searchCategory").value || null) === scope.category
+        && ($("searchFileTypes").value || null) === scope.fileTypes
+        && currentSearchMode() === scope.mode
+        && normalizedSearchBatchSizeValue($("maxResults").value) === scope.batchSize;
+    }
+
+    function staleSearchError() {
+      const error = new Error("Search result discarded because the case or search run changed.");
+      error.kdftStaleSearch = true;
+      return error;
+    }
+
+    function deepSearchResultsFrozen(scope = state.searchScope) {
+      if (!scope) {
+        return false;
+      }
+      return !searchRunIsCurrent(scope, scope.generation);
+    }
+
+    function deepSearchFrozenWarningHtml() {
+      return deepSearchResultsFrozen()
+        ? '<div class="analysis-status" style="color:var(--warn, #9a6700)"><strong>Results frozen:</strong> the case/index or search criteria changed after this result set was created. Run Search again before loading more or bookmarking.</div>'
+        : "";
+    }
+
+    function requireCurrentDeepSearchResults(action) {
+      const scope = state.searchScope;
+      if (!scope || !searchRunIsCurrent(scope, scope.generation)) {
+        setNotice(
+          "Deep Search results no longer match the loaded case/index and current criteria. Run Search again before " + action + ".",
+          true
+        );
+        return false;
+      }
+      return true;
+    }
+
+    function handleDeepSearchCriteriaEdited({ persist = false } = {}) {
+      const scope = state.searchScope;
+      if (scope && !deepSearchFormMatchesScope(scope)) {
+        if (scope.generation === state.searchGeneration) {
+          state.searchGeneration += 1;
+        }
+        state.searchRunning = false;
+        state.rawSearchRunning = false;
+        state.searchPageLoading = false;
+        const runButton = $("runSearch");
+        if (runButton) {
+          runButton.disabled = false;
+          runButton.textContent = "Run Search";
+        }
+        setNotice(
+          "Search criteria changed. Existing results are frozen; run the search again to apply the new scope.",
+          true
+        );
+      }
+      renderSearchResults();
+      renderRawSearchResults();
+      if (persist) {
+        persistDeepSearchSession();
+      }
+    }
+
+    function deepSearchApiRequest(scope, maxResults, cursor) {
+      return {
+        case_path: scope.casePath,
+        query: scope.query,
+        evidence_id: scope.evidenceId,
+        include_content: scope.includeContent,
+        max_results: Math.min(SEARCH_API_PAGE_MAX, Math.max(1, maxResults)),
+        cursor,
+        max_file_bytes: scope.maxFileBytes,
+        category: scope.category,
+        file_types: scope.fileTypes
+      };
+    }
+
+    async function fetchIndexedSearchBatch(cursor, requestedCount, scope, generation) {
+      const batch = {
+        results: [],
+        next_cursor: cursor || null,
+        complete: false,
+        coverage: null,
+        pagesFetched: 0,
+        error: null
+      };
+      while (batch.results.length < requestedCount && !batch.complete) {
+        const remaining = requestedCount - batch.results.length;
+        const requestCursor = batch.next_cursor;
+        let page;
+        try {
+          page = await apiPostReadOnlyWithNetworkRetry(
+            "/api/search/deep",
+            deepSearchApiRequest(scope, Math.min(SEARCH_API_PAGE_MAX, remaining), requestCursor)
+          );
+        } catch (err) {
+          if (!searchRunIsCurrent(scope, generation)) {
+            throw staleSearchError();
+          }
+          batch.error = err.message || String(err);
+          break;
+        }
+        if (!searchRunIsCurrent(scope, generation)) {
+          throw staleSearchError();
+        }
+        const nextCursor = page.next_cursor || null;
+        const complete = Boolean(page.complete) || !nextCursor;
+        // Validate forward progress before accepting rows. A broken server
+        // cursor must not duplicate a page until the examiner's batch fills.
+        if (!complete && JSON.stringify(nextCursor) === JSON.stringify(requestCursor)) {
+          batch.error = "Indexed-search continuation did not advance.";
+          break;
+        }
+        batch.results.push(...(page.results || []));
+        batch.coverage = page.coverage || batch.coverage;
+        batch.next_cursor = nextCursor;
+        batch.complete = complete;
+        batch.pagesFetched += 1;
+      }
+      return batch;
     }
 
     async function loadMoreSearchResults() {
       if (state.searchPageLoading || state.searchComplete || !state.searchCursor) {
         return;
       }
+      const scope = state.searchScope || captureDeepSearchScope({ announceBatch: false });
+      const generation = state.searchGeneration;
+      if (!searchRunIsCurrent(scope, generation)) {
+        setNotice("The case changed since this search ran. Run Search again before loading more results.", true);
+        return;
+      }
+      if (!deepSearchFormMatchesScope(scope)) {
+        setNotice("Search criteria changed after this result set was created. Run Search to apply the new criteria; Load more was not started against a mixed scope.", true);
+        return;
+      }
       state.searchPageLoading = true;
+      state.searchPageError = null;
       renderSearchResults();
       try {
-        const page = await apiPostReadOnlyWithNetworkRetry("/api/search/deep", {
-          case_path: currentCasePath(),
-          query: $("searchQuery").value,
-          evidence_id: $("searchEvidence").value ? Number($("searchEvidence").value) : null,
-          include_content: $("includeContent").value === "true",
-          max_results: searchPageSize(),
-          cursor: state.searchCursor,
-          max_file_bytes: boundedNumberValue("maxFileBytes", 4096, 1, 4096),
-          category: $("searchCategory").value || null,
-          file_types: $("searchFileTypes").value || null
-        });
+        const page = await fetchIndexedSearchBatch(
+          state.searchCursor,
+          scope.batchSize,
+          scope,
+          generation
+        );
         state.searchResults.push(...(page.results || []));
         state.searchCursor = page.next_cursor || null;
         state.searchComplete = Boolean(page.complete);
         state.searchCoverage = page.coverage || state.searchCoverage;
-        setNotice(indexedPassSummary() + ".");
+        state.searchPageError = page.error || null;
+        setNotice(
+          page.error
+            ? "Loaded " + page.results.length.toLocaleString() +
+              " indexed result(s), then paging paused: " + page.error +
+              " Use Load more to retry from the last confirmed cursor."
+            : indexedPassSummary() + ".",
+          Boolean(page.error)
+        );
       } catch (err) {
-        setNotice("Could not load the next indexed-search page: " + (err.message || err), true);
+        if (!err.kdftStaleSearch) {
+          setNotice("Could not load the next indexed-search page: " + (err.message || err), true);
+        }
       } finally {
         state.searchPageLoading = false;
         renderSearchResults();
@@ -12353,18 +12834,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       state.searchRunning = true;
+      const generation = ++state.searchGeneration;
+      const scope = captureDeepSearchScope({ generation });
+      state.searchScope = scope;
       const runButton = $("runSearch");
       if (runButton) {
         runButton.disabled = true;
         runButton.textContent = "Searching...";
       }
-      const mode = currentSearchMode();
+      const mode = scope.mode;
       state.searchResults = [];
       state.searchCursor = null;
       state.searchComplete = false;
       state.searchPageLoading = false;
       state.searchCoverage = null;
       state.searchError = null;
+      state.searchPageError = null;
       state.selectedSearchKeys = new Set();
       state.selectedRawSearchKeys = new Set();
       state.lastRawSearchKey = null;
@@ -12372,6 +12857,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderSearchResults();
       // Reset the bitwise section every run; it only re-appears for All mode.
       state.rawSearchResult = null;
+      state.rawSearchAttempted = false;
       resetGridView("rawSearch");
       const rawSection = $("rawSearchSection");
       if (rawSection) {
@@ -12379,25 +12865,46 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       renderRawSearchResults();
       persistDeepSearchSession();
+      if (!scope.caseRevision) {
+        state.searchError = "No stable loaded case/evidence revision is available. Reload the case before searching.";
+        state.searchRunning = false;
+        if (runButton) {
+          runButton.disabled = false;
+          runButton.textContent = "Run Search";
+        }
+        renderSearchResults();
+        persistDeepSearchSession();
+        setNotice(state.searchError, true);
+        return;
+      }
       try {
-        const page = await apiPostReadOnlyWithNetworkRetry("/api/search/deep", {
-          case_path: currentCasePath(),
-          query: $("searchQuery").value,
-          evidence_id: $("searchEvidence").value ? Number($("searchEvidence").value) : null,
-          include_content: $("includeContent").value === "true",
-          // Response page size only. The returned cursor continues through
-          // all later matches without retaining an unbounded browser array.
-          max_results: searchPageSize(),
-          cursor: null,
-          max_file_bytes: boundedNumberValue("maxFileBytes", 4096, 1, 4096),
-          category: $("searchCategory").value || null,
-          file_types: $("searchFileTypes").value || null
-        });
+        // The examiner-visible batch may be larger than one protected API
+        // response. Follow cursors automatically and render it as one batch.
+        const page = await fetchIndexedSearchBatch(
+          null,
+          scope.batchSize,
+          scope,
+          generation
+        );
         state.searchResults = page.results || [];
         state.searchCursor = page.next_cursor || null;
         state.searchComplete = Boolean(page.complete);
         state.searchCoverage = page.coverage || null;
+        state.searchPageError = page.error || null;
+        if (page.error && page.pagesFetched === 0) {
+          state.searchError = page.error;
+        }
       } catch (err) {
+        if (err.kdftStaleSearch) {
+          if (generation === state.searchGeneration) {
+            state.searchRunning = false;
+            if (runButton) {
+              runButton.disabled = false;
+              runButton.textContent = "Run Search";
+            }
+          }
+          return;
+        }
         // Do NOT abort here: in All mode the bitwise pass is independent of
         // the indexed pass and must still run (a failed indexed pass used to
         // silently skip it, leaving a blank "No results" with no explanation).
@@ -12411,7 +12918,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           state.searchError
             ? "Indexed search failed: " + state.searchError
             : indexedPassSummary() + ".",
-          Boolean(state.searchError)
+          Boolean(state.searchError || state.searchPageError)
         );
         state.searchRunning = false;
         if (runButton) {
@@ -12421,14 +12928,25 @@ const INDEX_HTML: &str = r###"<!doctype html>
         persistDeepSearchSession();
         return;
       }
-      setNotice(indexedPassSummary() + ". Running bitwise whole-disk scan...", Boolean(state.searchError));
+      setNotice(indexedPassSummary() + ". Running bitwise whole-disk scan...", Boolean(state.searchError || state.searchPageError));
       try {
-        await runBitwiseForUnifiedSearch();
+        await runBitwiseForUnifiedSearch(scope, generation);
+      } catch (err) {
+        // Editing criteria deliberately invalidates the in-flight immutable
+        // scope. The edit handler already freezes the old results and restores
+        // the Run button; stale completion is expected, not an unhandled error.
+        if (!err.kdftStaleSearch) {
+          state.rawSearchRunning = false;
+          setNotice("Bitwise search failed: " + (err.message || String(err)), true);
+        }
       } finally {
-        state.searchRunning = false;
-        if (runButton) {
-          runButton.disabled = false;
-          runButton.textContent = "Run Search";
+        if (generation === state.searchGeneration) {
+          state.searchRunning = false;
+          state.rawSearchRunning = false;
+          if (runButton) {
+            runButton.disabled = false;
+            runButton.textContent = "Run Search";
+          }
         }
       }
     }
@@ -12449,60 +12967,204 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return state.data.evidence.filter(isScannable).map((item) => ({ id: item.id, name: item.display_name }));
     }
 
-    async function runBitwiseForUnifiedSearch() {
-      const query = $("searchQuery").value;
+    async function fetchRawSearchBatch(target, scope, requestedCount, cursor, generation) {
+      const batch = {
+        hits: [],
+        bytes_scanned: 0,
+        covered_through: 0,
+        total_size: 0,
+        truncated: false,
+        complete: false,
+        next_cursor: cursor,
+        stop_reason: null,
+        evidence_sha256_hex: null,
+        coverage: null,
+        provenance: null,
+        pagesFetched: 0,
+        error: null
+      };
+      while (batch.hits.length < requestedCount && !batch.complete) {
+        const remaining = requestedCount - batch.hits.length;
+        const requestCursor = batch.next_cursor;
+        let result;
+        try {
+          result = await apiPost("/api/search/raw", {
+            case_path: scope.casePath,
+            evidence_id: target.id,
+            query: scope.query,
+            max_results: Math.min(SEARCH_API_PAGE_MAX, Math.max(1, remaining)),
+            max_scan_bytes: 0,
+            cursor: requestCursor
+          });
+        } catch (err) {
+          if (!searchRunIsCurrent(scope, generation)) {
+            throw staleSearchError();
+          }
+          batch.error = err.message || String(err);
+          break;
+        }
+        if (!searchRunIsCurrent(scope, generation)) {
+          throw staleSearchError();
+        }
+        const nextCursor = result.next_cursor || null;
+        const complete = Boolean(result.complete) || !nextCursor;
+        if (!complete && JSON.stringify(nextCursor) === JSON.stringify(requestCursor)) {
+          batch.error = "Bitwise-search continuation did not advance.";
+          break;
+        }
+        const provenance = { ...result };
+        delete provenance.hits;
+        (result.hits || []).forEach((hit) => batch.hits.push({
+          ...hit,
+          evidence_id: target.id,
+          evidence_name: target.name,
+          search_provenance: provenance
+        }));
+        batch.bytes_scanned += Number(result.bytes_scanned) || 0;
+        batch.covered_through = Math.max(
+          batch.covered_through,
+          (Number(result.scan_start) || 0) + (Number(result.bytes_scanned) || 0)
+        );
+        batch.total_size = Number(result.total_size) || batch.total_size;
+        batch.next_cursor = nextCursor;
+        batch.complete = complete;
+        batch.truncated = Boolean(result.truncated) || !batch.complete;
+        batch.stop_reason = result.stop_reason || null;
+        batch.evidence_sha256_hex = result.evidence_sha256_hex || batch.evidence_sha256_hex;
+        batch.coverage = result.coverage || batch.coverage;
+        batch.provenance = provenance;
+        batch.pagesFetched += 1;
+      }
+      return batch;
+    }
+
+    function newRawSearchSource(target) {
+      return {
+        evidence_id: target.id,
+        name: target.name,
+        hits: 0,
+        bytes_scanned: 0,
+        covered_through: 0,
+        total_size: 0,
+        truncated: true,
+        complete: false,
+        next_cursor: null,
+        started: false,
+        stop_reason: null,
+        evidence_sha256_hex: null,
+        coverage: null,
+        error: null
+      };
+    }
+
+    function recomputeRawSearchAggregate(merged) {
+      const sources = merged.sources || [];
+      merged.bytes_scanned = sources.reduce(
+        (sum, source) => sum + (Number(source.covered_through) || 0),
+        0
+      );
+      merged.total_size = sources.reduce(
+        (sum, source) => sum + (Number(source.total_size) || 0),
+        0
+      );
+      merged.complete = sources.length > 0 && sources.every((source) => source.complete);
+      merged.truncated = !merged.complete;
+    }
+
+    // Results per batch is a global examiner-visible budget, not a per-source
+    // multiplier. Untouched sources retain a null cursor and are started by
+    // the next Load more batch; partial sources retain their last confirmed
+    // cursor when a later protected page fails.
+    async function fetchRawSearchAggregateBatch(merged, scope, requestedCount, generation) {
+      let remaining = normalizedSearchBatchSizeValue(requestedCount);
+      let added = 0;
+      const errors = [];
+      for (const source of merged.sources || []) {
+        if (remaining <= 0) {
+          break;
+        }
+        if (source.complete) {
+          continue;
+        }
+        delete source.error;
+        const batch = await fetchRawSearchBatch(
+          { id: source.evidence_id, name: source.name },
+          scope,
+          remaining,
+          source.next_cursor,
+          generation
+        );
+        if (!searchRunIsCurrent(scope, generation)) {
+          throw staleSearchError();
+        }
+        merged.hits.push(...batch.hits);
+        added += batch.hits.length;
+        remaining -= batch.hits.length;
+        source.hits = (Number(source.hits) || 0) + batch.hits.length;
+        if (batch.pagesFetched > 0) {
+          source.started = true;
+          source.next_cursor = batch.next_cursor;
+          source.covered_through = Math.max(
+            Number(source.covered_through) || 0,
+            Number(batch.covered_through) || 0
+          );
+          source.bytes_scanned = source.covered_through;
+          source.total_size = Math.max(Number(source.total_size) || 0, Number(batch.total_size) || 0);
+          source.complete = Boolean(batch.complete);
+          source.truncated = !source.complete;
+          source.stop_reason = batch.stop_reason;
+          source.evidence_sha256_hex = batch.evidence_sha256_hex || source.evidence_sha256_hex;
+          source.coverage = batch.coverage || source.coverage;
+          merged.provenance[source.evidence_id] = batch.provenance || merged.provenance[source.evidence_id] || {};
+        }
+        if (batch.error) {
+          source.error = batch.error;
+          errors.push({ source, error: batch.error });
+        }
+      }
+      recomputeRawSearchAggregate(merged);
+      return { added, errors };
+    }
+
+    async function runBitwiseForUnifiedSearch(scope, generation) {
+      const query = scope.query;
+      state.rawSearchAttempted = true;
+      const targets = bitwiseEvidenceTargets(scope.evidenceId == null ? "" : String(scope.evidenceId));
+      // Preserve each source's scan provenance without duplicating its hits.
+      const merged = { hits: [], bytes_scanned: 0, total_size: 0, truncated: false, complete: true, sources: [], multiSource: targets.length > 1, query, provenance: {}, scope: { ...scope }, attempt_error: null };
       if (!query.trim()) {
+        merged.complete = false;
+        merged.truncated = true;
+        merged.attempt_error = "the query is empty";
+        state.rawSearchResult = merged;
+        persistDeepSearchSession();
+        renderRawSearchResults();
         setNotice("Enter a query to run the bitwise pass.", true);
         return;
       }
-      const targets = bitwiseEvidenceTargets($("searchEvidence").value);
-      // Preserve each source's scan provenance without duplicating its hits.
-      const merged = { hits: [], bytes_scanned: 0, total_size: 0, truncated: false, complete: true, sources: [], multiSource: targets.length > 1, query, provenance: {} };
       if (!targets.length) {
+        merged.complete = false;
+        merged.truncated = true;
+        merged.attempt_error = "the selected evidence has no raw byte stream (only image/file sources can be scanned byte-for-byte)";
         state.rawSearchResult = merged;
+        persistDeepSearchSession();
         renderRawSearchResults();
         setNotice(indexedPassSummary() + ". Bitwise pass skipped: the selected evidence has no raw byte stream (only image/file sources can be scanned byte-for-byte).", true);
         return;
       }
-      let maxResults;
-      try {
-        maxResults = searchPageSize();
-      } catch (err) {
-        setNotice(err.message || String(err), true);
-        return;
-      }
-      // A zero byte limit requests the complete selected evidence stream.
-      const maxScanBytes = 0;
+      merged.sources = targets.map(newRawSearchSource);
+      merged.complete = false;
+      merged.truncated = true;
+      // Parsing this browser/session value can never abort All mode; malformed
+      // state is normalized to a safe examiner-visible batch.
+      const batchSize = scope.batchSize;
       state.rawSearchRunning = true;
       renderRawSearchResults();
       const status = $("rawSearchStatus");
       if (status) {
         status.textContent = "Scanning " + targets.length + " source" + (targets.length === 1 ? "" : "s") + "...";
       }
-      for (const target of targets) {
-        try {
-          const result = await apiPost("/api/search/raw", {
-            case_path: currentCasePath(),
-            evidence_id: target.id,
-            query,
-            max_results: maxResults,
-            max_scan_bytes: maxScanBytes,
-            cursor: null
-          });
-          const provenance = { ...result };
-          delete provenance.hits;
-          (result.hits || []).forEach((hit) => merged.hits.push({ ...hit, evidence_id: target.id, evidence_name: target.name, search_provenance: provenance }));
-          merged.bytes_scanned += Number(result.bytes_scanned) || 0;
-          merged.total_size += Number(result.total_size) || 0;
-          merged.truncated = merged.truncated || Boolean(result.truncated);
-          merged.complete = merged.complete && Boolean(result.complete);
-          merged.provenance[target.id] = provenance;
-          merged.sources.push({ evidence_id: target.id, name: target.name, hits: (result.hits || []).length, bytes_scanned: result.bytes_scanned, covered_through: (Number(result.scan_start) || 0) + (Number(result.bytes_scanned) || 0), total_size: result.total_size, truncated: result.truncated, complete: Boolean(result.complete), next_cursor: result.next_cursor || null, stop_reason: result.stop_reason || null, evidence_sha256_hex: result.evidence_sha256_hex || null, coverage: result.coverage || null });
-        } catch (err) {
-          merged.complete = false;
-          merged.sources.push({ evidence_id: target.id, name: target.name, error: err.message || String(err) });
-        }
-      }
+      await fetchRawSearchAggregateBatch(merged, scope, batchSize, generation);
       state.rawSearchRunning = false;
       state.rawSearchResult = merged;
       resetGridView("rawSearch");
@@ -12514,7 +13176,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         indexedPassSummary() + ". Bitwise: " + merged.hits.length.toLocaleString() + " hit(s), " + scannedText +
           bitwiseStopReasonNote(merged) +
           (errored.length ? "; " + errored.length + " source(s) errored" : "") + ".",
-        Boolean(state.searchError) || merged.truncated || errored.length > 0
+        Boolean(state.searchError || state.searchPageError) || merged.truncated || errored.length > 0
       );
     }
 
@@ -12523,53 +13185,39 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!merged || state.rawSearchRunning) {
         return;
       }
-      const pending = (merged.sources || []).filter((source) => !source.error && source.next_cursor);
+      const scope = merged.scope
+        ? Object.freeze({ ...merged.scope })
+        : state.searchScope;
+      const generation = state.searchGeneration;
+      if (!searchRunIsCurrent(scope, generation)) {
+        setNotice("The case changed since this bitwise search ran. Run Search again before loading more hits.", true);
+        return;
+      }
+      if (!deepSearchFormMatchesScope(scope)) {
+        setNotice("Search criteria changed after this bitwise result set was created. Run Search to apply the new criteria; Load more was not started against a mixed scope.", true);
+        return;
+      }
+      // Keep a failed source retryable: its continuation is not consumed until
+      // a complete protected API page succeeds.
+      const pending = (merged.sources || []).filter((source) => !source.complete);
       if (!pending.length) {
         return;
       }
       state.rawSearchRunning = true;
       renderRawSearchResults();
-      for (const source of pending) {
-        try {
-          const result = await apiPost("/api/search/raw", {
-            case_path: currentCasePath(),
-            evidence_id: source.evidence_id,
-            query: merged.query,
-            max_results: searchPageSize(),
-            max_scan_bytes: 0,
-            cursor: source.next_cursor
-          });
-          const provenance = { ...result };
-          delete provenance.hits;
-          (result.hits || []).forEach((hit) => merged.hits.push({
-            ...hit,
-            evidence_id: source.evidence_id,
-            evidence_name: source.name,
-            search_provenance: provenance
-          }));
-          source.hits += (result.hits || []).length;
-          source.bytes_scanned = (Number(source.bytes_scanned) || 0) + (Number(result.bytes_scanned) || 0);
-          source.covered_through = Math.max(
-            Number(source.covered_through) || 0,
-            (Number(result.scan_start) || 0) + (Number(result.bytes_scanned) || 0)
-          );
-          source.truncated = Boolean(result.truncated);
-          source.complete = Boolean(result.complete);
-          source.next_cursor = result.next_cursor || null;
-          source.stop_reason = result.stop_reason || null;
-          source.coverage = result.coverage || source.coverage || null;
-          merged.provenance[source.evidence_id] = provenance;
-        } catch (err) {
-          source.error = err.message || String(err);
+      const batchSize = scope.batchSize;
+      try {
+        await fetchRawSearchAggregateBatch(merged, scope, batchSize, generation);
+      } catch (err) {
+        if (err.kdftStaleSearch) {
+          if (generation === state.searchGeneration) {
+            state.rawSearchRunning = false;
+          }
+          return;
         }
+        throw err;
       }
       state.rawSearchRunning = false;
-      merged.bytes_scanned = (merged.sources || []).reduce(
-        (sum, source) => sum + (Number(source.covered_through) || 0),
-        0
-      );
-      merged.complete = (merged.sources || []).every((source) => !source.error && source.complete);
-      merged.truncated = !merged.complete;
       renderRawSearchResults();
       persistDeepSearchSession();
       const errored = (merged.sources || []).filter((source) => source.error);
@@ -12587,8 +13235,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // stop_reason; falls back to the truncated flag for older results.
     function bitwiseStopReasonNote(merged) {
       const sources = (merged && merged.sources) || [];
-      if (sources.some((source) => source.next_cursor)) {
-        return " (more matches available - use Load more; later hits have not been discarded)";
+      if (sources.some((source) => !source.complete)) {
+        return " (coverage incomplete; continuation/retry available through Load more; confirmed hits have not been discarded)";
       }
       const reasons = sources.filter((source) => !source.error).map((source) => source.stop_reason).filter(Boolean);
       if (reasons.includes("result_limit")) {
@@ -12888,8 +13536,30 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function bookmarkSearchResult(index) {
+      if (!requireCurrentDeepSearchResults("bookmarking")) {
+        return;
+      }
+      const scope = state.searchScope;
+      const generation = scope.generation;
+      const casePath = scope.casePath;
       const hit = state.searchResults[index];
-      await bookmarkSearchHit(hit, true);
+      if (!hit) {
+        setNotice("This search result is no longer loaded. Re-run the search.", true);
+        return;
+      }
+      try {
+        await bookmarkSearchHit(hit, false, casePath);
+        if (!searchRunIsCurrent(scope, generation)) {
+          setNotice("The bookmark request completed, but the case/index or search scope changed. Reload the case before continuing.", true);
+          return;
+        }
+        await refresh();
+        if (searchRunIsCurrent(scope, generation)) {
+          setNotice("Bookmarked result " + hit.entry_id + ".");
+        }
+      } catch (err) {
+        setNotice(err.message || String(err), true);
+      }
     }
 
     async function bookmarkSearchHit(hit, refreshAfter = true, casePath = currentCasePath()) {
@@ -12923,6 +13593,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function bookmarkSelectedSearchResults() {
+      if (!requireCurrentDeepSearchResults("bookmarking")) {
+        return;
+      }
+      const bookmarkScope = state.searchScope;
+      const bookmarkGeneration = bookmarkScope.generation;
+      const bookmarkedRawResult = state.rawSearchResult;
       const casePath = state.loadedCasePath;
       if (!casePath || normalizePathInput($("casePath").value) !== casePath) {
         setNotice("The loaded case changed. Reload it before bookmarking search results.", true);
@@ -12946,7 +13622,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const failedIndexedKeys = [];
       const failedRawKeys = [];
       let lastError = "";
+      let scopeChanged = false;
       for (const row of indexedRows) {
+        if (!searchRunIsCurrent(bookmarkScope, bookmarkGeneration)) {
+          scopeChanged = true;
+          break;
+        }
         const hit = row.hit;
         if (!hit) {
           failedIndexedKeys.push(row.key);
@@ -12957,20 +13638,41 @@ const INDEX_HTML: &str = r###"<!doctype html>
           await bookmarkSearchHit(hit, false, casePath);
           succeeded += 1;
           remainingIndexedKeys.delete(row.key);
+          if (!searchRunIsCurrent(bookmarkScope, bookmarkGeneration)) {
+            scopeChanged = true;
+            break;
+          }
         } catch (err) {
           failedIndexedKeys.push(row.key);
           lastError = err.message || String(err);
         }
       }
-      for (const row of rawRows) {
+      for (const row of scopeChanged ? [] : rawRows) {
+        if (!searchRunIsCurrent(bookmarkScope, bookmarkGeneration)) {
+          scopeChanged = true;
+          break;
+        }
         try {
-          await bookmarkRawSearchHitRecord(row.hit, state.rawSearchResult, false, casePath);
+          await bookmarkRawSearchHitRecord(row.hit, bookmarkedRawResult, false, casePath);
           succeeded += 1;
           remainingRawKeys.delete(row.key);
+          if (!searchRunIsCurrent(bookmarkScope, bookmarkGeneration)) {
+            scopeChanged = true;
+            break;
+          }
         } catch (err) {
           failedRawKeys.push(row.key);
           lastError = err.message || String(err);
         }
+      }
+      if (scopeChanged) {
+        setNotice(
+          "Stopped bookmarking because the case/index or search criteria changed; " +
+            succeeded + " completed bookmark request" + (succeeded === 1 ? "" : "s") +
+            " may already be recorded. Reload the case before continuing.",
+          true
+        );
+        return;
       }
       if (state.loadedCasePath !== casePath || normalizePathInput($("casePath").value) !== casePath) {
         return;
@@ -20572,11 +21274,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       renderSearchSelectionCount();
       const result = state.rawSearchResult;
+      const frozenWarning = deepSearchFrozenWarningHtml();
       const loadMore = $("loadMoreRawSearchResults");
       if (loadMore) {
-        const hasMore = Boolean(result && (result.sources || []).some((source) => source.next_cursor));
+        const hasMore = Boolean(
+          result && !result.attempt_error && (result.sources || []).some((source) => !source.complete)
+        );
         loadMore.hidden = !hasMore;
-        loadMore.disabled = Boolean(state.rawSearchRunning);
+        loadMore.disabled = Boolean(state.rawSearchRunning) || deepSearchResultsFrozen();
         loadMore.textContent = state.rawSearchRunning ? "Loading..." : "Load more bitwise hits";
       }
       if (!result) {
@@ -20584,9 +21289,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
         if (status) {
           status.textContent = state.rawSearchRunning ? "Scanning evidence bytes..." : "";
         }
-        container.innerHTML = state.rawSearchRunning
+        container.innerHTML = frozenWarning + (state.rawSearchRunning
           ? empty("Bitwise whole-disk scan running - reading real evidence bytes; a large scan limit can take a while...")
-          : empty("Run a search in \"All\" mode to scan evidence byte-for-byte.");
+          : (state.rawSearchAttempted
+            ? empty("The bitwise pass was attempted but did not return a result. Review the examiner notice, correct the query/scope if needed, and retry.")
+            : empty("Run a search in \"All\" mode to scan evidence byte-for-byte.")));
         return;
       }
       const sources = result.sources || [];
@@ -20619,12 +21326,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const errorNote = errored.length
         ? empty("Could not scan: " + errored.map((source) => (source.name || source.evidence_id) + " (" + source.error + ")").join("; "))
         : "";
-      const emptyNote = sources.length === 0
-        ? empty("No image or file evidence to scan byte-for-byte. Attach a disk image or file source.")
-        : empty("No bitwise hits found in the scanned range" + bitwiseStopReasonNote(result) + ".");
-      container.innerHTML = rows.length
+      const emptyNote = result.attempt_error
+        ? empty("Bitwise pass was not started: " + result.attempt_error + ".")
+        : (sources.length === 0
+          ? empty("No image or file evidence to scan byte-for-byte. Attach a disk image or file source.")
+          : empty("No bitwise hits found in the scanned range" + bitwiseStopReasonNote(result) + "."));
+      container.innerHTML = frozenWarning + (rows.length
         ? rawCoverageNote + hashWarning + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No hits match the column filters.")) + errorNote
-        : rawCoverageNote + emptyNote + errorNote;
+        : rawCoverageNote + emptyNote + errorNote);
     }
 
     // Build item_ref_json for one whole-disk bitwise hit. Scan provenance
@@ -20714,10 +21423,26 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function bookmarkRawSearchHit(hitIndex) {
+      if (!requireCurrentDeepSearchResults("bookmarking")) {
+        return;
+      }
+      const scope = state.searchScope;
+      const generation = scope.generation;
+      const casePath = scope.casePath;
       const result = state.rawSearchResult;
       const hit = result && result.hits ? result.hits[hitIndex] : null;
       try {
-        await bookmarkRawSearchHitRecord(hit, result, true);
+        const hashNote = await bookmarkRawSearchHitRecord(hit, result, false, casePath);
+        if (!searchRunIsCurrent(scope, generation)) {
+          setNotice("The bookmark request completed, but the case/index or search scope changed. Reload the case before continuing.", true);
+          return;
+        }
+        await refresh();
+        if (searchRunIsCurrent(scope, generation)) {
+          const offset = Number(hit.offset) || 0;
+          const offsetLabel = offset.toLocaleString() + " (0x" + offset.toString(16).toUpperCase() + ")";
+          setNotice("Bookmarked bitwise hit at offset " + offsetLabel + " into \"Raw Search Hits\"." + hashNote, Boolean(hashNote));
+        }
       } catch (err) {
         setNotice(err.message || String(err), true);
       }
@@ -21173,7 +21898,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!state.data) {
         return "";
       }
-      const scoped = $("searchEvidence").value ? Number($("searchEvidence").value) : null;
+      // Once results exist, coverage warnings must describe their immutable
+      // scope, not an evidence selector the examiner may be editing for the
+      // next run.
+      const scoped = state.searchScope
+        ? state.searchScope.evidenceId
+        : ($("searchEvidence").value ? Number($("searchEvidence").value) : null);
       const affected = (state.data.evidence || []).filter((item) =>
         item.content_indexed === false && (scoped === null || item.id === scoped));
       if (!affected.length) {
@@ -21195,10 +21925,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function renderSearchResults() {
       const visibleRows = visibleSearchResultRows();
       const filterOn = searchColumnFiltersActive();
+      const frozenWarning = deepSearchFrozenWarningHtml();
+      const pageError = state.searchPageError
+        ? `<div class="analysis-status" style="color:var(--warn, #9a6700)"><strong>Indexed paging paused:</strong> ${escapeHtml(state.searchPageError)} Successfully loaded pages remain available; Load more retries from the last confirmed cursor.</div>`
+        : "";
       const loadMore = $("loadMoreSearchResults");
       if (loadMore) {
         loadMore.hidden = Boolean(state.searchError) || state.searchComplete || !state.searchCursor;
-        loadMore.disabled = state.searchPageLoading;
+        loadMore.disabled = state.searchPageLoading || deepSearchResultsFrozen();
         loadMore.textContent = state.searchPageLoading ? "Loading..." : "Load more indexed results";
       }
       $("searchCount").textContent = String(visibleRows.length);
@@ -21212,14 +21946,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
         // The indexed pass failed - say so in the results area itself, not
         // only in a transient notice (in All mode the bitwise pass still runs
         // below this message).
-        $("searchResults").innerHTML = `<div class="analysis-status" style="color:var(--bad, #c0392b)">Indexed search failed: ${escapeHtml(state.searchError)}</div>`;
+        $("searchResults").innerHTML = frozenWarning + `<div class="analysis-status" style="color:var(--bad, #c0392b)">Indexed search failed: ${escapeHtml(state.searchError)}</div>`;
         renderSearchSelectionCount();
         return;
       }
       if (state.searchResults.length === 0 && state.data && Number(state.data.entry_count || 0) === 0) {
-        $("searchResults").innerHTML = currentSearchMode() === "all"
+        $("searchResults").innerHTML = frozenWarning + (currentSearchMode() === "all"
           ? `<div class="analysis-status"><strong>Indexed search unavailable:</strong> this case has no processed entries. The independent bitwise whole-disk results appear below and search decoded evidence bytes, including unallocated space and slack.</div>`
-          : `<div class="analysis-status"><strong>Indexed search unavailable:</strong> this case has no processed entries. Process the evidence first, switch to All for a bitwise whole-disk scan, or use raw find in Browse.</div>`;
+          : `<div class="analysis-status"><strong>Indexed search unavailable:</strong> this case has no processed entries. Process the evidence first, switch to All for a bitwise whole-disk scan, or use raw find in Browse.</div>`);
         renderSearchSelectionCount();
         return;
       }
@@ -21241,9 +21975,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         </tr>`;
       }).join("");
       if (state.searchResults.length === 0) {
-        $("searchResults").innerHTML = indexedSearchCoverageHtml() + metadataOnlySearchWarningHtml() + empty("No results.");
+        $("searchResults").innerHTML = frozenWarning + pageError + indexedSearchCoverageHtml() + metadataOnlySearchWarningHtml() + empty("No results.");
       } else {
-        $("searchResults").innerHTML = indexedSearchCoverageHtml() + metadataOnlySearchWarningHtml() + searchResultsTable(rows) + (rows ? "" : empty("No results match the column filters."));
+        $("searchResults").innerHTML = frozenWarning + pageError + indexedSearchCoverageHtml() + metadataOnlySearchWarningHtml() + searchResultsTable(rows) + (rows ? "" : empty("No results match the column filters."));
       }
       renderSearchSelectionCount();
     }
@@ -21255,6 +21989,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         + selectedVisibleRawSearchResultRows().length;
       $("searchSelectedCount").textContent = selected + " selected"
         + (visible < selected ? " (" + visible + " visible)" : "");
+      const bookmarkButton = $("bookmarkSelectedSearchResults");
+      if (bookmarkButton) {
+        bookmarkButton.disabled = selected === 0 || deepSearchResultsFrozen();
+      }
     }
 
     function bookmarksGridColumns() {
@@ -21648,6 +22386,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
     $("loadMoreSearchResults").addEventListener("click", loadMoreSearchResults);
     $("loadMoreRawSearchResults").addEventListener("click", loadMoreRawSearchResults);
     $("searchMode").addEventListener("change", updateSearchModeUi);
+    [
+      "searchQuery",
+      "searchEvidence",
+      "includeContent",
+      "maxResults",
+      "maxFileBytes",
+      "searchCategory",
+      "searchFileTypes"
+    ].forEach((id) => {
+      $(id).addEventListener("input", () => handleDeepSearchCriteriaEdited());
+      $(id).addEventListener("change", () => handleDeepSearchCriteriaEdited({ persist: true }));
+    });
     $("selectAllSearchResults").addEventListener("click", selectAllSearchResults);
     $("bookmarkSelectedSearchResults").addEventListener("click", bookmarkSelectedSearchResults);
     $("clearSelectedSearchResults").addEventListener("click", clearSelectedSearchResults);
