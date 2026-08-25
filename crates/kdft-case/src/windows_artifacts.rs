@@ -185,6 +185,7 @@ pub struct WindowsArtifactKindCounts {
     pub candidates_seen: u64,
     pub parsed_sources: u64,
     pub partial_sources: u64,
+    pub optional_coverage_incomplete_sources: u64,
     pub failed_sources: u64,
     pub derived_entries: u64,
     pub text_segments: u64,
@@ -204,11 +205,13 @@ pub struct WindowsArtifactParseResult {
     pub supported_source_count: u64,
     pub up_to_date_sources_skipped: u64,
     pub reused_partial_sources: u64,
+    pub reused_optional_coverage_incomplete_sources: u64,
     pub snapshot_candidate_count: u64,
     pub snapshot_max_entry_id: Option<i64>,
     pub candidates_seen: u64,
     pub parsed_sources: u64,
     pub partial_sources: u64,
+    pub optional_coverage_incomplete_sources: u64,
     pub failed_sources: u64,
     pub derived_entries: u64,
     pub text_segments: u64,
@@ -229,6 +232,7 @@ pub struct WindowsArtifactParseResult {
 struct CandidateSnapshot {
     supported_count: u64,
     reused_partial_count: u64,
+    reused_optional_coverage_incomplete_count: u64,
     reuse_committed: bool,
     count: u64,
     max_entry_id: Option<i64>,
@@ -435,11 +439,14 @@ pub fn parse_windows_artifacts(
         supported_source_count: snapshot.supported_count,
         up_to_date_sources_skipped: snapshot.supported_count.saturating_sub(snapshot.count),
         reused_partial_sources: snapshot.reused_partial_count,
+        reused_optional_coverage_incomplete_sources: snapshot
+            .reused_optional_coverage_incomplete_count,
         snapshot_candidate_count: snapshot.count,
         snapshot_max_entry_id: snapshot.max_entry_id,
         candidates_seen: 0,
         parsed_sources: 0,
         partial_sources: 0,
+        optional_coverage_incomplete_sources: 0,
         failed_sources: 0,
         derived_entries: 0,
         text_segments: 0,
@@ -539,8 +546,22 @@ pub fn parse_windows_artifacts(
                                 kind_counts.partial_sources.saturating_add(1);
                             super::progress::progress_truncated(format!(
                                 "{} source {} was parsed with explicitly disclosed partial coverage",
-                                candidate.kind.key(), candidate.source_path_exact
+                                candidate.kind.key(),
+                                candidate.source_path_exact
                             ));
+                        }
+                        let optional_coverage_incomplete = summary
+                            .details
+                            .get("lnk_coverage_complete")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false);
+                        if optional_coverage_incomplete {
+                            result.optional_coverage_incomplete_sources = result
+                                .optional_coverage_incomplete_sources
+                                .saturating_add(1);
+                            kind_counts.optional_coverage_incomplete_sources = kind_counts
+                                .optional_coverage_incomplete_sources
+                                .saturating_add(1);
                         }
                         diagnostics.merge(&summary.diagnostics);
                         if let Some(warning) = outcome.cleanup_warning {
@@ -604,6 +625,8 @@ pub fn parse_windows_artifacts(
     result.supported_scope_complete = result.snapshot_stable
         && result.partial_sources == 0
         && result.reused_partial_sources == 0
+        && result.optional_coverage_incomplete_sources == 0
+        && result.reused_optional_coverage_incomplete_sources == 0
         && result.failed_sources == 0
         && result.diagnostic_count == 0;
     result.status = if result.supported_scope_complete {
@@ -659,6 +682,26 @@ fn candidate_snapshot_conn(
     };
     let reused_partial_count = u64::try_from(reused_partial_count)
         .context("Windows artifact reused partial source count is negative")?;
+    let reused_optional_coverage_incomplete_sql = format!(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2 {CANDIDATE_FILTER_SQL}
+           AND json_extract(metadata_json, '$.windows_artifact_parser_committed.parser_name') = ?3
+           AND json_extract(metadata_json, '$.windows_artifact_parser_committed.status') = 'parsed'
+           AND json_extract(metadata_json, '$.windows_artifact_parser_committed.supported_scope_complete') = 0"
+    );
+    let reused_optional_coverage_incomplete_count: i64 = if reuse_committed {
+        conn.query_row(
+            &reused_optional_coverage_incomplete_sql,
+            params![case_id, evidence_id, WINDOWS_ARTIFACT_PARSER_NAME],
+            |row| row.get(0),
+        )?
+    } else {
+        0
+    };
+    let reused_optional_coverage_incomplete_count = u64::try_from(
+        reused_optional_coverage_incomplete_count,
+    )
+    .context("Windows artifact reused optional-coverage-incomplete source count is negative")?;
     let pending_filter = if reuse_committed {
         PENDING_CANDIDATE_FILTER_SQL
     } else {
@@ -678,6 +721,7 @@ fn candidate_snapshot_conn(
     Ok(CandidateSnapshot {
         supported_count,
         reused_partial_count,
+        reused_optional_coverage_incomplete_count,
         reuse_committed,
         count,
         max_entry_id,
@@ -873,7 +917,7 @@ fn pass_safety_bounds() -> serde_json::Value {
         "jumplist_io_buffer_bytes": jump.io_buffer_bytes,
         "jumplist_diagnostic_sample_limit": jump.diagnostic_sample_limit,
         "jumplist_embedded_lnk_spooling": "one embedded LNK temporary file at a time",
-        "scheduled_task_max_source_bytes": 16 * 1024 * 1024,
+        "scheduled_task_max_source_bytes": super::scheduled_task::MAX_SCHEDULED_TASK_SOURCE_BYTES,
         "pass_diagnostic_sample_limit": DIAGNOSTIC_SAMPLE_LIMIT,
     })
 }
@@ -881,7 +925,7 @@ fn pass_safety_bounds() -> serde_json::Value {
 fn source_supported_scope(kind: WindowsArtifactKind) -> &'static str {
     match kind {
         WindowsArtifactKind::ShellLink => {
-            "One indexed, recoverable Shell Link source parsed by the bounded KDFT LNK parser; unsupported or malformed structures are disclosed by status and exact warning counters"
+            "One indexed, recoverable Shell Link source parsed by the bounded KDFT LNK parser; malformed or core-incomplete structures use Partial with exact warning counters, while safely bounded optional structures not semantically decoded are disclosed separately as coverage notes"
         }
         WindowsArtifactKind::Prefetch => {
             "One indexed, recoverable Windows Prefetch source parsed by the bounded KDFT Prefetch parser; a structurally valid recovered SCCA prefix may be retained as explicitly partial when MAM output is short, without fabricated padding"
@@ -896,7 +940,7 @@ fn source_supported_scope(kind: WindowsArtifactKind) -> &'static str {
             "All signatures found by the KDFT CustomDestinations streaming parser; canonical empty containers are valid zero-entry sources, while heuristic boundaries and damaged/omitted payloads are explicitly partial"
         }
         WindowsArtifactKind::UsnJournal => {
-            "The complete recovered $UsnJrnl:$J byte stream is parsed incrementally for USN V2/V3; unsupported V4/unknown versions and damaged records are counted explicitly"
+            "The complete recovered $UsnJrnl:$J byte stream is parsed incrementally for aligned USN V2/V3 and the documented V4.0 extent layout; damaged framing, unsupported V4 minor layouts, and unknown major versions are counted explicitly"
         }
         WindowsArtifactKind::ScheduledTask => {
             "One indexed, recoverable Windows Task Scheduler XML definition; registration, principals, settings, triggers, and actions are decoded without executing the task"
@@ -1355,7 +1399,7 @@ fn parse_scheduled_task_source(
     candidate: &WindowsArtifactCandidate,
     staging_path: &Path,
 ) -> Result<SourceParseSummary> {
-    const MAX_TASK_BYTES: u64 = 16 * 1024 * 1024;
+    let max_task_bytes = super::scheduled_task::MAX_SCHEDULED_TASK_SOURCE_BYTES as u64;
     let source_size = fs::metadata(staging_path)
         .with_context(|| {
             format!(
@@ -1364,11 +1408,11 @@ fn parse_scheduled_task_source(
             )
         })?
         .len();
-    if source_size > MAX_TASK_BYTES {
+    if source_size > max_task_bytes {
         bail!(
             "scheduled-task XML source is {} bytes; safety limit is {} bytes",
             source_size,
-            MAX_TASK_BYTES
+            max_task_bytes
         );
     }
     let file = File::open(staging_path).with_context(|| {
@@ -1426,6 +1470,8 @@ fn parse_scheduled_task_source(
         "task_hidden": parsed.settings.get("hidden"),
         "task_action_command": action_command,
         "task_action_arguments": action_arguments,
+        "task_xml_source_encoding": parsed.source_encoding,
+        "task_xml_source_had_byte_order_mark": parsed.source_had_byte_order_mark,
         "task_version": parsed.task_version,
         "task_registration": parsed.registration,
         "task_principals": parsed.principals,
@@ -1454,6 +1500,8 @@ fn parse_scheduled_task_source(
             "task_principal_count": parsed.principals.len(),
             "task_trigger_count": parsed.triggers.len(),
             "task_action_count": parsed.actions.len(),
+            "task_xml_source_encoding": parsed.source_encoding,
+            "task_xml_source_had_byte_order_mark": parsed.source_had_byte_order_mark,
             "task_default_coverage_cap": null,
         }),
     })
@@ -1470,6 +1518,8 @@ fn parse_lnk_source(
     let parsed = LnkParser::parse_reader(&mut file, &options);
     let exact_warning_count =
         (parsed.warnings.len() as u64).saturating_add(parsed.warnings_omitted);
+    let exact_coverage_note_count =
+        (parsed.coverage_notes.len() as u64).saturating_add(parsed.coverage_notes_omitted);
     if parsed.status == LnkStatus::Failed {
         let message = format!(
             "LNK parser rejected source: {}",
@@ -1489,6 +1539,9 @@ fn parse_lnk_source(
                 "lnk_warning_count": exact_warning_count,
                 "lnk_warnings_omitted": parsed.warnings_omitted,
                 "lnk_extra_blocks_omitted": parsed.extra_blocks_omitted,
+                "lnk_coverage_complete": parsed.coverage_complete,
+                "lnk_coverage_note_count": exact_coverage_note_count,
+                "lnk_coverage_notes_omitted": parsed.coverage_notes_omitted,
             }),
         )));
     }
@@ -1517,7 +1570,9 @@ fn parse_lnk_source(
         "artifact_kind": "windows_shell_link_record",
         "parser_name": WINDOWS_ARTIFACT_PARSER_NAME,
         "parser_status": if partial { "partial" } else { "parsed" },
-        "supported_scope_complete": !partial,
+        "supported_scope_complete": !partial && parsed.coverage_complete,
+        "core_parse_complete": !partial,
+        "optional_coverage_complete": parsed.coverage_complete,
         "supported_scope": source_supported_scope(candidate.kind),
         "safety_bounds": { "max_file_size_bytes": options.max_file_size },
         "lnk": parsed_json,
@@ -1544,6 +1599,9 @@ fn parse_lnk_source(
             "lnk_warning_count": exact_warning_count,
             "lnk_warnings_omitted": parsed.warnings_omitted,
             "lnk_extra_blocks_omitted": parsed.extra_blocks_omitted,
+            "lnk_coverage_complete": parsed.coverage_complete,
+            "lnk_coverage_note_count": exact_coverage_note_count,
+            "lnk_coverage_notes_omitted": parsed.coverage_notes_omitted,
         }),
     })
 }
@@ -1786,6 +1844,10 @@ impl UsnSink for SqliteUsnSink<'_, '_> {
     fn record(&mut self, record: &UsnRecord) -> Result<(), Self::Error> {
         self.ordinal = self.ordinal.saturating_add(1);
         let record_json = usn_record_json(record);
+        let display_name = record
+            .file_name
+            .clone()
+            .unwrap_or_else(|| format!("USN {} V4 range record", record.usn));
         let metadata = serde_json::json!({
             "artifact_kind": "windows_usn_record",
             "parser_name": WINDOWS_ARTIFACT_PARSER_NAME,
@@ -1796,6 +1858,17 @@ impl UsnSink for SqliteUsnSink<'_, '_> {
                 "record_count_cap": null,
                 "materialization": "one bounded USN record at a time"
             },
+            "source_entry_id": self.candidate.entry_id,
+            "source_logical_path_exact": self.candidate.logical_path,
+            "source_path_exact": self.candidate.source_path_exact,
+            "source_stream_offset": record.byte_offset,
+            "source_stream_offset_basis": "$UsnJrnl:$J recovered-stream byte offset; not a decoded-media or physical evidence offset",
+            "path_claim": if record.file_name.is_some() {
+                "USN filename component only; no full path inferred by this record parser"
+            } else {
+                "V4 contains no filename; no filename or path inferred"
+            },
+            "rename_pairing_claim": "none; OLD_NAME and NEW_NAME flags are preserved as independent journal observations and are not presented as a proven pair",
             "usn_record": record_json,
         });
         let logical_path = derived_logical_path(
@@ -1810,7 +1883,7 @@ impl UsnSink for SqliteUsnSink<'_, '_> {
             self.tx,
             self.candidate,
             &logical_path,
-            &record.file_name,
+            &display_name,
             "record",
             metadata,
             &search_text,
@@ -1914,12 +1987,15 @@ fn parse_usn_source(
             "usn_status": usn_status_name(parsed.status),
             "usn_bytes_read": parsed.stats.bytes_read,
             "usn_sparse_zero_bytes_skipped": parsed.stats.sparse_zero_bytes_skipped,
+            "usn_aligned_header_candidates": parsed.stats.aligned_header_candidates,
+            "usn_resync_slots_skipped": parsed.stats.resync_slots_skipped,
             "usn_records_seen": parsed.stats.records_seen,
             "usn_records_parsed": parsed.stats.records_parsed,
             "usn_records_emitted": parsed.stats.records_emitted,
             "usn_v2_records": parsed.stats.v2_records,
             "usn_v3_records": parsed.stats.v3_records,
-            "usn_unsupported_v4_records": parsed.stats.unsupported_v4_records,
+            "usn_v4_records": parsed.stats.v4_records,
+            "usn_unsupported_minor_version_records": parsed.stats.unsupported_minor_version_records,
             "usn_unknown_version_records": parsed.stats.unknown_version_records,
             "usn_corrupt_records": parsed.stats.corrupt_records,
             "usn_truncated_records": parsed.stats.truncated_records,
@@ -2181,6 +2257,12 @@ fn parse_jumplist_source(
             "jumplist_error_offset": error.offset,
             "jumplist_file_size": error.stats.file_size,
             "jumplist_bytes_read": error.stats.bytes_read,
+            "jumplist_v3_stream_size_high_dwords_ignored": error.stats.v3_stream_size_high_dwords_ignored,
+            "jumplist_custom_container_envelope_validated": error.stats.custom_container_envelope_validated,
+            "jumplist_custom_categories_declared": error.stats.custom_categories_declared,
+            "jumplist_custom_categories_validated": error.stats.custom_categories_validated,
+            "jumplist_custom_zero_entry_categories": error.stats.custom_zero_entry_categories,
+            "jumplist_custom_entries_without_complete_lnk_headers_declared": error.stats.custom_entries_without_complete_lnk_headers_declared,
             "jumplist_lnk_candidates": error.stats.lnk_candidates,
             "jumplist_lnk_streams_emitted_before_rollback": error.stats.lnk_streams_emitted,
             "jumplist_incomplete_streams": error.stats.incomplete_streams,
@@ -2255,6 +2337,12 @@ fn parse_jumplist_source(
             "jumplist_lnk_bytes_emitted": parsed.stats.lnk_bytes_emitted,
             "jumplist_dest_list_streams": parsed.stats.dest_list_streams,
             "jumplist_auxiliary_streams": parsed.stats.auxiliary_streams,
+            "jumplist_v3_stream_size_high_dwords_ignored": parsed.stats.v3_stream_size_high_dwords_ignored,
+            "jumplist_custom_container_envelope_validated": parsed.stats.custom_container_envelope_validated,
+            "jumplist_custom_categories_declared": parsed.stats.custom_categories_declared,
+            "jumplist_custom_categories_validated": parsed.stats.custom_categories_validated,
+            "jumplist_custom_zero_entry_categories": parsed.stats.custom_zero_entry_categories,
+            "jumplist_custom_entries_without_complete_lnk_headers_declared": parsed.stats.custom_entries_without_complete_lnk_headers_declared,
             "jumplist_corrupt_streams": parsed.stats.corrupt_streams,
             "jumplist_incomplete_streams": parsed.stats.incomplete_streams,
             "jumplist_omitted_lnk_streams": parsed.stats.omitted_lnk_streams,
@@ -2404,6 +2492,11 @@ fn committed_source_metadata(
     candidate: &WindowsArtifactCandidate,
     summary: &SourceParseSummary,
 ) -> serde_json::Value {
+    let optional_coverage_complete = summary
+        .details
+        .get("lnk_coverage_complete")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
     serde_json::json!({
         "parser_name": WINDOWS_ARTIFACT_PARSER_NAME,
         "source_kind": candidate.kind,
@@ -2413,7 +2506,9 @@ fn committed_source_metadata(
         "source_path_exact": candidate.source_path_exact,
         "source_is_deleted": candidate.is_deleted,
         "status": if summary.partial { "partial" } else { "parsed" },
-        "supported_scope_complete": !summary.partial,
+        "supported_scope_complete": !summary.partial && optional_coverage_complete,
+        "core_parse_complete": !summary.partial,
+        "optional_coverage_complete": optional_coverage_complete,
         "supported_scope": source_supported_scope(candidate.kind),
         "default_coverage_cap": null,
         "safety_bounds": pass_safety_bounds(),
@@ -2618,18 +2713,96 @@ fn usn_reference_json(reference: UsnFileReference) -> serde_json::Value {
             "raw": raw,
             "entry": entry,
             "sequence": sequence,
+            "width_bits": 64,
+            "entry_bits": 48,
+            "sequence_bits": 16,
         }),
-        UsnFileReference::V3 { low, high } => serde_json::json!({
-            "version": "v3",
-            "low": low,
-            "high": high,
-        }),
+        UsnFileReference::V3 { low, high } => usn_128_reference_json("v3", low, high),
+        UsnFileReference::V4 { low, high } => usn_128_reference_json("v4", low, high),
     }
 }
 
-fn usn_record_json(record: &UsnRecord) -> serde_json::Value {
+fn usn_128_reference_json(version: &str, low: u64, high: u64) -> serde_json::Value {
+    let mut raw = [0_u8; 16];
+    raw[..8].copy_from_slice(&low.to_le_bytes());
+    raw[8..].copy_from_slice(&high.to_le_bytes());
     serde_json::json!({
-        "version": match record.version { UsnVersion::V2 => "v2", UsnVersion::V3 => "v3" },
+        "version": version,
+        "low": low,
+        "high": high,
+        "raw_little_endian_hex": bytes_to_hex(&raw),
+        "width_bits": 128,
+    })
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn usn_record_json(record: &UsnRecord) -> serde_json::Value {
+    let record_stream_range = record
+        .byte_offset
+        .checked_add(u64::from(record.record_length))
+        .map(|end_exclusive| {
+            serde_json::json!({
+                "start": record.byte_offset,
+                "end_exclusive": end_exclusive,
+                "basis": "$UsnJrnl:$J recovered-stream bytes; not decoded-media or physical evidence bytes",
+            })
+        });
+    let file_name_stream_range = record
+        .file_name_offset
+        .zip(record.file_name_length)
+        .and_then(|(offset, length)| {
+            let start = record.byte_offset.checked_add(u64::from(offset))?;
+            let end_exclusive = start.checked_add(u64::from(length))?;
+            Some(serde_json::json!({
+                "start": start,
+                "end_exclusive": end_exclusive,
+                "basis": "$UsnJrnl:$J recovered-stream bytes; exact UTF-16LE filename field",
+            }))
+        });
+    let extent_size = u64::from(record.extent_size.unwrap_or(0));
+    let extents = record
+        .extents
+        .iter()
+        .enumerate()
+        .map(|(index, extent)| {
+            let field_offset = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(extent_size))
+                .and_then(|offset| u64::from(usn::USN_V4_HEADER_BYTES).checked_add(offset));
+            let source_stream_range = field_offset.and_then(|field_offset| {
+                let start = record.byte_offset.checked_add(field_offset)?;
+                let end_exclusive = start.checked_add(u64::try_from(extent.raw_bytes.len()).ok()?)?;
+                Some(serde_json::json!({
+                    "start": start,
+                    "end_exclusive": end_exclusive,
+                    "basis": "$UsnJrnl:$J recovered-stream bytes; exact raw V4 extent field",
+                }))
+            });
+            serde_json::json!({
+                "offset": extent.offset,
+                "length": extent.length,
+                "raw_hex": bytes_to_hex(&extent.raw_bytes),
+                "record_field_offset": field_offset,
+                "source_stream_byte_range": source_stream_range,
+                "offset_basis": "changed-file-relative byte range; not a journal-stream, decoded-media, or physical evidence offset",
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "version": match record.version {
+            UsnVersion::V2 => "v2",
+            UsnVersion::V3 => "v3",
+            UsnVersion::V4 => "v4",
+        },
         "major_version": record.major_version,
         "minor_version": record.minor_version,
         "record_length": record.record_length,
@@ -2641,11 +2814,43 @@ fn usn_record_json(record: &UsnRecord) -> serde_json::Value {
         "reason": record.reason,
         "reason_flags": record.reason_flags,
         "unknown_reason_bits": record.unknown_reason_bits,
+        "rename_role": match record.rename_role {
+            usn::UsnRenameRole::None => "none",
+            usn::UsnRenameRole::OldName => "old_name_observation",
+            usn::UsnRenameRole::NewName => "new_name_observation",
+            usn::UsnRenameRole::BothFlags => "both_flags_in_one_record",
+        },
+        "rename_pairing": "not_performed",
         "source_info": record.source_info,
+        "source_info_flags": record.source_info_flags,
+        "unknown_source_info_bits": record.unknown_source_info_bits,
         "security_id": record.security_id,
+        "security_id_semantics": if record.security_id.is_some() {
+            Some("underlying object-store security index; not a SID value")
+        } else {
+            None
+        },
         "file_attributes": record.file_attributes,
+        "file_attribute_flags": record.file_attribute_flags,
+        "unknown_file_attribute_bits": record.unknown_file_attribute_bits,
         "file_name": record.file_name,
+        "file_name_offset_in_record": record.file_name_offset,
+        "file_name_length_bytes": record.file_name_length,
+        "file_name_utf16le_hex": record
+            .file_name_utf16le
+            .as_deref()
+            .map(bytes_to_hex),
+        "file_name_decode_lossy": record.file_name_decode_lossy,
+        "file_name_source_stream_byte_range": file_name_stream_range,
+        "full_path_inferred": false,
+        "remaining_extents": record.remaining_extents,
+        "number_of_extents": record.number_of_extents,
+        "extent_size": record.extent_size,
+        "extent_unknown_trailing_bytes": record.extent_unknown_trailing_bytes,
+        "extents": extents,
         "byte_offset": record.byte_offset,
+        "byte_offset_basis": "$UsnJrnl:$J recovered-stream byte offset; not a decoded-media or physical evidence offset",
+        "record_source_stream_byte_range": record_stream_range,
     })
 }
 
@@ -3015,14 +3220,29 @@ mod tests {
                 }
             }),
         )?;
+        insert_source(
+            &conn,
+            8,
+            "/image/already-parsed-optional-gap.lnk",
+            "already-parsed-optional-gap.lnk",
+            serde_json::json!({
+                "source_path_exact": "Users\\Alice\\already-parsed-optional-gap.lnk",
+                "windows_artifact_parser_committed": {
+                    "parser_name": WINDOWS_ARTIFACT_PARSER_NAME,
+                    "status": "parsed",
+                    "supported_scope_complete": false
+                }
+            }),
+        )?;
         conn.execute(
             "UPDATE filesystem_entries SET is_deleted = 1 WHERE id = 3",
             [],
         )?;
 
         let snapshot = candidate_snapshot_conn(&conn, 1, 7, true)?;
-        assert_eq!(snapshot.supported_count, 5);
+        assert_eq!(snapshot.supported_count, 6);
         assert_eq!(snapshot.reused_partial_count, 1);
+        assert_eq!(snapshot.reused_optional_coverage_incomplete_count, 1);
         assert_eq!(snapshot.count, 3);
         assert_eq!(snapshot.max_entry_id, Some(3));
 
@@ -3212,6 +3432,65 @@ mod tests {
     }
 
     #[test]
+    fn optional_lnk_coverage_gap_does_not_relabel_core_parse_as_partial() -> Result<()> {
+        let mut conn = test_connection()?;
+        let canonical = "Users\\Alice\\Recent\\Property Target.LNK";
+        insert_source(
+            &conn,
+            11,
+            "/image/Users/Alice/Recent/Property Target.LNK",
+            "Property Target.LNK",
+            serde_json::json!({"ntfs_path": canonical}),
+        )?;
+        let candidate = candidate(
+            11,
+            "/image/Users/Alice/Recent/Property Target.LNK",
+            "Property Target.LNK",
+            canonical,
+            WindowsArtifactKind::ShellLink,
+        );
+        let (path, mut staged) = create_unique_temporary_file("kdft-windows-test", 11, "lnk")?;
+        let mut bytes = vec![0_u8; 116];
+        bytes[0..4].copy_from_slice(&0x4C_u32.to_le_bytes());
+        bytes[4..20].copy_from_slice(&LnkParser::SHELL_LINK_CLSID);
+        bytes[60..64].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[76..80].copy_from_slice(&36_u32.to_le_bytes());
+        bytes[80..84].copy_from_slice(&0xA0000009_u32.to_le_bytes());
+        bytes[84..88].copy_from_slice(&24_u32.to_le_bytes());
+        bytes[88..92].copy_from_slice(&0x5350_5331_u32.to_le_bytes());
+        bytes[92..108].copy_from_slice(&LnkParser::SHELL_LINK_CLSID);
+        staged.write_all(&bytes)?;
+        staged.flush()?;
+        drop(staged);
+
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let summary = parse_lnk_source(&tx, &candidate, &path)?;
+        assert!(!summary.partial);
+        assert_eq!(summary.details["lnk_coverage_complete"], false);
+        assert_eq!(summary.details["lnk_coverage_note_count"], 1);
+        let committed = committed_source_metadata(&candidate, &summary);
+        assert_eq!(committed["status"], "parsed");
+        assert_eq!(committed["core_parse_complete"], true);
+        assert_eq!(committed["optional_coverage_complete"], false);
+        assert_eq!(committed["supported_scope_complete"], false);
+        tx.commit()?;
+        fs::remove_file(path)?;
+
+        let metadata_json: String = conn.query_row(
+            "SELECT metadata_json FROM filesystem_entries
+             WHERE json_extract(metadata_json, '$.windows_artifact_derived') = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json)?;
+        assert_eq!(metadata["parser_status"], "parsed");
+        assert_eq!(metadata["core_parse_complete"], true);
+        assert_eq!(metadata["optional_coverage_complete"], false);
+        assert_eq!(metadata["supported_scope_complete"], false);
+        Ok(())
+    }
+
+    #[test]
     fn private_source_spool_bulk_imports_entries_and_text_exactly_once() -> Result<()> {
         let mut conn = test_connection()?;
         let canonical = "Users\\Alice\\Recent\\Target.LNK";
@@ -3282,6 +3561,89 @@ mod tests {
         fs::remove_file(database_path)?;
         fs::remove_dir(directory)?;
         Ok(())
+    }
+
+    #[test]
+    fn usn_v4_json_preserves_identifier_extent_and_offset_semantics() {
+        let record = UsnRecord {
+            version: UsnVersion::V4,
+            major_version: 4,
+            minor_version: 0,
+            record_length: 80,
+            file_reference: UsnFileReference::V4 {
+                low: 0x0807_0605_0403_0201,
+                high: 0x100f_0e0d_0c0b_0a09,
+            },
+            parent_reference: UsnFileReference::V4 { low: 3, high: 4 },
+            usn: 1234,
+            timestamp_filetime: None,
+            timestamp_utc: None,
+            reason: 1,
+            reason_flags: vec!["USN_REASON_DATA_OVERWRITE"],
+            unknown_reason_bits: 0,
+            rename_role: usn::UsnRenameRole::None,
+            source_info: 1,
+            source_info_flags: vec!["USN_SOURCE_DATA_MANAGEMENT"],
+            unknown_source_info_bits: 0,
+            security_id: None,
+            file_attributes: None,
+            file_attribute_flags: Vec::new(),
+            unknown_file_attribute_bits: 0,
+            file_name: None,
+            file_name_offset: None,
+            file_name_length: None,
+            file_name_utf16le: None,
+            file_name_decode_lossy: false,
+            remaining_extents: Some(2),
+            number_of_extents: Some(1),
+            extent_size: Some(16),
+            extent_unknown_trailing_bytes: Some(0),
+            extents: vec![usn::UsnExtent {
+                offset: 4096,
+                length: 512,
+                raw_bytes: [4096_i64.to_le_bytes(), 512_i64.to_le_bytes()].concat(),
+            }],
+            byte_offset: 8192,
+        };
+
+        let json = usn_record_json(&record);
+        assert_eq!(json["version"], "v4");
+        assert_eq!(json["file_name"], serde_json::Value::Null);
+        assert_eq!(json["file_name_utf16le_hex"], serde_json::Value::Null);
+        assert_eq!(json["full_path_inferred"], false);
+        assert_eq!(json["rename_pairing"], "not_performed");
+        assert_eq!(
+            json["file_reference"]["raw_little_endian_hex"],
+            "0102030405060708090A0B0C0D0E0F10"
+        );
+        assert_eq!(json["file_reference"]["width_bits"], 128);
+        assert_eq!(
+            json["extents"][0]["raw_hex"],
+            "00100000000000000002000000000000"
+        );
+        assert_eq!(json["extents"][0]["record_field_offset"], 64);
+        assert_eq!(
+            json["extents"][0]["source_stream_byte_range"]["start"],
+            8256
+        );
+        assert_eq!(
+            json["extents"][0]["source_stream_byte_range"]["end_exclusive"],
+            8272
+        );
+        assert_eq!(
+            json["extents"][0]["offset_basis"],
+            "changed-file-relative byte range; not a journal-stream, decoded-media, or physical evidence offset"
+        );
+        assert_eq!(json["byte_offset"], 8192);
+        assert_eq!(
+            json["record_source_stream_byte_range"]["end_exclusive"],
+            8272
+        );
+        assert_eq!(
+            json["byte_offset_basis"],
+            "$UsnJrnl:$J recovered-stream byte offset; not a decoded-media or physical evidence offset"
+        );
+        assert!(source_supported_scope(WindowsArtifactKind::UsnJournal).contains("V4.0"));
     }
 
     #[test]

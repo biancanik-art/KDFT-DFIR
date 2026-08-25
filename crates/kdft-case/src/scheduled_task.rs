@@ -7,12 +7,16 @@ use quick_xml::Reader;
 use quick_xml::XmlVersion;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 
 const MAX_FIELD_CHARS: usize = 65_536;
+const MAX_XML_DECLARATION_CHARS: usize = 1_024;
+pub(crate) const MAX_SCHEDULED_TASK_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ScheduledTaskRecord {
+    pub source_encoding: String,
+    pub source_had_byte_order_mark: bool,
     pub task_version: Option<String>,
     pub registration: BTreeMap<String, String>,
     pub principals: Vec<BTreeMap<String, String>>,
@@ -27,13 +31,31 @@ struct Component {
     fields: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Utf16ByteOrder {
+    LittleEndian,
+    BigEndian,
+}
+
+#[derive(Debug)]
+struct DecodedTaskXml {
+    text: String,
+    encoding: &'static str,
+    had_byte_order_mark: bool,
+}
+
 pub fn parse_scheduled_task<R: BufRead>(input: R) -> Result<ScheduledTaskRecord> {
-    let mut reader = Reader::from_reader(input);
+    let decoded = decode_task_xml(input)?;
+    let mut reader = Reader::from_reader(decoded.text.as_bytes());
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
     let mut stack = Vec::<String>::new();
     let mut text_stack = Vec::<String>::new();
-    let mut record = ScheduledTaskRecord::default();
+    let mut record = ScheduledTaskRecord {
+        source_encoding: decoded.encoding.to_string(),
+        source_had_byte_order_mark: decoded.had_byte_order_mark,
+        ..ScheduledTaskRecord::default()
+    };
     let mut saw_task = false;
     let mut principal: Option<Component> = None;
     let mut trigger: Option<Component> = None;
@@ -188,6 +210,125 @@ pub fn parse_scheduled_task<R: BufRead>(input: R) -> Result<ScheduledTaskRecord>
     Ok(record)
 }
 
+fn decode_task_xml<R: BufRead>(input: R) -> Result<DecodedTaskXml> {
+    let mut bytes = Vec::new();
+    let mut limited = input.take((MAX_SCHEDULED_TASK_SOURCE_BYTES as u64) + 1);
+    limited
+        .read_to_end(&mut bytes)
+        .context("reading scheduled-task XML within the source-size limit")?;
+    if bytes.len() > MAX_SCHEDULED_TASK_SOURCE_BYTES {
+        bail!(
+            "scheduled-task XML exceeds the {}-byte safety limit",
+            MAX_SCHEDULED_TASK_SOURCE_BYTES
+        );
+    }
+
+    // Test UTF-32 signatures before UTF-16LE because the UTF-32LE BOM begins
+    // with the UTF-16LE BOM. Task Scheduler XML is defined in UTF-8/UTF-16;
+    // silently interpreting UTF-32 as UTF-16 would corrupt provenance.
+    if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) || bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00])
+    {
+        bail!("UTF-32 scheduled-task XML is not supported");
+    }
+
+    if let Some(payload) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return Ok(DecodedTaskXml {
+            text: std::str::from_utf8(payload)
+                .context("scheduled-task XML after the UTF-8 BOM is not valid UTF-8")?
+                .to_owned(),
+            encoding: "utf-8",
+            had_byte_order_mark: true,
+        });
+    }
+    if let Some(payload) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16_task_xml(payload, Utf16ByteOrder::LittleEndian, true);
+    }
+    if let Some(payload) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16_task_xml(payload, Utf16ByteOrder::BigEndian, true);
+    }
+    if looks_like_bomless_utf16(&bytes, Utf16ByteOrder::LittleEndian) {
+        return decode_utf16_task_xml(&bytes, Utf16ByteOrder::LittleEndian, false);
+    }
+    if looks_like_bomless_utf16(&bytes, Utf16ByteOrder::BigEndian) {
+        return decode_utf16_task_xml(&bytes, Utf16ByteOrder::BigEndian, false);
+    }
+
+    Ok(DecodedTaskXml {
+        text: std::str::from_utf8(&bytes)
+            .context("scheduled-task XML is neither valid UTF-8 nor recognizable UTF-16")?
+            .to_owned(),
+        encoding: "utf-8",
+        had_byte_order_mark: false,
+    })
+}
+
+fn decode_utf16_task_xml(
+    bytes: &[u8],
+    byte_order: Utf16ByteOrder,
+    had_byte_order_mark: bool,
+) -> Result<DecodedTaskXml> {
+    let encoding = match byte_order {
+        Utf16ByteOrder::LittleEndian => "utf-16le",
+        Utf16ByteOrder::BigEndian => "utf-16be",
+    };
+    if !bytes.len().is_multiple_of(2) {
+        bail!(
+            "scheduled-task {encoding} XML has an odd byte length ({})",
+            bytes.len()
+        );
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| match byte_order {
+            Utf16ByteOrder::LittleEndian => u16::from_le_bytes([pair[0], pair[1]]),
+            Utf16ByteOrder::BigEndian => u16::from_be_bytes([pair[0], pair[1]]),
+        })
+        .collect::<Vec<_>>();
+    let mut text = String::from_utf16(&units)
+        .with_context(|| format!("scheduled-task {encoding} XML contains invalid UTF-16"))?;
+
+    // quick-xml receives the normalized UTF-8 representation below. Remove
+    // only the XML declaration so a truthful source declaration such as
+    // encoding="UTF-16" cannot make the reader reinterpret normalized bytes.
+    // The declaration carries no Task Scheduler artifact data.
+    strip_xml_declaration(&mut text)?;
+
+    Ok(DecodedTaskXml {
+        text,
+        encoding,
+        had_byte_order_mark,
+    })
+}
+
+fn looks_like_bomless_utf16(bytes: &[u8], byte_order: Utf16ByteOrder) -> bool {
+    bytes.chunks_exact(2).take(64).find_map(|pair| {
+        let unit = match byte_order {
+            Utf16ByteOrder::LittleEndian => u16::from_le_bytes([pair[0], pair[1]]),
+            Utf16ByteOrder::BigEndian => u16::from_be_bytes([pair[0], pair[1]]),
+        };
+        match unit {
+            0x0009 | 0x000A | 0x000D | 0x0020 => None,
+            0x003C => Some(true),
+            _ => Some(false),
+        }
+    }) == Some(true)
+}
+
+fn strip_xml_declaration(text: &mut String) -> Result<()> {
+    if !text.starts_with("<?xml") {
+        return Ok(());
+    }
+    let search_end = text.floor_char_boundary(MAX_XML_DECLARATION_CHARS.min(text.len()));
+    let Some(relative_end) = text[..search_end].find("?>") else {
+        bail!(
+            "scheduled-task XML declaration is not closed within {} characters",
+            MAX_XML_DECLARATION_CHARS
+        );
+    };
+    text.drain(..relative_end + 2);
+    Ok(())
+}
+
 fn decode_xml_text(text: &BytesText<'_>) -> Result<String> {
     text.xml10_content()
         .map(|value| value.into_owned())
@@ -290,6 +431,48 @@ fn bounded(value: &str) -> String {
 mod tests {
     use super::*;
 
+    const ENCODING_TEST_AUTHOR: &str = "ACME\\Ștefan 東京";
+
+    fn encoding_test_xml(declared_encoding: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="{declared_encoding}"?>
+              <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+                <RegistrationInfo><Author>{ENCODING_TEST_AUTHOR}</Author><Description>Δοκιμή</Description></RegistrationInfo>
+                <Actions><Exec><Command>powershell.exe</Command></Exec></Actions>
+              </Task>"#
+        )
+    }
+
+    fn utf16_bytes(xml: &str, byte_order: Utf16ByteOrder, with_bom: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if with_bom {
+            bytes.extend_from_slice(match byte_order {
+                Utf16ByteOrder::LittleEndian => &[0xFF, 0xFE],
+                Utf16ByteOrder::BigEndian => &[0xFE, 0xFF],
+            });
+        }
+        for unit in xml.encode_utf16() {
+            bytes.extend_from_slice(&match byte_order {
+                Utf16ByteOrder::LittleEndian => unit.to_le_bytes(),
+                Utf16ByteOrder::BigEndian => unit.to_be_bytes(),
+            });
+        }
+        bytes
+    }
+
+    fn assert_encoding_parse(
+        bytes: &[u8],
+        expected_encoding: &str,
+        expected_byte_order_mark: bool,
+    ) {
+        let record = parse_scheduled_task(bytes).unwrap();
+        assert_eq!(record.source_encoding, expected_encoding);
+        assert_eq!(record.source_had_byte_order_mark, expected_byte_order_mark);
+        assert_eq!(record.registration["author"], ENCODING_TEST_AUTHOR);
+        assert_eq!(record.registration["description"], "Δοκιμή");
+        assert_eq!(record.actions[0]["command"], "powershell.exe");
+    }
+
     #[test]
     fn parses_principal_trigger_and_exec_action() {
         let xml = br#"<?xml version="1.0"?>
@@ -326,5 +509,63 @@ mod tests {
         let xml = br#"<!DOCTYPE Task [<!ENTITY secret "unsafe">]><Task/>"#;
         let error = parse_scheduled_task(xml.as_slice()).unwrap_err();
         assert!(error.to_string().contains("document types"));
+    }
+
+    #[test]
+    fn parses_utf8_without_bom() {
+        let xml = encoding_test_xml("UTF-8");
+        assert_encoding_parse(xml.as_bytes(), "utf-8", false);
+    }
+
+    #[test]
+    fn parses_utf8_with_bom() {
+        let xml = encoding_test_xml("UTF-8");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(xml.as_bytes());
+        assert_encoding_parse(&bytes, "utf-8", true);
+    }
+
+    #[test]
+    fn parses_utf16le_with_bom() {
+        let xml = encoding_test_xml("UTF-16");
+        let bytes = utf16_bytes(&xml, Utf16ByteOrder::LittleEndian, true);
+        assert_encoding_parse(&bytes, "utf-16le", true);
+    }
+
+    #[test]
+    fn parses_utf16le_without_bom() {
+        let xml = encoding_test_xml("UTF-16LE");
+        let bytes = utf16_bytes(&xml, Utf16ByteOrder::LittleEndian, false);
+        assert_encoding_parse(&bytes, "utf-16le", false);
+    }
+
+    #[test]
+    fn parses_utf16be_with_bom() {
+        let xml = encoding_test_xml("UTF-16");
+        let bytes = utf16_bytes(&xml, Utf16ByteOrder::BigEndian, true);
+        assert_encoding_parse(&bytes, "utf-16be", true);
+    }
+
+    #[test]
+    fn parses_utf16be_without_bom() {
+        let xml = encoding_test_xml("UTF-16BE");
+        let bytes = utf16_bytes(&xml, Utf16ByteOrder::BigEndian, false);
+        assert_encoding_parse(&bytes, "utf-16be", false);
+    }
+
+    #[test]
+    fn rejects_odd_length_utf16() {
+        let xml = encoding_test_xml("UTF-16LE");
+        let mut bytes = utf16_bytes(&xml, Utf16ByteOrder::LittleEndian, false);
+        bytes.pop();
+        let error = parse_scheduled_task(bytes.as_slice()).unwrap_err();
+        assert!(error.to_string().contains("odd byte length"));
+    }
+
+    #[test]
+    fn rejects_unpaired_utf16_surrogate() {
+        let bytes = [0x3C, 0x00, 0x00, 0xD8];
+        let error = parse_scheduled_task(bytes.as_slice()).unwrap_err();
+        assert!(error.to_string().contains("invalid UTF-16"));
     }
 }

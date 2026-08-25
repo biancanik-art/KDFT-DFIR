@@ -97,6 +97,36 @@ pub struct LnkExtraDataBlock {
     pub name: String,
 }
 
+/// Structural inventory of an ItemIDList. Item payloads are intentionally not
+/// interpreted as paths unless another authoritative Shell Link field supplies
+/// the target; the item boundaries remain useful forensic provenance.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LnkTargetIdListInfo {
+    pub declared_size: u32,
+    pub item_count: u32,
+    pub item_sizes: Vec<u16>,
+    pub item_sizes_omitted: u64,
+    pub terminal_present: bool,
+}
+
+/// SpecialFolderDataBlock (0xA0000005) metadata.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LnkSpecialFolderData {
+    pub special_folder_id: u32,
+    pub offset: u32,
+}
+
+/// Structural summary of one PropertyStoreDataBlock. The serialized property
+/// values are preserved in the source bytes but are not decoded by this parser.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LnkPropertyStoreData {
+    pub block_offset: usize,
+    pub storage_count: u32,
+    pub format_ids: Vec<String>,
+    pub format_ids_omitted: u64,
+    pub terminal_present: bool,
+}
+
 /// Source byte offsets of parsed LNK sections.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LnkSourceOffsets {
@@ -126,6 +156,20 @@ pub struct LnkParseResult {
     pub environment_path: Option<String>,
     #[serde(default)]
     pub icon_environment_path: Option<String>,
+    #[serde(default)]
+    pub darwin_data: Option<String>,
+    #[serde(default)]
+    pub shim_layer_name: Option<String>,
+    #[serde(default)]
+    pub console_code_page: Option<u32>,
+    #[serde(default)]
+    pub special_folder_data: Option<LnkSpecialFolderData>,
+    #[serde(default)]
+    pub target_id_list: Option<LnkTargetIdListInfo>,
+    #[serde(default)]
+    pub vista_and_above_id_list: Option<LnkTargetIdListInfo>,
+    #[serde(default)]
+    pub property_store_data: Vec<LnkPropertyStoreData>,
     pub extra_data_blocks: Vec<LnkExtraDataBlock>,
     pub extra_blocks_omitted: u64,
     #[serde(default)]
@@ -134,6 +178,14 @@ pub struct LnkParseResult {
     pub source_offsets: LnkSourceOffsets,
     pub warnings: Vec<String>,
     pub warnings_omitted: u64,
+    /// Optional/ancillary structures that were safely bounded but not fully
+    /// interpreted. These notes do not by themselves make the core parse partial.
+    #[serde(default)]
+    pub coverage_notes: Vec<String>,
+    #[serde(default)]
+    pub coverage_notes_omitted: u64,
+    #[serde(default)]
+    pub coverage_complete: bool,
     pub is_valid: bool,
 }
 
@@ -197,6 +249,14 @@ fn record_warning(warnings: &mut Vec<String>, omitted: &mut u64, msg: String) {
     }
 }
 
+fn record_coverage_note(notes: &mut Vec<String>, omitted: &mut u64, msg: String) {
+    if notes.len() < 50 {
+        notes.push(msg);
+    } else {
+        *omitted = omitted.saturating_add(1);
+    }
+}
+
 /// Defensive parser for Windows Shell Link (.lnk) format.
 ///
 /// Note: `LnkParser` performs bounded whole-record in-memory parsing of LNK structures
@@ -237,6 +297,13 @@ impl LnkParser {
                 known_folder_offset: None,
                 environment_path: None,
                 icon_environment_path: None,
+                darwin_data: None,
+                shim_layer_name: None,
+                console_code_page: None,
+                special_folder_data: None,
+                target_id_list: None,
+                vista_and_above_id_list: None,
+                property_store_data: Vec::new(),
                 extra_data_blocks: Vec::new(),
                 extra_blocks_omitted: 0,
                 trailing_zero_padding_bytes: 0,
@@ -244,6 +311,9 @@ impl LnkParser {
                 source_offsets: LnkSourceOffsets::default(),
                 warnings,
                 warnings_omitted,
+                coverage_notes: Vec::new(),
+                coverage_notes_omitted: 0,
+                coverage_complete: false,
                 is_valid: false,
             };
         }
@@ -270,6 +340,13 @@ impl LnkParser {
                 known_folder_offset: None,
                 environment_path: None,
                 icon_environment_path: None,
+                darwin_data: None,
+                shim_layer_name: None,
+                console_code_page: None,
+                special_folder_data: None,
+                target_id_list: None,
+                vista_and_above_id_list: None,
+                property_store_data: Vec::new(),
                 extra_data_blocks: Vec::new(),
                 extra_blocks_omitted: 0,
                 trailing_zero_padding_bytes: 0,
@@ -277,6 +354,9 @@ impl LnkParser {
                 source_offsets: LnkSourceOffsets::default(),
                 warnings,
                 warnings_omitted,
+                coverage_notes: Vec::new(),
+                coverage_notes_omitted: 0,
+                coverage_complete: false,
                 is_valid: false,
             };
         }
@@ -288,8 +368,9 @@ impl LnkParser {
     pub fn parse_with_options(data: &[u8], options: &LnkParserOptions) -> LnkParseResult {
         let mut warnings = Vec::new();
         let mut warnings_omitted = 0u64;
+        let mut coverage_notes = Vec::new();
+        let mut coverage_notes_omitted = 0u64;
         let mut source_offsets = LnkSourceOffsets::default();
-        let mut has_unknown_blocks = false;
 
         if data.len() > options.max_file_size {
             record_warning(
@@ -311,6 +392,13 @@ impl LnkParser {
                 known_folder_offset: None,
                 environment_path: None,
                 icon_environment_path: None,
+                darwin_data: None,
+                shim_layer_name: None,
+                console_code_page: None,
+                special_folder_data: None,
+                target_id_list: None,
+                vista_and_above_id_list: None,
+                property_store_data: Vec::new(),
                 extra_data_blocks: Vec::new(),
                 extra_blocks_omitted: 0,
                 trailing_zero_padding_bytes: 0,
@@ -318,6 +406,9 @@ impl LnkParser {
                 source_offsets,
                 warnings,
                 warnings_omitted,
+                coverage_notes,
+                coverage_notes_omitted,
+                coverage_complete: false,
                 is_valid: false,
             };
         }
@@ -341,6 +432,13 @@ impl LnkParser {
                 known_folder_offset: None,
                 environment_path: None,
                 icon_environment_path: None,
+                darwin_data: None,
+                shim_layer_name: None,
+                console_code_page: None,
+                special_folder_data: None,
+                target_id_list: None,
+                vista_and_above_id_list: None,
+                property_store_data: Vec::new(),
                 extra_data_blocks: Vec::new(),
                 extra_blocks_omitted: 0,
                 trailing_zero_padding_bytes: 0,
@@ -348,6 +446,9 @@ impl LnkParser {
                 source_offsets,
                 warnings,
                 warnings_omitted,
+                coverage_notes,
+                coverage_notes_omitted,
+                coverage_complete: false,
                 is_valid: false,
             };
         }
@@ -370,6 +471,13 @@ impl LnkParser {
                     known_folder_offset: None,
                     environment_path: None,
                     icon_environment_path: None,
+                    darwin_data: None,
+                    shim_layer_name: None,
+                    console_code_page: None,
+                    special_folder_data: None,
+                    target_id_list: None,
+                    vista_and_above_id_list: None,
+                    property_store_data: Vec::new(),
                     extra_data_blocks: Vec::new(),
                     extra_blocks_omitted: 0,
                     trailing_zero_padding_bytes: 0,
@@ -377,6 +485,9 @@ impl LnkParser {
                     source_offsets,
                     warnings,
                     warnings_omitted,
+                    coverage_notes,
+                    coverage_notes_omitted,
+                    coverage_complete: false,
                     is_valid: false,
                 };
             }
@@ -408,6 +519,40 @@ impl LnkParser {
         }
 
         let valid_header = header_size == 0x4C && clsid_bytes == Self::SHELL_LINK_CLSID;
+
+        source_offsets.header_offset = 0;
+        source_offsets.header_size = 76;
+        if !valid_header {
+            return LnkParseResult {
+                status: LnkStatus::Failed,
+                header: None,
+                link_info: None,
+                string_data: LnkStringData::default(),
+                tracker_data: None,
+                known_folder_id: None,
+                known_folder_offset: None,
+                environment_path: None,
+                icon_environment_path: None,
+                darwin_data: None,
+                shim_layer_name: None,
+                console_code_page: None,
+                special_folder_data: None,
+                target_id_list: None,
+                vista_and_above_id_list: None,
+                property_store_data: Vec::new(),
+                extra_data_blocks: Vec::new(),
+                extra_blocks_omitted: 0,
+                trailing_zero_padding_bytes: 0,
+                canonical_target_path: None,
+                source_offsets,
+                warnings,
+                warnings_omitted,
+                coverage_notes,
+                coverage_notes_omitted,
+                coverage_complete: false,
+                is_valid: false,
+            };
+        }
 
         let link_flags = get_u32_le(data, 20).unwrap_or(0);
         let file_attributes = get_u32_le(data, 24).unwrap_or(0);
@@ -505,63 +650,59 @@ impl LnkParser {
             force_no_link_info,
         };
 
-        source_offsets.header_offset = 0;
-        source_offsets.header_size = 76;
-
-        if !valid_header {
-            return LnkParseResult {
-                status: LnkStatus::Failed,
-                header: Some(header_info),
-                link_info: None,
-                string_data: LnkStringData::default(),
-                tracker_data: None,
-                known_folder_id: None,
-                known_folder_offset: None,
-                environment_path: None,
-                icon_environment_path: None,
-                extra_data_blocks: Vec::new(),
-                extra_blocks_omitted: 0,
-                trailing_zero_padding_bytes: 0,
-                canonical_target_path: None,
-                source_offsets,
-                warnings,
-                warnings_omitted,
-                is_valid: false,
-            };
-        }
-
         let mut offset = 76usize;
+        let mut target_id_list = None;
 
-        // 1. LinkTargetIDList resolution check
+        // 1. LinkTargetIDList: validate item boundaries even though shell-item
+        // payload semantics are intentionally outside the current parser scope.
         if has_link_target_id_list {
-            record_warning(
-                &mut warnings,
-                &mut warnings_omitted,
-                "LinkTargetIDList present but full target ID list item resolution is unsupported"
-                    .to_string(),
-            );
             if let Some(id_list_size_u16) = get_u16_le(data, offset) {
                 let id_list_size = id_list_size_u16 as usize;
                 source_offsets.id_list_offset = Some(offset);
-                let full_id_list_size = id_list_size.saturating_add(2);
-                source_offsets.id_list_size = Some(full_id_list_size.min(data.len() - offset));
-                offset = match offset.checked_add(full_id_list_size) {
-                    Some(o) if o <= data.len() => o,
-                    _ => {
-                        record_warning(
-                            &mut warnings,
-                            &mut warnings_omitted,
-                            "LinkTargetIDList bounds exceeded buffer length".to_string(),
-                        );
-                        data.len()
+                if let Some(full_id_list_size) = id_list_size.checked_add(2) {
+                    source_offsets.id_list_size =
+                        Some(full_id_list_size.min(data.len().saturating_sub(offset)));
+                    match offset.checked_add(full_id_list_size) {
+                        Some(end) if end <= data.len() => {
+                            target_id_list = Some(parse_item_id_list(
+                                &data[offset + 2..end],
+                                id_list_size_u16 as u32,
+                                "LinkTargetIDList",
+                                &mut warnings,
+                                &mut warnings_omitted,
+                            ));
+                            record_coverage_note(
+                                &mut coverage_notes,
+                                &mut coverage_notes_omitted,
+                                "LinkTargetIDList item boundaries were validated, but shell-item payload semantics were not resolved"
+                                    .to_string(),
+                            );
+                            offset = end;
+                        }
+                        _ => {
+                            record_warning(
+                                &mut warnings,
+                                &mut warnings_omitted,
+                                "LinkTargetIDList bounds exceeded buffer length".to_string(),
+                            );
+                            offset = data.len();
+                        }
                     }
-                };
+                } else {
+                    record_warning(
+                        &mut warnings,
+                        &mut warnings_omitted,
+                        "LinkTargetIDList size overflowed addressable bounds".to_string(),
+                    );
+                    offset = data.len();
+                }
             } else {
                 record_warning(
                     &mut warnings,
                     &mut warnings_omitted,
                     "Truncated LinkTargetIDList header".to_string(),
                 );
+                offset = data.len();
             }
         }
 
@@ -737,6 +878,12 @@ impl LnkParser {
         let mut known_folder_offset = None;
         let mut environment_path = None;
         let mut icon_environment_path = None;
+        let mut darwin_data = None;
+        let mut shim_layer_name = None;
+        let mut console_code_page = None;
+        let mut special_folder_data = None;
+        let mut vista_and_above_id_list = None;
+        let mut property_store_data = Vec::new();
         let mut extra_data_blocks = Vec::new();
         let mut extra_blocks_omitted = 0u64;
         let extra_start_offset = offset;
@@ -794,17 +941,16 @@ impl LnkParser {
                 0xA0000003 => "TrackerDataBlock".to_string(),
                 0xA0000004 => "ConsoleFEDataBlock".to_string(),
                 0xA0000005 => "SpecialFolderDataBlock".to_string(),
-                0xA0000007 => "DarwinDataBlock".to_string(),
-                0xA0000008 => "IconEnvironmentDataBlock".to_string(),
+                0xA0000006 => "DarwinDataBlock".to_string(),
+                0xA0000007 => "IconEnvironmentDataBlock".to_string(),
+                0xA0000008 => "ShimDataBlock".to_string(),
                 0xA0000009 => "PropertyStoreDataBlock".to_string(),
-                0xA000000A => "ShimDataBlock".to_string(),
                 0xA000000B => "KnownFolderDataBlock".to_string(),
                 0xA000000C => "VistaAndAboveIDListDataBlock".to_string(),
                 _ => {
-                    has_unknown_blocks = true;
-                    record_warning(
-                        &mut warnings,
-                        &mut warnings_omitted,
+                    record_coverage_note(
+                        &mut coverage_notes,
+                        &mut coverage_notes_omitted,
                         format!(
                             "ExtraData signature 0x{sig:08X} at offset {offset} is unsupported"
                         ),
@@ -864,9 +1010,9 @@ impl LnkParser {
                     }
                 }
 
-                0xA0000001 | 0xA0000008 => {
+                0xA0000001 | 0xA0000007 => {
                     saw_environment_block |= sig == 0xA0000001;
-                    saw_icon_environment_block |= sig == 0xA0000008;
+                    saw_icon_environment_block |= sig == 0xA0000007;
                     if block_size != 0x314 {
                         record_warning(
                             &mut warnings,
@@ -881,16 +1027,119 @@ impl LnkParser {
                             ),
                         );
                     }
-                    let parsed_path = parse_environment_data_block(
-                        block_bytes,
-                        &mut warnings,
-                        &mut warnings_omitted,
-                    );
+                    let parsed_path = (block_size >= 0x314)
+                        .then(|| {
+                            parse_environment_data_block(
+                                block_bytes,
+                                &mut warnings,
+                                &mut warnings_omitted,
+                            )
+                        })
+                        .flatten();
                     if sig == 0xA0000001 {
                         environment_path = parsed_path;
                     } else {
                         icon_environment_path = parsed_path;
                     }
+                }
+                0xA0000006 => {
+                    saw_darwin_block = true;
+                    if block_size != 0x314 {
+                        record_warning(
+                            &mut warnings,
+                            &mut warnings_omitted,
+                            format!(
+                                "DarwinDataBlock size is 0x{block_size:X}; expected exactly 0x314"
+                            ),
+                        );
+                    }
+                    if block_size >= 0x314 {
+                        darwin_data = parse_environment_data_block(
+                            block_bytes,
+                            &mut warnings,
+                            &mut warnings_omitted,
+                        );
+                    }
+                }
+                0xA0000008 => {
+                    saw_shim_block = true;
+                    if block_size < 10 {
+                        record_warning(
+                            &mut warnings,
+                            &mut warnings_omitted,
+                            format!(
+                                "ShimDataBlock size is 0x{block_size:X}; expected at least 0xA"
+                            ),
+                        );
+                    } else {
+                        shim_layer_name = read_null_terminated_utf16(
+                            &block_bytes[8..],
+                            &mut warnings,
+                            &mut warnings_omitted,
+                        );
+                    }
+                }
+                0xA0000004 => {
+                    if block_size != 12 {
+                        record_warning(
+                            &mut warnings,
+                            &mut warnings_omitted,
+                            format!(
+                                "ConsoleFEDataBlock size is 0x{block_size:X}; expected exactly 0xC"
+                            ),
+                        );
+                    }
+                    if block_size >= 12 {
+                        console_code_page = get_u32_le(block_bytes, 8);
+                    }
+                }
+                0xA0000005 => {
+                    if block_size != 16 {
+                        record_warning(
+                            &mut warnings,
+                            &mut warnings_omitted,
+                            format!(
+                                "SpecialFolderDataBlock size is 0x{block_size:X}; expected exactly 0x10"
+                            ),
+                        );
+                    }
+                    if block_size >= 16 {
+                        special_folder_data = Some(LnkSpecialFolderData {
+                            special_folder_id: get_u32_le(block_bytes, 8).unwrap_or(0),
+                            offset: get_u32_le(block_bytes, 12).unwrap_or(0),
+                        });
+                    }
+                }
+                0xA0000009 => {
+                    property_store_data.push(parse_property_store_data_block(
+                        block_bytes,
+                        offset,
+                        &mut warnings,
+                        &mut warnings_omitted,
+                    ));
+                    record_coverage_note(
+                        &mut coverage_notes,
+                        &mut coverage_notes_omitted,
+                        format!(
+                            "PropertyStoreDataBlock at offset {offset} was structurally bounded, but serialized property values were not semantically decoded"
+                        ),
+                    );
+                }
+                0xA000000C => {
+                    vista_and_above_id_list = Some(parse_item_id_list(
+                        &block_bytes[8..],
+                        (block_size - 8) as u32,
+                        "VistaAndAboveIDListDataBlock",
+                        &mut warnings,
+                        &mut warnings_omitted,
+                    ));
+                    record_coverage_note(
+                        &mut coverage_notes,
+                        &mut coverage_notes_omitted,
+                        format!(
+                            "VistaAndAboveIDListDataBlock at offset {offset} had bounded item records, but shell-item payload semantics were not resolved"
+                        ),
+                    );
                 }
                 0xA000000B => {
                     if block_size != 0x1C {
@@ -911,15 +1160,12 @@ impl LnkParser {
                         known_folder_offset = get_u32_le(block_bytes, 24);
                     }
                 }
-                0xA0000002 | 0xA0000004 | 0xA0000005 | 0xA0000007 | 0xA0000009 | 0xA000000A
-                | 0xA000000C => {
-                    saw_darwin_block |= sig == 0xA0000007;
-                    saw_shim_block |= sig == 0xA000000A;
-                    record_warning(
-                        &mut warnings,
-                        &mut warnings_omitted,
+                0xA0000002 => {
+                    record_coverage_note(
+                        &mut coverage_notes,
+                        &mut coverage_notes_omitted,
                         format!(
-                            "{name} at offset {offset} was recognized, but its payload was not decoded"
+                            "ConsoleDataBlock at offset {offset} was structurally bounded, but console properties were not semantically decoded"
                         ),
                     );
                 }
@@ -1024,14 +1270,19 @@ impl LnkParser {
             environment_path.as_deref(),
         );
 
-        let status = if !valid_header {
-            LnkStatus::Failed
-        } else if warnings.is_empty()
-            && warnings_omitted == 0
-            && extra_blocks_omitted == 0
-            && !has_unknown_blocks
-            && !has_link_target_id_list
-        {
+        if has_link_target_id_list && canonical_target_path.is_none() {
+            record_warning(
+                &mut warnings,
+                &mut warnings_omitted,
+                "Shell Link target is encoded only in LinkTargetIDList; canonical target resolution is incomplete"
+                    .to_string(),
+            );
+        }
+
+        let coverage_complete =
+            coverage_notes.is_empty() && coverage_notes_omitted == 0 && extra_blocks_omitted == 0;
+
+        let status = if warnings.is_empty() && warnings_omitted == 0 {
             LnkStatus::Recognized
         } else {
             LnkStatus::Partial
@@ -1047,6 +1298,13 @@ impl LnkParser {
             known_folder_offset,
             environment_path,
             icon_environment_path,
+            darwin_data,
+            shim_layer_name,
+            console_code_page,
+            special_folder_data,
+            target_id_list,
+            vista_and_above_id_list,
+            property_store_data,
             extra_data_blocks,
             extra_blocks_omitted,
             trailing_zero_padding_bytes,
@@ -1054,7 +1312,10 @@ impl LnkParser {
             source_offsets,
             warnings,
             warnings_omitted,
-            is_valid: valid_header,
+            coverage_notes,
+            coverage_notes_omitted,
+            coverage_complete,
+            is_valid: true,
         }
     }
 
@@ -1596,6 +1857,213 @@ fn parse_environment_data_block(
     })
 }
 
+fn parse_item_id_list(
+    payload: &[u8],
+    declared_size: u32,
+    context: &str,
+    warnings: &mut Vec<String>,
+    warnings_omitted: &mut u64,
+) -> LnkTargetIdListInfo {
+    let mut position = 0usize;
+    let mut item_count = 0u32;
+    let mut item_sizes = Vec::new();
+    let mut item_sizes_omitted = 0u64;
+    let mut terminal_present = false;
+
+    while position < payload.len() {
+        if position + 2 > payload.len() {
+            record_warning(
+                warnings,
+                warnings_omitted,
+                format!("{context} has an unmatched trailing byte at payload offset {position}"),
+            );
+            break;
+        }
+
+        let item_size = get_u16_le(payload, position).unwrap_or(0);
+        if item_size == 0 {
+            terminal_present = true;
+            position += 2;
+            if payload[position..].iter().any(|byte| *byte != 0) {
+                record_warning(
+                    warnings,
+                    warnings_omitted,
+                    format!(
+                        "{context} contains non-zero bytes after its TerminalID at payload offset {position}"
+                    ),
+                );
+            }
+            break;
+        }
+        if item_size < 2 {
+            record_warning(
+                warnings,
+                warnings_omitted,
+                format!(
+                    "{context} ItemID at payload offset {position} declares invalid size {item_size}"
+                ),
+            );
+            break;
+        }
+
+        let item_size_usize = item_size as usize;
+        let Some(end) = position.checked_add(item_size_usize) else {
+            record_warning(
+                warnings,
+                warnings_omitted,
+                format!("{context} ItemID size overflow at payload offset {position}"),
+            );
+            break;
+        };
+        if end > payload.len() {
+            record_warning(
+                warnings,
+                warnings_omitted,
+                format!(
+                    "{context} ItemID at payload offset {position} declares {item_size} bytes, exceeding the {}-byte payload",
+                    payload.len()
+                ),
+            );
+            break;
+        }
+
+        item_count = item_count.saturating_add(1);
+        if item_sizes.len() < 256 {
+            item_sizes.push(item_size);
+        } else {
+            item_sizes_omitted = item_sizes_omitted.saturating_add(1);
+        }
+        position = end;
+    }
+
+    if !terminal_present {
+        record_warning(
+            warnings,
+            warnings_omitted,
+            format!("{context} is missing its two-byte TerminalID"),
+        );
+    }
+
+    LnkTargetIdListInfo {
+        declared_size,
+        item_count,
+        item_sizes,
+        item_sizes_omitted,
+        terminal_present,
+    }
+}
+
+fn parse_property_store_data_block(
+    block: &[u8],
+    block_offset: usize,
+    warnings: &mut Vec<String>,
+    warnings_omitted: &mut u64,
+) -> LnkPropertyStoreData {
+    let mut position = 8usize;
+    let mut storage_count = 0u32;
+    let mut format_ids = Vec::new();
+    let mut format_ids_omitted = 0u64;
+    let mut terminal_present = false;
+
+    while position < block.len() {
+        if position + 4 > block.len() {
+            record_warning(
+                warnings,
+                warnings_omitted,
+                format!(
+                    "PropertyStoreDataBlock at offset {block_offset} has a truncated SerializedPropertyStorage size at relative offset {position}"
+                ),
+            );
+            break;
+        }
+
+        let storage_size = get_u32_le(block, position).unwrap_or(0) as usize;
+        if storage_size == 0 {
+            terminal_present = true;
+            position += 4;
+            if block[position..].iter().any(|byte| *byte != 0) {
+                record_warning(
+                    warnings,
+                    warnings_omitted,
+                    format!(
+                        "PropertyStoreDataBlock at offset {block_offset} contains non-zero bytes after its terminal storage marker"
+                    ),
+                );
+            }
+            break;
+        }
+        if storage_size < 24 {
+            record_warning(
+                warnings,
+                warnings_omitted,
+                format!(
+                    "PropertyStoreDataBlock at offset {block_offset} has SerializedPropertyStorage size {storage_size}, below the 24-byte header minimum"
+                ),
+            );
+            break;
+        }
+
+        let Some(end) = position.checked_add(storage_size) else {
+            record_warning(
+                warnings,
+                warnings_omitted,
+                format!(
+                    "PropertyStoreDataBlock at offset {block_offset} storage size overflows at relative offset {position}"
+                ),
+            );
+            break;
+        };
+        if end > block.len() {
+            record_warning(
+                warnings,
+                warnings_omitted,
+                format!(
+                    "PropertyStoreDataBlock at offset {block_offset} storage at relative offset {position} declares {storage_size} bytes, exceeding the {}-byte block",
+                    block.len()
+                ),
+            );
+            break;
+        }
+
+        let version = get_u32_le(block, position + 4).unwrap_or(0);
+        if version != 0x5350_5331 {
+            record_warning(
+                warnings,
+                warnings_omitted,
+                format!(
+                    "PropertyStoreDataBlock at offset {block_offset} storage at relative offset {position} has version 0x{version:08X}; expected 0x53505331"
+                ),
+            );
+        }
+        let format_id = format_guid(&block[position + 8..position + 24]);
+        storage_count = storage_count.saturating_add(1);
+        if format_ids.len() < 32 {
+            format_ids.push(format_id);
+        } else {
+            format_ids_omitted = format_ids_omitted.saturating_add(1);
+        }
+        position = end;
+    }
+
+    if !terminal_present {
+        record_warning(
+            warnings,
+            warnings_omitted,
+            format!(
+                "PropertyStoreDataBlock at offset {block_offset} is missing its terminal storage marker"
+            ),
+        );
+    }
+
+    LnkPropertyStoreData {
+        block_offset,
+        storage_count,
+        format_ids,
+        format_ids_omitted,
+        terminal_present,
+    }
+}
+
 pub fn format_guid(bytes: &[u8]) -> String {
     if bytes.len() < 16 {
         return "00000000-0000-0000-0000-000000000000".to_string();
@@ -1773,6 +2241,22 @@ fn resolve_canonical_path(
 mod tests {
     use super::*;
 
+    fn shell_link_fixture(link_flags: u32, total_size: usize) -> Vec<u8> {
+        let mut buffer = vec![0u8; total_size.max(80)];
+        buffer[0..4].copy_from_slice(&0x4C_u32.to_le_bytes());
+        buffer[4..20].copy_from_slice(&LnkParser::SHELL_LINK_CLSID);
+        buffer[20..24].copy_from_slice(&link_flags.to_le_bytes());
+        buffer[60..64].copy_from_slice(&1_u32.to_le_bytes());
+        buffer
+    }
+
+    fn write_utf16_terminated(buffer: &mut [u8], start: usize, value: &str) {
+        for (index, unit) in value.encode_utf16().chain(std::iter::once(0)).enumerate() {
+            let position = start + index * 2;
+            buffer[position..position + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+    }
+
     #[test]
     fn test_lnk_header_parsing_synthetic() {
         let mut buf = vec![0u8; 80];
@@ -1794,10 +2278,7 @@ mod tests {
 
     #[test]
     fn test_lnk_target_id_list_forces_partial() {
-        let mut buf = vec![0u8; 128];
-        buf[0..4].copy_from_slice(&0x4C_u32.to_le_bytes());
-        buf[4..20].copy_from_slice(&LnkParser::SHELL_LINK_CLSID);
-        buf[20..24].copy_from_slice(&0x01_u32.to_le_bytes()); // HasLinkTargetIDList
+        let mut buf = shell_link_fixture(0x01, 128); // HasLinkTargetIDList
 
         buf[76..78].copy_from_slice(&4_u16.to_le_bytes());
         buf[78..82].copy_from_slice(&[0x01, 0x02, 0x03, 0x04]);
@@ -1805,7 +2286,52 @@ mod tests {
         let res = LnkParser::parse(&buf);
         assert!(res.is_valid);
         assert_eq!(res.status, LnkStatus::Partial);
-        assert!(!res.warnings.is_empty());
+        assert!(res
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("exceeding the 4-byte payload")));
+    }
+
+    #[test]
+    fn test_bounded_id_list_with_alternate_target_is_core_complete() {
+        let mut buf = shell_link_fixture(0x89, 98); // IDList | RelativePath | IsUnicode
+        buf[76..78].copy_from_slice(&6_u16.to_le_bytes());
+        buf[78..82].copy_from_slice(&[4, 0, 0xAA, 0xBB]);
+        buf[82..84].copy_from_slice(&0_u16.to_le_bytes());
+
+        let relative = "C:\\x";
+        buf[84..86].copy_from_slice(&(relative.encode_utf16().count() as u16).to_le_bytes());
+        write_utf16_terminated(&mut buf, 86, relative);
+        // StringData is counted and excludes its terminator, so overwrite that
+        // test-helper terminator with the ExtraData TerminalBlock.
+        buf[94..98].copy_from_slice(&0_u32.to_le_bytes());
+
+        let result = LnkParser::parse(&buf);
+        assert_eq!(result.status, LnkStatus::Recognized);
+        assert!(result.warnings.is_empty());
+        assert!(!result.coverage_complete);
+        assert_eq!(result.canonical_target_path.as_deref(), Some("C:\\x"));
+        let id_list = result.target_id_list.unwrap();
+        assert_eq!(id_list.item_count, 1);
+        assert_eq!(id_list.item_sizes, vec![4]);
+        assert!(id_list.terminal_present);
+    }
+
+    #[test]
+    fn test_bounded_id_list_only_target_remains_explicitly_partial() {
+        let mut buf = shell_link_fixture(0x01, 88);
+        buf[76..78].copy_from_slice(&6_u16.to_le_bytes());
+        buf[78..82].copy_from_slice(&[4, 0, 0xAA, 0xBB]);
+        buf[82..84].copy_from_slice(&0_u16.to_le_bytes());
+        buf[84..88].copy_from_slice(&0_u32.to_le_bytes());
+
+        let result = LnkParser::parse(&buf);
+        assert_eq!(result.status, LnkStatus::Partial);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| { warning.contains("target is encoded only in LinkTargetIDList") }));
+        assert!(!result.coverage_complete);
     }
 
     #[test]
@@ -1869,11 +2395,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lnk_unknown_block_fixture_marks_partial() {
-        let mut buf = vec![0u8; 150];
-        buf[0..4].copy_from_slice(&0x4C_u32.to_le_bytes());
-        buf[4..20].copy_from_slice(&LnkParser::SHELL_LINK_CLSID);
-        buf[20..24].copy_from_slice(&0x00_u32.to_le_bytes());
+    fn test_lnk_unknown_block_is_disclosed_without_core_partial() {
+        let mut buf = shell_link_fixture(0, 96);
 
         let block_start = 76;
         buf[block_start..block_start + 4].copy_from_slice(&16_u32.to_le_bytes());
@@ -1881,7 +2404,10 @@ mod tests {
 
         let res = LnkParser::parse(&buf);
         assert!(res.is_valid);
-        assert_eq!(res.status, LnkStatus::Partial);
+        assert_eq!(res.status, LnkStatus::Recognized);
+        assert!(res.warnings.is_empty());
+        assert!(!res.coverage_complete);
+        assert_eq!(res.coverage_notes.len(), 1);
         assert_eq!(res.extra_data_blocks.len(), 1);
         assert_eq!(res.extra_data_blocks[0].name, "UnknownBlock(0x99999999)");
     }
@@ -2062,29 +2588,120 @@ mod tests {
     }
 
     #[test]
-    fn test_lnk_known_extra_data_blocks_shim_consolefe_are_disclosed_as_unparsed() {
-        let mut buf = vec![0u8; 150];
-        buf[0..4].copy_from_slice(&0x4C_u32.to_le_bytes());
-        buf[4..20].copy_from_slice(&LnkParser::SHELL_LINK_CLSID);
-        buf[20..24].copy_from_slice(&0x00_u32.to_le_bytes());
+    fn test_lnk_shim_and_consolefe_blocks_are_decoded() {
+        let mut buf = shell_link_fixture(0x0002_0000, 120); // RunWithShimLayer
 
         let block1 = 76;
         buf[block1..block1 + 4].copy_from_slice(&12u32.to_le_bytes());
         buf[block1 + 4..block1 + 8].copy_from_slice(&0xA0000004_u32.to_le_bytes()); // ConsoleFEDataBlock
+        buf[block1 + 8..block1 + 12].copy_from_slice(&65001_u32.to_le_bytes());
 
         let block2 = 88;
-        buf[block2..block2 + 4].copy_from_slice(&12u32.to_le_bytes());
-        buf[block2 + 4..block2 + 8].copy_from_slice(&0xA000000A_u32.to_le_bytes()); // ShimDataBlock
+        buf[block2..block2 + 4].copy_from_slice(&28u32.to_le_bytes());
+        buf[block2 + 4..block2 + 8].copy_from_slice(&0xA0000008_u32.to_le_bytes()); // ShimDataBlock
+        write_utf16_terminated(&mut buf, block2 + 8, "WINXPSP3X");
+        buf[116..120].copy_from_slice(&0_u32.to_le_bytes());
 
         let res = LnkParser::parse(&buf);
         assert_eq!(res.extra_data_blocks.len(), 2);
         assert_eq!(res.extra_data_blocks[0].name, "ConsoleFEDataBlock");
         assert_eq!(res.extra_data_blocks[1].name, "ShimDataBlock");
-        assert_eq!(res.status, LnkStatus::Partial);
-        assert!(res
+        assert_eq!(res.console_code_page, Some(65001));
+        assert_eq!(res.shim_layer_name.as_deref(), Some("WINXPSP3X"));
+        assert_eq!(res.status, LnkStatus::Recognized);
+        assert!(res.warnings.is_empty());
+        assert!(res.coverage_complete);
+    }
+
+    #[test]
+    fn test_icon_environment_signature_and_flag_are_not_misclassified_as_darwin() {
+        let mut buf = shell_link_fixture(0x0000_4000, 868); // HasExpIcon
+        buf[76..80].copy_from_slice(&0x314_u32.to_le_bytes());
+        buf[80..84].copy_from_slice(&0xA0000007_u32.to_le_bytes());
+        write_utf16_terminated(&mut buf, 76 + 268, "%SystemRoot%\\system32\\shell32.dll");
+        buf[864..868].copy_from_slice(&0_u32.to_le_bytes());
+
+        let result = LnkParser::parse(&buf);
+        assert_eq!(result.status, LnkStatus::Recognized);
+        assert!(result.warnings.is_empty());
+        assert_eq!(
+            result.icon_environment_path.as_deref(),
+            Some("%SystemRoot%\\system32\\shell32.dll")
+        );
+        assert!(result.darwin_data.is_none());
+        assert_eq!(result.extra_data_blocks[0].name, "IconEnvironmentDataBlock");
+    }
+
+    #[test]
+    fn test_darwin_signature_and_flag_are_decoded() {
+        let mut buf = shell_link_fixture(0x0000_1000, 868); // HasDarwinID
+        buf[76..80].copy_from_slice(&0x314_u32.to_le_bytes());
+        buf[80..84].copy_from_slice(&0xA0000006_u32.to_le_bytes());
+        write_utf16_terminated(&mut buf, 76 + 268, "DarwinDescriptor");
+        buf[864..868].copy_from_slice(&0_u32.to_le_bytes());
+
+        let result = LnkParser::parse(&buf);
+        assert_eq!(result.status, LnkStatus::Recognized);
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.darwin_data.as_deref(), Some("DarwinDescriptor"));
+        assert!(result.icon_environment_path.is_none());
+        assert_eq!(result.extra_data_blocks[0].name, "DarwinDataBlock");
+    }
+
+    #[test]
+    fn test_special_folder_block_is_structurally_complete() {
+        let mut buf = shell_link_fixture(0, 96);
+        buf[76..80].copy_from_slice(&16_u32.to_le_bytes());
+        buf[80..84].copy_from_slice(&0xA0000005_u32.to_le_bytes());
+        buf[84..88].copy_from_slice(&42_u32.to_le_bytes());
+        buf[88..92].copy_from_slice(&123_u32.to_le_bytes());
+        buf[92..96].copy_from_slice(&0_u32.to_le_bytes());
+
+        let result = LnkParser::parse(&buf);
+        assert_eq!(result.status, LnkStatus::Recognized);
+        assert!(result.coverage_complete);
+        let special = result.special_folder_data.unwrap();
+        assert_eq!(special.special_folder_id, 42);
+        assert_eq!(special.offset, 123);
+    }
+
+    #[test]
+    fn test_property_store_envelope_is_bounded_without_core_partial() {
+        let mut buf = shell_link_fixture(0, 116);
+        buf[76..80].copy_from_slice(&36_u32.to_le_bytes());
+        buf[80..84].copy_from_slice(&0xA0000009_u32.to_le_bytes());
+        buf[84..88].copy_from_slice(&24_u32.to_le_bytes());
+        buf[88..92].copy_from_slice(&0x5350_5331_u32.to_le_bytes());
+        buf[92..108].copy_from_slice(&LnkParser::SHELL_LINK_CLSID);
+        buf[108..112].copy_from_slice(&0_u32.to_le_bytes());
+        buf[112..116].copy_from_slice(&0_u32.to_le_bytes());
+
+        let result = LnkParser::parse(&buf);
+        assert_eq!(result.status, LnkStatus::Recognized);
+        assert!(result.warnings.is_empty());
+        assert!(!result.coverage_complete);
+        assert_eq!(result.property_store_data.len(), 1);
+        let store = &result.property_store_data[0];
+        assert_eq!(store.storage_count, 1);
+        assert!(store.terminal_present);
+        assert_eq!(store.format_ids.len(), 1);
+    }
+
+    #[test]
+    fn test_malformed_property_store_storage_remains_partial() {
+        let mut buf = shell_link_fixture(0, 116);
+        buf[76..80].copy_from_slice(&36_u32.to_le_bytes());
+        buf[80..84].copy_from_slice(&0xA0000009_u32.to_le_bytes());
+        buf[84..88].copy_from_slice(&40_u32.to_le_bytes());
+        buf[112..116].copy_from_slice(&0_u32.to_le_bytes());
+
+        let result = LnkParser::parse(&buf);
+        assert_eq!(result.status, LnkStatus::Partial);
+        assert!(result
             .warnings
             .iter()
-            .any(|warning| warning.contains("payload was not decoded")));
+            .any(|warning| warning.contains("exceeding the 36-byte block")));
+        assert!(!result.coverage_complete);
     }
 
     #[test]
@@ -2100,6 +2717,27 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("does not match standard Shell Link CLSID")));
+    }
+
+    #[test]
+    fn test_overwritten_deleted_candidate_fails_before_fabricating_header_fields() {
+        let mut buf = vec![0u8; 100];
+        // Representative of a reused deleted data run: UTF-16 text rather than
+        // a ShellLinkHeader, including a non-0x4C first DWORD.
+        buf[..16].copy_from_slice(&[
+            0x20, 0x00, 0x20, 0x00, 0x57, 0x00, 0x65, 0x00, 0x6C, 0x00, 0x6C, 0x00, 0x2D, 0x00,
+            0x6B, 0x00,
+        ]);
+
+        let result = LnkParser::parse(&buf);
+        assert_eq!(result.status, LnkStatus::Failed);
+        assert!(!result.is_valid);
+        assert!(result.header.is_none());
+        assert_eq!(result.warnings.len(), 2);
+        assert!(result
+            .warnings
+            .iter()
+            .all(|warning| warning.contains("HeaderSize") || warning.contains("LinkCLSID")));
     }
 
     #[test]

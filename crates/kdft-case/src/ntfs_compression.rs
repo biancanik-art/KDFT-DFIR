@@ -13,7 +13,9 @@
 //! for NTFS because the last physical cluster of a compressed unit can contain
 //! zero padding, while the last logical unit of a stream can be shorter than a
 //! complete compression unit.  The function returns exactly the requested
-//! number of bytes or an error; it never silently returns partial data.
+//! prefix length or an error; it never silently returns a shorter prefix.
+//! Physical bytes after the chunks needed for that prefix can contain later
+//! independent chunks or physical-cluster slack and are not interpreted.
 
 use std::error::Error;
 use std::fmt;
@@ -57,7 +59,8 @@ pub enum Lznt1Error {
     },
     /// Decoding stopped before the caller's trusted logical length was reached.
     OutputLengthMismatch { expected: usize, actual: usize },
-    /// Nonzero bytes followed the complete logical output or an end marker.
+    /// Nonzero bytes followed an end marker before the trusted logical length
+    /// was reached.
     NonzeroTrailingData { offset: usize },
 }
 
@@ -116,11 +119,13 @@ impl Error for Lznt1Error {}
 
 /// Decompress an LZNT1 buffer to exactly `expected_length` logical bytes.
 ///
-/// The decoder accepts an optional zero end marker and zero-filled physical
-/// padding after the encoded chunks.  Any nonzero trailing byte is rejected so
-/// that a caller cannot accidentally decode only a prefix of a physical run.
-/// The final decoded chunk is trimmed only when `expected_length` ends inside
-/// that chunk, which is how NTFS represents a short final compression unit.
+/// The decoder accepts an optional zero end marker.  Once exactly
+/// `expected_length` logical bytes have been produced, later independent
+/// chunks or allocation slack are deliberately not interpreted.  Structural
+/// errors in every chunk needed to reach that boundary remain fatal.  The
+/// final decoded chunk is trimmed only when `expected_length` ends inside that
+/// chunk, which supports both bounded prefix reads and a short final NTFS
+/// compression unit.
 pub fn decompress_lznt1(input: &[u8], expected_length: usize) -> Result<Vec<u8>, Lznt1Error> {
     let mut input_offset = 0usize;
     let mut output = Vec::new();
@@ -180,7 +185,6 @@ pub fn decompress_lznt1(input: &[u8], expected_length: usize) -> Result<Vec<u8>,
         input_offset = payload_end;
     }
 
-    ensure_zero_tail(input, input_offset)?;
     Ok(output)
 }
 
@@ -418,13 +422,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nonzero_data_after_expected_output() {
+    fn accepts_arbitrary_physical_slack_after_complete_output() {
+        let mut encoded = Vec::from(chunk_header(false, 3));
+        encoded.extend_from_slice(b"abc");
+        encoded.extend_from_slice(&[0, 0, 0x7f]);
+
+        assert_eq!(decompress_lznt1(&encoded, 3).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn rejects_nonzero_data_after_premature_end_marker() {
         let mut encoded = Vec::from(chunk_header(false, 3));
         encoded.extend_from_slice(b"abc");
         encoded.extend_from_slice(&[0, 0, 0x7f]);
 
         assert_eq!(
-            decompress_lznt1(&encoded, 3),
+            decompress_lznt1(&encoded, 4),
             Err(Lznt1Error::NonzeroTrailingData { offset: 7 })
         );
     }
@@ -573,101 +586,180 @@ mod tests {
     /// ```
     ///
     /// `KDFT_GOLD_NTFS_COMPRESSED_ENTRY_ID` may override the historical entry
-    /// id (189561).  The query-only session prevents schema migration, WAL
-    /// changes, audit events, or any other case mutation during validation.
+    /// id (189561), while `KDFT_GOLD_NTFS_COMPRESSED_ENTRY_IDS` accepts a
+    /// comma-separated batch.  The query-only session prevents schema
+    /// migration, WAL changes, audit events, or any other case mutation during
+    /// validation.
     #[test]
     #[ignore = "requires the examiner-owned gold case database and segmented E01"]
     fn gold_ntfs_lznt1_evtx_entry_is_reconstructed() {
         let case_path = env::var_os("KDFT_GOLD_CASE_PATH")
             .map(PathBuf::from)
             .expect("KDFT_GOLD_CASE_PATH must name the historical indexed gold case");
-        let entry_id = env::var("KDFT_GOLD_NTFS_COMPRESSED_ENTRY_ID")
+        let entry_ids = env::var("KDFT_GOLD_NTFS_COMPRESSED_ENTRY_IDS")
             .ok()
             .map(|value| {
-                value
-                    .parse::<i64>()
-                    .expect("KDFT_GOLD_NTFS_COMPRESSED_ENTRY_ID must be an i64")
+                let ids = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| {
+                        value.parse::<i64>().expect(
+                            "KDFT_GOLD_NTFS_COMPRESSED_ENTRY_IDS values must each be an i64",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    !ids.is_empty(),
+                    "KDFT_GOLD_NTFS_COMPRESSED_ENTRY_IDS must contain at least one id"
+                );
+                ids
             })
-            .unwrap_or(189_561);
+            .unwrap_or_else(|| {
+                vec![env::var("KDFT_GOLD_NTFS_COMPRESSED_ENTRY_ID")
+                    .ok()
+                    .map(|value| {
+                        value
+                            .parse::<i64>()
+                            .expect("KDFT_GOLD_NTFS_COMPRESSED_ENTRY_ID must be an i64")
+                    })
+                    .unwrap_or(189_561)]
+            });
 
         let mut session = crate::EvidenceReadSession::open_worker_read_only(&case_path)
             .expect("open gold case query-only");
-        let mut bytes = Vec::new();
-        let mut total_size = None;
-        let mut offset = 0_u64;
+        for entry_id in entry_ids {
+            let mut bytes = Vec::new();
+            let mut total_size = None;
+            let mut offset = 0_u64;
 
-        loop {
+            loop {
+                let read = crate::read_filesystem_entry_bytes_in_session(
+                    &mut session,
+                    crate::ReadEntryBytesOptions {
+                        entry_id,
+                        offset,
+                        length: 1024 * 1024,
+                    },
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "reconstruct gold NTFS-compressed entry {entry_id} at {offset}: {error:#}"
+                    )
+                });
+                let expected_total = *total_size.get_or_insert(read.total_size);
+                assert_eq!(read.total_size, expected_total);
+                assert_eq!(read.offset, offset);
+                assert_eq!(read.bytes_read, read.bytes.len());
+                assert!(
+                    read.total_size <= 256 * 1024 * 1024,
+                    "gold EVTX unexpectedly exceeds the bounded regression-test allocation"
+                );
+                assert!(
+                    !read.bytes.is_empty() || read.eof,
+                    "non-EOF gold entry read made no progress at offset {offset}"
+                );
+                bytes.extend_from_slice(&read.bytes);
+                offset = offset
+                    .checked_add(read.bytes_read as u64)
+                    .expect("gold EVTX offset overflow");
+                if read.eof {
+                    break;
+                }
+            }
+
+            let total_size = total_size.expect("gold EVTX produced no read result");
+            assert_eq!(offset, total_size);
+            assert_eq!(bytes.len() as u64, total_size);
+            assert_eq!(
+                bytes.get(..8),
+                Some(b"ElfFile\0".as_slice()),
+                "reconstructed entry does not have an EVTX file signature"
+            );
+            if bytes.len() > 4096 {
+                assert_eq!(
+                    bytes.get(4096..4104),
+                    Some(b"ElfChnk\0".as_slice()),
+                    "reconstructed EVTX does not have a first chunk signature"
+                );
+            }
+
+            let sha256 = format!("{:x}", Sha256::digest(&bytes));
+
+            let mut parser = evtx::EvtxParser::from_buffer(bytes)
+                .expect("open reconstructed gold EVTX with the independent EVTX parser");
+            let mut valid_records = 0_usize;
+            let mut parse_errors = 0_usize;
+            for record in parser.records() {
+                match record {
+                    Ok(_) => valid_records += 1,
+                    Err(error) => {
+                        parse_errors += 1;
+                        eprintln!("gold EVTX record diagnostic: {error:#}");
+                    }
+                }
+            }
+            assert_eq!(
+                parse_errors, 0,
+                "reconstructed gold EVTX produced independent parser diagnostics"
+            );
+            eprintln!(
+                "validated compressed NTFS entry {entry_id}: {total_size} bytes, \
+             SHA-256 {sha256}, {valid_records} EVTX record(s), \
+             {parse_errors} parser diagnostic(s)"
+            );
+        }
+    }
+
+    /// Read-only regression for the file-signature pass.  This deliberately
+    /// reads only the bounded header that signature classification consumes;
+    /// a structural error later in a stream must still fail a later/full read.
+    #[test]
+    #[ignore = "requires examiner-owned gold case data"]
+    fn gold_ntfs_signature_candidate_headers_are_readable() {
+        let case_path = env::var_os("KDFT_GOLD_CASE_PATH")
+            .map(PathBuf::from)
+            .expect("KDFT_GOLD_CASE_PATH must name the historical indexed gold case");
+        let entry_ids = env::var("KDFT_GOLD_NTFS_SIGNATURE_ENTRY_IDS")
+            .expect("KDFT_GOLD_NTFS_SIGNATURE_ENTRY_IDS must contain comma-separated entry ids")
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .expect("KDFT_GOLD_NTFS_SIGNATURE_ENTRY_IDS values must each be an i64")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !entry_ids.is_empty(),
+            "KDFT_GOLD_NTFS_SIGNATURE_ENTRY_IDS must contain at least one id"
+        );
+
+        let mut session = crate::EvidenceReadSession::open_worker_read_only(&case_path)
+            .expect("open gold case query-only");
+        for entry_id in entry_ids {
             let read = crate::read_filesystem_entry_bytes_in_session(
                 &mut session,
                 crate::ReadEntryBytesOptions {
                     entry_id,
-                    offset,
-                    length: 1024 * 1024,
+                    offset: 0,
+                    length: 8192,
                 },
             )
             .unwrap_or_else(|error| {
-                panic!("reconstruct gold NTFS-compressed entry {entry_id} at {offset}: {error:#}")
+                panic!("read gold NTFS signature candidate {entry_id}: {error:#}")
             });
-            let expected_total = *total_size.get_or_insert(read.total_size);
-            assert_eq!(read.total_size, expected_total);
-            assert_eq!(read.offset, offset);
+            assert_eq!(read.offset, 0);
             assert_eq!(read.bytes_read, read.bytes.len());
             assert!(
-                read.total_size <= 256 * 1024 * 1024,
-                "gold EVTX unexpectedly exceeds the bounded regression-test allocation"
+                read.total_size == 0 || read.bytes_read > 0,
+                "nonempty gold signature candidate {entry_id} made no progress"
             );
-            assert!(
-                !read.bytes.is_empty() || read.eof,
-                "non-EOF gold entry read made no progress at offset {offset}"
-            );
-            bytes.extend_from_slice(&read.bytes);
-            offset = offset
-                .checked_add(read.bytes_read as u64)
-                .expect("gold EVTX offset overflow");
-            if read.eof {
-                break;
-            }
-        }
-
-        let total_size = total_size.expect("gold EVTX produced no read result");
-        assert_eq!(offset, total_size);
-        assert_eq!(bytes.len() as u64, total_size);
-        assert_eq!(
-            bytes.get(..8),
-            Some(b"ElfFile\0".as_slice()),
-            "reconstructed entry does not have an EVTX file signature"
-        );
-        if bytes.len() > 4096 {
-            assert_eq!(
-                bytes.get(4096..4104),
-                Some(b"ElfChnk\0".as_slice()),
-                "reconstructed EVTX does not have a first chunk signature"
+            eprintln!(
+                "validated signature header for NTFS entry {entry_id}: {} of {} byte(s)",
+                read.bytes_read, read.total_size
             );
         }
-
-        let sha256 = format!("{:x}", Sha256::digest(&bytes));
-
-        let mut parser = evtx::EvtxParser::from_buffer(bytes)
-            .expect("open reconstructed gold EVTX with the independent EVTX parser");
-        let mut valid_records = 0_usize;
-        let mut parse_errors = 0_usize;
-        for record in parser.records() {
-            match record {
-                Ok(_) => valid_records += 1,
-                Err(error) => {
-                    parse_errors += 1;
-                    eprintln!("gold EVTX record diagnostic: {error:#}");
-                }
-            }
-        }
-        assert_eq!(
-            parse_errors, 0,
-            "reconstructed gold EVTX produced independent parser diagnostics"
-        );
-        eprintln!(
-            "validated compressed NTFS entry {entry_id}: {total_size} bytes, \
-             SHA-256 {sha256}, {valid_records} EVTX record(s), \
-             {parse_errors} parser diagnostic(s)"
-        );
     }
 }

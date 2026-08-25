@@ -18,6 +18,11 @@ const TRUNCATION_REASON_LIMIT: usize = 16;
 pub enum JobProgressState {
     Active,
     Complete,
+    /// Every selected stage reached finalization and committed its usable
+    /// output, but one or more artifact parsers reported bounded gaps or
+    /// recoverable diagnostics. This is deliberately distinct from
+    /// `Truncated`, which means processing actually stopped at a limit.
+    CompleteWithDiagnostics,
     Truncated,
     Cancelled,
     Failed,
@@ -929,6 +934,7 @@ mod tests {
     fn terminal_job_states_are_preserved() {
         for state in [
             JobProgressState::Complete,
+            JobProgressState::CompleteWithDiagnostics,
             JobProgressState::Cancelled,
             JobProgressState::Failed,
             JobProgressState::Truncated,

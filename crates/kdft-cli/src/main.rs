@@ -735,7 +735,7 @@ fn main() -> Result<()> {
                     Some(1),
                 );
                 tracker.advance(1, Some("Process results committed".to_string()));
-                let pipeline_truncated = result.truncated
+                let pipeline_has_diagnostics = result.partial_artifact_coverage
                     || archive_result
                         .as_ref()
                         .is_some_and(|archives| archives.truncated)
@@ -769,8 +769,11 @@ fn main() -> Result<()> {
                         "Windows artifact parsing completed with partial coverage; filesystem indexing completed",
                     );
                 }
-                tracker.finish(if pipeline_truncated {
+                let stopped_at_examiner_limit = result.truncated;
+                tracker.finish(if stopped_at_examiner_limit {
                     JobProgressState::Truncated
+                } else if pipeline_has_diagnostics {
+                    JobProgressState::CompleteWithDiagnostics
                 } else {
                     JobProgressState::Complete
                 });
@@ -808,7 +811,12 @@ fn main() -> Result<()> {
                         );
                 }
                 let final_progress = tracker.snapshot();
-                apply_cli_pipeline_status(&mut output, pipeline_truncated, &final_progress)?;
+                apply_cli_pipeline_status(
+                    &mut output,
+                    stopped_at_examiner_limit,
+                    pipeline_has_diagnostics && !stopped_at_examiner_limit,
+                    &final_progress,
+                )?;
                 print_json_or_debug(args.json, &output)?;
             }
             EvidenceCommand::SignatureAnalysis(args) => {
@@ -837,8 +845,10 @@ fn main() -> Result<()> {
                 };
                 tracker.start_stage("Finalization", 2, Some(2), "steps", Some(1));
                 tracker.advance(1, Some("Analysis results committed".to_string()));
-                tracker.finish(if result.truncated {
+                tracker.finish(if args.max_entries > 0 && result.truncated {
                     JobProgressState::Truncated
+                } else if result.truncated {
+                    JobProgressState::CompleteWithDiagnostics
                 } else {
                     JobProgressState::Complete
                 });
@@ -1048,7 +1058,8 @@ fn main() -> Result<()> {
 /// inventory itself completed successfully.
 fn apply_cli_pipeline_status(
     output: &mut serde_json::Value,
-    pipeline_truncated: bool,
+    stopped_at_examiner_limit: bool,
+    completed_with_diagnostics: bool,
     progress: &JobProgressSnapshot,
 ) -> Result<()> {
     let object = output
@@ -1057,8 +1068,10 @@ fn apply_cli_pipeline_status(
     object.insert(
         "status".to_string(),
         serde_json::Value::String(
-            if pipeline_truncated {
+            if stopped_at_examiner_limit {
                 "truncated"
+            } else if completed_with_diagnostics {
+                "completed_with_diagnostics"
             } else {
                 "completed"
             }
@@ -1067,7 +1080,15 @@ fn apply_cli_pipeline_status(
     );
     object.insert(
         "truncated".to_string(),
-        serde_json::Value::Bool(pipeline_truncated),
+        serde_json::Value::Bool(stopped_at_examiner_limit),
+    );
+    object.insert(
+        "completed_with_diagnostics".to_string(),
+        serde_json::Value::Bool(completed_with_diagnostics),
+    );
+    object.insert(
+        "partial_artifact_coverage".to_string(),
+        serde_json::Value::Bool(stopped_at_examiner_limit || completed_with_diagnostics),
     );
     object.insert(
         "progress".to_string(),
@@ -1128,6 +1149,7 @@ fn format_cli_progress(progress: &JobProgressSnapshot) -> String {
     let state = match progress.state {
         JobProgressState::Active => "active",
         JobProgressState::Complete => "complete",
+        JobProgressState::CompleteWithDiagnostics => "complete-with-diagnostics",
         JobProgressState::Truncated => "truncated",
         JobProgressState::Cancelled => "cancelled",
         JobProgressState::Failed => "failed",
@@ -1280,16 +1302,18 @@ mod tests {
     #[test]
     fn cli_process_status_marks_optional_parser_partial_at_top_level() -> Result<()> {
         let tracker = cli_progress_tracker(1, "process-test");
-        tracker.finish(JobProgressState::Truncated);
+        tracker.finish(JobProgressState::CompleteWithDiagnostics);
         let mut output = serde_json::json!({
             "entries_indexed": 42,
             "truncated": false,
             "document_parsing": { "status": "truncated" }
         });
-        apply_cli_pipeline_status(&mut output, true, &tracker.snapshot())?;
-        assert_eq!(output["status"], "truncated");
-        assert_eq!(output["truncated"], true);
-        assert_eq!(output["progress"]["state"], "truncated");
+        apply_cli_pipeline_status(&mut output, false, true, &tracker.snapshot())?;
+        assert_eq!(output["status"], "completed_with_diagnostics");
+        assert_eq!(output["truncated"], false);
+        assert_eq!(output["completed_with_diagnostics"], true);
+        assert_eq!(output["partial_artifact_coverage"], true);
+        assert_eq!(output["progress"]["state"], "complete_with_diagnostics");
         assert_eq!(output["entries_indexed"], 42);
         Ok(())
     }

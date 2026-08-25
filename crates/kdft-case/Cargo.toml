@@ -7,13 +7,16 @@ license.workspace = true
 [dependencies]
 aho-corasick.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 bitlocker-decrypt = { path = "../bitlocker-decrypt" }
 chrono.workspace = true
 chrome-cache-parser.workspace = true
 codepage-strings.workspace = true
 disk-forensic.workspace = true
+encoding_rs.workspace = true
 evtx.workspace = true
 ewf.workspace = true
+flate2.workspace = true
 ext4.workspace = true
 fatfs.workspace = true
 mft.workspace = true

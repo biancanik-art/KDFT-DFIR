@@ -114,6 +114,8 @@ CREATE TABLE IF NOT EXISTS filesystem_entry_text_segments (
     part_name TEXT NOT NULL,
     content BLOB NOT NULL,
     content_encoding TEXT NOT NULL,
+    segment_kind TEXT NOT NULL DEFAULT 'visible_text',
+    provenance_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(entry_id, parser_name, segment_index)
 );
 

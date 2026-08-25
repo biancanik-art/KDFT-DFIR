@@ -31,6 +31,8 @@ const MIN_IO_BUFFER_BYTES: usize = 512;
 const HARD_MAX_IO_BUFFER_BYTES: usize = 1024 * 1024;
 const DEFAULT_DIAGNOSTIC_SAMPLES: usize = 32;
 const HARD_MAX_DIAGNOSTIC_SAMPLES: usize = 256;
+const HARD_MAX_CUSTOM_CATEGORIES: u32 = 4_096;
+const HARD_MAX_CUSTOM_CATEGORY_NAME_BYTES: usize = 128 * 1024;
 const DIAGNOSTIC_MESSAGE_BYTES: usize = 512;
 const FILETIME_UNIX_EPOCH_100NS: i128 = 116_444_736_000_000_000;
 
@@ -39,12 +41,14 @@ pub const AUTOMATIC_DESTINATIONS_LIMITATIONS: &[&str] = &[
     "DestList per-entry access counts and timestamps are not decoded by this module",
     "embedded LNK fields require the downstream LNK parser; this module streams exact payload bytes",
     "CFB directory tree reachability is not reconstructed; allocated stream entries in directory sectors are examined",
+    "non-DestList streams whose names are not hexadecimal Jump List entry identifiers are retained as auxiliary container streams and are not inferred to be LNK records",
 ];
 
 pub const CUSTOM_DESTINATIONS_LIMITATIONS: &[&str] = &[
     "record boundaries are inferred from LNK signatures and therefore remain heuristic",
     "AppID is external filename context and is not derived from the payload",
     "embedded LNK fields require the downstream LNK parser; this module streams payload bytes",
+    "structurally valid zero-entry categories are retained as container metadata even when no embedded LNK exists",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +130,14 @@ pub struct JumpListStats {
     pub lnk_bytes_emitted: u64,
     pub dest_list_streams: u64,
     pub auxiliary_streams: u64,
+    /// CFB v3 stores a 32-bit stream size. Older writers can leave the unused upper DWORD dirty;
+    /// this records every non-zero upper DWORD ignored under the MS-CFB v3 compatibility rule.
+    pub v3_stream_size_high_dwords_ignored: u64,
+    pub custom_container_envelope_validated: bool,
+    pub custom_categories_declared: Option<u32>,
+    pub custom_categories_validated: u64,
+    pub custom_zero_entry_categories: u64,
+    pub custom_entries_without_complete_lnk_headers_declared: u64,
     pub corrupt_streams: u64,
     pub incomplete_streams: u64,
     pub omitted_lnk_streams: u64,
@@ -311,6 +323,7 @@ struct DirectoryEntry {
     object_type: u8,
     start_sector: u32,
     stream_size: u64,
+    stream_size_high_dword_ignored: bool,
     created_filetime: Option<u64>,
     modified_filetime: Option<u64>,
 }
@@ -386,8 +399,9 @@ pub fn is_custom_destinations<R: Read + Seek>(
         .map_err(|error| public_error(error, stats.clone()))?
     {
         Some(_) => true,
-        None => is_empty_custom_destinations(reader, file_size, &mut stats)
-            .map_err(|error| public_error(error, stats.clone()))?,
+        None => inspect_custom_container_without_lnk(reader, file_size, &mut stats)
+            .map_err(|error| public_error(error, stats.clone()))?
+            .is_some(),
     };
     reader
         .seek(SeekFrom::Start(original))
@@ -517,6 +531,7 @@ fn parse_automatic_inner<R: Read + Seek, S: JumpListSink>(
     walk_directory_entries(
         &mut context,
         directory_length,
+        true,
         |context, entry, stats| {
             if entry.object_type != 2 {
                 return Ok(());
@@ -562,11 +577,7 @@ fn parse_automatic_inner<R: Read + Seek, S: JumpListSink>(
                     }
                     Err(error) => return Err(error),
                 }
-            } else if entry.label.eq_ignore_ascii_case("DestListPropertyStore") {
-                // This stream is auxiliary property-store metadata, not an embedded Shell Link.
-                // Treating it as a LNK creates a false parse failure on otherwise valid Jump Lists.
-                stats.auxiliary_streams = stats.auxiliary_streams.saturating_add(1);
-            } else {
+            } else if is_automatic_lnk_stream_label(&entry.label) {
                 stats.lnk_candidates = stats.lnk_candidates.saturating_add(1);
                 match parse_lnk_stream(context, mini_context.as_mut(), &entry, sink, stats) {
                     Ok(()) => {}
@@ -585,6 +596,12 @@ fn parse_automatic_inner<R: Read + Seek, S: JumpListSink>(
                     }
                     Err(error) => return Err(error),
                 }
+            } else {
+                // Automatic Destinations embedded LNK streams are hexadecimal entry identifiers.
+                // Other named streams (including DestListPropertyStore and SummaryInformation)
+                // are container metadata. Do not invent LNK ownership or downgrade the source just
+                // because an auxiliary stream does not begin with a Shell Link header.
+                stats.auxiliary_streams = stats.auxiliary_streams.saturating_add(1);
             }
             Ok(())
         },
@@ -604,6 +621,26 @@ fn parse_automatic_inner<R: Read + Seek, S: JumpListSink>(
     Ok(dest_list)
 }
 
+#[derive(Debug, Clone)]
+struct CustomContainerInspection {
+    categories_declared: u32,
+    categories_validated: u64,
+    zero_entry_categories: u64,
+    entries_without_complete_lnk_headers_declared: u64,
+    envelope_validated: bool,
+    partial_offset: Option<u64>,
+    partial_reason: Option<String>,
+}
+
+fn is_automatic_lnk_stream_label(label: &str) -> bool {
+    let mut bytes = label.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    let valid_first = matches!(first, b'1'..=b'9' | b'a'..=b'f' | b'A'..=b'F');
+    valid_first && bytes.all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn parse_custom_inner<R: Read + Seek, S: JumpListSink>(
     reader: &mut R,
     sink: &mut S,
@@ -615,13 +652,23 @@ fn parse_custom_inner<R: Read + Seek, S: JumpListSink>(
         .map_err(|error| CoreError::io(None, "measuring Custom Destinations file", error))?;
     stats.file_size = file_size;
     let Some(mut current_start) = find_next_signature(reader, 0, file_size, options, stats)? else {
-        if is_empty_custom_destinations(reader, file_size, stats)? {
+        if let Some(inspection) = inspect_custom_container_without_lnk(reader, file_size, stats)? {
+            apply_custom_container_inspection(stats, &inspection);
+            if let Some(reason) = inspection.partial_reason {
+                stats.diagnostic(
+                    options,
+                    Some("Custom Destinations container"),
+                    inspection.partial_offset,
+                    JumpListErrorKind::InvalidStream,
+                    reason,
+                );
+            }
             return Ok(());
         }
         return Err(CoreError::new(
             JumpListErrorKind::NotJumpList,
             None,
-            "no Shell Link signature was found",
+            "no Shell Link signature or structurally valid Custom Destinations envelope was found",
         ));
     };
     stats.heuristic_custom_boundaries = true;
@@ -677,24 +724,326 @@ fn parse_custom_inner<R: Read + Seek, S: JumpListSink>(
     Ok(())
 }
 
-fn is_empty_custom_destinations<R: Read + Seek>(
+fn apply_custom_container_inspection(
+    stats: &mut JumpListStats,
+    inspection: &CustomContainerInspection,
+) {
+    stats.custom_container_envelope_validated = inspection.envelope_validated;
+    stats.custom_categories_declared = Some(inspection.categories_declared);
+    stats.custom_categories_validated = inspection.categories_validated;
+    stats.custom_zero_entry_categories = inspection.zero_entry_categories;
+    stats.custom_entries_without_complete_lnk_headers_declared =
+        inspection.entries_without_complete_lnk_headers_declared;
+}
+
+fn inspect_custom_container_without_lnk<R: Read + Seek>(
     reader: &mut R,
     file_size: u64,
     stats: &mut JumpListStats,
-) -> CoreResult<bool> {
-    // Empty Custom Destinations files emitted by Windows are a compact 24-byte
-    // container: a stable four-DWORD prologue, one state DWORD, and the standard
-    // footer. There is intentionally no embedded Shell Link signature.
-    if file_size != 24 {
-        return Ok(false);
+) -> CoreResult<Option<CustomContainerInspection>> {
+    // A Custom Destinations container begins with version, category count, and a reserved zero
+    // DWORD. A file with no embedded LNK can still be valid: known categories and zero-entry custom
+    // or task categories contain only their bounded descriptors and footer. Parse that grammar
+    // instead of treating absence of a Shell Link as proof of corruption.
+    if file_size < 12 {
+        return Ok(None);
     }
-    let mut bytes = [0_u8; 24];
-    read_exact_at(reader, 0, &mut bytes, stats)?;
-    Ok(bytes[0..4] == 2_u32.to_le_bytes()
-        && bytes[4..8] == 1_u32.to_le_bytes()
-        && bytes[8..12] == 0_u32.to_le_bytes()
-        && bytes[12..16] == 1_u32.to_le_bytes()
-        && bytes[20..24] == CUSTOM_DESTINATIONS_EMPTY_FOOTER)
+    let mut header = [0_u8; 12];
+    read_exact_at(reader, 0, &mut header, stats)?;
+    if slice_u32(&header, 0)? != 2 || slice_u32(&header, 8)? != 0 {
+        return Ok(None);
+    }
+    let categories_declared = slice_u32(&header, 4)?;
+    if categories_declared > HARD_MAX_CUSTOM_CATEGORIES {
+        return Err(CoreError::new(
+            JumpListErrorKind::InvalidStream,
+            Some(4),
+            format!(
+                "Custom Destinations declares {categories_declared} categories, above the hard bound {HARD_MAX_CUSTOM_CATEGORIES}"
+            ),
+        ));
+    }
+    let file_derived_category_bound = file_size.saturating_sub(12) / 12;
+    if u64::from(categories_declared) > file_derived_category_bound {
+        return Err(CoreError::new(
+            JumpListErrorKind::TruncatedData,
+            Some(4),
+            format!(
+                "Custom Destinations declares {categories_declared} categories, but {file_size} bytes cannot contain their minimum descriptors"
+            ),
+        ));
+    }
+    if categories_declared == 0 {
+        if file_size != 12 {
+            return Err(CoreError::new(
+                JumpListErrorKind::InvalidStream,
+                Some(12),
+                format!(
+                    "zero-category Custom Destinations header has {} unexplained trailing byte(s)",
+                    file_size.saturating_sub(12)
+                ),
+            ));
+        }
+        return Ok(Some(CustomContainerInspection {
+            categories_declared,
+            categories_validated: 0,
+            zero_entry_categories: 0,
+            entries_without_complete_lnk_headers_declared: 0,
+            envelope_validated: true,
+            partial_offset: None,
+            partial_reason: None,
+        }));
+    }
+
+    let mut cursor = 12_u64;
+    let mut categories_validated = 0_u64;
+    let mut zero_entry_categories = 0_u64;
+    for category_index in 0..categories_declared {
+        let category_offset = cursor;
+        let category_type = read_custom_u32(reader, cursor, file_size, stats, "category type")?;
+        cursor = checked_custom_advance(cursor, 4, file_size, "category type")?;
+        let entry_count = match category_type {
+            0 => {
+                let name_characters = read_custom_u16(
+                    reader,
+                    cursor,
+                    file_size,
+                    stats,
+                    "custom category name length",
+                )?;
+                cursor =
+                    checked_custom_advance(cursor, 2, file_size, "custom category name length")?;
+                let name_bytes = usize::from(name_characters).checked_mul(2).ok_or_else(|| {
+                    CoreError::new(
+                        JumpListErrorKind::CheckedArithmeticOverflow,
+                        Some(cursor),
+                        "custom category name byte count overflow",
+                    )
+                })?;
+                if name_bytes > HARD_MAX_CUSTOM_CATEGORY_NAME_BYTES {
+                    return Err(CoreError::new(
+                        JumpListErrorKind::InvalidStream,
+                        Some(cursor),
+                        format!(
+                            "custom category name is {name_bytes} bytes, above the hard bound {HARD_MAX_CUSTOM_CATEGORY_NAME_BYTES}"
+                        ),
+                    ));
+                }
+                validate_custom_category_name(reader, cursor, name_bytes, file_size, stats)?;
+                cursor = checked_custom_advance(
+                    cursor,
+                    name_bytes as u64,
+                    file_size,
+                    "custom category name",
+                )?;
+                let count = read_custom_u32(
+                    reader,
+                    cursor,
+                    file_size,
+                    stats,
+                    "custom category entry count",
+                )?;
+                cursor =
+                    checked_custom_advance(cursor, 4, file_size, "custom category entry count")?;
+                count
+            }
+            1 => {
+                let identifier = read_custom_u32(
+                    reader,
+                    cursor,
+                    file_size,
+                    stats,
+                    "known category identifier",
+                )?;
+                cursor = checked_custom_advance(cursor, 4, file_size, "known category identifier")?;
+                if !matches!(identifier, 1 | 2) {
+                    return Err(CoreError::new(
+                        JumpListErrorKind::InvalidStream,
+                        Some(category_offset),
+                        format!(
+                            "Custom Destinations category {} has invalid known-category identifier {identifier}; expected 1 (recent) or 2 (frequent)",
+                            category_index.saturating_add(1)
+                        ),
+                    ));
+                }
+                0
+            }
+            2 => {
+                let count =
+                    read_custom_u32(reader, cursor, file_size, stats, "user-tasks entry count")?;
+                cursor = checked_custom_advance(cursor, 4, file_size, "user-tasks entry count")?;
+                count
+            }
+            other => {
+                return Err(CoreError::new(
+                    JumpListErrorKind::InvalidStream,
+                    Some(category_offset),
+                    format!(
+                        "Custom Destinations category {} has invalid category type {other}; expected 0, 1, or 2",
+                        category_index.saturating_add(1)
+                    ),
+                ));
+            }
+        };
+
+        categories_validated = categories_validated.saturating_add(1);
+        if entry_count > 0 {
+            validate_terminal_custom_footer(reader, file_size, stats)?;
+            return Ok(Some(CustomContainerInspection {
+                categories_declared,
+                categories_validated,
+                zero_entry_categories,
+                entries_without_complete_lnk_headers_declared: u64::from(entry_count),
+                envelope_validated: true,
+                partial_offset: Some(cursor),
+                partial_reason: Some(format!(
+                    "Custom Destinations category {} declares {entry_count} shell object entr{} but none contains a complete Shell Link header; the original source is retained and no unsupported record ownership is inferred",
+                    category_index.saturating_add(1),
+                    if entry_count == 1 { "y" } else { "ies" }
+                )),
+            }));
+        }
+
+        let footer = read_custom_u32(reader, cursor, file_size, stats, "category footer")?;
+        if footer != u32::from_le_bytes(CUSTOM_DESTINATIONS_EMPTY_FOOTER) {
+            return Err(CoreError::new(
+                JumpListErrorKind::InvalidStream,
+                Some(cursor),
+                format!(
+                    "Custom Destinations category {} footer is {footer:#010X}, expected 0xBABFFBAB",
+                    category_index.saturating_add(1)
+                ),
+            ));
+        }
+        cursor = checked_custom_advance(cursor, 4, file_size, "category footer")?;
+        zero_entry_categories = zero_entry_categories.saturating_add(1);
+    }
+
+    if cursor != file_size {
+        return Err(CoreError::new(
+            JumpListErrorKind::InvalidStream,
+            Some(cursor),
+            format!(
+                "validated Custom Destinations categories leave {} unexplained trailing byte(s)",
+                file_size.saturating_sub(cursor)
+            ),
+        ));
+    }
+    Ok(Some(CustomContainerInspection {
+        categories_declared,
+        categories_validated,
+        zero_entry_categories,
+        entries_without_complete_lnk_headers_declared: 0,
+        envelope_validated: true,
+        partial_offset: None,
+        partial_reason: None,
+    }))
+}
+
+fn checked_custom_advance(
+    offset: u64,
+    length: u64,
+    file_size: u64,
+    label: &str,
+) -> CoreResult<u64> {
+    let end = offset.checked_add(length).ok_or_else(|| {
+        CoreError::new(
+            JumpListErrorKind::CheckedArithmeticOverflow,
+            Some(offset),
+            format!("{label} end offset overflows u64"),
+        )
+    })?;
+    if end > file_size {
+        return Err(CoreError::new(
+            JumpListErrorKind::TruncatedData,
+            Some(offset),
+            format!("{label} extends beyond the {file_size}-byte Custom Destinations source"),
+        ));
+    }
+    Ok(end)
+}
+
+fn read_custom_u16<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    file_size: u64,
+    stats: &mut JumpListStats,
+    label: &str,
+) -> CoreResult<u16> {
+    checked_custom_advance(offset, 2, file_size, label)?;
+    let mut bytes = [0_u8; 2];
+    read_exact_at(reader, offset, &mut bytes, stats)?;
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_custom_u32<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    file_size: u64,
+    stats: &mut JumpListStats,
+    label: &str,
+) -> CoreResult<u32> {
+    checked_custom_advance(offset, 4, file_size, label)?;
+    let mut bytes = [0_u8; 4];
+    read_exact_at(reader, offset, &mut bytes, stats)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn validate_custom_category_name<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    name_bytes: usize,
+    file_size: u64,
+    stats: &mut JumpListStats,
+) -> CoreResult<()> {
+    checked_custom_advance(offset, name_bytes as u64, file_size, "custom category name")?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(name_bytes).map_err(|error| {
+        CoreError::new(
+            JumpListErrorKind::Allocation,
+            Some(offset),
+            format!("reserving bounded custom category name: {error}"),
+        )
+    })?;
+    bytes.resize(name_bytes, 0);
+    read_exact_at(reader, offset, &mut bytes, stats)?;
+    let has_invalid_utf16 = char::decode_utf16(
+        bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+    )
+    .any(|character| character.is_err());
+    if has_invalid_utf16 {
+        return Err(CoreError::new(
+            JumpListErrorKind::InvalidStream,
+            Some(offset),
+            "custom category name contains invalid UTF-16LE",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_terminal_custom_footer<R: Read + Seek>(
+    reader: &mut R,
+    file_size: u64,
+    stats: &mut JumpListStats,
+) -> CoreResult<()> {
+    let footer_offset = file_size.checked_sub(4).ok_or_else(|| {
+        CoreError::new(
+            JumpListErrorKind::TruncatedData,
+            Some(file_size),
+            "Custom Destinations source is too short for a footer",
+        )
+    })?;
+    let footer = read_custom_u32(reader, footer_offset, file_size, stats, "terminal footer")?;
+    if footer != u32::from_le_bytes(CUSTOM_DESTINATIONS_EMPTY_FOOTER) {
+        return Err(CoreError::new(
+            JumpListErrorKind::InvalidStream,
+            Some(footer_offset),
+            format!("Custom Destinations terminal footer is {footer:#010X}, expected 0xBABFFBAB"),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_options(options: &JumpListParseOptions) -> Result<(), String> {
@@ -1250,6 +1599,7 @@ fn find_root_entry<R: Read + Seek>(
     walk_directory_entries(
         context,
         directory_length,
+        false,
         |_context, entry, _stats| {
             if entry.object_type == 5 {
                 if root.is_some() {
@@ -1280,6 +1630,7 @@ fn find_root_entry<R: Read + Seek>(
 fn walk_directory_entries<R: Read + Seek, F>(
     context: &mut CfbContext<'_, R>,
     directory_length: u64,
+    count_stream_size_compatibility_repairs: bool,
     mut visitor: F,
     stats: &mut JumpListStats,
 ) -> CoreResult<()>
@@ -1295,7 +1646,11 @@ where
             if object_type == 0 {
                 continue;
             }
-            let entry = parse_directory_entry(chunk)?;
+            let entry = parse_directory_entry(chunk, context.header.major_version)?;
+            if count_stream_size_compatibility_repairs && entry.stream_size_high_dword_ignored {
+                stats.v3_stream_size_high_dwords_ignored =
+                    stats.v3_stream_size_high_dwords_ignored.saturating_add(1);
+            }
             visitor(context, entry, stats)?;
         }
         sector = context.fat_next(sector, stats)?;
@@ -1303,7 +1658,7 @@ where
     Ok(())
 }
 
-fn parse_directory_entry(bytes: &[u8]) -> CoreResult<DirectoryEntry> {
+fn parse_directory_entry(bytes: &[u8], major_version: u16) -> CoreResult<DirectoryEntry> {
     if bytes.len() != CFB_DIRECTORY_ENTRY_BYTES {
         return Err(CoreError::new(
             JumpListErrorKind::InvalidDirectory,
@@ -1338,11 +1693,23 @@ fn parse_directory_entry(bytes: &[u8]) -> CoreResult<DirectoryEntry> {
     };
     let created_raw = slice_u64(bytes, 100)?;
     let modified_raw = slice_u64(bytes, 108)?;
+    let raw_stream_size = slice_u64(bytes, 120)?;
+    let stream_size_high_dword_ignored = major_version == 3 && raw_stream_size >> 32 != 0;
+    let stream_size = if major_version == 3 {
+        // MS-CFB v3 directory stream sizes are 32-bit. Some older writers left the unused upper
+        // DWORD uninitialized, and the specification recommends that parsers ignore it. Applying
+        // that rule prevents a dirty upper DWORD from fabricating a multi-exabyte root mini stream
+        // while preserving the raw anomaly as an exact parser statistic.
+        raw_stream_size & u64::from(u32::MAX)
+    } else {
+        raw_stream_size
+    };
     Ok(DirectoryEntry {
         label,
         object_type,
         start_sector: slice_u32(bytes, 116)?,
-        stream_size: slice_u64(bytes, 120)?,
+        stream_size,
+        stream_size_high_dword_ignored,
         created_filetime: (created_raw != 0).then_some(created_raw),
         modified_filetime: (modified_raw != 0).then_some(modified_raw),
     })
@@ -2739,6 +3106,86 @@ mod tests {
     }
 
     #[test]
+    fn automatic_lnk_stream_labels_are_strict_hexadecimal_entry_identifiers() {
+        for label in ["1", "9", "a", "F", "10", "1f", "ABC"] {
+            assert!(is_automatic_lnk_stream_label(label), "{label}");
+        }
+        for label in [
+            "",
+            "0",
+            "00",
+            "DestListPropertyStore",
+            "\u{0005}SummaryInformation",
+            "foo",
+            "1g",
+        ] {
+            assert!(!is_automatic_lnk_stream_label(label), "{label:?}");
+        }
+    }
+
+    #[test]
+    fn arbitrary_non_hex_cfb_stream_is_retained_as_auxiliary_metadata() {
+        let mut data = automatic_fixture(false);
+        let directory = 512 * 2;
+        write_directory_entry(
+            &mut data[directory + 384..directory + 512],
+            "\u{0005}SummaryInformation",
+            2,
+            2,
+            16,
+        );
+        let mini_stream = 512 * 3;
+        data[mini_stream + 128..mini_stream + 144].copy_from_slice(b"metadata-not-lnk");
+        let mini_fat = 512 * 4;
+        data[mini_fat + 8..mini_fat + 12].copy_from_slice(&END_OF_CHAIN.to_le_bytes());
+
+        let mut sink = CollectSink::default();
+        let result = parse_automatic_destinations(
+            &mut Cursor::new(data),
+            &mut sink,
+            &JumpListParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.status, JumpListTerminalStatus::Recognized);
+        assert_eq!(result.stats.auxiliary_streams, 1);
+        assert_eq!(result.stats.lnk_candidates, 1);
+        assert_eq!(result.stats.omitted_lnk_streams, 0);
+        assert_eq!(sink.entries.len(), 1);
+    }
+
+    #[test]
+    fn cfb_v3_ignores_dirty_stream_size_high_dword_and_discloses_it() {
+        let mut data = automatic_fixture(false);
+        let root_size = 128_u64 | (0xDEAD_BEEF_u64 << 32);
+        let directory = 512 * 2;
+        data[directory + 120..directory + 128].copy_from_slice(&root_size.to_le_bytes());
+
+        let mut sink = CollectSink::default();
+        let result = parse_automatic_destinations(
+            &mut Cursor::new(data),
+            &mut sink,
+            &JumpListParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.status, JumpListTerminalStatus::Recognized);
+        assert_eq!(result.stats.v3_stream_size_high_dwords_ignored, 1);
+        assert_eq!(result.stats.lnk_streams_emitted, 1);
+        assert_eq!(result.stats.dest_list_streams, 1);
+    }
+
+    #[test]
+    fn directory_stream_size_uses_version_specific_width() {
+        let mut bytes = [0_u8; CFB_DIRECTORY_ENTRY_BYTES];
+        write_directory_entry(&mut bytes, "Stream", 2, 7, 5 | (9_u64 << 32));
+        let version_3 = parse_directory_entry(&bytes, 3).unwrap();
+        assert_eq!(version_3.stream_size, 5);
+        assert!(version_3.stream_size_high_dword_ignored);
+        let version_4 = parse_directory_entry(&bytes, 4).unwrap();
+        assert_eq!(version_4.stream_size, 5 | (9_u64 << 32));
+        assert!(!version_4.stream_size_high_dword_ignored);
+    }
+
+    #[test]
     fn regular_fat_stream_is_complete_without_payload_buffer_cap() {
         let mut reader = Cursor::new(regular_stream_fixture());
         let mut sink = CollectSink::default();
@@ -2867,7 +3314,7 @@ mod tests {
 
     #[test]
     fn canonical_empty_custom_destinations_is_not_a_failure() {
-        for state in [1_u32, 2_u32, u32::MAX] {
+        for state in [1_u32, 2_u32] {
             let mut data = Vec::new();
             data.extend_from_slice(&2_u32.to_le_bytes());
             data.extend_from_slice(&1_u32.to_le_bytes());
@@ -2885,7 +3332,155 @@ mod tests {
             assert_eq!(result.status, JumpListTerminalStatus::Recognized);
             assert_eq!(result.stats.lnk_candidates, 0);
             assert_eq!(result.stats.lnk_streams_emitted, 0);
+            assert!(result.stats.custom_container_envelope_validated);
+            assert_eq!(result.stats.custom_categories_declared, Some(1));
+            assert_eq!(result.stats.custom_categories_validated, 1);
+            assert_eq!(result.stats.custom_zero_entry_categories, 1);
         }
+    }
+
+    #[test]
+    fn zero_category_custom_destinations_is_valid_container_metadata() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2_u32.to_le_bytes());
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        let mut sink = CollectSink::default();
+        let result = parse_custom_destinations(
+            &mut Cursor::new(data.clone()),
+            &mut sink,
+            &JumpListParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.status, JumpListTerminalStatus::Recognized);
+        assert!(result.stats.custom_container_envelope_validated);
+        assert_eq!(result.stats.custom_categories_declared, Some(0));
+        assert_eq!(result.stats.custom_categories_validated, 0);
+        assert!(
+            is_custom_destinations(&mut Cursor::new(data), &JumpListParseOptions::default())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn zero_entry_custom_and_user_task_categories_are_retained() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2_u32.to_le_bytes());
+        data.extend_from_slice(&2_u32.to_le_bytes());
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data.extend_from_slice(&4_u16.to_le_bytes());
+        for unit in "Work".encode_utf16() {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data.extend_from_slice(&CUSTOM_DESTINATIONS_EMPTY_FOOTER);
+        data.extend_from_slice(&2_u32.to_le_bytes());
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data.extend_from_slice(&CUSTOM_DESTINATIONS_EMPTY_FOOTER);
+
+        let mut sink = CollectSink::default();
+        let result = parse_custom_destinations(
+            &mut Cursor::new(data),
+            &mut sink,
+            &JumpListParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.status, JumpListTerminalStatus::Recognized);
+        assert_eq!(result.stats.custom_categories_declared, Some(2));
+        assert_eq!(result.stats.custom_categories_validated, 2);
+        assert_eq!(result.stats.custom_zero_entry_categories, 2);
+        assert_eq!(
+            result
+                .stats
+                .custom_entries_without_complete_lnk_headers_declared,
+            0
+        );
+        assert!(sink.entries.is_empty());
+    }
+
+    #[test]
+    fn declared_custom_entries_without_complete_lnk_are_partial_not_fatal() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2_u32.to_le_bytes());
+        data.extend_from_slice(&1_u32.to_le_bytes());
+        data.extend_from_slice(&0_u32.to_le_bytes());
+        data.extend_from_slice(&2_u32.to_le_bytes());
+        data.extend_from_slice(&2_u32.to_le_bytes());
+        data.extend_from_slice(b"bounded-record-bytes");
+        data.extend_from_slice(&CUSTOM_DESTINATIONS_EMPTY_FOOTER);
+
+        let mut sink = CollectSink::default();
+        let result = parse_custom_destinations(
+            &mut Cursor::new(data),
+            &mut sink,
+            &JumpListParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.status, JumpListTerminalStatus::Partial);
+        assert!(result.stats.custom_container_envelope_validated);
+        assert_eq!(result.stats.custom_categories_declared, Some(1));
+        assert_eq!(result.stats.custom_categories_validated, 1);
+        assert_eq!(
+            result
+                .stats
+                .custom_entries_without_complete_lnk_headers_declared,
+            2
+        );
+        assert_eq!(result.stats.diagnostic_count, 1);
+        assert_eq!(result.stats.lnk_streams_emitted, 0);
+        assert!(sink.entries.is_empty());
+    }
+
+    #[test]
+    fn malformed_custom_envelopes_are_not_silently_accepted() {
+        let mut invalid_utf16 = Vec::new();
+        invalid_utf16.extend_from_slice(&2_u32.to_le_bytes());
+        invalid_utf16.extend_from_slice(&1_u32.to_le_bytes());
+        invalid_utf16.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_utf16.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_utf16.extend_from_slice(&1_u16.to_le_bytes());
+        invalid_utf16.extend_from_slice(&0xD800_u16.to_le_bytes());
+        invalid_utf16.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_utf16.extend_from_slice(&CUSTOM_DESTINATIONS_EMPTY_FOOTER);
+        let mut sink = CollectSink::default();
+        let error = parse_custom_destinations(
+            &mut Cursor::new(invalid_utf16),
+            &mut sink,
+            &JumpListParseOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, JumpListErrorKind::InvalidStream);
+
+        let mut invalid_footer = Vec::new();
+        invalid_footer.extend_from_slice(&2_u32.to_le_bytes());
+        invalid_footer.extend_from_slice(&1_u32.to_le_bytes());
+        invalid_footer.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_footer.extend_from_slice(&2_u32.to_le_bytes());
+        invalid_footer.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_footer.extend_from_slice(&0_u32.to_le_bytes());
+        let error = parse_custom_destinations(
+            &mut Cursor::new(invalid_footer),
+            &mut sink,
+            &JumpListParseOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, JumpListErrorKind::InvalidStream);
+
+        let mut invalid_category = Vec::new();
+        invalid_category.extend_from_slice(&2_u32.to_le_bytes());
+        invalid_category.extend_from_slice(&1_u32.to_le_bytes());
+        invalid_category.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_category.extend_from_slice(&99_u32.to_le_bytes());
+        invalid_category.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_category.extend_from_slice(&CUSTOM_DESTINATIONS_EMPTY_FOOTER);
+        let error = parse_custom_destinations(
+            &mut Cursor::new(invalid_category),
+            &mut sink,
+            &JumpListParseOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, JumpListErrorKind::InvalidStream);
     }
 
     #[test]

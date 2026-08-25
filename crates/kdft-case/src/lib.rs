@@ -4,6 +4,7 @@
 
 mod identity_network;
 mod ntfs_compression;
+mod wof;
 
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
 use anyhow::{anyhow, bail, Context, Result};
@@ -11,6 +12,7 @@ use chrome_cache_parser::block_file::{BlockCacheEntryState, LazyBlockFileCacheEn
 use chrome_cache_parser::ChromeCache;
 use chrono::{DateTime, SecondsFormat, Utc};
 use evtx::{EvtxParser, ParserSettings as EvtxParserSettings, SerializedEvtxRecord};
+use flate2::bufread::GzDecoder;
 use notatin::cell_key_value::CellKeyValueDataTypes as RegistryValueDataType;
 use notatin::cell_value::CellValue as RegistryCellValue;
 use notatin::parser::ParserIterator as RegistryParserIterator;
@@ -18,7 +20,8 @@ use notatin::parser_builder::ParserBuilder as RegistryParserBuilder;
 use ntfs::NtfsReadSeek as _;
 use rayon::prelude::*;
 use rusqlite::{
-    named_params, params, Connection, OpenFlags, OptionalExtension, TransactionBehavior,
+    named_params, params, types::ValueRef, Connection, OpenFlags, OptionalExtension,
+    TransactionBehavior,
 };
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -134,6 +137,17 @@ impl Drop for AtomicOutput {
     }
 }
 
+fn create_private_new_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 pub fn write_new_file_atomically(destination: &Path, bytes: &[u8]) -> Result<()> {
     let mut output = AtomicOutput::create(destination)?;
     output
@@ -230,7 +244,7 @@ const EVTX_EVENT_SUMMARY_PREVIEW_CHARS: usize = 1200;
 const EVTX_PARSER_ERROR_LIMIT: usize = 16;
 const PST_PARSER_NAME: &str = "outlook-pst 1.2.0";
 const OOXML_PARSER_NAME: &str = "kdft-wordprocessingml 1";
-const ZIP_PARSER_NAME: &str = "kdft-zip 1";
+const ZIP_PARSER_NAME: &str = "kdft-zip 2";
 const DOCUMENT_PARSE_ERROR_DISPLAY_LIMIT: usize = 100;
 const TEMP_CLEANUP_WARNING_DISPLAY_LIMIT: usize = 32;
 const DOCUMENT_UNSUPPORTED_PART_DISPLAY_LIMIT: usize = 100;
@@ -331,9 +345,21 @@ pub struct EvidenceSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AcquisitionSegmentManifest {
+    /// One-based position in the acquisition's validated segment order.
+    #[serde(default)]
+    pub ordinal: usize,
+    /// Deterministic absolute path as supplied to the segment hasher.
     pub path: String,
+    #[serde(default)]
+    pub path_kind: String,
     pub size: u64,
     pub sha256: String,
+    /// Stable operating-system file identity captured from the opened handle
+    /// (volume/file index on Windows; device/inode on Unix), when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_utc: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -343,17 +369,31 @@ pub struct AcquisitionManifest {
     pub total_size: u64,
     pub segment_count: usize,
     pub complete: bool,
+    /// `complete`, `incomplete_gap_detected`, or
+    /// `uncertain_terminal_marker`. This prevents a false completeness claim
+    /// when filenames alone cannot prove the final EWF segment.
+    #[serde(default)]
+    pub completeness_state: String,
+    #[serde(default)]
+    pub enumeration_basis: String,
+    #[serde(default)]
+    pub source_generation: String,
+    #[serde(default)]
+    pub source_generation_basis: String,
     pub note: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct HashEvidenceResult {
     pub evidence_id: i64,
+    pub job_id: i64,
     pub sha256_hex: String,
     pub sha256_scope: String,
     pub bytes_hashed: u64,
     pub hashed_at: String,
     pub acquisition_manifest_json: Option<AcquisitionManifest>,
+    pub completed_with_diagnostics: bool,
+    pub status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -367,14 +407,22 @@ pub struct CarveOptions {
 #[derive(Debug, Serialize)]
 pub struct CarveResult {
     pub evidence_id: i64,
+    /// Structurally validated files with an exact, bounded end.
     pub carved_files: usize,
+    /// Recognized corrupt, incomplete, limited, or unsupported candidates.
+    /// These are retained as non-exportable records, not asserted as files.
+    pub recognized_candidates: usize,
+    /// Header-like byte sequences rejected by structural validation.
+    pub rejected_header_candidates: usize,
     pub bytes_scanned: u64,
     pub truncated: bool,
     pub status: String,
     pub truncation_reasons: Vec<String>,
-    /// Files whose end could not be established before the protective extent
-    /// inspection limit. Each affected entry also carries its exact offset and
-    /// reason in metadata.
+    pub completed_with_diagnostics: bool,
+    pub canonical_generation_preserved: bool,
+    /// Candidates whose end could not be established before the protective
+    /// per-candidate inspection limit. This is a parser diagnostic, not an
+    /// examiner truncation of the evidence scan.
     pub protective_extent_limit_hits: usize,
 }
 
@@ -493,8 +541,29 @@ fn set_processing_profile(profile: ProcessingProfile) -> ProcessingProfileGuard 
 pub struct ProcessEvidenceResult {
     pub job_id: i64,
     pub evidence_id: i64,
+    /// Rows committed by this attempt. When a non-complete image reprocess
+    /// preserves an older complete generation, this is zero even though the
+    /// parser examined and staged rows before the replacement was rejected.
     pub entries_indexed: usize,
+    /// Rows produced by the parser during this attempt before generation
+    /// acceptance. This is deliberately separate from `entries_indexed` so a
+    /// retained old snapshot is never reported as newly indexed work.
+    pub attempt_entries_indexed: usize,
+    /// True when this attempt replaced the canonical filesystem generation.
+    pub replacement_committed: bool,
+    /// True when an existing complete image generation was retained because
+    /// this attempt was limited or otherwise incomplete.
+    pub canonical_generation_preserved: bool,
+    /// Number of canonical rows still visible after commit.
+    pub retained_entry_count: usize,
+    /// True only when processing actually stopped at an examiner-requested
+    /// entry limit. Parser diagnostics that retain usable results do not set
+    /// this flag.
     pub truncated: bool,
+    /// One or more auxiliary recovery/parser paths reported bounded gaps while
+    /// the filesystem inventory still reached finalization.
+    pub partial_artifact_coverage: bool,
+    pub completed_with_diagnostics: bool,
     pub status: String,
     pub bookmark_items_relinked: usize,
     pub truncation_reasons: Vec<String>,
@@ -534,6 +603,15 @@ pub struct DeepSearchResult {
     pub selection_offset: Option<i64>,
     pub selection_length: Option<i64>,
     pub data_preview: Option<String>,
+    /// Semantic role of a parser-derived text hit. This is separate from the
+    /// raw matched content so deleted/hidden/field text remains discoverable
+    /// without being presented as ordinary visible document text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parsed_segment_kind: Option<String>,
+    /// Parser-coordinate provenance for a parser-derived text hit. OOXML
+    /// values are package-relative and explicitly never evidence-physical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parsed_segment_provenance: Option<serde_json::Value>,
 }
 
 /// Opaque-in-practice continuation returned by [`deep_search_page`].  The UI
@@ -674,6 +752,10 @@ pub struct EntryDiskLocation {
     pub file_relative_offset: Option<u64>,
     pub contiguous_bytes: Option<u64>,
     pub exact_start: bool,
+    /// Whether the decoded-media range directly represents logical file
+    /// bytes. Compressed/encrypted/attribute-list mappings can have an exact
+    /// raw allocation start while this remains false.
+    pub direct_logical_mapping: bool,
     pub basis: String,
     pub warning: Option<String>,
 }
@@ -732,6 +814,14 @@ pub struct AnalyzeSignaturesResult {
     /// Number of candidate rows visited, including disclosed skips/errors.
     pub candidates_processed: usize,
     pub files_examined: usize,
+    /// Candidate rows not examined because they do not represent an applicable logical-file
+    /// byte stream. These are deliberate, provenance-stamped outcomes, not read failures.
+    pub not_applicable: usize,
+    pub not_applicable_wof_auxiliary_streams: usize,
+    pub not_applicable_ntfs_no_unnamed_stream: usize,
+    pub not_applicable_non_file_rows: usize,
+    /// Total unexamined candidates, including `not_applicable`, genuine read errors, and invalid
+    /// metadata. Use the dedicated counters to distinguish those outcomes.
     pub files_skipped: usize,
     pub matches: usize,
     pub aliases: usize,
@@ -742,6 +832,16 @@ pub struct AnalyzeSignaturesResult {
     pub metadata_parse_errors: usize,
     pub errors: Vec<String>,
     pub errors_omitted: usize,
+    /// Exact number of per-entry metadata merge patches published by this attempt. A retained
+    /// prior generation reports zero even though candidates were examined and staged.
+    pub metadata_updates_committed: usize,
+    /// True when this attempt published its staged per-entry outcomes atomically.
+    pub replacement_committed: bool,
+    /// True when a prior signature generation remained byte-for-byte canonical because this
+    /// attempt stopped at a limit or completed with diagnostics.
+    pub canonical_generation_preserved: bool,
+    /// Parser/read diagnostics were recorded, but the examiner did not stop the candidate walk.
+    pub completed_with_diagnostics: bool,
     pub truncated: bool,
     pub status: String,
 }
@@ -1011,11 +1111,7 @@ pub fn create_case(case_path: &Path, options: CreateCaseOptions) -> Result<i64> 
             ".kdft-case-{}-{stamp}-{nonce}.tmp",
             std::process::id()
         ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        match create_private_new_file(&candidate) {
             Ok(file) => {
                 drop(file);
                 staging_path = Some(candidate);
@@ -1307,7 +1403,7 @@ pub fn list_evidence(case_path: &Path) -> Result<Vec<EvidenceSource>> {
                  FROM evidence_jobs j
                  WHERE j.case_id = e.case_id AND j.evidence_id = e.id
                    AND j.job_type = 'filesystem_index'
-                   AND j.status IN ('completed', 'truncated')
+                   AND j.status IN ('completed', 'completed_with_diagnostics', 'truncated')
                  ORDER BY j.id DESC LIMIT 1)
          FROM evidence_sources e
          WHERE e.attach_status <> 'superseded'
@@ -1390,130 +1486,552 @@ struct AcquisitionSegmentSet {
     scheme: String,
     paths: Vec<PathBuf>,
     complete: bool,
+    completeness_state: String,
+    enumeration_basis: String,
     note: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct AcquisitionSourceState {
     path: PathBuf,
     size: u64,
     modified: Option<std::time::SystemTime>,
+    file_identity: Option<String>,
 }
 
-const EWF_NUMBERED_SEGMENT_LIMIT: usize = 775;
+const EWF_V1_NUMBERED_SEGMENT_LIMIT: usize = 775;
+const EWF_V2_NUMBERED_SEGMENT_LIMIT: usize = EWF_V1_NUMBERED_SEGMENT_LIMIT * 3;
 
-fn ewf_segment_ordinal(extension: &str) -> Option<(String, usize, bool)> {
-    if !extension.is_ascii() || extension.len() < 3 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EwfFilenameVersion {
+    V1,
+    V2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EwfSegmentName {
+    family: char,
+    version: EwfFilenameVersion,
+    ordinal: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EwfTerminalMarker {
+    Next,
+    Done,
+    Other(String),
+}
+
+#[derive(Debug)]
+struct EwfSegmentInspection {
+    segment_number: usize,
+    terminal_marker: EwfTerminalMarker,
+    acquisition_identity: Option<Vec<u8>>,
+}
+
+fn metadata_file_identity(metadata: &fs::Metadata) -> Option<String> {
+    #[cfg(windows)]
+    {
+        // Safe std does not yet expose volume serial + file index on the
+        // Windows toolchain used here. Avoid unsafe Win32 calls solely for an
+        // optional signal; opened-handle/path size and timestamp checks remain
+        // mandatory and the residual limitation is disclosed.
+        let _ = metadata;
         return None;
     }
-    let (prefix, suffix) = extension.split_at(extension.len() - 2);
-    if !matches!(
-        prefix.to_ascii_lowercase().as_str(),
-        "e" | "ex" | "l" | "lx" | "s" | "sx"
-    ) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        return Some(format!(
+            "unix-device:{:016x};inode:{:016x}",
+            metadata.dev(),
+            metadata.ino()
+        ));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn acquisition_source_state(path: &Path, metadata: &fs::Metadata) -> AcquisitionSourceState {
+    AcquisitionSourceState {
+        path: path.to_path_buf(),
+        size: metadata.len(),
+        modified: metadata.modified().ok(),
+        file_identity: metadata_file_identity(metadata),
+    }
+}
+
+fn acquisition_source_state_matches(
+    expected: &AcquisitionSourceState,
+    current: &AcquisitionSourceState,
+) -> bool {
+    expected.path == current.path
+        && expected.size == current.size
+        && expected.modified == current.modified
+        && expected.file_identity == current.file_identity
+}
+
+fn acquisition_source_generation(snapshot: &[AcquisitionSourceState]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for (ordinal, source) in snapshot.iter().enumerate() {
+        let ordinal = u64::try_from(ordinal)
+            .context("segment ordinal exceeds u64")?
+            .checked_add(1)
+            .context("segment ordinal exceeds u64")?;
+        hasher.update(ordinal.to_le_bytes());
+        let path = stable_path_string(&source.path);
+        hasher.update(u64::try_from(path.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(source.size.to_le_bytes());
+        let modified = source
+            .modified
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos().to_string())
+            .unwrap_or_else(|| "unavailable".to_string());
+        hasher.update(modified.as_bytes());
+        hasher.update(
+            source
+                .file_identity
+                .as_deref()
+                .unwrap_or("identity-unavailable")
+                .as_bytes(),
+        );
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn ewf_local_segment_ordinal(suffix: &str) -> Option<usize> {
+    if suffix.len() != 2 || !suffix.is_ascii() {
         return None;
     }
     let suffix_bytes = suffix.as_bytes();
-    let ordinal = if suffix_bytes.iter().all(u8::is_ascii_digit) {
+    if suffix_bytes.iter().all(u8::is_ascii_digit) {
         let value = suffix.parse::<usize>().ok()?;
-        (1..=99).contains(&value).then_some(value)?
+        (1..=99).contains(&value).then_some(value)
     } else if suffix_bytes.iter().all(u8::is_ascii_alphabetic) {
         let upper = suffix.to_ascii_uppercase();
         let bytes = upper.as_bytes();
-        if bytes[0] < b'A' || bytes[1] < b'A' {
-            return None;
-        }
-        100 + usize::from(bytes[0] - b'A') * 26 + usize::from(bytes[1] - b'A')
+        Some(100 + usize::from(bytes[0] - b'A') * 26 + usize::from(bytes[1] - b'A'))
     } else {
-        return None;
-    };
-    (ordinal <= EWF_NUMBERED_SEGMENT_LIMIT).then_some((
-        prefix.to_string(),
-        ordinal,
-        extension.chars().any(|ch| ch.is_ascii_uppercase()),
-    ))
+        None
+    }
 }
 
-fn ewf_segment_extension(prefix: &str, ordinal: usize, uppercase: bool) -> String {
-    let suffix = if ordinal <= 99 {
-        format!("{ordinal:02}")
+fn ewf_segment_name(extension: &str) -> Option<EwfSegmentName> {
+    if !extension.is_ascii() || !matches!(extension.len(), 3 | 4) {
+        return None;
+    }
+    let bytes = extension.as_bytes();
+    let family = char::from(bytes[0]).to_ascii_uppercase();
+    if !matches!(family, 'E' | 'L' | 'S') {
+        return None;
+    }
+    if extension.len() == 3 {
+        return Some(EwfSegmentName {
+            family,
+            version: EwfFilenameVersion::V1,
+            ordinal: ewf_local_segment_ordinal(&extension[1..])?,
+        });
+    }
+    let namespace = char::from(bytes[1]).to_ascii_lowercase();
+    let namespace_index = match namespace {
+        'x' => 0,
+        'y' => 1,
+        'z' => 2,
+        _ => return None,
+    };
+    let local = ewf_local_segment_ordinal(&extension[2..])?;
+    Some(EwfSegmentName {
+        family,
+        version: EwfFilenameVersion::V2,
+        ordinal: namespace_index * EWF_V1_NUMBERED_SEGMENT_LIMIT + local,
+    })
+}
+
+fn ewf_segment_extension(name: EwfSegmentName, uppercase: bool) -> Option<String> {
+    let limit = match name.version {
+        EwfFilenameVersion::V1 => EWF_V1_NUMBERED_SEGMENT_LIMIT,
+        EwfFilenameVersion::V2 => EWF_V2_NUMBERED_SEGMENT_LIMIT,
+    };
+    if !(1..=limit).contains(&name.ordinal) {
+        return None;
+    }
+    let (namespace, local) = match name.version {
+        EwfFilenameVersion::V1 => (None, name.ordinal),
+        EwfFilenameVersion::V2 => {
+            let zero_based = name.ordinal - 1;
+            let namespace = match zero_based / EWF_V1_NUMBERED_SEGMENT_LIMIT {
+                0 => 'x',
+                1 => 'y',
+                2 => 'z',
+                _ => return None,
+            };
+            (
+                Some(namespace),
+                zero_based % EWF_V1_NUMBERED_SEGMENT_LIMIT + 1,
+            )
+        }
+    };
+    let suffix = if local <= 99 {
+        format!("{local:02}")
     } else {
-        let value = ordinal - 100;
+        let value = local - 100;
         let first = char::from(b'A' + u8::try_from(value / 26).unwrap_or(25));
         let second = char::from(b'A' + u8::try_from(value % 26).unwrap_or(25));
         format!("{first}{second}")
     };
-    if uppercase {
-        format!("{prefix}{suffix}")
+    let family = if uppercase {
+        name.family.to_ascii_uppercase()
     } else {
-        format!("{prefix}{}", suffix.to_ascii_lowercase())
+        name.family.to_ascii_lowercase()
+    };
+    let extension = match namespace {
+        Some(namespace) => format!("{family}{namespace}{suffix}"),
+        None => format!("{family}{suffix}"),
+    };
+    Some(if uppercase {
+        extension
+    } else {
+        extension.to_ascii_lowercase()
+    })
+}
+
+fn inspect_ewf_segment(path: &Path, version: EwfFilenameVersion) -> Result<EwfSegmentInspection> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("opening EWF segment header {}", path.display()))?;
+    let length = file
+        .metadata()
+        .with_context(|| format!("reading EWF segment metadata {}", path.display()))?
+        .len();
+    match version {
+        EwfFilenameVersion::V1 => {
+            const HEADER_BYTES: usize = 13;
+            const DESCRIPTOR_BYTES: usize = 76;
+            if length < (HEADER_BYTES + DESCRIPTOR_BYTES) as u64 {
+                bail!("EWF v1 segment is too short: {}", path.display());
+            }
+            let mut header = [0_u8; HEADER_BYTES];
+            file.read_exact(&mut header)
+                .with_context(|| format!("reading EWF v1 header {}", path.display()))?;
+            if header[..8] != ewf::EVF_SIGNATURE {
+                bail!(
+                    "EWF v1 segment has an invalid signature: {}",
+                    path.display()
+                );
+            }
+            let segment_number = usize::from(u16::from_le_bytes([header[9], header[10]]));
+            file.seek(SeekFrom::End(-(DESCRIPTOR_BYTES as i64)))?;
+            let mut descriptor = [0_u8; DESCRIPTOR_BYTES];
+            file.read_exact(&mut descriptor).with_context(|| {
+                format!("reading EWF v1 terminal descriptor {}", path.display())
+            })?;
+            let type_end = descriptor[..16]
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(16);
+            let marker = String::from_utf8_lossy(&descriptor[..type_end]).to_ascii_lowercase();
+            let descriptor_offset = length - DESCRIPTOR_BYTES as u64;
+            let next = u64::from_le_bytes([
+                descriptor[16],
+                descriptor[17],
+                descriptor[18],
+                descriptor[19],
+                descriptor[20],
+                descriptor[21],
+                descriptor[22],
+                descriptor[23],
+            ]);
+            let section_size = u64::from_le_bytes([
+                descriptor[24],
+                descriptor[25],
+                descriptor[26],
+                descriptor[27],
+                descriptor[28],
+                descriptor[29],
+                descriptor[30],
+                descriptor[31],
+            ]);
+            let structure_valid = (section_size == 0 || section_size == DESCRIPTOR_BYTES as u64)
+                && (next == 0 || next == descriptor_offset);
+            let terminal_marker = match (marker.as_str(), structure_valid) {
+                ("next", true) => EwfTerminalMarker::Next,
+                ("done", true) => EwfTerminalMarker::Done,
+                (_, false) => EwfTerminalMarker::Other(format!(
+                    "invalid-terminal-structure(type={marker},next={next:#x},section_size={section_size})"
+                )),
+                _ => EwfTerminalMarker::Other(marker),
+            };
+            Ok(EwfSegmentInspection {
+                segment_number,
+                terminal_marker,
+                acquisition_identity: None,
+            })
+        }
+        EwfFilenameVersion::V2 => {
+            const HEADER_BYTES: usize = 32;
+            const DESCRIPTOR_BYTES: usize = 64;
+            if length < (HEADER_BYTES + DESCRIPTOR_BYTES) as u64 {
+                bail!("EWF v2 segment is too short: {}", path.display());
+            }
+            let mut header = [0_u8; HEADER_BYTES];
+            file.read_exact(&mut header)
+                .with_context(|| format!("reading EWF v2 header {}", path.display()))?;
+            const EVF2_SIGNATURE: [u8; 8] = [0x45, 0x56, 0x46, 0x32, 0x0d, 0x0a, 0x81, 0x00];
+            const LEF2_SIGNATURE: [u8; 8] = [0x4c, 0x45, 0x46, 0x32, 0x0d, 0x0a, 0x81, 0x00];
+            if header[..8] != EVF2_SIGNATURE && header[..8] != LEF2_SIGNATURE {
+                bail!(
+                    "EWF v2 segment has an invalid signature: {}",
+                    path.display()
+                );
+            }
+            let segment_number = usize::try_from(u32::from_le_bytes([
+                header[12], header[13], header[14], header[15],
+            ]))
+            .context("EWF v2 segment number exceeds usize")?;
+            let mut acquisition_identity = Vec::with_capacity(28);
+            acquisition_identity.extend_from_slice(&header[..12]);
+            acquisition_identity.extend_from_slice(&header[16..32]);
+            file.seek(SeekFrom::End(-(DESCRIPTOR_BYTES as i64)))?;
+            let mut descriptor = [0_u8; DESCRIPTOR_BYTES];
+            file.read_exact(&mut descriptor).with_context(|| {
+                format!("reading EWF v2 terminal descriptor {}", path.display())
+            })?;
+            let marker =
+                u32::from_le_bytes([descriptor[0], descriptor[1], descriptor[2], descriptor[3]]);
+            let previous_offset = u64::from_le_bytes([
+                descriptor[8],
+                descriptor[9],
+                descriptor[10],
+                descriptor[11],
+                descriptor[12],
+                descriptor[13],
+                descriptor[14],
+                descriptor[15],
+            ]);
+            let data_size = u64::from_le_bytes([
+                descriptor[16],
+                descriptor[17],
+                descriptor[18],
+                descriptor[19],
+                descriptor[20],
+                descriptor[21],
+                descriptor[22],
+                descriptor[23],
+            ]);
+            let descriptor_size = u32::from_le_bytes([
+                descriptor[24],
+                descriptor[25],
+                descriptor[26],
+                descriptor[27],
+            ]);
+            let descriptor_offset = length - DESCRIPTOR_BYTES as u64;
+            let previous_valid = previous_offset == 0
+                || (previous_offset >= HEADER_BYTES as u64
+                    && previous_offset < descriptor_offset
+                    && previous_offset
+                        .checked_add(DESCRIPTOR_BYTES as u64)
+                        .is_some_and(|end| end <= descriptor_offset));
+            let structure_valid =
+                descriptor_size == DESCRIPTOR_BYTES as u32 && data_size == 0 && previous_valid;
+            let terminal_marker = match (marker, structure_valid) {
+                (0x0d, true) => EwfTerminalMarker::Next,
+                (0x0f, true) => EwfTerminalMarker::Done,
+                (_, false) => EwfTerminalMarker::Other(format!(
+                    "invalid-terminal-structure(type={marker:#04x},descriptor_size={descriptor_size},data_size={data_size},previous_offset={previous_offset:#x})"
+                )),
+                (other, true) => {
+                    EwfTerminalMarker::Other(format!("section-type-{other:#04x}"))
+                }
+            };
+            Ok(EwfSegmentInspection {
+                segment_number,
+                terminal_marker,
+                acquisition_identity: Some(acquisition_identity),
+            })
+        }
     }
 }
 
-/// Enumerates the standard, finite EWF numbered namespace (E01-E99, EAA-EZZ,
-/// and the equivalent Ex/Lx/Sx prefixes). Candidate generation is bounded and
-/// deterministic; a sibling after a gap is included but marks the set partial.
+/// Enumerates the finite EWF namespace from the containing directory, including
+/// the EWF2 Ex -> Ey -> Ez continuation. Filename order is checked against the
+/// segment number in every file header; non-final `next` and final `done`
+/// descriptors are required before the manifest claims completeness.
 fn ewf_numbered_segments(path: &Path) -> Result<Option<AcquisitionSegmentSet>> {
     let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
         return Ok(None);
     };
-    let Some((prefix, source_ordinal, uppercase)) = ewf_segment_ordinal(extension) else {
+    let Some(source_name) = ewf_segment_name(extension) else {
         return Ok(None);
     };
 
-    let mut paths = Vec::new();
-    let mut ordinals = Vec::new();
-    for ordinal in 1..=EWF_NUMBERED_SEGMENT_LIMIT {
-        let candidate = if ordinal == source_ordinal {
-            path.to_path_buf()
-        } else {
-            path.with_extension(ewf_segment_extension(&prefix, ordinal, uppercase))
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let source_stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .context("EWF acquisition filename is not valid Unicode")?;
+    let mut by_ordinal = BTreeMap::<usize, PathBuf>::new();
+    for entry in fs::read_dir(parent)
+        .with_context(|| format!("enumerating EWF segment directory {}", parent.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "reading EWF segment directory entry in {}",
+                parent.display()
+            )
+        })?;
+        let candidate = entry.path();
+        if !candidate.is_file()
+            || !candidate
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(source_stem))
+        {
+            continue;
+        }
+        let Some(candidate_name) = candidate
+            .extension()
+            .and_then(|value| value.to_str())
+            .and_then(ewf_segment_name)
+        else {
+            continue;
         };
-        if candidate.is_file() {
-            paths.push(candidate);
-            ordinals.push(ordinal);
+        if candidate_name.family != source_name.family
+            || candidate_name.version != source_name.version
+        {
+            continue;
+        }
+        let candidate = fs::canonicalize(&candidate).with_context(|| {
+            format!(
+                "resolving deterministic EWF segment path {}",
+                candidate.display()
+            )
+        })?;
+        if let Some(existing) = by_ordinal.insert(candidate_name.ordinal, candidate.clone()) {
+            bail!(
+                "multiple EWF segment filenames map to ordinal {}: {} and {}",
+                candidate_name.ordinal,
+                existing.display(),
+                candidate.display()
+            );
         }
     }
-    if paths.is_empty() {
+    if by_ordinal.is_empty() {
         bail!(
             "EWF acquisition source is no longer a file: {}",
             path.display()
         );
     }
+    let source_path = fs::canonicalize(path)
+        .with_context(|| format!("resolving attached EWF segment {}", path.display()))?;
+    if by_ordinal.get(&source_name.ordinal) != Some(&source_path) {
+        bail!(
+            "attached EWF segment was not retained at filename ordinal {}",
+            source_name.ordinal
+        );
+    }
 
-    let highest = ordinals.iter().copied().max().unwrap_or(source_ordinal);
+    let highest = *by_ordinal
+        .keys()
+        .next_back()
+        .unwrap_or(&source_name.ordinal);
+    let limit = match source_name.version {
+        EwfFilenameVersion::V1 => EWF_V1_NUMBERED_SEGMENT_LIMIT,
+        EwfFilenameVersion::V2 => EWF_V2_NUMBERED_SEGMENT_LIMIT,
+    };
+    if highest > limit {
+        bail!("EWF filename ordinal {highest} exceeds the supported namespace {limit}");
+    }
     let missing = (1..=highest)
-        .filter(|ordinal| !ordinals.contains(ordinal))
+        .filter(|ordinal| !by_ordinal.contains_key(ordinal))
         .collect::<Vec<_>>();
     let gap_free = missing.is_empty();
-    // Filename enumeration can prove gaps, but (without an exposed EWF final-
-    // segment marker) it cannot prove that a gap-free, shorter set did not lose
-    // a terminal sibling. Only exhaustion of the bounded standard namespace is
-    // conclusive from filenames alone.
-    let complete = gap_free && highest == EWF_NUMBERED_SEGMENT_LIMIT;
-    let note = if complete {
-        format!(
-            "Sequential EWF segment files exhaust the bounded standard E01-EZZ namespace through ordinal {highest}; every enumerated file was hashed after the logical-media stream decoded successfully."
-        )
-    } else if !gap_free {
+    let mut terminal_sequence_valid = gap_free;
+    let mut shared_identity: Option<Vec<u8>> = None;
+    for (ordinal, segment_path) in &by_ordinal {
+        let inspection = inspect_ewf_segment(segment_path, source_name.version)?;
+        if inspection.segment_number != *ordinal {
+            bail!(
+                "EWF filename/header order mismatch: {} maps to ordinal {ordinal} but declares segment {}",
+                segment_path.display(),
+                inspection.segment_number
+            );
+        }
+        if let Some(identity) = inspection.acquisition_identity {
+            match shared_identity.as_ref() {
+                Some(expected) if expected != &identity => bail!(
+                    "EWF2 segment headers do not describe the same acquisition: {}",
+                    segment_path.display()
+                ),
+                None => shared_identity = Some(identity),
+                _ => {}
+            }
+        }
+        let expected_terminal = if *ordinal == highest {
+            EwfTerminalMarker::Done
+        } else {
+            EwfTerminalMarker::Next
+        };
+        terminal_sequence_valid &= inspection.terminal_marker == expected_terminal;
+    }
+    let complete = gap_free && terminal_sequence_valid;
+    let (completeness_state, note) = if !gap_free {
         let missing = missing
             .iter()
             .take(8)
-            .map(usize::to_string)
+            .map(|ordinal| {
+                ewf_segment_extension(
+                    EwfSegmentName {
+                        family: source_name.family,
+                        version: source_name.version,
+                        ordinal: *ordinal,
+                    },
+                    extension.chars().next().is_some_and(char::is_uppercase),
+                )
+                .unwrap_or_else(|| format!("ordinal-{ordinal}"))
+            })
             .collect::<Vec<_>>()
             .join(", ");
-        format!(
-            "EWF segment enumeration found a gap before ordinal {highest} (missing ordinal(s): {missing}); the acquisition manifest is partial even though the decoder returned a logical-media stream."
+        (
+            "incomplete_gap_detected".to_string(),
+            format!(
+                "EWF segment enumeration found a gap before ordinal {highest} (missing segment filename(s): {missing}); no completeness claim is made."
+            ),
+        )
+    } else if !terminal_sequence_valid {
+        (
+            "uncertain_terminal_marker".to_string(),
+            format!(
+                "EWF headers are sequential through ordinal {highest}, but one or more terminal descriptors did not follow non-final Next/final Done semantics; all supplied segments can be hashed, but acquisition completeness is not claimed."
+            ),
         )
     } else {
-        format!(
-            "EWF segment files were sequential through ordinal {highest} and all were hashed, but filename enumeration alone cannot prove that a terminal sibling is not missing because the decoder does not expose the EWF final-segment marker; completeness is therefore recorded as partial."
+        (
+            "complete".to_string(),
+            format!(
+                "EWF segment filenames and embedded segment numbers are sequential through ordinal {highest}; every non-final segment ends in Next and the final segment ends in Done."
+            ),
         )
+    };
+    let note = if source_name.version == EwfFilenameVersion::V1 {
+        format!(
+            "{note} Residual limitation: EWF v1 file headers carry segment numbers but no acquisition set identifier; the exact ordered set is additionally required to pass the decoder before any hash is published."
+        )
+    } else {
+        note
     };
     Ok(Some(AcquisitionSegmentSet {
         scheme: "ewf_numbered_segments".to_string(),
-        paths,
+        paths: by_ordinal.into_values().collect(),
         complete,
+        completeness_state,
+        enumeration_basis: "bounded directory enumeration; parsed filename ordinal; embedded segment-number ordering; non-final Next/final Done terminal descriptors".to_string(),
         note,
     }))
 }
@@ -1524,6 +2042,8 @@ fn acquisition_segment_set(path: &Path) -> Result<AcquisitionSegmentSet> {
             scheme: "split_raw_segments".to_string(),
             paths: segments.into_iter().map(|(path, _)| path).collect(),
             complete: true,
+            completeness_state: "complete".to_string(),
+            enumeration_basis: "gap-checked sequential numeric segment filenames".to_string(),
             note: "All sequential split-raw segments were enumerated from the first segment; the split-raw gap check passed and every segment file was hashed.".to_string(),
         });
     }
@@ -1534,6 +2054,8 @@ fn acquisition_segment_set(path: &Path) -> Result<AcquisitionSegmentSet> {
         scheme: "single_container_file".to_string(),
         paths: vec![path.to_path_buf()],
         complete: true,
+        completeness_state: "complete".to_string(),
+        enumeration_basis: "single attached container file".to_string(),
         note: "The acquisition consists of one container file; every byte of that file was hashed."
             .to_string(),
     })
@@ -1565,26 +2087,55 @@ fn sha256_reader(reader: &mut dyn Read, description: &str) -> Result<(String, u6
 }
 
 fn hash_acquisition_segment(path: &Path) -> Result<AcquisitionSegmentManifest> {
-    progress::progress_current(stable_path_string(path));
-    let before = fs::metadata(path)
+    let metadata = fs::metadata(path)
         .with_context(|| format!("reading acquisition segment metadata {}", path.display()))?;
-    if !before.is_file() {
-        bail!("acquisition segment is not a file: {}", path.display());
-    }
-    let modified_before = before.modified().ok();
+    let expected = acquisition_source_state(path, &metadata);
+    hash_acquisition_segment_from_snapshot(&expected, 1)
+}
+
+fn hash_acquisition_segment_from_snapshot(
+    expected: &AcquisitionSourceState,
+    ordinal: usize,
+) -> Result<AcquisitionSegmentManifest> {
+    let path = &expected.path;
+    progress::progress_current(stable_path_string(path));
     let mut file = fs::File::open(path)
         .with_context(|| format!("opening acquisition segment {}", path.display()))?;
+    let before_handle = file
+        .metadata()
+        .with_context(|| format!("reading opened acquisition segment {}", path.display()))?;
+    let before_path = fs::metadata(path)
+        .with_context(|| format!("rechecking acquisition segment path {}", path.display()))?;
+    if !before_handle.is_file() || !before_path.is_file() {
+        bail!(
+            "acquisition segment is not a regular file: {}",
+            path.display()
+        );
+    }
+    let before_handle = acquisition_source_state(path, &before_handle);
+    let before_path = acquisition_source_state(path, &before_path);
+    if !acquisition_source_state_matches(expected, &before_handle)
+        || !acquisition_source_state_matches(expected, &before_path)
+    {
+        bail!(
+            "acquisition segment changed before hashing; no manifest was stored: {}",
+            path.display()
+        );
+    }
     let (sha256, size) = sha256_reader(
         &mut file,
         &format!("acquisition segment {}", path.display()),
     )?;
-    let after = fs::metadata(path)
-        .with_context(|| format!("rechecking acquisition segment {}", path.display()))?;
-    if size != before.len()
-        || size != after.len()
-        || modified_before
-            .zip(after.modified().ok())
-            .is_some_and(|(before, after)| before != after)
+    let after_handle = file
+        .metadata()
+        .with_context(|| format!("rechecking opened acquisition segment {}", path.display()))?;
+    let after_path = fs::metadata(path)
+        .with_context(|| format!("rechecking acquisition segment path {}", path.display()))?;
+    let after_handle = acquisition_source_state(path, &after_handle);
+    let after_path = acquisition_source_state(path, &after_path);
+    if size != expected.size
+        || !acquisition_source_state_matches(expected, &after_handle)
+        || !acquisition_source_state_matches(expected, &after_path)
     {
         bail!(
             "acquisition segment changed while hashing; no manifest was stored: {}",
@@ -1592,9 +2143,13 @@ fn hash_acquisition_segment(path: &Path) -> Result<AcquisitionSegmentManifest> {
         );
     }
     Ok(AcquisitionSegmentManifest {
+        ordinal,
         path: stable_path_string(path),
+        path_kind: "canonical absolute acquisition-file path".to_string(),
         size,
         sha256,
+        file_identity: after_handle.file_identity,
+        modified_utc: system_time_rfc3339(after_handle.modified),
     })
 }
 
@@ -1608,28 +2163,21 @@ fn acquisition_source_snapshot(set: &AcquisitionSegmentSet) -> Result<Vec<Acquis
             if !metadata.is_file() {
                 bail!("acquisition segment is not a file: {}", path.display());
             }
-            Ok(AcquisitionSourceState {
-                path: path.clone(),
-                size: metadata.len(),
-                modified: metadata.modified().ok(),
-            })
+            Ok(acquisition_source_state(path, &metadata))
         })
         .collect()
 }
 
 fn verify_acquisition_source_snapshot(snapshot: &[AcquisitionSourceState]) -> Result<()> {
     for expected in snapshot {
-        let current = fs::metadata(&expected.path).with_context(|| {
+        let current_metadata = fs::metadata(&expected.path).with_context(|| {
             format!(
                 "rechecking acquisition source metadata {}",
                 expected.path.display()
             )
         })?;
-        let modified_changed = expected
-            .modified
-            .zip(current.modified().ok())
-            .is_some_and(|(before, after)| before != after);
-        if !current.is_file() || current.len() != expected.size || modified_changed {
+        let current = acquisition_source_state(&expected.path, &current_metadata);
+        if !current_metadata.is_file() || !acquisition_source_state_matches(expected, &current) {
             bail!(
                 "acquisition source changed between decoded-media and container hashing; no mutually inconsistent hashes were stored: {}",
                 expected.path.display()
@@ -1639,23 +2187,47 @@ fn verify_acquisition_source_snapshot(snapshot: &[AcquisitionSourceState]) -> Re
     Ok(())
 }
 
-fn acquisition_manifest(set: AcquisitionSegmentSet) -> Result<AcquisitionManifest> {
+fn acquisition_manifest(
+    set: &AcquisitionSegmentSet,
+    source_snapshot: &[AcquisitionSourceState],
+    source_generation: &str,
+) -> Result<AcquisitionManifest> {
+    if set.paths.len() != source_snapshot.len() {
+        bail!(
+            "acquisition segment set changed before manifest hashing: {} paths versus {} snapshots",
+            set.paths.len(),
+            source_snapshot.len()
+        );
+    }
     let mut segments = Vec::with_capacity(set.paths.len());
     let mut total_size = 0_u64;
-    for path in set.paths {
-        let segment = hash_acquisition_segment(&path)?;
+    for (index, (path, expected)) in set.paths.iter().zip(source_snapshot).enumerate() {
+        if path != &expected.path {
+            bail!("acquisition path order changed before manifest hashing");
+        }
+        let segment = hash_acquisition_segment_from_snapshot(expected, index + 1)?;
         total_size = total_size
             .checked_add(segment.size)
             .context("acquisition segment total size exceeds u64")?;
         segments.push(segment);
     }
     Ok(AcquisitionManifest {
-        scheme: set.scheme,
+        scheme: set.scheme.clone(),
         segment_count: segments.len(),
         segments,
         total_size,
         complete: set.complete,
-        note: set.note,
+        completeness_state: set.completeness_state.clone(),
+        enumeration_basis: set.enumeration_basis.clone(),
+        source_generation: source_generation.to_string(),
+        source_generation_basis: if cfg!(windows) {
+            "SHA-256 over ordered canonical path, one-based ordinal, size, and modification time captured before hashing; stable Windows volume/file identity is not available through safe std on this toolchain, so opened-handle and path metadata are compared before and after every hash"
+                .to_string()
+        } else {
+            "SHA-256 over ordered canonical path, one-based ordinal, size, modification time, and stable device/inode identity; opened-handle and path metadata are compared before and after every hash"
+                .to_string()
+        },
+        note: set.note.clone(),
     })
 }
 
@@ -1674,117 +2246,325 @@ pub fn hash_evidence(case_path: &Path, evidence_id: i64) -> Result<HashEvidenceR
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
 
-    let (sha256_hex, bytes_hashed, sha256_scope, acquisition_manifest_json) = if source_kind
-        == "image"
-    {
-        let segment_set = acquisition_segment_set(Path::new(&source_path))?;
-        let source_snapshot = acquisition_source_snapshot(&segment_set)?;
-        let mut opened = open_disk_image(Path::new(&source_path))?;
-        let acquisition_bytes = source_snapshot
-            .iter()
-            .fold(0_u64, |total, segment| total.saturating_add(segment.size));
-        progress::progress_set_unit("bytes");
-        progress::progress_set_total(Some(opened.decoded_size.saturating_add(acquisition_bytes)));
-        progress::progress_current(source_path.clone());
-        opened.reader.seek(SeekFrom::Start(0))?;
-        let (sha256_hex, bytes_hashed) =
-            sha256_reader(&mut *opened.reader, "decoded logical-media stream")?;
-        let acquisition_manifest_json =
-            acquisition_manifest(segment_set).context("hashing acquisition files")?;
-        verify_acquisition_source_snapshot(&source_snapshot)?;
-        (
-            sha256_hex,
-            bytes_hashed,
-            "logical_media".to_string(),
-            Some(acquisition_manifest_json),
-        )
-    } else {
-        let metadata = fs::metadata(&source_path)
-            .with_context(|| format!("reading evidence metadata {source_path}"))?;
-        if !metadata.is_file() {
-            bail!(
-                "hashing supports file and image evidence; {source_kind} evidence is a directory"
-            );
+    let actor = audit_actor(&conn, case_id)?;
+    let job_id = {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reconciled = tx.execute(
+            "UPDATE evidence_jobs
+             SET status = 'failed',
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 error = 'Interrupted before hash finalization; prior canonical evidence hashes were preserved',
+                 parameters_json = json_set(
+                     parameters_json,
+                     '$.interrupted_before_finalization', json('true'),
+                     '$.canonical_prior_hash_preserved', json('true'))
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND job_type = 'hash' AND status = 'running'",
+            params![case_id, evidence_id],
+        )?;
+        if reconciled > 0 {
+            tx.execute(
+                "INSERT INTO audit_events(
+                     case_id, event_type, actor, object_type, object_id, details_json
+                 ) VALUES (
+                     ?1, 'evidence.hash.interrupted_reconciled', ?2, 'evidence', ?3,
+                     json_object('reconciled_jobs', ?4,
+                                 'canonical_prior_hash_preserved', json('true'))
+                 )",
+                params![
+                    case_id,
+                    actor,
+                    evidence_id,
+                    i64::try_from(reconciled).unwrap_or(i64::MAX)
+                ],
+            )?;
         }
-        let mut file = fs::File::open(&source_path)
-            .with_context(|| format!("opening evidence {source_path}"))?;
-        progress::progress_set_unit("bytes");
-        progress::progress_set_total(Some(metadata.len()));
-        progress::progress_current(source_path.clone());
-        let (sha256_hex, bytes_hashed) = sha256_reader(&mut file, "evidence file")?;
-        (sha256_hex, bytes_hashed, "file".to_string(), None)
+        let initial_parameters = serde_json::json!({
+            "algorithm": "sha256",
+            "source_kind": source_kind.as_str(),
+            "lifecycle": "running job persisted before source enumeration or hashing; evidence hash and manifest publish atomically only after source-stability checks",
+            "canonical_prior_hash_preserved_until_finalization": true,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO evidence_jobs(
+                 case_id, evidence_id, job_type, status, parameters_json, started_at
+             ) VALUES (
+                 ?1, ?2, 'hash', 'running', ?3,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             )",
+            params![case_id, evidence_id, initial_parameters],
+        )?;
+        let job_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO audit_events(
+                 case_id, event_type, actor, object_type, object_id, details_json
+             ) VALUES (
+                 ?1, 'evidence.hash.started', ?2, 'evidence', ?3,
+                 json_object('job_id', ?4, 'algorithm', 'sha256',
+                             'source_kind', ?5,
+                             'canonical_prior_hash_preserved_until_finalization', json('true'))
+             )",
+            params![case_id, actor, evidence_id, job_id, source_kind],
+        )?;
+        tx.commit()?;
+        job_id
+    };
+    progress::progress_set_job_id(job_id);
+
+    struct ComputedEvidenceHash {
+        sha256_hex: String,
+        bytes_hashed: u64,
+        sha256_scope: String,
+        source_generation: String,
+        source_generation_basis: String,
+        acquisition_manifest: Option<AcquisitionManifest>,
+    }
+
+    let computation = (|| -> Result<ComputedEvidenceHash> {
+        if source_kind == "image" {
+            let segment_set = acquisition_segment_set(Path::new(&source_path))?;
+            let source_snapshot = acquisition_source_snapshot(&segment_set)?;
+            let source_generation = acquisition_source_generation(&source_snapshot)?;
+            verify_acquisition_source_snapshot(&source_snapshot)?;
+            let mut opened = if segment_set.scheme == "ewf_numbered_segments" {
+                let reader = ewf::EwfReader::open_segments(&segment_set.paths)
+                    .with_context(|| format!("decoding exact EWF segment set for {source_path}"))?;
+                let decoded_size = reader.total_size();
+                OpenedDiskImage {
+                    format: "Ewf".to_string(),
+                    decoded_size,
+                    reader: Box::new(reader),
+                    container_finding_count: 0,
+                }
+            } else {
+                open_disk_image(Path::new(&source_path))?
+            };
+            let acquisition_bytes = source_snapshot.iter().try_fold(0_u64, |total, segment| {
+                total
+                    .checked_add(segment.size)
+                    .context("acquisition byte total exceeds u64")
+            })?;
+            let progress_total = opened
+                .decoded_size
+                .checked_add(acquisition_bytes)
+                .context("decoded-media plus acquisition byte total exceeds u64")?;
+            progress::progress_set_unit("bytes");
+            progress::progress_set_total(Some(progress_total));
+            progress::progress_current(source_path.clone());
+            opened.reader.seek(SeekFrom::Start(0))?;
+            let (sha256_hex, bytes_hashed) =
+                sha256_reader(&mut *opened.reader, "decoded logical-media stream")?;
+            if bytes_hashed != opened.decoded_size {
+                bail!(
+                    "decoded logical-media hash covered {bytes_hashed} bytes but the decoder declared {}",
+                    opened.decoded_size
+                );
+            }
+            verify_acquisition_source_snapshot(&source_snapshot)?;
+            let acquisition_manifest =
+                acquisition_manifest(&segment_set, &source_snapshot, &source_generation)
+                    .context("hashing acquisition files")?;
+            verify_acquisition_source_snapshot(&source_snapshot)?;
+            Ok(ComputedEvidenceHash {
+                sha256_hex,
+                bytes_hashed,
+                sha256_scope: "logical_media".to_string(),
+                source_generation,
+                source_generation_basis: acquisition_manifest.source_generation_basis.clone(),
+                acquisition_manifest: Some(acquisition_manifest),
+            })
+        } else {
+            let canonical_path = fs::canonicalize(&source_path)
+                .with_context(|| format!("resolving evidence path {source_path}"))?;
+            let metadata = fs::metadata(&canonical_path)
+                .with_context(|| format!("reading evidence metadata {source_path}"))?;
+            if !metadata.is_file() {
+                bail!(
+                    "hashing supports file and image evidence; {source_kind} evidence is not a regular file"
+                );
+            }
+            let expected = acquisition_source_state(&canonical_path, &metadata);
+            let source_generation = acquisition_source_generation(std::slice::from_ref(&expected))?;
+            progress::progress_set_unit("bytes");
+            progress::progress_set_total(Some(expected.size));
+            // The standalone helper repeats the opened-handle/path checks
+            // around the complete read. The original snapshot is then checked
+            // once more below so the published generation remains bound to
+            // the state captured before hashing began.
+            let file_hash = hash_acquisition_segment(&canonical_path)?;
+            verify_acquisition_source_snapshot(std::slice::from_ref(&expected))?;
+            let source_generation_basis = if cfg!(windows) {
+                "SHA-256 over canonical path, size, and modification time; safe std cannot expose stable Windows file identity on this toolchain, so the opened handle and path metadata were compared before and after hashing"
+            } else {
+                "SHA-256 over canonical path, size, modification time, and stable device/inode identity; the opened handle and path metadata were compared before and after hashing"
+            }
+            .to_string();
+            Ok(ComputedEvidenceHash {
+                sha256_hex: file_hash.sha256,
+                bytes_hashed: file_hash.size,
+                sha256_scope: "file".to_string(),
+                source_generation,
+                source_generation_basis,
+                acquisition_manifest: None,
+            })
+        }
+    })();
+
+    let computed = match computation {
+        Ok(computed) => computed,
+        Err(error) => {
+            let error_text = format!("{error:#}").chars().take(4_000).collect::<String>();
+            progress::progress_error(Some(source_path.clone()));
+            let failed_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = failed_tx.execute(
+                "UPDATE evidence_jobs
+                 SET status = 'failed',
+                     finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     error = ?2,
+                     parameters_json = json_set(
+                         parameters_json,
+                         '$.failure_before_atomic_publication', json('true'),
+                         '$.canonical_prior_hash_preserved', json('true'))
+                 WHERE id = ?1 AND status = 'running'",
+                params![job_id, error_text],
+            )?;
+            if changed != 1 {
+                bail!("marking evidence-hash job {job_id} failed affected {changed} rows");
+            }
+            failed_tx.execute(
+                "INSERT INTO audit_events(
+                     case_id, event_type, actor, object_type, object_id, details_json
+                 ) VALUES (
+                     ?1, 'evidence.hash.failed', ?2, 'evidence', ?3,
+                     json_object('job_id', ?4, 'error', ?5,
+                                 'canonical_prior_hash_preserved', json('true'))
+                 )",
+                params![case_id, actor, evidence_id, job_id, error_text],
+            )?;
+            failed_tx.commit()?;
+            return Err(error);
+        }
     };
 
-    let acquisition_manifest_text = acquisition_manifest_json
+    let completed_with_diagnostics = computed
+        .acquisition_manifest
+        .as_ref()
+        .is_some_and(|manifest| !manifest.complete);
+    let status = if completed_with_diagnostics {
+        "completed_with_diagnostics"
+    } else {
+        "completed"
+    };
+    let acquisition_manifest_text = computed
+        .acquisition_manifest
         .as_ref()
         .map(serde_json::to_string)
         .transpose()
         .context("serializing acquisition manifest")?;
     let job_parameters = serde_json::json!({
         "algorithm": "sha256",
-        "bytes_hashed": bytes_hashed,
-        "sha256_scope": sha256_scope.as_str(),
-        "acquisition_manifest_json": acquisition_manifest_json.as_ref(),
+        "bytes_hashed": computed.bytes_hashed,
+        "sha256_scope": computed.sha256_scope.as_str(),
+        "source_generation": computed.source_generation.as_str(),
+        "source_generation_basis": computed.source_generation_basis.as_str(),
+        "acquisition_manifest_json": computed.acquisition_manifest.as_ref(),
+        "atomic_publication_completed": true,
+        "completed_with_diagnostics": completed_with_diagnostics,
     })
     .to_string();
     let mut audit_details = serde_json::json!({
+        "job_id": job_id,
         "algorithm": "sha256",
-        "sha256": sha256_hex.as_str(),
-        "sha256_scope": sha256_scope.as_str(),
-        "bytes_hashed": bytes_hashed,
-        "acquisition_manifest_json": acquisition_manifest_json.as_ref(),
+        "sha256": computed.sha256_hex.as_str(),
+        "sha256_scope": computed.sha256_scope.as_str(),
+        "bytes_hashed": computed.bytes_hashed,
+        "source_generation": computed.source_generation.as_str(),
+        "source_generation_basis": computed.source_generation_basis.as_str(),
+        "acquisition_manifest_json": computed.acquisition_manifest.as_ref(),
+        "status": status,
     });
-    if sha256_scope == "logical_media" {
-        audit_details["logical_media_sha256"] = serde_json::json!(sha256_hex.as_str());
+    if computed.sha256_scope == "logical_media" {
+        audit_details["logical_media_sha256"] = serde_json::json!(computed.sha256_hex.as_str());
     } else {
-        audit_details["file_sha256"] = serde_json::json!(sha256_hex.as_str());
+        audit_details["file_sha256"] = serde_json::json!(computed.sha256_hex.as_str());
     }
 
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let actor = audit_actor(&tx, case_id)?;
-    tx.execute(
-        "UPDATE evidence_sources
-         SET sha256_hex = ?3,
-             hashed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-             sha256_scope = ?4,
-             acquisition_manifest_json = ?5
-         WHERE case_id = ?1 AND id = ?2",
-        params![
-            case_id,
-            evidence_id,
-            sha256_hex,
-            sha256_scope,
-            acquisition_manifest_text
-        ],
-    )?;
-    tx.execute(
-        "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json,
-                                   started_at, finished_at)
-         VALUES (?1, ?2, 'hash', 'completed',
-                 ?3,
-                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        params![case_id, evidence_id, job_parameters],
-    )?;
-    progress::progress_set_job_id(tx.last_insert_rowid());
-    tx.execute(
-        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
-         VALUES (?1, 'evidence.hash', ?2, 'evidence', ?3,
-                 ?4)",
-        params![case_id, actor, evidence_id, audit_details.to_string()],
-    )?;
-    let hashed_at: String = tx.query_row(
-        "SELECT hashed_at FROM evidence_sources WHERE case_id = ?1 AND id = ?2",
-        params![case_id, evidence_id],
-        |row| row.get(0),
-    )?;
-    tx.commit()?;
+    let finalize = (|| -> Result<String> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE evidence_sources
+             SET sha256_hex = ?3,
+                 hashed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 sha256_scope = ?4,
+                 acquisition_manifest_json = ?5
+             WHERE case_id = ?1 AND id = ?2",
+            params![
+                case_id,
+                evidence_id,
+                computed.sha256_hex,
+                computed.sha256_scope,
+                acquisition_manifest_text
+            ],
+        )?;
+        if changed != 1 {
+            bail!("publishing evidence hash affected {changed} evidence rows");
+        }
+        let changed = tx.execute(
+            "UPDATE evidence_jobs
+             SET status = ?2, parameters_json = ?3,
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), error = NULL
+             WHERE id = ?1 AND status = 'running'",
+            params![job_id, status, job_parameters],
+        )?;
+        if changed != 1 {
+            bail!("finalizing evidence-hash job {job_id} affected {changed} rows");
+        }
+        tx.execute(
+            "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+             VALUES (?1, 'evidence.hash', ?2, 'evidence', ?3, ?4)",
+            params![case_id, actor, evidence_id, audit_details.to_string()],
+        )?;
+        let hashed_at: String = tx.query_row(
+            "SELECT hashed_at FROM evidence_sources WHERE case_id = ?1 AND id = ?2",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(hashed_at)
+    })();
+    let hashed_at = match finalize {
+        Ok(hashed_at) => hashed_at,
+        Err(error) => {
+            let error_text = format!("{error:#}").chars().take(4_000).collect::<String>();
+            if let Err(mark_error) = conn.execute(
+                "UPDATE evidence_jobs
+                 SET status = 'failed', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     error = ?2,
+                     parameters_json = json_set(
+                         parameters_json,
+                         '$.failure_before_atomic_publication', json('true'),
+                         '$.canonical_prior_hash_preserved', json('true'))
+                 WHERE id = ?1 AND status = 'running'",
+                params![job_id, error_text],
+            ) {
+                return Err(error.context(format!(
+                    "also failed to mark evidence-hash job {job_id} failed: {mark_error:#}"
+                )));
+            }
+            return Err(error);
+        }
+    };
     Ok(HashEvidenceResult {
         evidence_id,
-        sha256_hex,
-        sha256_scope,
-        bytes_hashed,
+        job_id,
+        sha256_hex: computed.sha256_hex,
+        sha256_scope: computed.sha256_scope,
+        bytes_hashed: computed.bytes_hashed,
         hashed_at,
-        acquisition_manifest_json,
+        acquisition_manifest_json: computed.acquisition_manifest,
+        completed_with_diagnostics,
+        status: status.to_string(),
     })
 }
 
@@ -1799,14 +2579,27 @@ pub struct HashIndexedFilesOptions {
 
 #[derive(Debug, Serialize)]
 pub struct HashIndexedFilesResult {
+    pub job_id: i64,
     pub evidence_id: i64,
     pub eligible_files_total: usize,
+    pub pending_files_total: usize,
     pub up_to_date_files_skipped: usize,
     pub worker_threads: usize,
     pub files_hashed: usize,
+    /// Legacy aggregate retained for API compatibility. This is the sum of
+    /// not-applicable, read-error, incomplete, and per-file examiner-cap
+    /// outcomes actually visited by the job.
     pub files_skipped: usize,
+    pub files_not_applicable: usize,
+    pub files_read_error: usize,
+    pub files_incomplete: usize,
+    pub files_deferred_at_examiner_limit: usize,
+    pub prior_hashes_preserved: usize,
+    pub prior_hashes_invalidated_source_changed: usize,
     pub bytes_hashed: u64,
+    pub completed_with_diagnostics: bool,
     pub truncated: bool,
+    pub status: String,
 }
 
 // One window is large enough to keep the EWF reader's bounded Rayon chunk
@@ -1814,7 +2607,7 @@ pub struct HashIndexedFilesResult {
 // order. This also cuts per-file read/NTFS setup calls by 8x versus 1 MiB.
 const FILE_HASH_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const FILE_HASH_WRITE_BATCH_SIZE: usize = 256;
-const FILE_HASH_CHECKPOINT_VERSION: &str = "sha256-complete-v2";
+const FILE_HASH_CHECKPOINT_VERSION: &str = "sha256-complete-v3-generation-bound";
 
 #[derive(Debug)]
 struct IndexedFileHashCandidate {
@@ -2107,7 +2900,7 @@ pub fn hash_indexed_files(
         let mut write_error: Option<anyhow::Error> = None;
         pool.spawn(move || {
             candidates.into_par_iter().for_each_init(
-                || match EvidenceReadSession::open_worker_read_only(&case_path) {
+                || match EvidenceReadSession::open_worker_read_only_fresh(&case_path) {
                     Ok(session) => HashWorkerReadSession::Ready(session),
                     Err(error) => HashWorkerReadSession::Failed(format!("{error:#}")),
                 },
@@ -2211,14 +3004,24 @@ pub fn hash_indexed_files(
         ],
     )?;
     Ok(HashIndexedFilesResult {
+        job_id,
         evidence_id: options.evidence_id,
         eligible_files_total,
+        pending_files_total,
         up_to_date_files_skipped,
         worker_threads,
         files_hashed,
         files_skipped,
+        files_not_applicable: 0,
+        files_read_error: 0,
+        files_incomplete: files_skipped,
+        files_deferred_at_examiner_limit: pending_files_total.saturating_sub(files_to_process),
+        prior_hashes_preserved: 0,
+        prior_hashes_invalidated_source_changed: 0,
         bytes_hashed: total_bytes_hashed,
+        completed_with_diagnostics: files_skipped > 0,
         truncated,
+        status: status.to_string(),
     })
 }
 
@@ -2267,6 +3070,12 @@ pub struct DocumentParseResult {
     pub cleanup_warning_count: usize,
     pub cleanup_warnings: Vec<String>,
     pub cleanup_warnings_omitted: usize,
+    /// True when one or more documents retained usable but explicitly partial
+    /// parser coverage, or a candidate failed while the batch still finished.
+    pub partial_artifact_coverage: bool,
+    pub completed_with_diagnostics: bool,
+    /// Reserved for an actual protective bound or snapshot interruption. Parser
+    /// diagnostics alone do not mean the batch stopped early.
     pub truncated: bool,
     pub status: String,
 }
@@ -2278,12 +3087,29 @@ pub struct ArchiveParseResult {
     pub up_to_date_archives_skipped: usize,
     pub archives_found: usize,
     pub archives_parsed: usize,
+    pub archives_complete: usize,
+    pub archives_partial: usize,
+    pub archives_unsupported: usize,
     pub members_indexed: usize,
+    pub validated_members: usize,
+    pub encrypted_members: usize,
+    pub unsupported_members: usize,
+    pub corrupt_members: usize,
+    pub io_error_members: usize,
+    pub internal_error_members: usize,
+    pub metadata_unavailable_members: usize,
+    pub path_risk_members: usize,
+    pub crc32_validated_members: usize,
     pub text_segments_indexed: u64,
     pub uncompressed_bytes_validated: u128,
     /// Files named `.zip` whose captured bytes contain no ZIP signature. They
     /// are disclosed as extension/signature mismatches, not parser failures.
     pub signature_mismatch_count: usize,
+    /// Member-level corruption/I/O/metadata diagnostics. Deliberate encrypted
+    /// and unsupported-method limitations are counted separately above.
+    pub member_diagnostic_count: usize,
+    pub member_diagnostics: Vec<String>,
+    pub member_diagnostics_omitted: usize,
     pub parse_error_count: usize,
     pub parse_errors: Vec<String>,
     pub parse_errors_omitted: usize,
@@ -2307,10 +3133,16 @@ pub struct IdentityParseResult {
     pub network_artifacts_indexed: usize,
     pub wifi_profiles_indexed: usize,
     pub credential_stores_indexed: usize,
+    /// Retained for JSON/API compatibility. Sensitive values are no longer
+    /// copied into derived metadata, so this is always zero.
     pub plaintext_secrets_indexed: usize,
+    pub structured_secret_findings_indexed: usize,
     pub parse_error_count: usize,
     pub parse_errors: Vec<String>,
     pub parse_errors_omitted: usize,
+    pub completed_with_diagnostics: bool,
+    pub canonical_generation_preserved: bool,
+    pub sensitive_metadata_rows_sanitized: usize,
     pub truncated: bool,
     pub status: String,
 }
@@ -2330,14 +3162,246 @@ struct DerivedIdentityEntry {
     logical_path: String,
     display_name: String,
     metadata: serde_json::Value,
+    source_job_id: i64,
+}
+
+#[derive(Debug)]
+struct IdentityHiveOutcome {
+    entries: Vec<DerivedIdentityEntry>,
+    parser_reported_partial: bool,
+}
+
+/// Owns one collision-resistant, parser-private staging directory. Cleanup is
+/// intentionally bounded to the exact file and exact directory created here;
+/// no recursive removal or caller-controlled path is ever used.
+#[derive(Debug)]
+struct PrivateIdentityStagingFile {
+    directory: PathBuf,
+    path: PathBuf,
+    cleaned: bool,
+}
+
+impl PrivateIdentityStagingFile {
+    fn create(purpose: &str, suffix: &str) -> Result<Self> {
+        if purpose.is_empty()
+            || suffix.is_empty()
+            || !purpose
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            bail!("invalid identity staging filename component");
+        }
+        static NEXT_IDENTITY_STAGING: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let parent = std::env::temp_dir();
+        for _ in 0..128 {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default();
+            let nonce = NEXT_IDENTITY_STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let directory = parent.join(format!(
+                "kdft-identity-{purpose}-{}-{stamp}-{nonce}",
+                std::process::id()
+            ));
+            #[cfg(unix)]
+            let created = {
+                use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder.create(&directory)
+            };
+            #[cfg(not(unix))]
+            let created = fs::create_dir(&directory);
+            match created {
+                Ok(()) => {
+                    ensure_directory_is_not_reparse(
+                        &directory,
+                        "identity parser staging directory",
+                    )?;
+                    let path = directory.join(format!("source.{suffix}"));
+                    return Ok(Self {
+                        directory,
+                        path,
+                        cleaned: false,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "creating private identity staging directory under {}",
+                            parent.display()
+                        )
+                    })
+                }
+            }
+        }
+        bail!("could not reserve a private identity staging directory after 128 attempts")
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup(mut self) -> Result<()> {
+        self.cleanup_exact()?;
+        self.cleaned = true;
+        Ok(())
+    }
+
+    fn cleanup_exact(&self) -> Result<()> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("removing staged identity file {}", self.path.display())
+                })
+            }
+        }
+        fs::remove_dir(&self.directory).with_context(|| {
+            format!(
+                "removing private identity staging directory {}",
+                self.directory.display()
+            )
+        })
+    }
+}
+
+impl Drop for PrivateIdentityStagingFile {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            let _ = self.cleanup_exact();
+        }
+    }
+}
+
+fn read_filesystem_entry_bounded_in_session(
+    session: &mut EvidenceReadSession,
+    entry_id: i64,
+    expected_evidence_id: i64,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>> {
+    if maximum_bytes == 0 {
+        bail!("identity parser byte bound must be greater than zero");
+    }
+    const READ_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+    let mut offset = 0_u64;
+    let mut expected_total = None;
+    let mut output = Vec::new();
+    loop {
+        let remaining_bound = maximum_bytes.saturating_sub(offset);
+        if remaining_bound == 0 && expected_total.is_none_or(|total| offset < total) {
+            bail!(
+                "filesystem entry {entry_id} exceeds the identity parser limit of {maximum_bytes} bytes"
+            );
+        }
+        let requested = usize::try_from(remaining_bound)
+            .unwrap_or(usize::MAX)
+            .clamp(1, READ_WINDOW_BYTES);
+        let chunk = read_filesystem_entry_bytes_in_session(
+            session,
+            ReadEntryBytesOptions {
+                entry_id,
+                offset,
+                length: requested,
+            },
+        )?;
+        if chunk.evidence_id != expected_evidence_id {
+            bail!(
+                "filesystem entry {entry_id} belongs to evidence {}, not requested evidence {expected_evidence_id}",
+                chunk.evidence_id
+            );
+        }
+        if chunk.offset != offset || chunk.bytes_read != chunk.bytes.len() {
+            bail!("filesystem entry {entry_id} returned an inconsistent bounded read window");
+        }
+        match expected_total {
+            None => {
+                if chunk.total_size > maximum_bytes {
+                    bail!(
+                        "filesystem entry {entry_id} is {} bytes, exceeding the identity parser limit of {maximum_bytes} bytes",
+                        chunk.total_size
+                    );
+                }
+                output
+                    .try_reserve_exact(usize::try_from(chunk.total_size).unwrap_or(usize::MAX))
+                    .map_err(|error| {
+                        anyhow!("reserving bounded identity source buffer: {error}")
+                    })?;
+                expected_total = Some(chunk.total_size);
+            }
+            Some(total) if total != chunk.total_size => {
+                bail!("filesystem entry {entry_id} size changed during the bounded read")
+            }
+            Some(_) => {}
+        }
+        if chunk.bytes.len() as u64 > remaining_bound {
+            bail!("filesystem entry {entry_id} exceeded its bounded read window");
+        }
+        output.extend_from_slice(&chunk.bytes);
+        offset = offset.saturating_add(chunk.bytes.len() as u64);
+        if chunk.eof {
+            let total = expected_total.unwrap_or_default();
+            if offset != total {
+                bail!(
+                    "filesystem entry {entry_id} ended at {offset} bytes but declared {total} bytes"
+                );
+            }
+            return Ok(output);
+        }
+        if chunk.bytes.is_empty() {
+            bail!("filesystem entry {entry_id} made no progress before end of file");
+        }
+    }
+}
+
+fn recover_filesystem_entry_bounded_in_session(
+    session: &mut EvidenceReadSession,
+    entry_id: i64,
+    expected_evidence_id: i64,
+    output_path: &Path,
+    maximum_bytes: u64,
+) -> Result<()> {
+    let bytes = read_filesystem_entry_bounded_in_session(
+        session,
+        entry_id,
+        expected_evidence_id,
+        maximum_bytes,
+    )?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options
+        .open(output_path)
+        .with_context(|| format!("creating staged identity file {}", output_path.display()))?;
+    output
+        .write_all(&bytes)
+        .with_context(|| format!("writing staged identity file {}", output_path.display()))?;
+    output
+        .flush()
+        .with_context(|| format!("flushing staged identity file {}", output_path.display()))?;
+    output
+        .sync_all()
+        .with_context(|| format!("syncing staged identity file {}", output_path.display()))?;
+    Ok(())
 }
 
 /// Extracts identity and network metadata from allocated SAM, SOFTWARE, and
 /// SYSTEM hives plus high-confidence WLAN profiles and credential-store
-/// locations. Plaintext WLAN key material is retained only when it is already
-/// present in the structured profile; encrypted blobs are never mislabeled as
-/// decoded passwords.
+/// locations. Sensitive values are observed only in exact structured source
+/// fields; ordinary case metadata and reports retain a locator, state, length,
+/// and SHA-256 rather than the value itself. Protected blobs are never
+/// mislabeled as decoded passwords.
 pub fn parse_identity_artifacts(case_path: &Path, evidence_id: i64) -> Result<IdentityParseResult> {
+    let sensitive_metadata_rows_sanitized =
+        sanitize_legacy_identity_sensitive_metadata(case_path, evidence_id)?;
     let candidates = {
         let conn = open_existing_case(case_path)?;
         let case_id = active_case_id(&conn)?;
@@ -2375,28 +3439,37 @@ pub fn parse_identity_artifacts(case_path: &Path, evidence_id: i64) -> Result<Id
         wifi_profiles_indexed: 0,
         credential_stores_indexed: 0,
         plaintext_secrets_indexed: 0,
+        structured_secret_findings_indexed: 0,
         parse_error_count: 0,
         parse_errors: Vec::new(),
         parse_errors_omitted: 0,
+        completed_with_diagnostics: false,
+        canonical_generation_preserved: false,
+        sensitive_metadata_rows_sanitized,
         truncated: false,
         status: "completed".to_string(),
     };
+    let mut derived = Vec::new();
     progress::progress_set_unit("hives");
     progress::progress_set_total(Some(candidates.len() as u64));
     let mut read_session = EvidenceReadSession::open(case_path)?;
     for candidate in &candidates {
         progress::progress_current(candidate.logical_path.clone());
-        match parse_one_identity_hive(case_path, &mut read_session, evidence_id, candidate) {
-            Ok((local_accounts, domain_accounts, profiles, hosts, networks)) => {
+        match parse_one_identity_hive(&mut read_session, evidence_id, candidate) {
+            Ok(outcome) => {
                 result.hives_parsed += 1;
-                result.local_accounts_indexed += local_accounts;
-                result.domain_accounts_indexed += domain_accounts;
-                result.user_profiles_indexed += profiles;
-                result.host_identities_indexed += hosts;
-                result.network_artifacts_indexed += networks;
+                if outcome.parser_reported_partial {
+                    retain_identity_diagnostic(
+                        &mut result,
+                        format!(
+                            "{} (entry {}): Registry parser reached its internal safety bound",
+                            candidate.logical_path, candidate.entry_id
+                        ),
+                    );
+                }
+                derived.extend(outcome.entries);
             }
             Err(err) => {
-                result.parse_error_count = result.parse_error_count.saturating_add(1);
                 let message = format!(
                     "{} (entry {}): {err:#}",
                     candidate.logical_path, candidate.entry_id
@@ -2405,11 +3478,7 @@ pub fn parse_identity_artifacts(case_path: &Path, evidence_id: i64) -> Result<Id
                     progress::JobDiagnosticKind::ParserDiagnostic,
                     message.clone(),
                 );
-                if result.parse_errors.len() < EMBEDDED_PASS_ERROR_DISPLAY_LIMIT {
-                    result.parse_errors.push(message);
-                } else {
-                    result.parse_errors_omitted = result.parse_errors_omitted.saturating_add(1);
-                }
+                retain_identity_diagnostic(&mut result, message);
                 progress::progress_error(Some(candidate.logical_path.clone()));
                 progress::progress_skip(Some(candidate.logical_path.clone()));
             }
@@ -2418,47 +3487,494 @@ pub fn parse_identity_artifacts(case_path: &Path, evidence_id: i64) -> Result<Id
     }
     progress::progress_set_total(None);
     progress::progress_set_unit("identity artifacts");
-    result.browser_accounts_indexed = derive_browser_account_identities(case_path, evidence_id)?;
+    let (browser_accounts, browser_errors) =
+        derive_browser_account_identities(case_path, evidence_id)?;
+    derived.extend(browser_accounts);
+    for error in browser_errors {
+        progress::progress_diagnostic(progress::JobDiagnosticKind::ParserDiagnostic, error.clone());
+        retain_identity_diagnostic(&mut result, error);
+    }
     let (wifi_profiles, wifi_errors) =
         derive_wifi_profiles(case_path, &mut read_session, evidence_id)?;
-    result.wifi_profiles_indexed = wifi_profiles;
+    derived.extend(wifi_profiles);
     for error in wifi_errors {
-        result.parse_error_count = result.parse_error_count.saturating_add(1);
         progress::progress_diagnostic(progress::JobDiagnosticKind::ParserDiagnostic, error.clone());
-        if result.parse_errors.len() < EMBEDDED_PASS_ERROR_DISPLAY_LIMIT {
-            result.parse_errors.push(error);
-        } else {
-            result.parse_errors_omitted = result.parse_errors_omitted.saturating_add(1);
-        }
+        retain_identity_diagnostic(&mut result, error);
     }
-    result.credential_stores_indexed = derive_credential_store_leads(case_path, evidence_id)?;
-    let (plaintext_secrets, secret_errors) =
-        derive_plaintext_secret_leads(case_path, &mut read_session, evidence_id)?;
-    result.plaintext_secrets_indexed = plaintext_secrets;
+    derived.extend(derive_credential_store_leads(case_path, evidence_id)?);
+    let (structured_secrets, secret_errors) =
+        derive_structured_secret_leads(case_path, &mut read_session, evidence_id)?;
+    derived.extend(structured_secrets);
     for error in secret_errors {
-        result.parse_error_count = result.parse_error_count.saturating_add(1);
         progress::progress_diagnostic(progress::JobDiagnosticKind::ParserDiagnostic, error.clone());
-        if result.parse_errors.len() < EMBEDDED_PASS_ERROR_DISPLAY_LIMIT {
-            result.parse_errors.push(error);
-        } else {
-            result.parse_errors_omitted = result.parse_errors_omitted.saturating_add(1);
-        }
+        retain_identity_diagnostic(&mut result, error);
     }
-    result.truncated = result.parse_error_count > 0;
-    result.status = if result.truncated {
-        progress::progress_truncated(format!(
-            "{} identity hive(s) could not be parsed; {} diagnostic(s) omitted",
-            result.parse_error_count, result.parse_errors_omitted
-        ));
-        "truncated".to_string()
+
+    let derived = deduplicate_identity_entries(derived);
+    result.completed_with_diagnostics = result.parse_error_count > 0;
+    result.status = if result.completed_with_diagnostics {
+        "completed_with_diagnostics".to_string()
     } else {
         "completed".to_string()
     };
+    let prior_rows = existing_identity_generation_rows(case_path, evidence_id)?;
+    result.canonical_generation_preserved = result.completed_with_diagnostics && prior_rows > 0;
+    if !result.canonical_generation_preserved {
+        commit_identity_generation(
+            case_path,
+            evidence_id,
+            &derived,
+            !result.completed_with_diagnostics,
+        )?;
+    }
+    let visible_counts = identity_visible_counts(case_path, evidence_id)?;
+    result.local_accounts_indexed = visible_counts
+        .get("windows_local_account")
+        .copied()
+        .unwrap_or(0);
+    result.domain_accounts_indexed = visible_counts
+        .get("windows_domain_account")
+        .copied()
+        .unwrap_or(0);
+    result.user_profiles_indexed = visible_counts
+        .get("windows_user_profile")
+        .copied()
+        .unwrap_or(0);
+    result.browser_accounts_indexed = visible_counts.get("browser_account").copied().unwrap_or(0);
+    result.host_identities_indexed = visible_counts.get("host_identity").copied().unwrap_or(0);
+    result.network_artifacts_indexed = visible_counts
+        .get("network_configuration")
+        .copied()
+        .unwrap_or(0);
+    result.wifi_profiles_indexed = visible_counts.get("wifi_profile").copied().unwrap_or(0);
+    result.credential_stores_indexed = visible_counts.get("credential_store").copied().unwrap_or(0);
+    result.structured_secret_findings_indexed = visible_counts
+        .get("structured_secret")
+        .copied()
+        .unwrap_or(0);
+    record_identity_parse_audit(case_path, evidence_id, &result, derived.len(), prior_rows)?;
     Ok(result)
 }
 
-fn derive_browser_account_identities(case_path: &Path, evidence_id: i64) -> Result<usize> {
+fn retain_identity_diagnostic(result: &mut IdentityParseResult, message: String) {
+    result.parse_error_count = result.parse_error_count.saturating_add(1);
+    if result.parse_errors.len() < EMBEDDED_PASS_ERROR_DISPLAY_LIMIT {
+        result.parse_errors.push(message);
+    } else {
+        result.parse_errors_omitted = result.parse_errors_omitted.saturating_add(1);
+    }
+}
+
+const IDENTITY_DERIVED_ARTIFACT_KINDS: &[&str] = &[
+    "windows_local_account",
+    "windows_domain_account",
+    "windows_user_profile",
+    "browser_account",
+    "host_identity",
+    "network_configuration",
+    "wifi_profile",
+    "credential_store",
+    "structured_secret",
+    // Legacy kind retained only so old unsafe rows can be sanitized and
+    // replaced by the redacted structured-secret representation.
+    "plaintext_secret",
+];
+
+fn is_identity_derived_artifact_kind(kind: &str) -> bool {
+    IDENTITY_DERIVED_ARTIFACT_KINDS.contains(&kind)
+}
+
+fn sanitize_legacy_identity_sensitive_metadata(
+    case_path: &Path,
+    evidence_id: i64,
+) -> Result<usize> {
     let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    ensure_evidence_source(&conn, case_id, evidence_id)?;
+    let rows = {
+        let mut statement = conn.prepare(
+            "SELECT id, metadata_json
+             FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_valid(metadata_json) = 1
+               AND json_extract(metadata_json, '$.artifact_kind') IN
+                   ('wifi_profile', 'plaintext_secret', 'structured_secret')
+             ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![case_id, evidence_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut sanitized = 0_usize;
+    for (entry_id, metadata_text) in rows {
+        let mut metadata = serde_json::from_str::<serde_json::Value>(&metadata_text)
+            .with_context(|| format!("parsing legacy sensitive metadata for entry {entry_id}"))?;
+        let Some(object) = metadata.as_object_mut() else {
+            continue;
+        };
+        let mut changed = false;
+        let mut wifi_summaries = Vec::new();
+        for (field, state) in [
+            ("wifi_key_plaintext", "plaintext_value_in_source"),
+            ("wifi_key_encrypted", "protected_blob_in_source"),
+            ("key_material", "protection_state_unknown"),
+        ] {
+            if let Some(value) = object.remove(field) {
+                changed = true;
+                if let Some(value) = value.as_str().filter(|value| !value.is_empty()) {
+                    wifi_summaries.push(serde_json::json!({
+                        "material_state": state,
+                        "value_length_bytes": value.len(),
+                        "value_sha256": sha256_hex(value.as_bytes()),
+                        "hash_basis": "exact UTF-8 bytes decoded from the structured source field",
+                    }));
+                }
+            }
+        }
+        if !wifi_summaries.is_empty() {
+            let first = &wifi_summaries[0];
+            object.insert(
+                "wifi_key_material_state".to_string(),
+                first["material_state"].clone(),
+            );
+            object.insert(
+                "wifi_key_value_length_bytes".to_string(),
+                first["value_length_bytes"].clone(),
+            );
+            object.insert(
+                "wifi_key_value_sha256".to_string(),
+                first["value_sha256"].clone(),
+            );
+            object.insert(
+                "wifi_key_hash_basis".to_string(),
+                first["hash_basis"].clone(),
+            );
+            if wifi_summaries.len() > 1 {
+                object.insert(
+                    "wifi_key_material_summaries".to_string(),
+                    serde_json::Value::Array(wifi_summaries),
+                );
+            }
+            object.insert(
+                "sensitive_value_disclosure".to_string(),
+                serde_json::json!("withheld"),
+            );
+            object.insert(
+                "secret_access_policy".to_string(),
+                serde_json::json!("inspect the original WLAN profile through an explicit examiner action; ordinary metadata and reports do not disclose key material"),
+            );
+        }
+        if let Some(value) = object.remove("secret_value") {
+            changed = true;
+            if let Some(value) = value.as_str().filter(|value| !value.is_empty()) {
+                object.insert(
+                    "secret_value_length_bytes".to_string(),
+                    serde_json::json!(value.len()),
+                );
+                object.insert(
+                    "secret_value_sha256".to_string(),
+                    serde_json::json!(sha256_hex(value.as_bytes())),
+                );
+                object.insert(
+                    "secret_hash_basis".to_string(),
+                    serde_json::json!("exact UTF-8 bytes decoded from the structured source field"),
+                );
+                object.insert(
+                    "secret_material_state".to_string(),
+                    serde_json::json!("plaintext_value_in_source"),
+                );
+                object.insert(
+                    "sensitive_value_present".to_string(),
+                    serde_json::json!(true),
+                );
+            }
+            object.insert(
+                "sensitive_value_disclosure".to_string(),
+                serde_json::json!("withheld"),
+            );
+            object.insert(
+                "secret_access_policy".to_string(),
+                serde_json::json!("inspect the original source entry through an explicit examiner action; ordinary metadata and reports do not disclose the value"),
+            );
+        }
+        if object
+            .get("artifact_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("plaintext_secret")
+        {
+            object.insert(
+                "artifact_kind".to_string(),
+                serde_json::json!("structured_secret"),
+            );
+            changed = true;
+        }
+        if changed {
+            tx.execute(
+                "UPDATE filesystem_entries SET metadata_json = ?1
+                 WHERE case_id = ?2 AND evidence_id = ?3 AND id = ?4",
+                params![metadata.to_string(), case_id, evidence_id, entry_id],
+            )?;
+            sanitized = sanitized.saturating_add(1);
+        }
+    }
+    tx.commit()?;
+    Ok(sanitized)
+}
+
+fn identity_metadata_string(metadata: &serde_json::Value, key: &str) -> String {
+    metadata
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn identity_entry_semantic_key(entry: &DerivedIdentityEntry) -> String {
+    let kind = identity_metadata_string(&entry.metadata, "artifact_kind");
+    let fields: &[&str] = match kind.as_str() {
+        "windows_local_account" => &["account_name"],
+        "windows_domain_account" => &["qualified_account"],
+        "windows_user_profile" => &["profile_sid", "profile_path"],
+        "browser_account" => &["browser_family", "account_service", "account_identifier"],
+        "host_identity" | "network_configuration" => &["lead_type", "value"],
+        "wifi_profile" => &[
+            "profile_name",
+            "ssid",
+            "authentication",
+            "encryption",
+            "wifi_key_value_sha256",
+        ],
+        "credential_store" => &["credential_store_type", "source_artifact_path"],
+        "structured_secret" | "plaintext_secret" => &[
+            "derived_from_entry_id",
+            "secret_source_location",
+            "secret_value_sha256",
+        ],
+        _ => return format!("{kind}\u{1f}{}", entry.logical_path.to_ascii_lowercase()),
+    };
+    let mut key = kind;
+    for field in fields {
+        key.push('\u{1f}');
+        if *field == "derived_from_entry_id" {
+            key.push_str(
+                &entry
+                    .metadata
+                    .get(*field)
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+            );
+        } else {
+            key.push_str(&identity_metadata_string(&entry.metadata, field));
+        }
+    }
+    key
+}
+
+fn identity_source_reference(entry: &DerivedIdentityEntry) -> serde_json::Value {
+    serde_json::json!({
+        "derived_from_entry_id": entry.metadata.get("derived_from_entry_id"),
+        "source_artifact_path": entry.metadata.get("source_artifact_path"),
+        "source_record_locator": entry.metadata.get("source_record_locator"),
+    })
+}
+
+fn deduplicate_identity_entries(entries: Vec<DerivedIdentityEntry>) -> Vec<DerivedIdentityEntry> {
+    let mut output: Vec<DerivedIdentityEntry> = Vec::new();
+    let mut positions = HashMap::<String, usize>::new();
+    for entry in entries {
+        let key = identity_entry_semantic_key(&entry);
+        if let Some(position) = positions.get(&key).copied() {
+            let duplicate_reference = identity_source_reference(&entry);
+            let retained = &mut output[position];
+            let original_reference = identity_source_reference(retained);
+            let object = retained.metadata.as_object_mut();
+            if let Some(object) = object {
+                let sources = object
+                    .entry("corroborating_sources".to_string())
+                    .or_insert_with(|| serde_json::json!([original_reference]));
+                if let Some(sources) = sources.as_array_mut() {
+                    if !sources.contains(&duplicate_reference) {
+                        sources.push(duplicate_reference);
+                    }
+                    let source_count = sources.len();
+                    object.insert(
+                        "corroborating_source_count".to_string(),
+                        serde_json::json!(source_count),
+                    );
+                }
+            }
+            continue;
+        }
+        positions.insert(key, output.len());
+        output.push(entry);
+    }
+    output
+}
+
+fn existing_identity_generation_rows(case_path: &Path, evidence_id: i64) -> Result<usize> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2 AND json_valid(metadata_json) = 1
+           AND json_extract(metadata_json, '$.artifact_kind') IN
+               ('windows_local_account','windows_domain_account','windows_user_profile',
+                'browser_account','host_identity','network_configuration','wifi_profile',
+                'credential_store','structured_secret','plaintext_secret')
+           AND json_extract(metadata_json, '$.identity_generation_complete') = 1
+           AND COALESCE(json_extract(metadata_json, '$.identity_generation_canonical'), 1) = 1",
+        params![case_id, evidence_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    usize::try_from(count.max(0)).context("converting prior identity generation row count")
+}
+
+fn commit_identity_generation(
+    case_path: &Path,
+    evidence_id: i64,
+    entries: &[DerivedIdentityEntry],
+    complete: bool,
+) -> Result<()> {
+    static NEXT_IDENTITY_GENERATION: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let nonce = NEXT_IDENTITY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let generation_id = format!("identity-{}-{stamp}-{nonce}", std::process::id());
+    let generation_time = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    ensure_evidence_source(&conn, case_id, evidence_id)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for entry in entries {
+        let mut metadata = entry.metadata.clone();
+        let kind = metadata
+            .get("artifact_kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !is_identity_derived_artifact_kind(kind) {
+            bail!("refusing to commit non-identity artifact kind {kind:?} in identity generation");
+        }
+        metadata["identity_generation_id"] = serde_json::json!(generation_id);
+        metadata["identity_generation_complete"] = serde_json::json!(complete);
+        metadata["identity_generation_canonical"] = serde_json::json!(true);
+        metadata["identity_generation_status"] =
+            serde_json::json!(if complete { "complete" } else { "partial" });
+        metadata["identity_generation_created_utc"] = serde_json::json!(generation_time);
+        upsert_filesystem_entry(
+            &tx,
+            case_id,
+            evidence_id,
+            &entry.logical_path,
+            &entry.display_name,
+            "record",
+            None,
+            &metadata.to_string(),
+            entry.source_job_id,
+        )?;
+    }
+    tx.execute(
+        "UPDATE filesystem_entries
+         SET metadata_json = json_set(
+             metadata_json,
+             '$.identity_generation_canonical', 0,
+             '$.identity_generation_stale', 1,
+             '$.identity_generation_stale_reason', 'superseded but retained because an examiner bookmark references this row')
+         WHERE case_id = ?1 AND evidence_id = ?2 AND json_valid(metadata_json) = 1
+           AND json_extract(metadata_json, '$.artifact_kind') IN
+               ('windows_local_account','windows_domain_account','windows_user_profile',
+                'browser_account','host_identity','network_configuration','wifi_profile',
+                'credential_store','structured_secret','plaintext_secret')
+           AND COALESCE(json_extract(metadata_json, '$.identity_generation_id'), '') <> ?3
+           AND EXISTS (SELECT 1 FROM bookmark_items WHERE bookmark_items.entry_id = filesystem_entries.id)",
+        params![case_id, evidence_id, generation_id],
+    )?;
+    tx.execute(
+        "DELETE FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2 AND json_valid(metadata_json) = 1
+           AND json_extract(metadata_json, '$.artifact_kind') IN
+               ('windows_local_account','windows_domain_account','windows_user_profile',
+                'browser_account','host_identity','network_configuration','wifi_profile',
+                'credential_store','structured_secret','plaintext_secret')
+           AND COALESCE(json_extract(metadata_json, '$.identity_generation_id'), '') <> ?3
+           AND NOT EXISTS (SELECT 1 FROM bookmark_items WHERE bookmark_items.entry_id = filesystem_entries.id)",
+        params![case_id, evidence_id, generation_id],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn identity_visible_counts(case_path: &Path, evidence_id: i64) -> Result<HashMap<String, usize>> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let mut statement = conn.prepare(
+        "SELECT json_extract(metadata_json, '$.artifact_kind'), COUNT(*)
+         FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2 AND json_valid(metadata_json) = 1
+           AND COALESCE(json_extract(metadata_json, '$.identity_generation_canonical'), 1) = 1
+           AND json_extract(metadata_json, '$.artifact_kind') IN
+               ('windows_local_account','windows_domain_account','windows_user_profile',
+                'browser_account','host_identity','network_configuration','wifi_profile',
+                'credential_store','structured_secret')
+         GROUP BY json_extract(metadata_json, '$.artifact_kind')",
+    )?;
+    let rows = statement.query_map(params![case_id, evidence_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut counts = HashMap::new();
+    for row in rows {
+        let (kind, count) = row?;
+        counts.insert(
+            kind,
+            usize::try_from(count.max(0)).context("converting identity artifact count")?,
+        );
+    }
+    Ok(counts)
+}
+
+fn record_identity_parse_audit(
+    case_path: &Path,
+    evidence_id: i64,
+    result: &IdentityParseResult,
+    candidate_count: usize,
+    prior_complete_rows: usize,
+) -> Result<()> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let actor = audit_actor(&conn, case_id)?;
+    let details = serde_json::json!({
+        "evidence_id": evidence_id,
+        "status": result.status,
+        "completed_with_diagnostics": result.completed_with_diagnostics,
+        "diagnostic_count": result.parse_error_count,
+        "diagnostics_retained_in_response": result.parse_errors.len(),
+        "diagnostics_omitted_from_response": result.parse_errors_omitted,
+        "candidate_rows_after_deduplication": candidate_count,
+        "prior_complete_generation_rows": prior_complete_rows,
+        "canonical_generation_preserved": result.canonical_generation_preserved,
+        "sensitive_metadata_rows_sanitized": result.sensitive_metadata_rows_sanitized,
+        "structured_secret_findings": result.structured_secret_findings_indexed,
+        "plaintext_secret_values_copied_to_metadata": 0,
+    });
+    conn.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'evidence.identity_parse', ?2, 'evidence', ?3, ?4)",
+        params![case_id, actor, evidence_id, details.to_string()],
+    )?;
+    Ok(())
+}
+
+fn derive_browser_account_identities(
+    case_path: &Path,
+    evidence_id: i64,
+) -> Result<(Vec<DerivedIdentityEntry>, Vec<String>)> {
+    let conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     let source_rows = {
         let mut stmt = conn.prepare(
@@ -2478,17 +3994,27 @@ fn derive_browser_account_identities(case_path: &Path, evidence_id: i64) -> Resu
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute(
-        "DELETE FROM filesystem_entries
-         WHERE case_id = ?1 AND evidence_id = ?2
-           AND json_extract(metadata_json, '$.artifact_kind') = 'browser_account'",
-        params![case_id, evidence_id],
-    )?;
     let mut seen = HashSet::new();
-    let mut indexed = 0_usize;
+    let mut derived = Vec::new();
+    let mut errors = Vec::new();
     for (source_entry_id, source_job_id, source_path, metadata_text) in source_rows {
-        let source: serde_json::Value = serde_json::from_str(&metadata_text).unwrap_or_default();
+        let source: serde_json::Value = match serde_json::from_str::<serde_json::Value>(
+            &metadata_text,
+        ) {
+            Ok(value) if value.is_object() => value,
+            Ok(_) => {
+                errors.push(format!(
+                    "browser login entry {source_entry_id} has non-object metadata and cannot support an account derivation"
+                ));
+                continue;
+            }
+            Err(error) => {
+                errors.push(format!(
+                    "browser login entry {source_entry_id} has invalid metadata JSON: {error}"
+                ));
+                continue;
+            }
+        };
         let username = source["username"]
             .as_str()
             .map(str::trim)
@@ -2527,52 +4053,39 @@ fn derive_browser_account_identities(case_path: &Path, evidence_id: i64) -> Resu
             "date_last_used_utc": source["date_last_used_utc"],
             "times_used": source["times_used"],
             "secrets_accessed": false,
-            "secret_scope_note": "this derived identity row contains username and service only; the source browser-login record retains any available password ciphertext separately",
+            "secret_scope_note": "this derived identity row contains username and service only; password material is not copied into this row",
             "derived_from_entry_id": source_entry_id,
             "source_artifact_path": source_path,
+            "source_record_locator": source["source_record_locator"],
+            "source_locator_coordinate_kind": source["source_locator_coordinate_kind"],
         });
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
-        upsert_filesystem_entry(
-            &tx,
-            case_id,
-            evidence_id,
-            &logical_path,
-            &display_name,
-            "record",
-            None,
-            &metadata.to_string(),
+        derived.push(DerivedIdentityEntry {
+            logical_path,
+            display_name,
+            metadata,
             source_job_id,
-        )?;
-        indexed += 1;
+        });
     }
-    tx.commit()?;
-    Ok(indexed)
+    Ok((derived, errors))
 }
 
 fn parse_one_identity_hive(
-    case_path: &Path,
     read_session: &mut EvidenceReadSession,
     evidence_id: i64,
     candidate: &EmbeddedIdentityHiveCandidate,
-) -> Result<(usize, usize, usize, usize, usize)> {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    // Keep evidence-controlled names out of host paths. A crafted raw filename
-    // must never introduce separators or parent components into a staging path.
-    let staging_path = std::env::temp_dir().join(format!(
-        "kdft-identity-hive-{}-{}-{nonce}.hive",
-        std::process::id(),
-        candidate.entry_id
-    ));
+) -> Result<IdentityHiveOutcome> {
+    const MAX_IDENTITY_HIVE_BYTES: u64 = 512 * 1024 * 1024;
+    const MAX_IDENTITY_HIVE_REGISTRY_ENTRIES: usize = 5_000_000;
+    let staging = PrivateIdentityStagingFile::create("registry-hive", "hive")?;
+    let staging_path = staging.path().to_path_buf();
     let parsed = (|| -> Result<_> {
-        recover_filesystem_entry_in_session(
+        recover_filesystem_entry_bounded_in_session(
             read_session,
-            RecoverEntryOptions {
-                entry_id: candidate.entry_id,
-                output_path: staging_path.clone(),
-            },
+            candidate.entry_id,
+            evidence_id,
+            &staging_path,
+            MAX_IDENTITY_HIVE_BYTES,
         )
         .with_context(|| {
             format!(
@@ -2580,16 +4093,22 @@ fn parse_one_identity_hive(
                 candidate.logical_path
             )
         })?;
-        collect_registry_hive_import(&staging_path, &candidate.name, usize::MAX)
+        collect_registry_hive_import(
+            &staging_path,
+            &candidate.name,
+            MAX_IDENTITY_HIVE_REGISTRY_ENTRIES,
+        )
     })();
-    let cleanup = match fs::remove_file(&staging_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error)
-            .with_context(|| format!("removing staged identity hive {}", staging_path.display())),
+    let cleanup = staging.cleanup();
+    let import = match (parsed, cleanup) {
+        (Ok(import), Ok(())) => import,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(cleanup_error)) => return Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => {
+            return Err(error.context(format!("staging cleanup also failed: {cleanup_error:#}")))
+        }
     };
-    let import = parsed?;
-    cleanup?;
+    let parser_reported_partial = import.truncated;
 
     let hive_name = candidate.name.to_ascii_lowercase();
     let mut derived = Vec::new();
@@ -2635,6 +4154,7 @@ fn parse_one_identity_hive(
                 logical_path,
                 display_name: username.to_string(),
                 metadata,
+                source_job_id: candidate.source_job_id,
             });
         }
     } else if hive_name == "software" {
@@ -2697,6 +4217,7 @@ fn parse_one_identity_hive(
                 logical_path,
                 display_name,
                 metadata,
+                source_job_id: candidate.source_job_id,
             });
         }
     }
@@ -2712,6 +4233,11 @@ fn parse_one_identity_hive(
                 key_path,
                 value_name: entry.display_name.clone(),
                 value_data,
+                value_data_truncated: entry.metadata["registry_value_data_truncated"]
+                    .as_bool()
+                    .unwrap_or(false),
+                value_file_relative_offset: entry.metadata["registry_value_offset"].as_u64(),
+                value_size_bytes: entry.metadata["registry_value_data_size"].as_u64(),
                 last_write_utc: entry.metadata["registry_key_last_write_utc"]
                     .as_str()
                     .map(str::to_string),
@@ -2744,6 +4270,7 @@ fn parse_one_identity_hive(
             logical_path,
             display_name: lead.label,
             metadata,
+            source_job_id: candidate.source_job_id,
         });
     }
     for (ordinal, account) in
@@ -2776,57 +4303,14 @@ fn parse_one_identity_hive(
             logical_path,
             display_name,
             metadata,
+            source_job_id: candidate.source_job_id,
         });
     }
 
-    let local_accounts = derived
-        .iter()
-        .filter(|entry| entry.metadata["artifact_kind"] == "windows_local_account")
-        .count();
-    let domain_accounts = derived
-        .iter()
-        .filter(|entry| entry.metadata["artifact_kind"] == "windows_domain_account")
-        .count();
-    let profiles = derived
-        .iter()
-        .filter(|entry| entry.metadata["artifact_kind"] == "windows_user_profile")
-        .count();
-    let hosts = derived
-        .iter()
-        .filter(|entry| entry.metadata["artifact_kind"] == "host_identity")
-        .count();
-    let networks = derived
-        .iter()
-        .filter(|entry| entry.metadata["artifact_kind"] == "network_configuration")
-        .count();
-    let mut conn = open_existing_case(case_path)?;
-    let case_id = active_case_id(&conn)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute(
-        "DELETE FROM filesystem_entries
-         WHERE case_id = ?1 AND evidence_id = ?2
-           AND json_extract(metadata_json, '$.derived_from_entry_id') = ?3
-           AND json_extract(metadata_json, '$.artifact_kind') IN (
-               'windows_local_account','windows_domain_account','windows_user_profile',
-               'host_identity','network_configuration'
-           )",
-        params![case_id, evidence_id, candidate.entry_id],
-    )?;
-    for entry in derived {
-        upsert_filesystem_entry(
-            &tx,
-            case_id,
-            evidence_id,
-            &entry.logical_path,
-            &entry.display_name,
-            "record",
-            None,
-            &entry.metadata.to_string(),
-            candidate.source_job_id,
-        )?;
-    }
-    tx.commit()?;
-    Ok((local_accounts, domain_accounts, profiles, hosts, networks))
+    Ok(IdentityHiveOutcome {
+        entries: derived,
+        parser_reported_partial,
+    })
 }
 
 #[derive(Debug)]
@@ -2841,7 +4325,7 @@ fn derive_wifi_profiles(
     case_path: &Path,
     read_session: &mut EvidenceReadSession,
     evidence_id: i64,
-) -> Result<(usize, Vec<String>)> {
+) -> Result<(Vec<DerivedIdentityEntry>, Vec<String>)> {
     let candidates = {
         let conn = open_existing_case(case_path)?;
         let case_id = active_case_id(&conn)?;
@@ -2872,42 +4356,23 @@ fn derive_wifi_profiles(
     let mut derived = Vec::new();
     let mut errors = Vec::new();
     for candidate in candidates {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let staging_path = std::env::temp_dir().join(format!(
-            "kdft-wifi-profile-{}-{}-{nonce}.xml",
-            std::process::id(),
-            candidate.entry_id
-        ));
-        let parsed = (|| -> Result<identity_network::WifiProfile> {
-            recover_filesystem_entry_in_session(
-                read_session,
-                RecoverEntryOptions {
-                    entry_id: candidate.entry_id,
-                    output_path: staging_path.clone(),
-                },
-            )
-            .with_context(|| format!("recovering WLAN profile {}", candidate.logical_path))?;
-            let bytes = fs::read(&staging_path).with_context(|| {
-                format!("reading recovered WLAN profile {}", candidate.logical_path)
-            })?;
-            identity_network::parse_wifi_profile_xml(&bytes)
-                .with_context(|| format!("parsing WLAN profile {}", candidate.logical_path))
-        })();
-        let cleanup_error = if staging_path.exists() {
-            fs::remove_file(&staging_path).err()
-        } else {
-            None
+        let bytes = match read_filesystem_entry_bounded_in_session(
+            read_session,
+            candidate.entry_id,
+            evidence_id,
+            identity_network::MAX_WIFI_PROFILE_BYTES as u64,
+        )
+        .with_context(|| format!("reading bounded WLAN profile {}", candidate.logical_path))
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                errors.push(format!("{}: {error:#}", candidate.logical_path));
+                continue;
+            }
         };
-        if let Some(error) = cleanup_error {
-            errors.push(format!(
-                "{}: parsed staging file could not be removed: {error}",
-                candidate.logical_path
-            ));
-        }
-        let profile = match parsed {
+        let profile = match identity_network::parse_wifi_profile_xml(&bytes)
+            .with_context(|| format!("parsing WLAN profile {}", candidate.logical_path))
+        {
             Ok(profile) => profile,
             Err(error) => {
                 errors.push(format!("{}: {error:#}", candidate.logical_path));
@@ -2925,12 +4390,22 @@ fn derive_wifi_profiles(
             candidate.entry_id,
             sanitize_logical_segment(&display_name)
         );
-        let key_is_protected = profile
-            .key_protected
+        let (key_is_protected, key_material_state) =
+            match profile.key_protected.as_deref().map(str::trim) {
+                Some(value) if value.eq_ignore_ascii_case("true") => {
+                    (Some(true), "protected_blob_in_source")
+                }
+                Some(value) if value.eq_ignore_ascii_case("false") => {
+                    (Some(false), "plaintext_value_in_source")
+                }
+                _ => (None, "protection_state_unknown"),
+            };
+        let key_summary = profile
+            .key_material
             .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-        let key_material = profile.key_material.clone();
-        let sensitive_value_present = key_material.is_some();
+            .filter(|value| !value.is_empty())
+            .map(|value| (value.len(), sha256_hex(value.as_bytes())));
+        let sensitive_value_present = key_summary.is_some();
         let mut metadata = serde_json::json!({
             "artifact_kind": "wifi_profile",
             "profile_name": profile.profile_name,
@@ -2939,46 +4414,38 @@ fn derive_wifi_profiles(
             "encryption": profile.encryption,
             "key_type": profile.key_type,
             "key_material_protected": key_is_protected,
-            "wifi_key_plaintext": if key_is_protected { None } else { key_material.clone() },
-            "wifi_key_encrypted": if key_is_protected { key_material } else { None },
+            "wifi_key_material_state": if sensitive_value_present { Some(key_material_state) } else { None },
+            "wifi_key_value_length_bytes": key_summary.as_ref().map(|summary| summary.0),
+            "wifi_key_value_sha256": key_summary.as_ref().map(|summary| summary.1.as_str()),
+            "wifi_key_hash_basis": if sensitive_value_present { Some("exact UTF-8 bytes decoded from WLANProfile/MSM/security/sharedKey/keyMaterial") } else { None },
             "sensitive_value_present": sensitive_value_present,
+            "sensitive_value_disclosure": if sensitive_value_present { Some("withheld") } else { None },
+            "secret_access_policy": if sensitive_value_present { Some("inspect the original WLAN profile through an explicit examiner action; ordinary metadata and reports do not disclose key material") } else { None },
+            "secret_source_location": if sensitive_value_present { Some("/WLANProfile/MSM/security/sharedKey/keyMaterial") } else { None },
+            "source_locator_coordinate_kind": "XML element path",
+            "source_byte_offset_available": false,
+            "source_physical_offset_available": false,
             "source_artifact_path": candidate.logical_path,
+            "source_size_bytes": bytes.len(),
             "derived_from_entry_id": candidate.entry_id,
             "structured_source": true,
             "parser": "kdft-wlan-profile-xml-v1",
         });
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
-        derived.push((
-            candidate.source_job_id,
-            DerivedIdentityEntry {
-                logical_path,
-                display_name,
-                metadata,
-            },
-        ));
+        derived.push(DerivedIdentityEntry {
+            logical_path,
+            display_name,
+            metadata,
+            source_job_id: candidate.source_job_id,
+        });
     }
-
-    let mut conn = open_existing_case(case_path)?;
-    let case_id = active_case_id(&conn)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for (source_job_id, entry) in &derived {
-        upsert_filesystem_entry(
-            &tx,
-            case_id,
-            evidence_id,
-            &entry.logical_path,
-            &entry.display_name,
-            "record",
-            None,
-            &entry.metadata.to_string(),
-            *source_job_id,
-        )?;
-    }
-    tx.commit()?;
-    Ok((derived.len(), errors))
+    Ok((derived, errors))
 }
 
-fn derive_credential_store_leads(case_path: &Path, evidence_id: i64) -> Result<usize> {
+fn derive_credential_store_leads(
+    case_path: &Path,
+    evidence_id: i64,
+) -> Result<Vec<DerivedIdentityEntry>> {
     let candidates = {
         let conn = open_existing_case(case_path)?;
         let case_id = active_case_id(&conn)?;
@@ -3021,15 +4488,13 @@ fn derive_credential_store_leads(case_path: &Path, evidence_id: i64) -> Result<u
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    let mut conn = open_existing_case(case_path)?;
-    let case_id = active_case_id(&conn)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut indexed = 0_usize;
+    let mut derived = Vec::new();
     for (entry_id, source_job_id, name, exact_path) in candidates {
-        let Some(store_type) = identity_network::known_credential_store_type(&exact_path, &name)
+        let Some(recognition) = identity_network::known_credential_store_type(&exact_path, &name)
         else {
             continue;
         };
+        let store_type = recognition.store_type;
         let derived_path = format!(
             "/Parsed identities/Credential stores/{entry_id:08}-{}.record",
             sanitize_logical_segment(&name)
@@ -3043,28 +4508,24 @@ fn derive_credential_store_leads(case_path: &Path, evidence_id: i64) -> Result<u
             "contains_sensitive_material": true,
             "values_extracted": false,
             "encrypted_material_not_presented_as_plaintext": true,
+            "recognition_basis": recognition.recognition_basis,
+            "recognition_confidence": recognition.confidence,
+            "structure_validated": recognition.structure_validated,
             "parser": "kdft-known-credential-stores-v1",
         });
         add_entry_category(&mut metadata, &derived_path, &name, "record");
-        upsert_filesystem_entry(
-            &tx,
-            case_id,
-            evidence_id,
-            &derived_path,
-            &format!("{store_type}: {name}"),
-            "record",
-            None,
-            &metadata.to_string(),
+        derived.push(DerivedIdentityEntry {
+            logical_path: derived_path,
+            display_name: format!("{store_type}: {name}"),
+            metadata,
             source_job_id,
-        )?;
-        indexed = indexed.saturating_add(1);
+        });
     }
-    tx.commit()?;
-    Ok(indexed)
+    Ok(derived)
 }
 
 #[derive(Debug)]
-struct PlaintextSecretCandidate {
+struct StructuredSecretCandidate {
     entry_id: i64,
     source_job_id: i64,
     logical_path: String,
@@ -3073,12 +4534,11 @@ struct PlaintextSecretCandidate {
     size_bytes: Option<i64>,
 }
 
-fn derive_plaintext_secret_leads(
+fn derive_structured_secret_leads(
     case_path: &Path,
     read_session: &mut EvidenceReadSession,
     evidence_id: i64,
-) -> Result<(usize, Vec<String>)> {
-    const MAX_PLAINTEXT_SECRET_SOURCE_BYTES: i64 = 8 * 1024 * 1024;
+) -> Result<(Vec<DerivedIdentityEntry>, Vec<String>)> {
     let candidates = {
         let conn = open_existing_case(case_path)?;
         let case_id = active_case_id(&conn)?;
@@ -3095,7 +4555,6 @@ fn derive_plaintext_secret_leads(
              FROM filesystem_entries
              WHERE case_id = ?1 AND evidence_id = ?2
                AND entry_kind = 'file' AND is_deleted = 0
-               AND COALESCE(size_bytes, 0) <= ?3
                AND (
                    lower(name) = '.env' OR lower(name) LIKE '.env.%'
                    OR lower(name) IN (
@@ -3107,23 +4566,20 @@ fn derive_plaintext_secret_leads(
                )
              ORDER BY id",
         )?;
-        let rows = statement.query_map(
-            params![case_id, evidence_id, MAX_PLAINTEXT_SECRET_SOURCE_BYTES],
-            |row| {
-                Ok(PlaintextSecretCandidate {
-                    entry_id: row.get(0)?,
-                    source_job_id: row.get(1)?,
-                    logical_path: row.get(2)?,
-                    name: row.get(3)?,
-                    size_bytes: row.get(4)?,
-                    exact_path: row.get(5)?,
-                })
-            },
-        )?;
+        let rows = statement.query_map(params![case_id, evidence_id], |row| {
+            Ok(StructuredSecretCandidate {
+                entry_id: row.get(0)?,
+                source_job_id: row.get(1)?,
+                logical_path: row.get(2)?,
+                name: row.get(3)?,
+                size_bytes: row.get(4)?,
+                exact_path: row.get(5)?,
+            })
+        })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
             .filter(|candidate| {
-                identity_network::known_plaintext_secret_source(
+                identity_network::known_structured_secret_source(
                     &candidate.exact_path,
                     &candidate.name,
                 )
@@ -3131,84 +4587,59 @@ fn derive_plaintext_secret_leads(
             .collect::<Vec<_>>()
     };
 
-    let mut indexed = 0_usize;
+    let mut derived = Vec::new();
     let mut errors = Vec::new();
     for candidate in candidates {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let staging_path = std::env::temp_dir().join(format!(
-            "kdft-secret-source-{}-{}-{nonce}.txt",
-            std::process::id(),
-            candidate.entry_id
-        ));
-        let parsed = (|| -> Result<Vec<identity_network::PlaintextSecretLead>> {
-            recover_filesystem_entry_in_session(
-                read_session,
-                RecoverEntryOptions {
-                    entry_id: candidate.entry_id,
-                    output_path: staging_path.clone(),
-                },
-            )
-            .with_context(|| {
-                format!(
-                    "recovering structured secret source {}",
-                    candidate.exact_path
-                )
-            })?;
-            let bytes = fs::read(&staging_path).with_context(|| {
-                format!("reading structured secret source {}", candidate.exact_path)
-            })?;
-            Ok(identity_network::parse_plaintext_secret_leads(
-                &candidate.exact_path,
-                &candidate.name,
-                &bytes,
-            ))
-        })();
-        let cleanup_error = if staging_path.exists() {
-            fs::remove_file(&staging_path).err()
-        } else {
-            None
+        let bytes = match read_filesystem_entry_bounded_in_session(
+            read_session,
+            candidate.entry_id,
+            evidence_id,
+            identity_network::MAX_STRUCTURED_SECRET_SOURCE_BYTES as u64,
+        )
+        .with_context(|| format!("reading structured secret source {}", candidate.exact_path))
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                errors.push(format!("{}: {error:#}", candidate.exact_path));
+                continue;
+            }
         };
-        let leads = match parsed {
+        let leads = match identity_network::parse_structured_secret_leads(
+            &candidate.exact_path,
+            &candidate.name,
+            &bytes,
+        )
+        .with_context(|| format!("parsing structured secret source {}", candidate.exact_path))
+        {
             Ok(leads) => leads,
             Err(error) => {
                 errors.push(format!("{}: {error:#}", candidate.exact_path));
                 continue;
             }
         };
-        if let Some(error) = cleanup_error {
-            errors.push(format!(
-                "{}: parsed secret-source staging file could not be removed: {error}",
-                candidate.exact_path
-            ));
-        }
-        let mut conn = open_existing_case(case_path)?;
-        let case_id = active_case_id(&conn)?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "DELETE FROM filesystem_entries
-             WHERE case_id = ?1 AND evidence_id = ?2
-               AND json_extract(metadata_json, '$.artifact_kind') = 'plaintext_secret'
-               AND json_extract(metadata_json, '$.derived_from_entry_id') = ?3",
-            params![case_id, evidence_id, candidate.entry_id],
-        )?;
         for (ordinal, lead) in leads.into_iter().enumerate() {
             let display_name = format!("{} ({})", lead.key, candidate.name);
             let logical_path = format!(
-                "/Parsed identities/Recovered secrets/{:08}-{ordinal:06}-{}.record",
+                "/Parsed identities/Structured secret indicators/{:08}-{ordinal:06}-{}.record",
                 candidate.entry_id,
                 sanitize_logical_segment(&lead.key)
             );
             let mut metadata = serde_json::json!({
-                "artifact_kind": "plaintext_secret",
+                "artifact_kind": "structured_secret",
                 "secret_key": lead.key,
-                "secret_value": lead.value,
+                "secret_value_length_bytes": lead.value_length_bytes,
+                "secret_value_sha256": lead.value_sha256,
+                "secret_material_state": lead.material_state,
                 "secret_source_location": lead.source_location,
                 "secret_source_format": lead.source_format,
+                "secret_hash_basis": lead.hash_basis,
                 "sensitive_value_present": true,
-                "secret_interpretation": "plaintext value recovered from an exact structured configuration field",
+                "sensitive_value_disclosure": "withheld",
+                "secret_interpretation": "sensitive value is present in an exact structured field; only length and SHA-256 are retained in ordinary metadata",
+                "secret_access_policy": "inspect the original source entry through an explicit examiner action; ordinary metadata and reports do not disclose the value",
+                "source_locator_coordinate_kind": "structured text locator",
+                "source_byte_offset_available": false,
+                "source_physical_offset_available": false,
                 "source_artifact_path": candidate.exact_path,
                 "source_logical_path": candidate.logical_path,
                 "source_size_bytes": candidate.size_bytes,
@@ -3217,22 +4648,15 @@ fn derive_plaintext_secret_leads(
                 "structured_source": true,
             });
             add_entry_category(&mut metadata, &logical_path, &display_name, "record");
-            upsert_filesystem_entry(
-                &tx,
-                case_id,
-                evidence_id,
-                &logical_path,
-                &display_name,
-                "record",
-                None,
-                &metadata.to_string(),
-                candidate.source_job_id,
-            )?;
-            indexed = indexed.saturating_add(1);
+            derived.push(DerivedIdentityEntry {
+                logical_path,
+                display_name,
+                metadata,
+                source_job_id: candidate.source_job_id,
+            });
         }
-        tx.commit()?;
     }
-    Ok((indexed, errors))
+    Ok((derived, errors))
 }
 
 #[derive(Debug)]
@@ -3272,9 +4696,12 @@ struct DocumentCandidateSnapshot {
 struct DocumentStreamSummary {
     stats: ooxml::OoxmlParseStats,
     supported_scope_complete: bool,
+    semantic_scope_complete: bool,
+    relationship_scope_complete: bool,
     unsupported_parts_total: usize,
     unsupported_parts_omitted: usize,
     unsupported_may_contain_text_count: usize,
+    replacement_committed: bool,
 }
 
 /// Transaction-owned production sink. Extracted text is inserted as each
@@ -3316,12 +4743,40 @@ impl ooxml::OoxmlSink for SqliteOoxmlSink<'_> {
                 self.segments_indexed
             );
         }
+        let zip_member = segment.part_provenance.as_ref().map(|provenance| {
+            serde_json::json!({
+                "archive_index": provenance.archive_index,
+                "crc32": provenance.crc32,
+                "compression_method": provenance.compression_method,
+                "compressed_size": provenance.compressed_size,
+                "uncompressed_size": provenance.uncompressed_size,
+                "zip_local_header_offset": provenance.zip_local_header_offset,
+                "zip_data_offset": provenance.zip_data_offset,
+                "zip_central_header_offset": provenance.zip_central_header_offset,
+            })
+        });
+        let provenance = serde_json::json!({
+            "part_kind": segment.part_kind.as_str(),
+            "hidden": segment.hidden,
+            "in_text_box": segment.in_text_box,
+            "source_fields": segment.source_fields,
+            "zip_member": zip_member,
+            "coordinate_system": {
+                "offset_basis": "docx_zip_package_relative",
+                "zip_data_offset_meaning": "start_of_compressed_member_data",
+                "xml_text_offset_available": false,
+                "evidence_physical_offset_available": false,
+                "one_to_one_physical_mapping": false,
+            },
+        });
         self.insert.execute(params![
             self.entry_id,
             OOXML_PARSER_NAME,
             i64::try_from(segment.ordinal).context("DOCX segment index exceeds SQLite i64")?,
             segment.part_name,
             segment.text.as_bytes(),
+            segment.text_role.as_str(),
+            provenance.to_string(),
         ])?;
         self.segments_indexed = self.segments_indexed.saturating_add(1);
         self.text_bytes_indexed = self
@@ -3341,8 +4796,15 @@ impl ooxml::OoxmlSink for SqliteOoxmlSink<'_> {
                 "part_name": part.part_name,
                 "reason": part.reason.as_str(),
                 "may_contain_text": part.may_contain_text,
+                "crc32": part.crc32,
+                "compression_method": part.compression_method,
                 "compressed_size": part.compressed_size,
                 "uncompressed_size": part.uncompressed_size,
+                "zip_local_header_offset": part.zip_local_header_offset,
+                "zip_data_offset": part.zip_data_offset,
+                "zip_central_header_offset": part.zip_central_header_offset,
+                "offset_basis": "docx_zip_package_relative",
+                "physical_offset_available": false,
             }));
         }
         Ok(())
@@ -3489,7 +4951,7 @@ pub fn parse_archive_artifacts(case_path: &Path, evidence_id: i64) -> Result<Arc
                    ?3 <> 0
                    AND COALESCE(json_extract(metadata_json, '$.archive_parser.parser_name'), '') = ?4
                    AND COALESCE(json_extract(metadata_json, '$.archive_parser.status'), '')
-                       IN ('parsed', 'skipped_signature_mismatch')
+                       IN ('complete', 'partial', 'unsupported', 'skipped_signature_mismatch')
                )
              ORDER BY id",
         )?;
@@ -3518,10 +4980,25 @@ pub fn parse_archive_artifacts(case_path: &Path, evidence_id: i64) -> Result<Arc
         up_to_date_archives_skipped: archives_supported.saturating_sub(candidates.len()),
         archives_found: candidates.len(),
         archives_parsed: 0,
+        archives_complete: 0,
+        archives_partial: 0,
+        archives_unsupported: 0,
         members_indexed: 0,
+        validated_members: 0,
+        encrypted_members: 0,
+        unsupported_members: 0,
+        corrupt_members: 0,
+        io_error_members: 0,
+        internal_error_members: 0,
+        metadata_unavailable_members: 0,
+        path_risk_members: 0,
+        crc32_validated_members: 0,
         text_segments_indexed: 0,
         uncompressed_bytes_validated: 0,
         signature_mismatch_count: 0,
+        member_diagnostic_count: 0,
+        member_diagnostics: Vec::new(),
+        member_diagnostics_omitted: 0,
         parse_error_count: 0,
         parse_errors: Vec::new(),
         parse_errors_omitted: 0,
@@ -3539,14 +5016,74 @@ pub fn parse_archive_artifacts(case_path: &Path, evidence_id: i64) -> Result<Arc
             Ok(outcome) => {
                 let summary = outcome.parsed;
                 result.archives_parsed += 1;
+                match summary.status() {
+                    archive::ZipArchiveStatus::Complete => {
+                        result.archives_complete = result.archives_complete.saturating_add(1);
+                    }
+                    archive::ZipArchiveStatus::Partial => {
+                        result.archives_partial = result.archives_partial.saturating_add(1);
+                    }
+                    archive::ZipArchiveStatus::Unsupported => {
+                        result.archives_unsupported = result.archives_unsupported.saturating_add(1);
+                    }
+                }
                 result.members_indexed =
                     result.members_indexed.saturating_add(summary.member_count);
+                result.validated_members = result
+                    .validated_members
+                    .saturating_add(summary.validated_member_count);
+                result.encrypted_members = result
+                    .encrypted_members
+                    .saturating_add(summary.encrypted_member_count);
+                result.unsupported_members = result
+                    .unsupported_members
+                    .saturating_add(summary.unsupported_member_count);
+                result.corrupt_members = result
+                    .corrupt_members
+                    .saturating_add(summary.corrupt_member_count);
+                result.io_error_members = result
+                    .io_error_members
+                    .saturating_add(summary.io_error_member_count);
+                result.internal_error_members = result
+                    .internal_error_members
+                    .saturating_add(summary.internal_error_member_count);
+                result.metadata_unavailable_members = result
+                    .metadata_unavailable_members
+                    .saturating_add(summary.metadata_unavailable_member_count);
+                result.path_risk_members = result
+                    .path_risk_members
+                    .saturating_add(summary.path_risk_member_count);
+                result.crc32_validated_members = result
+                    .crc32_validated_members
+                    .saturating_add(summary.crc32_validated_member_count);
                 result.text_segments_indexed = result
                     .text_segments_indexed
                     .saturating_add(summary.text_segment_count);
                 result.uncompressed_bytes_validated = result
                     .uncompressed_bytes_validated
                     .saturating_add(summary.uncompressed_bytes_read);
+                result.member_diagnostic_count = result
+                    .member_diagnostic_count
+                    .saturating_add(summary.member_diagnostic_count);
+                for diagnostic in summary.member_diagnostics {
+                    let message = format!(
+                        "{} (entry {}): {diagnostic}",
+                        candidate.logical_path, candidate.entry_id
+                    );
+                    progress::progress_diagnostic(
+                        progress::JobDiagnosticKind::ParserDiagnostic,
+                        message.clone(),
+                    );
+                    if result.member_diagnostics.len() < DOCUMENT_PARSE_ERROR_DISPLAY_LIMIT {
+                        result.member_diagnostics.push(message);
+                    } else {
+                        result.member_diagnostics_omitted =
+                            result.member_diagnostics_omitted.saturating_add(1);
+                    }
+                }
+                result.member_diagnostics_omitted = result
+                    .member_diagnostics_omitted
+                    .saturating_add(summary.member_diagnostics_omitted);
                 if let Some(warning) = outcome.cleanup_warning {
                     if let Err(record_error) = record_artifact_cleanup_warning(
                         case_path,
@@ -3597,20 +5134,25 @@ pub fn parse_archive_artifacts(case_path: &Path, evidence_id: i64) -> Result<Arc
                 } else {
                     result.parse_errors_omitted += 1;
                 }
-                result.truncated = true;
                 progress::progress_error(Some(candidate.current_object.clone()));
                 progress::progress_skip(Some(candidate.current_object.clone()));
-                progress::progress_truncated(format!(
-                    "ZIP entry {} could not be parsed: {error:#}",
-                    candidate.entry_id
-                ));
+                progress::progress_diagnostic(
+                    progress::JobDiagnosticKind::ParserDiagnostic,
+                    format!(
+                        "ZIP entry {} could not be parsed: {error:#}",
+                        candidate.entry_id
+                    ),
+                );
             }
         }
         progress::progress_advance(candidate.current_object.clone());
     }
 
-    result.status = if result.truncated {
-        "truncated".to_string()
+    result.status = if result.parse_error_count > 0
+        || result.archives_partial > 0
+        || result.archives_unsupported > 0
+    {
+        "partial".to_string()
     } else {
         "completed".to_string()
     };
@@ -3621,23 +5163,45 @@ pub fn parse_archive_artifacts(case_path: &Path, evidence_id: i64) -> Result<Arc
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'evidence.archive_parse', ?2, 'evidence', ?3,
                  json_object('archives_found', ?4, 'archives_parsed', ?5,
-                             'members_indexed', ?6, 'text_segments_indexed', ?7,
-                             'uncompressed_bytes_validated', ?8,
-                             'signature_mismatch_count', ?9,
-                             'parse_error_count', ?10,
-                             'cleanup_warning_count', ?11,
-                             'cleanup_warnings_omitted', ?12,
-                             'status', ?13))",
+                             'archives_complete', ?6, 'archives_partial', ?7,
+                             'archives_unsupported', ?8, 'members_indexed', ?9,
+                             'validated_members', ?10, 'encrypted_members', ?11,
+                             'unsupported_members', ?12, 'corrupt_members', ?13,
+                             'io_error_members', ?14, 'internal_error_members', ?15,
+                             'metadata_unavailable_members', ?16,
+                             'path_risk_members', ?17,
+                             'crc32_validated_members', ?18,
+                             'text_segments_indexed', ?19,
+                             'uncompressed_bytes_validated', ?20,
+                             'signature_mismatch_count', ?21,
+                             'member_diagnostic_count', ?22,
+                             'parse_error_count', ?23,
+                             'cleanup_warning_count', ?24,
+                             'cleanup_warnings_omitted', ?25,
+                             'status', ?26))",
         params![
             case_id,
             actor,
             evidence_id,
             i64::try_from(result.archives_found).unwrap_or(i64::MAX),
             i64::try_from(result.archives_parsed).unwrap_or(i64::MAX),
+            i64::try_from(result.archives_complete).unwrap_or(i64::MAX),
+            i64::try_from(result.archives_partial).unwrap_or(i64::MAX),
+            i64::try_from(result.archives_unsupported).unwrap_or(i64::MAX),
             i64::try_from(result.members_indexed).unwrap_or(i64::MAX),
+            i64::try_from(result.validated_members).unwrap_or(i64::MAX),
+            i64::try_from(result.encrypted_members).unwrap_or(i64::MAX),
+            i64::try_from(result.unsupported_members).unwrap_or(i64::MAX),
+            i64::try_from(result.corrupt_members).unwrap_or(i64::MAX),
+            i64::try_from(result.io_error_members).unwrap_or(i64::MAX),
+            i64::try_from(result.internal_error_members).unwrap_or(i64::MAX),
+            i64::try_from(result.metadata_unavailable_members).unwrap_or(i64::MAX),
+            i64::try_from(result.path_risk_members).unwrap_or(i64::MAX),
+            i64::try_from(result.crc32_validated_members).unwrap_or(i64::MAX),
             i64::try_from(result.text_segments_indexed).unwrap_or(i64::MAX),
             i64::try_from(result.uncompressed_bytes_validated).unwrap_or(i64::MAX),
             i64::try_from(result.signature_mismatch_count).unwrap_or(i64::MAX),
+            i64::try_from(result.member_diagnostic_count).unwrap_or(i64::MAX),
             i64::try_from(result.parse_error_count).unwrap_or(i64::MAX),
             i64::try_from(result.cleanup_warning_count).unwrap_or(i64::MAX),
             i64::try_from(result.cleanup_warnings_omitted).unwrap_or(i64::MAX),
@@ -3726,8 +5290,8 @@ fn store_archive_parse_success(
                     "/Parsed archives/{:08}/Member-{:08}",
                     candidate.entry_id, member.archive_index
                 );
-                let raw_name_hex = member
-                    .name_raw
+                let reader_name_bytes_hex = member
+                    .name_reader_bytes
                     .iter()
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>();
@@ -3738,13 +5302,31 @@ fn store_archive_parse_success(
                     "archive_source_path": candidate.logical_path,
                     "archive_member_index": member.archive_index,
                     "archive_member_name_exact": member.name,
-                    "archive_member_name_raw_hex": raw_name_hex,
+                    "archive_member_name_reader_bytes_hex": reader_name_bytes_hex,
+                    "archive_member_name_reader_bytes_semantics": "ZIP reader-selected filename bytes; a valid Unicode Path extra field may replace the literal central-directory filename field",
+                    "archive_member_name_is_utf8": member.name_is_utf8,
                     "archive_member_is_directory": member.is_directory,
+                    "archive_member_is_symlink": member.is_symlink,
+                    "archive_member_unix_mode": member.unix_mode,
+                    "archive_member_encrypted": member.encrypted,
+                    "archive_member_uses_data_descriptor": member.uses_data_descriptor,
+                    "archive_member_uses_zip64": member.uses_zip64,
                     "archive_member_compressed_size": member.compressed_size,
                     "archive_member_uncompressed_size": member.uncompressed_size,
                     "archive_member_crc32": member.crc32,
                     "archive_member_compression_method": format!("{:?}", member.compression_method),
                     "archive_member_is_textual": member.is_textual,
+                    "archive_member_status": "pending_validation",
+                    "archive_member_coverage": "pending_validation",
+                    "archive_member_archive_stream_source_offset": member.archive_stream_offset,
+                    "archive_member_local_header_source_offset": member.local_header_offset,
+                    "archive_member_compressed_data_source_offset": member.compressed_data_offset,
+                    "archive_member_compressed_data_end_source_offset_exclusive": member.compressed_data_end,
+                    "archive_member_central_directory_header_source_offset": member.central_directory_header_offset,
+                    "archive_member_source_offset_basis": "byte offsets relative to the recovered ZIP source stream; not evidence-media offsets and not decoded member offsets",
+                    "archive_member_decoded_content_offset_basis": "byte offsets relative to the uncompressed member payload",
+                    "archive_member_path_risk_codes": member.path_risk_codes,
+                    "archive_member_path_is_risky": member.has_path_risk(),
                     "source_path_exact": member.name,
                 });
                 add_entry_category(&mut metadata, &logical_path, &member.name, "record");
@@ -3774,8 +5356,9 @@ fn store_archive_parse_success(
             archive::ZipEvent::TextSegment {
                 member,
                 segment_index,
+                byte_offset,
                 bytes,
-                ..
+                is_final,
             } => {
                 let (archive_index, member_entry_id) =
                     current_member.context("ZIP parser emitted text before its member metadata")?;
@@ -3792,30 +5375,179 @@ fn store_archive_parse_success(
                         ZIP_PARSER_NAME,
                         i64::try_from(segment_index)
                             .context("ZIP text segment index exceeds SQLite i64")?,
-                        member.name,
+                        format!(
+                            "{} [decoded member byte offset {}; final={}]",
+                            member.name, byte_offset, is_final
+                        ),
                         bytes
                     ],
+                )?;
+            }
+            archive::ZipEvent::MemberOutcome { member, outcome } => {
+                let (archive_index, member_entry_id) = current_member
+                    .take()
+                    .context("ZIP parser emitted a terminal outcome before member metadata")?;
+                if archive_index != member.archive_index {
+                    bail!("ZIP parser outcome/member ordering changed unexpectedly");
+                }
+                if !outcome.content_complete || !outcome.crc32_validated {
+                    tx.execute(
+                        "DELETE FROM filesystem_entry_text_segments
+                         WHERE entry_id = ?1 AND parser_name = ?2",
+                        params![member_entry_id, ZIP_PARSER_NAME],
+                    )?;
+                }
+                let diagnostic = outcome.diagnostic.as_ref().map(|diagnostic| {
+                    serde_json::json!({
+                        "kind": diagnostic.kind.as_str(),
+                        "message": diagnostic.message,
+                    })
+                });
+                let is_limitation = matches!(
+                    outcome.status,
+                    archive::ZipMemberStatus::Encrypted
+                        | archive::ZipMemberStatus::UnsupportedCompression
+                );
+                let coverage = match outcome.status {
+                    archive::ZipMemberStatus::Validated => "complete",
+                    archive::ZipMemberStatus::Encrypted
+                    | archive::ZipMemberStatus::UnsupportedCompression => "metadata_only",
+                    archive::ZipMemberStatus::Corrupt
+                    | archive::ZipMemberStatus::IoError
+                    | archive::ZipMemberStatus::InternalError => "incomplete",
+                };
+                let metadata_patch = serde_json::json!({
+                    "archive_member_status": outcome.status.as_str(),
+                    "archive_member_coverage": coverage,
+                    "archive_member_uncompressed_bytes_read": outcome.uncompressed_bytes_read,
+                    "archive_member_content_complete": outcome.content_complete,
+                    "archive_member_crc32_validated": outcome.crc32_validated,
+                    "archive_member_limitation": if is_limitation {
+                        diagnostic.clone()
+                    } else {
+                        None
+                    },
+                    "archive_member_diagnostic": if is_limitation {
+                        None
+                    } else {
+                        diagnostic
+                    },
+                });
+                tx.execute(
+                    "UPDATE filesystem_entries
+                     SET metadata_json = json_patch(metadata_json, json(?2))
+                     WHERE id = ?1",
+                    params![member_entry_id, metadata_patch.to_string()],
+                )?;
+            }
+            archive::ZipEvent::MemberUnavailable(unavailable) => {
+                current_member = None;
+                let logical_path = format!(
+                    "/Parsed archives/{:08}/Member-{:08}",
+                    candidate.entry_id, unavailable.archive_index
+                );
+                let display_name = unavailable
+                    .member_name
+                    .clone()
+                    .unwrap_or_else(|| format!("Member-{:08}", unavailable.archive_index));
+                let mut metadata = serde_json::json!({
+                    "artifact_kind": "archive_member",
+                    "archive_parser": ZIP_PARSER_NAME,
+                    "archive_derived_from_entry_id": candidate.entry_id,
+                    "archive_source_path": candidate.logical_path,
+                    "archive_member_index": unavailable.archive_index,
+                    "archive_member_name_exact": unavailable.member_name,
+                    "archive_member_name_available": unavailable.member_name.is_some(),
+                    "archive_member_status": "metadata_unavailable",
+                    "archive_member_coverage": "incomplete",
+                    "archive_member_path_risk_codes": unavailable.path_risk_codes,
+                    "archive_member_path_is_risky": !unavailable.path_risk_codes.is_empty(),
+                    "archive_member_diagnostic": {
+                        "kind": unavailable.diagnostic.kind.as_str(),
+                        "message": unavailable.diagnostic.message,
+                    },
+                    "source_path_exact": unavailable.member_name,
+                });
+                add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+                upsert_filesystem_entry(
+                    &tx,
+                    case_id,
+                    evidence_id,
+                    &logical_path,
+                    &display_name,
+                    "record",
+                    None,
+                    &metadata.to_string(),
+                    candidate.source_job_id,
+                )?;
+                let member_entry_id = tx.query_row(
+                    "SELECT id FROM filesystem_entries
+                     WHERE evidence_id = ?1 AND logical_path = ?2",
+                    params![evidence_id, logical_path],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                tx.execute(
+                    "UPDATE filesystem_entries SET parent_id = ?2 WHERE id = ?1",
+                    params![member_entry_id, candidate.entry_id],
                 )?;
             }
         }
         Ok(())
     })
     .map_err(|error| anyhow!("{error}"))?;
+    let member_diagnostics = summary
+        .member_diagnostics
+        .iter()
+        .map(|diagnostic| {
+            serde_json::json!({
+                "kind": diagnostic.kind.as_str(),
+                "archive_member_index": diagnostic.archive_index,
+                "archive_member_name": diagnostic.member_name,
+                "compression_method": diagnostic
+                    .compression_method
+                    .map(|method| format!("{method:?}")),
+                "message": diagnostic.message,
+            })
+        })
+        .collect::<Vec<_>>();
+    let archive_status = summary.status();
     let metadata = serde_json::json!({
         "parser_name": ZIP_PARSER_NAME,
-        "status": "parsed",
+        "status": archive_status.as_str(),
+        "coverage_status": archive_status.as_str(),
+        "archive_stream_source_offset": summary.archive_stream_offset,
+        "central_directory_source_offset": summary.central_directory_offset,
+        "archive_uses_zip64": summary.archive_uses_zip64,
+        "source_offset_basis": "byte offsets relative to the recovered ZIP source stream; not evidence-media offsets",
         "members_indexed": summary.member_count,
         "directories_indexed": summary.directory_count,
         "files_indexed": summary.file_count,
+        "members_validated": summary.validated_member_count,
+        "files_validated": summary.validated_file_count,
+        "encrypted_members_metadata_only": summary.encrypted_member_count,
+        "unsupported_compression_members_metadata_only": summary.unsupported_member_count,
+        "corrupt_members": summary.corrupt_member_count,
+        "io_error_members": summary.io_error_member_count,
+        "internal_error_members": summary.internal_error_member_count,
+        "metadata_unavailable_members": summary.metadata_unavailable_member_count,
+        "path_risk_members": summary.path_risk_member_count,
+        "crc32_validated_members": summary.crc32_validated_member_count,
         "text_members_indexed": summary.text_member_count,
         "text_segments_indexed": summary.text_segment_count,
         "uncompressed_bytes_validated": summary.uncompressed_bytes_read.to_string(),
         "text_bytes_indexed": summary.text_bytes_emitted.to_string(),
-        "supported_scope_complete": true,
+        "member_diagnostic_count": summary.member_diagnostic_count,
+        "member_diagnostics": member_diagnostics,
+        "member_diagnostics_omitted": summary.member_diagnostics_omitted,
+        "coverage_limitation_member_count": summary.limitation_member_count(),
+        "supported_scope_complete": archive_status == archive::ZipArchiveStatus::Complete,
     });
     tx.execute(
         "UPDATE filesystem_entries
-         SET metadata_json = json_set(metadata_json, '$.archive_parser', json(?2))
+         SET metadata_json = json_remove(
+                 json_set(metadata_json, '$.archive_parser', json(?2)),
+                 '$.archive_parser_last_error'
+             )
          WHERE id = ?1",
         params![candidate.entry_id, metadata.to_string()],
     )?;
@@ -3828,15 +5560,7 @@ fn store_archive_parse_error(
     candidate: &ArchiveCandidate,
     message: &str,
 ) -> Result<()> {
-    let mut conn = open_existing_case(case_path)?;
-    let case_id = active_case_id(&conn)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    tx.execute(
-        "DELETE FROM filesystem_entries
-         WHERE case_id = ?1
-           AND json_extract(metadata_json, '$.archive_derived_from_entry_id') = ?2",
-        params![case_id, candidate.entry_id],
-    )?;
+    let conn = open_existing_case(case_path)?;
     let metadata = serde_json::json!({
         "parser_name": ZIP_PARSER_NAME,
         "status": "error",
@@ -3844,13 +5568,15 @@ fn store_archive_parse_error(
         "members_indexed": 0,
         "supported_scope_complete": false,
     });
-    tx.execute(
+    // A failed attempt is not a defensible replacement generation. Keep any
+    // previously committed derived rows and terminal parser metadata intact,
+    // while disclosing this retry separately for audit/recovery.
+    conn.execute(
         "UPDATE filesystem_entries
-         SET metadata_json = json_set(metadata_json, '$.archive_parser', json(?2))
+         SET metadata_json = json_set(metadata_json, '$.archive_parser_last_error', json(?2))
          WHERE id = ?1",
         params![candidate.entry_id, metadata.to_string()],
     )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -3877,7 +5603,10 @@ fn store_archive_signature_mismatch(
     });
     tx.execute(
         "UPDATE filesystem_entries
-         SET metadata_json = json_set(metadata_json, '$.archive_parser', json(?2))
+         SET metadata_json = json_remove(
+                 json_set(metadata_json, '$.archive_parser', json(?2)),
+                 '$.archive_parser_last_error'
+             )
          WHERE id = ?1",
         params![candidate.entry_id, metadata.to_string()],
     )?;
@@ -4031,17 +5760,22 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
         cleanup_warning_count: 0,
         cleanup_warnings: Vec::new(),
         cleanup_warnings_omitted: 0,
-        truncated: snapshot.reused_partial_count > 0,
+        partial_artifact_coverage: snapshot.reused_partial_count > 0,
+        completed_with_diagnostics: snapshot.reused_partial_count > 0,
+        truncated: false,
         status: "completed".to_string(),
     };
     let mut after_entry_id = i64::MIN;
     let mut candidates_seen = 0_usize;
     let mut read_session = EvidenceReadSession::open(case_path)?;
     if snapshot.reused_partial_count > 0 {
-        progress::progress_truncated(format!(
+        progress::progress_diagnostic(
+            progress::JobDiagnosticKind::ParserDiagnostic,
+            format!(
             "{} previously committed partial DOCX result(s) were reused; re-index the filesystem to force a complete parser rerun",
             snapshot.reused_partial_count
-        ));
+            ),
+        );
     }
     if let Some(max_entry_id) = snapshot.max_entry_id {
         loop {
@@ -4063,22 +5797,35 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
                     Ok(outcome) => {
                         let parsed = outcome.parsed;
                         result.documents_parsed = result.documents_parsed.saturating_add(1);
-                        result.segments_indexed = result
-                            .segments_indexed
-                            .saturating_add(parsed.stats.segments_emitted);
-                        result.text_bytes_indexed = result
-                            .text_bytes_indexed
-                            .saturating_add(parsed.stats.text_bytes);
-                        if !parsed.supported_scope_complete {
+                        if parsed.replacement_committed {
+                            result.segments_indexed = result
+                                .segments_indexed
+                                .saturating_add(parsed.stats.segments_emitted);
+                            result.text_bytes_indexed = result
+                                .text_bytes_indexed
+                                .saturating_add(parsed.stats.text_bytes);
+                        }
+                        if !parsed.supported_scope_complete
+                            || !parsed.semantic_scope_complete
+                            || !parsed.relationship_scope_complete
+                        {
                             result.partial_documents = result.partial_documents.saturating_add(1);
-                            result.truncated = true;
-                            progress::progress_truncated(format!(
-                                "DOCX entry {} contains {} unsupported package part(s) that may contain text ({} total unsupported, {} disclosure(s) omitted)",
-                                candidate.entry_id,
-                                parsed.unsupported_may_contain_text_count,
-                                parsed.unsupported_parts_total,
-                                parsed.unsupported_parts_omitted,
-                            ));
+                            result.partial_artifact_coverage = true;
+                            result.completed_with_diagnostics = true;
+                            progress::progress_diagnostic(
+                                progress::JobDiagnosticKind::ParserDiagnostic,
+                                format!(
+                                    "DOCX entry {} has incomplete coverage (supported parts={}, semantic roles={}, OPC relationships={}); {} unsupported package part(s) may contain text ({} total unsupported, {} disclosure(s) omitted); replacement committed={}",
+                                    candidate.entry_id,
+                                    parsed.supported_scope_complete,
+                                    parsed.semantic_scope_complete,
+                                    parsed.relationship_scope_complete,
+                                    parsed.unsupported_may_contain_text_count,
+                                    parsed.unsupported_parts_total,
+                                    parsed.unsupported_parts_omitted,
+                                    parsed.replacement_committed,
+                                ),
+                            );
                         }
                         if let Some(warning) = outcome.cleanup_warning {
                             if let Err(record_error) = record_artifact_cleanup_warning(
@@ -4115,13 +5862,17 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
                             result.parse_errors_omitted =
                                 result.parse_errors_omitted.saturating_add(1);
                         }
-                        result.truncated = true;
+                        result.partial_artifact_coverage = true;
+                        result.completed_with_diagnostics = true;
                         progress::progress_error(Some(candidate.current_object.clone()));
                         progress::progress_skip(Some(candidate.current_object.clone()));
-                        progress::progress_truncated(format!(
-                            "DOCX entry {} could not be parsed: {error:#}",
-                            candidate.entry_id
-                        ));
+                        progress::progress_diagnostic(
+                            progress::JobDiagnosticKind::ParserDiagnostic,
+                            format!(
+                                "DOCX entry {} could not be parsed: {error:#}",
+                                candidate.entry_id
+                            ),
+                        );
                     }
                 }
                 progress::progress_advance(candidate.current_object.clone());
@@ -4144,8 +5895,13 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
         progress::progress_truncated(message);
     }
 
+    if result.cleanup_warning_count > 0 {
+        result.completed_with_diagnostics = true;
+    }
     result.status = if result.truncated {
         "truncated".to_string()
+    } else if result.completed_with_diagnostics {
+        "completed_with_diagnostics".to_string()
     } else {
         "completed".to_string()
     };
@@ -4160,7 +5916,9 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
                              'partial_documents', ?8, 'parse_error_count', ?9,
                              'cleanup_warning_count', ?10,
                              'cleanup_warnings_omitted', ?11,
-                             'status', ?12))",
+                             'partial_artifact_coverage', ?12,
+                             'completed_with_diagnostics', ?13,
+                             'status', ?14))",
         params![
             case_id,
             actor,
@@ -4173,6 +5931,8 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
             i64::try_from(result.parse_error_count).unwrap_or(i64::MAX),
             i64::try_from(result.cleanup_warning_count).unwrap_or(i64::MAX),
             i64::try_from(result.cleanup_warnings_omitted).unwrap_or(i64::MAX),
+            i64::from(result.partial_artifact_coverage),
+            i64::from(result.completed_with_diagnostics),
             result.status
         ],
     )?;
@@ -4222,6 +5982,20 @@ fn stream_document_parse_success(
 ) -> Result<DocumentStreamSummary> {
     let mut conn = open_existing_case(case_path)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (previous_segments, previous_status): (i64, Option<String>) = tx.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM filesystem_entry_text_segments
+              WHERE entry_id = ?1 AND parser_name = ?2),
+             json_extract(metadata_json, '$.document_parser.status')
+         FROM filesystem_entries WHERE id = ?1",
+        params![candidate.entry_id, OOXML_PARSER_NAME],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let preserve_prior_generation =
+        previous_segments > 0 && matches!(previous_status.as_deref(), Some("parsed" | "partial"));
+    if preserve_prior_generation {
+        tx.execute_batch("SAVEPOINT kdft_ooxml_reprocess")?;
+    }
     tx.execute(
         "DELETE FROM filesystem_entry_text_segments
          WHERE entry_id = ?1 AND parser_name = ?2",
@@ -4229,8 +6003,9 @@ fn stream_document_parse_success(
     )?;
     let insert = tx.prepare(
         "INSERT INTO filesystem_entry_text_segments(
-             entry_id, parser_name, segment_index, part_name, content, content_encoding)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'utf-8')",
+             entry_id, parser_name, segment_index, part_name, content, content_encoding,
+             segment_kind, provenance_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'utf-8', ?6, ?7)",
     )?;
     let mut sink = SqliteOoxmlSink::new(insert, candidate.entry_id);
     let parsed = ooxml::parse_docx_streaming(file, ooxml::OoxmlStreamOptions::default(), &mut sink)
@@ -4270,9 +6045,12 @@ fn stream_document_parse_success(
     let unsupported_parts_omitted = unsupported_total.saturating_sub(unsupported_parts.len());
     drop(sink);
 
+    let coverage_complete = parsed.supported_scope_complete
+        && parsed.semantic_scope_complete
+        && parsed.relationship_scope_complete;
     let metadata = serde_json::json!({
         "parser_name": OOXML_PARSER_NAME,
-        "status": if parsed.supported_scope_complete { "parsed" } else { "partial" },
+        "status": if coverage_complete { "parsed" } else { "partial" },
         "segments_indexed": segments_indexed,
         "text_bytes_indexed": parsed.stats.text_bytes,
         "text_chars_indexed": parsed.stats.text_chars,
@@ -4280,14 +6058,84 @@ fn stream_document_parse_success(
         "text_parts_parsed": parsed.stats.text_parts_parsed,
         "hyperlink_targets": parsed.stats.hyperlink_targets,
         "supported_scope_complete": parsed.supported_scope_complete,
+        "semantic_scope_complete": parsed.semantic_scope_complete,
+        "relationship_scope_complete": parsed.relationship_scope_complete,
+        "visible_text_chars": parsed.stats.visible_text_chars,
+        "deleted_text_chars": parsed.stats.deleted_text_chars,
+        "field_instruction_chars": parsed.stats.field_instruction_chars,
+        "directly_hidden_text_chars": parsed.stats.directly_hidden_text_chars,
+        "text_box_chars": parsed.stats.text_box_chars,
+        "run_or_paragraph_style_references": parsed.stats.run_or_paragraph_style_references,
+        "alternate_content_blocks": parsed.stats.alternate_content_blocks,
+        "non_text_control_elements": parsed.stats.non_text_control_elements,
+        "internal_relationships": parsed.stats.internal_relationships,
+        "external_relationships": parsed.stats.external_relationships,
+        "dangling_internal_relationships": parsed.stats.dangling_internal_relationships,
+        "relationship_cycles": parsed.stats.relationship_cycles,
+        "unreferenced_story_parts": parsed.stats.unreferenced_story_parts,
+        "opc_start_relationship_present": parsed.stats.opc_start_relationship_present,
+        "orphan_relationship_parts": parsed.stats.orphan_relationship_parts,
+        "text_segment_offset_basis": "DOCX ZIP package-relative member metadata only; extracted XML text has no source-byte or evidence-physical offset",
         "unsupported_parts": unsupported_parts,
         "unsupported_parts_total": unsupported_total,
         "unsupported_parts_omitted": unsupported_parts_omitted,
         "unsupported_may_contain_text_count": unsupported_may_contain_text_count,
+        "replacement_committed": true,
+        "replacement_rolled_back": false,
+        "previous_segments_preserved": false,
+        "previous_segments_replaced": previous_segments,
+        "retained_segment_count": segments_indexed,
+        "canonical_generation_preserved": false,
     });
+    if preserve_prior_generation && !coverage_complete {
+        tx.execute_batch(
+            "ROLLBACK TO SAVEPOINT kdft_ooxml_reprocess;
+             RELEASE SAVEPOINT kdft_ooxml_reprocess;",
+        )?;
+        let mut attempt_metadata = metadata;
+        attempt_metadata["replacement_committed"] = serde_json::json!(false);
+        attempt_metadata["replacement_rolled_back"] = serde_json::json!(true);
+        attempt_metadata["previous_segments_preserved"] = serde_json::json!(true);
+        attempt_metadata["previous_segments_replaced"] = serde_json::json!(0);
+        attempt_metadata["retained_segment_count"] = serde_json::json!(previous_segments);
+        attempt_metadata["canonical_generation_preserved"] = serde_json::json!(true);
+        let updated = tx.execute(
+            "UPDATE filesystem_entries
+             SET metadata_json = json_set(
+                 COALESCE(metadata_json, '{}'),
+                 '$.document_parser_last_attempt', json(?2)
+             )
+             WHERE id = ?1",
+            params![candidate.entry_id, attempt_metadata.to_string()],
+        )?;
+        if updated != 1 {
+            bail!(
+                "DOCX source entry {} disappeared before rolled-back attempt metadata could be committed",
+                candidate.entry_id
+            );
+        }
+        tx.commit()?;
+        return Ok(DocumentStreamSummary {
+            stats: parsed.stats,
+            supported_scope_complete: parsed.supported_scope_complete,
+            semantic_scope_complete: parsed.semantic_scope_complete,
+            relationship_scope_complete: parsed.relationship_scope_complete,
+            unsupported_parts_total: unsupported_total,
+            unsupported_parts_omitted,
+            unsupported_may_contain_text_count,
+            replacement_committed: false,
+        });
+    }
+    if preserve_prior_generation {
+        tx.execute_batch("RELEASE SAVEPOINT kdft_ooxml_reprocess")?;
+    }
     let updated = tx.execute(
         "UPDATE filesystem_entries
-         SET metadata_json = json_set(metadata_json, '$.document_parser', json(?2))
+         SET metadata_json = json_set(
+             COALESCE(metadata_json, '{}'),
+             '$.document_parser', json(?2),
+             '$.document_parser_last_attempt', json(?2)
+         )
          WHERE id = ?1",
         params![candidate.entry_id, metadata.to_string()],
     )?;
@@ -4301,9 +6149,12 @@ fn stream_document_parse_success(
     Ok(DocumentStreamSummary {
         stats: parsed.stats,
         supported_scope_complete: parsed.supported_scope_complete,
+        semantic_scope_complete: parsed.semantic_scope_complete,
+        relationship_scope_complete: parsed.relationship_scope_complete,
         unsupported_parts_total: unsupported_total,
         unsupported_parts_omitted,
         unsupported_may_contain_text_count,
+        replacement_committed: true,
     })
 }
 
@@ -4314,12 +6165,17 @@ fn store_document_parse_error(
 ) -> Result<()> {
     let mut conn = open_existing_case(case_path)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let previous_segments_retained: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM filesystem_entry_text_segments
-         WHERE entry_id = ?1 AND parser_name = ?2",
+    let (previous_segments_retained, previous_status): (i64, Option<String>) = tx.query_row(
+        "SELECT
+             (SELECT COUNT(*) FROM filesystem_entry_text_segments
+              WHERE entry_id = ?1 AND parser_name = ?2),
+             json_extract(metadata_json, '$.document_parser.status')
+         FROM filesystem_entries WHERE id = ?1",
         params![candidate.entry_id, OOXML_PARSER_NAME],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    let preserve_prior_generation = previous_segments_retained > 0
+        && matches!(previous_status.as_deref(), Some("parsed" | "partial"));
     let metadata = serde_json::json!({
         "parser_name": OOXML_PARSER_NAME,
         "status": "error",
@@ -4327,16 +6183,41 @@ fn store_document_parse_error(
         "segments_indexed": previous_segments_retained,
         "replacement_committed": false,
         "replacement_rolled_back": true,
-        "previous_segments_preserved": true,
+        "previous_segments_preserved": preserve_prior_generation,
         "previous_segments_retained": previous_segments_retained,
         "supported_scope_complete": false,
+        "semantic_scope_complete": false,
+        "relationship_scope_complete": false,
+        "canonical_generation_preserved": preserve_prior_generation,
     });
-    tx.execute(
-        "UPDATE filesystem_entries
-         SET metadata_json = json_set(metadata_json, '$.document_parser', json(?2))
-         WHERE id = ?1",
-        params![candidate.entry_id, metadata.to_string()],
-    )?;
+    let updated = if preserve_prior_generation {
+        tx.execute(
+            "UPDATE filesystem_entries
+             SET metadata_json = json_set(
+                 COALESCE(metadata_json, '{}'),
+                 '$.document_parser_last_attempt', json(?2)
+             )
+             WHERE id = ?1",
+            params![candidate.entry_id, metadata.to_string()],
+        )?
+    } else {
+        tx.execute(
+            "UPDATE filesystem_entries
+             SET metadata_json = json_set(
+                 COALESCE(metadata_json, '{}'),
+                 '$.document_parser', json(?2),
+                 '$.document_parser_last_attempt', json(?2)
+             )
+             WHERE id = ?1",
+            params![candidate.entry_id, metadata.to_string()],
+        )?
+    };
+    if updated != 1 {
+        bail!(
+            "DOCX source entry {} disappeared before parser-attempt metadata could be committed",
+            candidate.entry_id
+        );
+    }
     tx.commit()?;
     Ok(())
 }
@@ -4922,11 +6803,238 @@ pub fn find_browser_profile_candidates(
 
 const CARVE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const CARVE_LENGTH_CHUNK_BYTES: usize = 64 * 1024;
-/// Formats without a supported footer or declared-size rule cannot be allowed
-/// to claim the rest of a disk after a coincidental header. This is a disclosed
-/// protective extent limit, not a completeness claim: hitting it makes both
-/// the carved entry and the carve job explicitly truncated.
+const CARVE_PARSER_NAME: &str = "kdft-carve 2";
+/// Per-candidate structural inspection bound. Reaching this bound produces a
+/// recognized partial candidate and a parser diagnostic. It does not mean the
+/// examiner limited the evidence scan.
 const CARVE_UNKNOWN_LENGTH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// A small compressed GZIP member can expand enormously. Validation discards
+/// decoded bytes and refuses to assert a complete file once this bound is
+/// crossed, while still retaining the exact candidate offset and reason.
+const CARVE_GZIP_DECODED_MAX_BYTES: u64 = 256 * 1024 * 1024;
+const CARVE_SPOOL_PATH_MAX_BYTES: usize = 16 * 1024;
+const CARVE_SPOOL_NAME_MAX_BYTES: usize = 4 * 1024;
+const CARVE_SPOOL_METADATA_MAX_BYTES: usize = 256 * 1024;
+
+struct CarveRecordSpool {
+    conn: Connection,
+    _guard: TempFileGuard,
+    collecting: bool,
+}
+
+struct CarveSpoolRecord {
+    logical_path: String,
+    name: String,
+    entry_kind: String,
+    size_bytes: Option<i64>,
+    metadata_json: String,
+}
+
+fn reserve_unique_carve_spool_path(source_hint: &Path) -> Result<PathBuf> {
+    static NEXT_CARVE_SPOOL_NONCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    let source_name = source_hint
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    for _ in 0..128 {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default();
+        let nonce = NEXT_CARVE_SPOOL_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "kdft-carve-records-{}-{timestamp}-{nonce}-{}.sqlite",
+            std::process::id(),
+            sanitize_logical_segment(source_name)
+        ));
+        match create_private_new_file(&path) {
+            Ok(file) => {
+                drop(file);
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reserving carve spool {}", path.display()));
+            }
+        }
+    }
+    bail!("could not reserve a unique carve spool after 128 attempts")
+}
+
+impl CarveRecordSpool {
+    fn new(source_hint: &Path) -> Result<Self> {
+        let path = reserve_unique_carve_spool_path(source_hint)?;
+        let guard = TempFileGuard::new(path.clone());
+        let conn = Connection::open(&path)
+            .with_context(|| format!("creating carve record spool {}", path.display()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = OFF;
+             PRAGMA synchronous = OFF;
+             PRAGMA temp_store = MEMORY;
+             CREATE TABLE carve_records(
+                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                 logical_path TEXT NOT NULL UNIQUE,
+                 name TEXT NOT NULL,
+                 entry_kind TEXT NOT NULL,
+                 size_bytes INTEGER,
+                 metadata_json TEXT NOT NULL
+             );
+             BEGIN IMMEDIATE;",
+        )
+        .context("initializing carve record spool")?;
+        Ok(Self {
+            conn,
+            _guard: guard,
+            collecting: true,
+        })
+    }
+
+    fn push(&self, record: &CarveSpoolRecord) -> Result<()> {
+        if !self.collecting {
+            bail!("cannot append to a sealed carve record spool");
+        }
+        if record.logical_path.len() > CARVE_SPOOL_PATH_MAX_BYTES
+            || record.name.len() > CARVE_SPOOL_NAME_MAX_BYTES
+            || record.metadata_json.len() > CARVE_SPOOL_METADATA_MAX_BYTES
+        {
+            bail!("carve spool record exceeds a bounded field length");
+        }
+        let metadata: serde_json::Value = serde_json::from_str(&record.metadata_json)
+            .context("validating carve spool metadata serialization")?;
+        if !metadata.is_object() {
+            bail!("carve spool metadata must be a JSON object");
+        }
+        self.conn.execute(
+            "INSERT INTO carve_records(
+                 logical_path, name, entry_kind, size_bytes, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                record.logical_path,
+                record.name,
+                record.entry_kind,
+                record.size_bytes,
+                record.metadata_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn seal(&mut self) -> Result<()> {
+        if self.collecting {
+            self.conn
+                .execute_batch("COMMIT")
+                .context("sealing carve record spool")?;
+            self.collecting = false;
+        }
+        Ok(())
+    }
+
+    fn for_each<F>(&self, mut consume: F) -> Result<()>
+    where
+        F: FnMut(CarveSpoolRecord) -> Result<()>,
+    {
+        if self.collecting {
+            bail!("carve record spool must be sealed before publication");
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT logical_path, name, entry_kind, size_bytes, metadata_json
+             FROM carve_records ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(CarveSpoolRecord {
+                logical_path: row.get(0)?,
+                name: row.get(1)?,
+                entry_kind: row.get(2)?,
+                size_bytes: row.get(3)?,
+                metadata_json: row.get(4)?,
+            })
+        })?;
+        for row in rows {
+            consume(row?)?;
+        }
+        Ok(())
+    }
+}
+
+fn finalize_failed_carve_job(
+    case_path: &Path,
+    evidence_id: i64,
+    job_id: i64,
+    error: &str,
+) -> Result<()> {
+    let bounded_error = error.chars().take(4_000).collect::<String>();
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    let prior_complete_rows: i64 = tx.query_row(
+        "SELECT COUNT(*)
+         FROM filesystem_entries fe
+         LEFT JOIN evidence_jobs prior_job ON prior_job.id = fe.discovered_by_job_id
+         WHERE fe.case_id = ?1 AND fe.evidence_id = ?2
+           AND json_valid(fe.metadata_json) = 1
+           AND json_extract(fe.metadata_json, '$.artifact_kind') IN ('carved_file', 'carve_candidate')
+           AND COALESCE(json_extract(fe.metadata_json, '$.carve_generation_canonical'), 1) = 1
+           AND (
+               json_extract(fe.metadata_json, '$.carve_generation_complete') = 1
+               OR (
+                   json_type(fe.metadata_json, '$.carve_generation_complete') IS NULL
+                   AND prior_job.status = 'completed'
+               )
+           )",
+        params![case_id, evidence_id],
+        |row| row.get(0),
+    )?;
+    let canonical_generation_preserved = prior_complete_rows > 0;
+    tx.execute(
+        "UPDATE evidence_jobs
+         SET status = 'failed',
+             finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             error = ?2,
+             parameters_json = json_set(
+                 parameters_json,
+                 '$.failure_before_publication', json('true'),
+                 '$.replacement_committed', json('false'),
+                 '$.canonical_generation_preserved', json(?3),
+                 '$.prior_complete_rows_preserved', ?4)
+         WHERE id = ?1 AND case_id = ?5 AND evidence_id = ?6",
+        params![
+            job_id,
+            bounded_error,
+            if canonical_generation_preserved {
+                "true"
+            } else {
+                "false"
+            },
+            prior_complete_rows,
+            case_id,
+            evidence_id,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'evidence.carve.failed', ?2, 'evidence', ?3,
+                 json_object(
+                     'job_id', ?4,
+                     'error', ?5,
+                     'replacement_committed', 0,
+                     'canonical_generation_preserved', ?6,
+                     'prior_complete_rows_preserved', ?7))",
+        params![
+            case_id,
+            actor,
+            evidence_id,
+            job_id,
+            bounded_error,
+            canonical_generation_preserved,
+            prior_complete_rows,
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 struct CarveSignature {
@@ -4979,12 +7087,14 @@ const CARVE_SIGNATURES: &[CarveSignature] = &[
 ];
 
 /// Examiner-driven signature carving: scans the decoded image for known file
-/// headers and records each hit as a carved file under
-/// /Image Analysis/Carved. Never runs automatically. A zero scan-size or file
-/// limit means unlimited. Explicit examiner limits and protective extent
-/// limits are always reflected by a truncated job with a reason; carved bytes
-/// are served on demand via the physical-extent reader rather than copied into
-/// the case database.
+/// headers, validates a bounded extent for supported formats, and records only
+/// structurally validated extents as files under `/Image Analysis/Carved`.
+/// Recognized partial or unsupported candidates are retained as metadata-only
+/// records; header-like false positives are counted and discarded. Never runs
+/// automatically. A zero scan-size or file limit means unlimited. Only an
+/// examiner-requested scope limit is truncation; per-candidate parser limits
+/// are diagnostics. Carved bytes are served on demand from the decoded evidence
+/// media rather than copied into the case database.
 pub fn carve_evidence(
     case_path: &Path,
     evidence_id: i64,
@@ -5052,207 +7162,433 @@ fn carve_evidence_with_protective_limit(
     };
     let cpu_worker_threads = available_processing_worker_count();
 
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let actor = audit_actor(&tx, case_id)?;
-    tx.execute(
-        "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json, started_at)
+    let (job_id, actor) = {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actor = audit_actor(&tx, case_id)?;
+        tx.execute(
+            "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json, started_at)
          VALUES (?1, ?2, 'carve', 'running',
-                 json_object('max_scan_bytes', ?3,
-                             'effective_scan_bytes', ?4,
+                  json_object('max_scan_bytes', ?3,
+                              'effective_scan_bytes', ?4,
                              'max_files', ?5,
                              'effective_max_files', ?6,
                              'signature_matcher', ?7,
                              'cpu_worker_threads', ?8,
                              'gpu_acceleration', 'not used: bounded CPU matcher plus parallel EWF decompression is the deterministic path'),
                  strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        params![
-            case_id,
-            evidence_id,
-            i64::try_from(options.max_scan_bytes).unwrap_or(i64::MAX),
-            i64::try_from(scan_limit).unwrap_or(i64::MAX),
-            i64::try_from(options.max_files).unwrap_or(i64::MAX),
-            effective_max_files,
-            signature_matcher_kind,
-            i64::try_from(cpu_worker_threads).unwrap_or(i64::MAX),
-        ],
-    )?;
-    let job_id = tx.last_insert_rowid();
-    progress::progress_set_job_id(job_id);
+            params![
+                case_id,
+                evidence_id,
+                i64::try_from(options.max_scan_bytes).unwrap_or(i64::MAX),
+                i64::try_from(scan_limit).unwrap_or(i64::MAX),
+                i64::try_from(options.max_files).unwrap_or(i64::MAX),
+                effective_max_files,
+                signature_matcher_kind,
+                i64::try_from(cpu_worker_threads).unwrap_or(i64::MAX),
+            ],
+        )?;
+        let job_id = tx.last_insert_rowid();
+        tx.commit()?;
+        (job_id, actor)
+    };
+    let attempt_result = (|| -> Result<CarveResult> {
+        progress::progress_set_job_id(job_id);
+        let mut spool = CarveRecordSpool::new(Path::new(&source_path))?;
 
-    let mut carved = 0_usize;
-    let mut truncated = false;
-    let mut truncation_reasons = Vec::new();
-    let mut protective_extent_limit_hits = 0_usize;
-    let mut carry: Vec<u8> = Vec::new();
-    let mut carry_base = 0_u64;
-    let mut scan_cursor = 0_u64;
-    let mut bytes_scanned = 0_u64;
-    let mut min_next_offset = 0_u64;
-    let mut buffer = vec![0_u8; CARVE_CHUNK_BYTES];
+        let mut carved = 0_usize;
+        let mut recognized_candidates = 0_usize;
+        let mut rejected_header_candidates = 0_usize;
+        let mut truncated = false;
+        let mut truncation_reasons = Vec::new();
+        let mut protective_extent_limit_hits = 0_usize;
+        let mut carry: Vec<u8> = Vec::new();
+        let mut carry_base = 0_u64;
+        let mut scan_cursor = 0_u64;
+        let mut bytes_scanned = 0_u64;
+        let mut min_next_offset = 0_u64;
+        let mut buffer = vec![0_u8; CARVE_CHUNK_BYTES];
 
-    'scan: while scan_cursor < scan_limit {
-        opened.reader.seek(SeekFrom::Start(scan_cursor))?;
-        let want = ((scan_limit - scan_cursor) as usize).min(CARVE_CHUNK_BYTES);
-        let read = opened.reader.read(&mut buffer[..want])?;
-        if read == 0 {
-            let reason = format!(
+        'scan: while scan_cursor < scan_limit {
+            opened.reader.seek(SeekFrom::Start(scan_cursor))?;
+            let want = ((scan_limit - scan_cursor) as usize).min(CARVE_CHUNK_BYTES);
+            let read = opened.reader.read(&mut buffer[..want])?;
+            if read == 0 {
+                bail!(
                 "carving source reached an unexpected end after {scan_cursor} of {scan_limit} requested decoded bytes"
             );
-            truncated = true;
-            truncation_reasons.push(reason.clone());
-            progress::progress_truncated(reason);
-            break;
-        }
-        bytes_scanned = scan_cursor.saturating_add(read as u64);
-        // Window = leftover overlap from the previous chunk + this chunk, so a
-        // header straddling a chunk boundary is still detected.
-        let mut window = std::mem::take(&mut carry);
-        window.extend_from_slice(&buffer[..read]);
-        // There is no future chunk to complete an overlap at the end of the
-        // requested scan scope, so the final trailing bytes are searchable now.
-        let searchable = if bytes_scanned >= scan_limit {
-            window.len()
-        } else {
-            window.len().saturating_sub(overlap)
-        };
-        for signature_match in signature_matcher.find_overlapping_iter(&window) {
-            let index = signature_match.start();
-            if index >= searchable {
-                break;
             }
-            let absolute = carry_base + index as u64;
-            if absolute < min_next_offset {
-                continue;
-            }
-            let sig = &CARVE_SIGNATURES[signature_match.pattern().as_usize()];
-            let available_len = scan_limit.saturating_sub(absolute);
-            let carved_length = carve_length_with_protective_limit(
-                &mut *opened.reader,
-                absolute,
-                sig,
-                available_len,
-                unknown_length_limit,
-            )?;
-            let length = carved_length.length;
-            opened.reader.seek(SeekFrom::Start(scan_cursor))?;
-            if length < sig.header.len() as u64 {
-                continue;
-            }
-            carved += 1;
-            // A measured file can suppress nested signatures inside its own
-            // bytes. An unverified extent must not hide later independent
-            // headers merely because its provisional bound is large.
-            min_next_offset = absolute.saturating_add(if carved_length.definitive {
-                length
+            bytes_scanned = scan_cursor.saturating_add(read as u64);
+            // Window = leftover overlap from the previous chunk + this chunk, so a
+            // header straddling a chunk boundary is still detected.
+            let mut window = std::mem::take(&mut carry);
+            window.extend_from_slice(&buffer[..read]);
+            // There is no future chunk to complete an overlap at the end of the
+            // requested scan scope, so the final trailing bytes are searchable now.
+            let searchable = if bytes_scanned >= scan_limit {
+                window.len()
             } else {
-                sig.header.len() as u64
-            });
-            let name = format!("carved-{carved:05}-0x{absolute:X}.{}", sig.extension);
-            let logical_path = format!("/Image Analysis/Carved/{name}");
-            let extent_truncation_reason = carved_length.protective_limit_hit.then(|| {
+                window.len().saturating_sub(overlap)
+            };
+            for signature_match in signature_matcher.find_overlapping_iter(&window) {
+                let index = signature_match.start();
+                if index >= searchable {
+                    break;
+                }
+                let absolute = carry_base + index as u64;
+                if absolute < min_next_offset {
+                    continue;
+                }
+                let sig = &CARVE_SIGNATURES[signature_match.pattern().as_usize()];
+                let available_len = scan_limit.saturating_sub(absolute);
+                let carved_length = carve_length_with_protective_limit(
+                    &mut *opened.reader,
+                    absolute,
+                    sig,
+                    available_len,
+                    unknown_length_limit,
+                )?;
+                let length = carved_length.length;
+                opened.reader.seek(SeekFrom::Start(scan_cursor))?;
+                if carved_length.status == CarveValidationStatus::Rejected {
+                    rejected_header_candidates = rejected_header_candidates.saturating_add(1);
+                    continue;
+                }
+                let extent_structurally_validated =
+                    carved_length.status == CarveValidationStatus::Validated;
+                if extent_structurally_validated {
+                    carved = carved.saturating_add(1);
+                } else {
+                    recognized_candidates = recognized_candidates.saturating_add(1);
+                }
+                // A measured file can suppress nested signatures inside its own
+                // bytes. An unverified extent must not hide later independent
+                // headers merely because its provisional bound is large.
+                min_next_offset = absolute.saturating_add(if extent_structurally_validated {
+                    length
+                } else {
+                    sig.header.len() as u64
+                });
+                let (name, logical_path, artifact_kind, entry_kind) =
+                    if extent_structurally_validated {
+                        let name = format!("carved-0x{absolute:016X}.{}", sig.extension);
+                        let logical_path = format!("/Image Analysis/Carved/{name}");
+                        (name, logical_path, "carved_file", "file")
+                    } else {
+                        let name = format!("candidate-0x{absolute:016X}.{}", sig.extension);
+                        let logical_path = format!("/Image Analysis/Carve Candidates/{name}");
+                        (name, logical_path, "carve_candidate", "record")
+                    };
+                let extent_truncation_reason = carved_length.protective_limit_hit.then(|| {
                 format!(
                     "{} at decoded offset 0x{absolute:X} reached the {}-byte protective extent limit; its end was not verified",
                     sig.label, unknown_length_limit
                 )
             });
-            if extent_truncation_reason.is_some() {
-                protective_extent_limit_hits = protective_extent_limit_hits.saturating_add(1);
+                if extent_truncation_reason.is_some() {
+                    protective_extent_limit_hits = protective_extent_limit_hits.saturating_add(1);
+                }
+                let content_integrity_status = match (sig.extension, carved_length.status) {
+                    (_, CarveValidationStatus::Partial) => "not_validated_partial_candidate",
+                    (_, CarveValidationStatus::RecognizedUnsupported) => {
+                        "not_validated_unsupported_candidate"
+                    }
+                    ("png", CarveValidationStatus::Validated) => "all_chunk_crc32_values_validated",
+                    ("gz", CarveValidationStatus::Validated) => {
+                        "all_member_crc32_and_isize_trailers_validated"
+                    }
+                    ("zip", CarveValidationStatus::Validated) => {
+                        "partial_member_payload_validation_see_validation_details"
+                    }
+                    ("pdf", CarveValidationStatus::Validated) => {
+                        "bounded_revision_extent_only_not_semantic_pdf_validation"
+                    }
+                    ("jpg", CarveValidationStatus::Validated) => {
+                        "marker_structure_and_extent_only_not_entropy_decode"
+                    }
+                    ("gif", CarveValidationStatus::Validated) => {
+                        "block_structure_and_extent_only_not_lzw_pixel_decode"
+                    }
+                    ("bmp", CarveValidationStatus::Validated) => {
+                        "header_and_extent_only_not_pixel_decode"
+                    }
+                    (_, CarveValidationStatus::Validated) => "extent_validation_only",
+                    (_, CarveValidationStatus::Rejected) => {
+                        "rejected_candidate_not_persisted_as_a_recovered_file"
+                    }
+                };
+                let mut metadata = serde_json::json!({
+                    "artifact_kind": artifact_kind,
+                    "carve_parser": CARVE_PARSER_NAME,
+                    "recovery_source": "signature_carving",
+                    "recovery_status": if extent_structurally_validated {
+                        "structurally validated extent recovered from decoded evidence media"
+                    } else {
+                        "recognized signature candidate retained without asserting a recovered file"
+                    },
+                    "recovery_read": if extent_structurally_validated {
+                        "decoded_media_extent"
+                    } else {
+                        "none_metadata_only"
+                    },
+                    "storage_area": if extent_structurally_validated { "carved" } else { "carve_candidate" },
+                    "carve_format": sig.label,
+                    "carve_signature": sig
+                        .header
+                        .iter()
+                        .map(|byte| format!("{byte:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    "carve_length_basis": carved_length.basis,
+                    "carve_length_definitive": carved_length.definitive,
+                    "carve_validation_status": carved_length.status.as_str(),
+                    "carve_validation_details": carved_length.details,
+                    "extent_structurally_validated": extent_structurally_validated,
+                    "content_integrity_status": content_integrity_status,
+                    "candidate_decoded_media_offset": absolute,
+                    "carve_extent_truncated": carved_length.protective_limit_hit,
+                    "carve_extent_truncation_reason": extent_truncation_reason,
+                    "carve_protective_extent_limit_bytes": if carved_length.protective_limit_hit {
+                        Some(unknown_length_limit)
+                    } else {
+                        None
+                    },
+                    "file_data_decoded_media_offset": extent_structurally_validated.then_some(absolute),
+                    "file_data_file_offset": extent_structurally_validated.then_some(0),
+                    "file_data_contiguous_bytes": extent_structurally_validated.then_some(length),
+                    "file_data_direct_logical_mapping": extent_structurally_validated,
+                    "offset_coordinate_system": "decoded_evidence_media_byte_offset",
+                    "container_physical_offset_available": false,
+                    "container_physical_offset_note": "decoded logical-media offsets do not map one-to-one to E01 segment/container-file offsets",
+                    "size_bytes": extent_structurally_validated.then_some(length),
+                });
+                if extent_structurally_validated {
+                    add_entry_category(&mut metadata, &logical_path, &name, "file");
+                } else if let Some(object) = metadata.as_object_mut() {
+                    object.insert("category".to_string(), serde_json::json!("Recovery"));
+                    object.insert(
+                        "subcategory".to_string(),
+                        serde_json::json!("Carving candidates"),
+                    );
+                }
+                let content_head_length = extent_structurally_validated
+                    .then(|| (CONTENT_INDEX_BYTES as u64).min(length) as usize);
+                if let Some(object) = metadata.as_object_mut() {
+                    object.insert(
+                        "content_head_source".to_string(),
+                        serde_json::json!(
+                            extent_structurally_validated.then_some("decoded_media_extent")
+                        ),
+                    );
+                    object.insert(
+                        "content_head_offset".to_string(),
+                        serde_json::json!(extent_structurally_validated.then_some(absolute)),
+                    );
+                    object.insert(
+                        "content_head_length".to_string(),
+                        serde_json::json!(content_head_length),
+                    );
+                    object.insert(
+                        "content_head_scope".to_string(),
+                        serde_json::json!(extent_structurally_validated.then_some(
+                            "first bounded bytes of the structurally validated carved extent"
+                        )),
+                    );
+                }
+                spool.push(&CarveSpoolRecord {
+                    logical_path,
+                    name,
+                    entry_kind: entry_kind.to_string(),
+                    size_bytes: extent_structurally_validated
+                        .then(|| i64::try_from(length).unwrap_or(i64::MAX)),
+                    metadata_json: metadata.to_string(),
+                })?;
+                if extent_structurally_validated && carved >= max_files {
+                    let reason =
+                        format!("carving stopped at the examiner-requested {max_files} file limit");
+                    truncated = true;
+                    truncation_reasons.push(reason.clone());
+                    progress::progress_truncated(reason);
+                    progress::progress_set_processed(bytes_scanned, Some(source_path.clone()));
+                    break 'scan;
+                }
             }
-            let mut metadata = serde_json::json!({
-                "artifact_kind": "carved_file",
-                "recovery_source": "signature_carving",
-                "recovery_status": if carved_length.definitive {
-                    "carved from image by file signature"
-                } else {
-                    "carved from image by file signature (length not verified - see carve_length_basis)"
-                },
-                "recovery_read": "physical_extent",
-                "storage_area": "carved",
-                "carve_format": sig.label,
-                "carve_signature": sig
-                    .header
-                    .iter()
-                    .map(|byte| format!("{byte:02X}"))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                "carve_length_basis": carved_length.basis,
-                "carve_length_definitive": carved_length.definitive,
-                "carve_extent_truncated": carved_length.protective_limit_hit,
-                "carve_extent_truncation_reason": extent_truncation_reason,
-                "carve_protective_extent_limit_bytes": if carved_length.protective_limit_hit {
-                    Some(unknown_length_limit)
-                } else {
-                    None
-                },
-                "file_data_physical_offset": absolute,
-                "file_data_logical_offset": absolute,
-                "size_bytes": length,
-            });
-            add_entry_category(&mut metadata, &logical_path, &name, "file");
-            let content_head = {
-                let head_len = (CONTENT_INDEX_BYTES as u64).min(length) as usize;
-                let mut head = vec![0_u8; head_len];
-                opened.reader.seek(SeekFrom::Start(absolute))?;
-                let head_read = opened.reader.read(&mut head)?;
-                head.truncate(head_read);
-                opened.reader.seek(SeekFrom::Start(scan_cursor))?;
-                head
-            };
-            upsert_filesystem_entry_with_content(
-                &tx,
-                case_id,
-                evidence_id,
-                &logical_path,
-                &name,
-                "file",
-                Some(i64::try_from(length).unwrap_or(i64::MAX)),
-                &metadata.to_string(),
-                job_id,
-                Some(&content_head),
-            )?;
-            if carved >= max_files {
-                let reason =
-                    format!("carving stopped at the examiner-requested {max_files} file limit");
-                truncated = true;
-                truncation_reasons.push(reason.clone());
-                progress::progress_truncated(reason);
-                progress::progress_set_processed(bytes_scanned, Some(source_path.clone()));
-                break 'scan;
-            }
+            // Preserve the trailing overlap so a boundary-spanning header survives.
+            let keep = window.len().min(overlap);
+            carry_base += (window.len() - keep) as u64;
+            carry = window.split_off(window.len() - keep);
+            scan_cursor += read as u64;
+            progress::progress_set_processed(scan_cursor, Some(source_path.clone()));
         }
-        // Preserve the trailing overlap so a boundary-spanning header survives.
-        let keep = window.len().min(overlap);
-        carry_base += (window.len() - keep) as u64;
-        carry = window.split_off(window.len() - keep);
-        scan_cursor += read as u64;
-        progress::progress_set_processed(scan_cursor, Some(source_path.clone()));
-    }
 
-    if scan_limit < opened.decoded_size {
-        let reason = format!(
+        if scan_limit < opened.decoded_size {
+            let reason = format!(
             "carving scanned {scan_limit} of {} decoded bytes because of the examiner-requested scan limit",
             opened.decoded_size
         );
-        truncated = true;
-        truncation_reasons.push(reason.clone());
-        progress::progress_truncated(reason);
-    }
-    if protective_extent_limit_hits > 0 {
-        let reason = format!(
-            "{protective_extent_limit_hits} carved extent(s) reached the {}-byte protective limit because their formats have no supported end rule; each affected entry records its exact decoded offset and cutoff reason",
-            unknown_length_limit
+            truncated = true;
+            truncation_reasons.push(reason.clone());
+            progress::progress_truncated(reason);
+        }
+        let completed_with_diagnostics = recognized_candidates > 0;
+        let status = if truncated {
+            "truncated"
+        } else if completed_with_diagnostics {
+            "completed_with_diagnostics"
+        } else {
+            "completed"
+        };
+        spool.seal()?;
+        let truncation_reason = truncated.then(|| truncation_reasons.join("; "));
+        let truncation_reasons_json = serde_json::to_string(&truncation_reasons)
+            .context("serializing carve truncation reasons")?;
+        // Per-candidate diagnostics do not make a byte-for-byte full-media scan
+        // incomplete. Only an examiner scope limit prevents this generation from
+        // replacing an earlier complete scan.
+        let generation_complete = !truncated;
+        let generation_id = format!(
+            "carve-{}-{}-{job_id}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default()
         );
-        truncated = true;
-        truncation_reasons.push(reason.clone());
-        progress::progress_truncated(reason);
-    }
-
-    let status = if truncated { "truncated" } else { "completed" };
-    let truncation_reason = truncated.then(|| truncation_reasons.join("; "));
-    let truncation_reasons_json = serde_json::to_string(&truncation_reasons)
-        .context("serializing carve truncation reasons")?;
-    tx.execute(
-        "UPDATE evidence_jobs
+        let generation_time = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (prior_complete_files, prior_complete_candidates): (i64, i64) = tx.query_row(
+        "SELECT
+             COALESCE(SUM(CASE WHEN json_extract(fe.metadata_json, '$.artifact_kind') = 'carved_file' THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN json_extract(fe.metadata_json, '$.artifact_kind') = 'carve_candidate' THEN 1 ELSE 0 END), 0)
+         FROM filesystem_entries fe
+         LEFT JOIN evidence_jobs job ON job.id = fe.discovered_by_job_id
+         WHERE fe.case_id = ?1 AND fe.evidence_id = ?2
+           AND json_valid(fe.metadata_json) = 1
+           AND json_extract(fe.metadata_json, '$.artifact_kind') IN ('carved_file', 'carve_candidate')
+           AND COALESCE(json_extract(fe.metadata_json, '$.carve_generation_canonical'), 1) = 1
+           AND (
+               json_extract(fe.metadata_json, '$.carve_generation_complete') = 1
+               OR (
+                   json_type(fe.metadata_json, '$.carve_generation_complete') IS NULL
+                   AND job.status = 'completed'
+               )
+           )",
+        params![case_id, evidence_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+        let prior_complete_rows = prior_complete_files.saturating_add(prior_complete_candidates);
+        let canonical_generation_preserved = !generation_complete && prior_complete_rows > 0;
+        if canonical_generation_preserved {
+            tx.execute(
+            "UPDATE filesystem_entries
+             SET metadata_json = json_set(
+                 metadata_json,
+                 '$.carve_last_attempt_job_id', ?3,
+                 '$.carve_last_attempt_status', ?4,
+                 '$.carve_last_attempt_replacement_committed', json('false'),
+                 '$.carve_last_attempt_canonical_generation_preserved', json('true'),
+                 '$.carve_last_attempt_carved_files', ?5,
+                 '$.carve_last_attempt_recognized_candidates', ?6,
+                 '$.carve_last_attempt_rejected_headers', ?7,
+                 '$.carve_last_attempt_bytes_scanned', ?8)
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_valid(metadata_json) = 1
+               AND json_extract(metadata_json, '$.artifact_kind') IN ('carved_file', 'carve_candidate')
+               AND COALESCE(json_extract(metadata_json, '$.carve_generation_canonical'), 1) = 1",
+            params![
+                case_id,
+                evidence_id,
+                job_id,
+                status,
+                i64::try_from(carved).unwrap_or(i64::MAX),
+                i64::try_from(recognized_candidates).unwrap_or(i64::MAX),
+                i64::try_from(rejected_header_candidates).unwrap_or(i64::MAX),
+                i64::try_from(bytes_scanned).unwrap_or(i64::MAX),
+            ],
+        )?;
+        } else {
+            spool.for_each(|record| {
+                let mut metadata: serde_json::Value =
+                    serde_json::from_str(&record.metadata_json)
+                        .context("reading staged carve record metadata")?;
+                metadata["carve_generation_id"] = serde_json::json!(generation_id);
+                metadata["carve_generation_created_utc"] = serde_json::json!(generation_time);
+                metadata["carve_generation_complete"] = serde_json::json!(generation_complete);
+                metadata["carve_generation_canonical"] = serde_json::json!(true);
+                metadata["carve_generation_status"] = serde_json::json!(status);
+                metadata["carve_last_attempt_job_id"] = serde_json::json!(job_id);
+                metadata["carve_last_attempt_status"] = serde_json::json!(status);
+                metadata["carve_last_attempt_replacement_committed"] = serde_json::json!(true);
+                metadata["carve_last_attempt_canonical_generation_preserved"] =
+                    serde_json::json!(false);
+                let content_head = if metadata
+                    .get("extent_structurally_validated")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    let offset = metadata
+                        .get("file_data_decoded_media_offset")
+                        .and_then(serde_json::Value::as_u64)
+                        .context("validated carve record is missing its decoded-media offset")?;
+                    let head_length = metadata
+                        .get("content_head_length")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                        .context("validated carve record has an invalid content-head length")?;
+                    if head_length > CONTENT_INDEX_BYTES {
+                        bail!("validated carve content-head length exceeds its fixed bound");
+                    }
+                    let mut head = vec![0_u8; head_length];
+                    opened.reader.seek(SeekFrom::Start(offset))?;
+                    opened.reader.read_exact(&mut head)?;
+                    Some(head)
+                } else {
+                    None
+                };
+                upsert_filesystem_entry_with_content(
+                    &tx,
+                    case_id,
+                    evidence_id,
+                    &record.logical_path,
+                    &record.name,
+                    &record.entry_kind,
+                    record.size_bytes,
+                    &metadata.to_string(),
+                    job_id,
+                    content_head.as_deref(),
+                )
+            })?;
+            tx.execute(
+            "UPDATE filesystem_entries
+             SET metadata_json = json_set(
+                 metadata_json,
+                 '$.carve_generation_canonical', json('false'),
+                 '$.carve_generation_stale', json('true'),
+                 '$.carve_generation_stale_reason', 'superseded but retained because an examiner bookmark references this row')
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_valid(metadata_json) = 1
+               AND json_extract(metadata_json, '$.artifact_kind') IN ('carved_file', 'carve_candidate')
+               AND COALESCE(json_extract(metadata_json, '$.carve_generation_id'), '') <> ?3
+               AND EXISTS (
+                   SELECT 1 FROM bookmark_items
+                   WHERE bookmark_items.entry_id = filesystem_entries.id
+               )",
+            params![case_id, evidence_id, generation_id],
+        )?;
+            tx.execute(
+            "DELETE FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_valid(metadata_json) = 1
+               AND json_extract(metadata_json, '$.artifact_kind') IN ('carved_file', 'carve_candidate')
+               AND COALESCE(json_extract(metadata_json, '$.carve_generation_id'), '') <> ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM bookmark_items
+                   WHERE bookmark_items.entry_id = filesystem_entries.id
+               )",
+            params![case_id, evidence_id, generation_id],
+        )?;
+        }
+        tx.execute(
+            "UPDATE evidence_jobs
          SET status = ?2,
              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
              error = ?3,
@@ -5262,20 +7598,54 @@ fn carve_evidence_with_protective_limit(
                  '$.bytes_scanned', ?5,
                  '$.truncated', json(?6),
                  '$.protective_extent_limit_hits', ?7,
-                 '$.truncation_reasons', json(?8))
+                 '$.truncation_reasons', json(?8),
+                 '$.recognized_candidates', ?9,
+                 '$.rejected_header_candidates', ?10,
+                 '$.completed_with_diagnostics', json(?11),
+                 '$.attempt_carved_files', ?12,
+                 '$.attempt_recognized_candidates', ?13,
+                 '$.prior_complete_carved_files', ?14,
+                 '$.prior_complete_candidates', ?15,
+                 '$.canonical_generation_preserved', json(?16),
+                 '$.replacement_committed', json(?17),
+                 '$.carve_generation_id', ?18,
+                 '$.canonical_generation_complete', json(?19))
          WHERE id = ?1",
-        params![
-            job_id,
-            status,
-            truncation_reason,
-            i64::try_from(carved).unwrap_or(i64::MAX),
-            i64::try_from(bytes_scanned).unwrap_or(i64::MAX),
-            if truncated { "true" } else { "false" },
-            i64::try_from(protective_extent_limit_hits).unwrap_or(i64::MAX),
-            truncation_reasons_json,
-        ],
-    )?;
-    tx.execute(
+            params![
+                job_id,
+                status,
+                truncation_reason,
+                i64::try_from(carved).unwrap_or(i64::MAX),
+                i64::try_from(bytes_scanned).unwrap_or(i64::MAX),
+                if truncated { "true" } else { "false" },
+                i64::try_from(protective_extent_limit_hits).unwrap_or(i64::MAX),
+                truncation_reasons_json,
+                i64::try_from(recognized_candidates).unwrap_or(i64::MAX),
+                i64::try_from(rejected_header_candidates).unwrap_or(i64::MAX),
+                if completed_with_diagnostics {
+                    "true"
+                } else {
+                    "false"
+                },
+                i64::try_from(carved).unwrap_or(i64::MAX),
+                i64::try_from(recognized_candidates).unwrap_or(i64::MAX),
+                prior_complete_files,
+                prior_complete_candidates,
+                if canonical_generation_preserved {
+                    "true"
+                } else {
+                    "false"
+                },
+                if canonical_generation_preserved {
+                    "false"
+                } else {
+                    "true"
+                },
+                generation_id,
+                if generation_complete { "true" } else { "false" },
+            ],
+        )?;
+        tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'evidence.carve', ?2, 'evidence', ?3,
                  json_object('job_id', ?4,
@@ -5284,7 +7654,13 @@ fn carve_evidence_with_protective_limit(
                              'truncated', ?7,
                              'status', ?8,
                              'truncation_reason', ?9,
-                             'protective_extent_limit_hits', ?10))",
+                             'protective_extent_limit_hits', ?10,
+                             'recognized_candidates', ?11,
+                             'rejected_header_candidates', ?12,
+                             'completed_with_diagnostics', ?13,
+                             'canonical_generation_preserved', ?14,
+                             'replacement_committed', ?15,
+                             'generation_id', ?16))",
         params![
             case_id,
             actor,
@@ -5296,213 +7672,1086 @@ fn carve_evidence_with_protective_limit(
             status,
             truncation_reason,
             i64::try_from(protective_extent_limit_hits).unwrap_or(i64::MAX),
+            i64::try_from(recognized_candidates).unwrap_or(i64::MAX),
+            i64::try_from(rejected_header_candidates).unwrap_or(i64::MAX),
+            completed_with_diagnostics,
+            canonical_generation_preserved,
+            !canonical_generation_preserved,
+            generation_id,
         ],
     )?;
-    tx.commit()?;
+        tx.commit()?;
 
-    Ok(CarveResult {
-        evidence_id,
-        carved_files: carved,
-        bytes_scanned,
-        truncated,
-        status: status.to_string(),
-        truncation_reasons,
-        protective_extent_limit_hits,
-    })
+        Ok(CarveResult {
+            evidence_id,
+            carved_files: carved,
+            recognized_candidates,
+            rejected_header_candidates,
+            bytes_scanned,
+            truncated,
+            status: status.to_string(),
+            truncation_reasons,
+            completed_with_diagnostics,
+            canonical_generation_preserved,
+            protective_extent_limit_hits,
+        })
+    })();
+    match attempt_result {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            match finalize_failed_carve_job(case_path, evidence_id, job_id, &error.to_string()) {
+                Ok(()) => Err(error),
+                Err(finalize_error) => Err(error).context(format!(
+                    "carve attempt also failed to finalize job {job_id}: {finalize_error}"
+                )),
+            }
+        }
+    }
 }
 
-/// How a carved file's recorded length was established. An examiner must be
-/// able to tell a measured length (structure footer, valid declared size)
-/// from a fallback cap - a capped length means "the real end was never
-/// found", and exporting such a carve yields window-sized bytes, not a
-/// verified file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarveValidationStatus {
+    Validated,
+    Partial,
+    RecognizedUnsupported,
+    Rejected,
+}
+
+impl CarveValidationStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Validated => "structurally_validated",
+            Self::Partial => "recognized_partial",
+            Self::RecognizedUnsupported => "recognized_unsupported",
+            Self::Rejected => "rejected_header_candidate",
+        }
+    }
+}
+
+/// A header match is only a candidate. `Validated` is the sole state allowed
+/// to become an exportable carved file; all other recognized states are
+/// retained as metadata-only records with their exact decoded-media offset.
 struct CarvedLength {
     length: u64,
-    basis: &'static str,
+    basis: String,
     definitive: bool,
     protective_limit_hit: bool,
+    status: CarveValidationStatus,
+    details: serde_json::Value,
 }
 
-struct FooterSearchResult {
-    length: Option<u64>,
-    bytes_read: u64,
+impl CarvedLength {
+    fn validated(length: usize, basis: impl Into<String>, details: serde_json::Value) -> Self {
+        Self {
+            length: length as u64,
+            basis: basis.into(),
+            definitive: true,
+            protective_limit_hit: false,
+            status: CarveValidationStatus::Validated,
+            details,
+        }
+    }
+
+    fn partial(
+        inspected: usize,
+        basis: impl Into<String>,
+        protective_limit_hit: bool,
+        details: serde_json::Value,
+    ) -> Self {
+        Self {
+            length: inspected as u64,
+            basis: basis.into(),
+            definitive: false,
+            protective_limit_hit,
+            status: CarveValidationStatus::Partial,
+            details,
+        }
+    }
+
+    fn unsupported(inspected: usize, basis: impl Into<String>, details: serde_json::Value) -> Self {
+        Self {
+            length: inspected as u64,
+            basis: basis.into(),
+            definitive: false,
+            protective_limit_hit: false,
+            status: CarveValidationStatus::RecognizedUnsupported,
+            details,
+        }
+    }
+
+    fn rejected(basis: impl Into<String>) -> Self {
+        Self {
+            length: 0,
+            basis: basis.into(),
+            definitive: false,
+            protective_limit_hit: false,
+            status: CarveValidationStatus::Rejected,
+            details: serde_json::json!({}),
+        }
+    }
 }
 
-/// Determines a carved extent's length without loading the extent into memory.
-/// Footer-based formats are searched through the entire available scan scope
-/// using a bounded rolling window. Only formats for which KDFT has no reliable
-/// end rule use the disclosed protective limit. The limit is injected so the
-/// cutoff behavior can be tested with tiny deterministic fixtures.
+fn read_bounded_carve_candidate(
+    reader: &mut dyn disk_forensic::container::ReadSeek,
+    start: u64,
+    available_len: u64,
+    inspection_limit: u64,
+    minimum: usize,
+) -> Result<Vec<u8>> {
+    let wanted = available_len
+        .min(inspection_limit.max(minimum as u64))
+        .min(usize::MAX as u64) as usize;
+    reader.seek(SeekFrom::Start(start))?;
+    let mut bytes = vec![0_u8; wanted];
+    reader
+        .read_exact(&mut bytes)
+        .with_context(|| format!("reading {wanted} bounded carve-candidate bytes at {start}"))?;
+    Ok(bytes)
+}
+
 fn carve_length_with_protective_limit(
     reader: &mut dyn disk_forensic::container::ReadSeek,
     start: u64,
     sig: &CarveSignature,
     available_len: u64,
-    unknown_length_limit: u64,
+    inspection_limit: u64,
 ) -> Result<CarvedLength> {
     if available_len == 0 {
-        return Ok(CarvedLength {
-            length: 0,
-            basis: "no data available at carve offset",
-            definitive: false,
-            protective_limit_hit: false,
-        });
+        return Ok(CarvedLength::rejected("no data available at carve offset"));
     }
-
-    let footer_rule = match sig.extension {
-        "jpg" => Some((&[0xFF, 0xD9][..], 0)),
-        "png" => Some((&[0x49, 0x45, 0x4E, 0x44][..], 4)),
-        "gif" => Some((&[0x00, 0x3B][..], 0)),
-        // Stop at the first complete PDF revision. Searching to the last EOF
-        // in the remaining disk could merge later, independent PDF files into
-        // this carve and suppress their headers from the main scan.
-        "pdf" => Some((b"%%EOF" as &[u8], 0)),
-        _ => None,
-    };
-    if let Some((footer, trailing)) = footer_rule {
-        let search = stream_footer_search(reader, start, available_len, footer, trailing)?;
-        return Ok(match search.length {
-            Some(length) => CarvedLength {
-                length,
-                basis: "format footer signature located by streaming search",
-                definitive: true,
-                protective_limit_hit: false,
-            },
-            None => CarvedLength {
-                length: search.bytes_read,
-                basis: "no footer found before end of available scan scope; end not verified",
-                definitive: false,
-                protective_limit_hit: false,
-            },
-        });
-    }
-
-    if sig.extension == "bmp" {
-        let mut header = [0_u8; 6];
-        let mut filled = 0_usize;
-        reader.seek(SeekFrom::Start(start))?;
-        let wanted =
-            usize::try_from(available_len.min(header.len() as u64)).unwrap_or(header.len());
-        while filled < wanted {
-            let read = reader.read(&mut header[filled..wanted])?;
-            if read == 0 {
-                break;
-            }
-            filled += read;
-        }
-        if filled >= header.len() {
-            let declared = u64::from(u32::from_le_bytes([
-                header[2], header[3], header[4], header[5],
-            ]));
-            if declared >= sig.header.len() as u64 {
-                return Ok(if declared <= available_len {
-                    CarvedLength {
-                        length: declared,
-                        basis: "BMP header declared file size",
-                        definitive: true,
-                        protective_limit_hit: false,
-                    }
-                } else {
-                    CarvedLength {
-                        length: available_len,
-                        basis: "BMP header declared size exceeded the available scan scope; end not verified",
-                        definitive: false,
-                        protective_limit_hit: false,
-                    }
-                });
-            }
-        }
-    }
-
-    // ZIP, GZIP and RAR currently have no validated structural end parser in
-    // the carving path. Bound those ambiguous extents, but make the cutoff a
-    // first-class truncation fact instead of silently presenting it as a file.
-    let protective_limit = unknown_length_limit.max(sig.header.len() as u64);
-    let read_limit = available_len.min(protective_limit);
-    reader.seek(SeekFrom::Start(start))?;
-    let buffer_len = CARVE_LENGTH_CHUNK_BYTES
-        .min(usize::try_from(read_limit).unwrap_or(usize::MAX))
-        .max(1);
-    let mut buffer = vec![0_u8; buffer_len];
-    let mut bytes_read = 0_u64;
-    while bytes_read < read_limit {
-        let wanted = usize::try_from((read_limit - bytes_read).min(buffer.len() as u64))
-            .unwrap_or(buffer.len());
-        let read = reader.read(&mut buffer[..wanted])?;
-        if read == 0 {
-            break;
-        }
-        bytes_read += read as u64;
-    }
-    let protective_limit_hit = bytes_read == read_limit && read_limit < available_len;
-    Ok(CarvedLength {
-        length: bytes_read,
-        basis: if protective_limit_hit {
-            "no supported end rule; protective extent limit reached, end not verified"
-        } else {
-            "no supported end rule before end of available scan scope; end not verified"
-        },
-        definitive: false,
-        protective_limit_hit,
+    let bytes = read_bounded_carve_candidate(
+        reader,
+        start,
+        available_len,
+        inspection_limit,
+        sig.header.len(),
+    )?;
+    let limit_hit = (bytes.len() as u64) < available_len;
+    Ok(match sig.extension {
+        "jpg" => validate_jpeg_candidate(&bytes, limit_hit),
+        "png" => validate_png_candidate(&bytes, limit_hit),
+        "gif" => validate_gif_candidate(&bytes, limit_hit),
+        "pdf" => validate_pdf_candidate(&bytes, limit_hit),
+        "bmp" => validate_bmp_candidate(&bytes, available_len),
+        "zip" => validate_zip_candidate(&bytes, limit_hit),
+        "gz" => validate_gzip_candidate(&bytes, limit_hit),
+        "rar" => validate_rar_candidate(&bytes),
+        _ => CarvedLength::rejected("unknown carve signature descriptor"),
     })
 }
 
-fn stream_footer_search(
-    reader: &mut dyn disk_forensic::container::ReadSeek,
-    start: u64,
-    available_len: u64,
-    footer: &[u8],
-    trailing: usize,
-) -> Result<FooterSearchResult> {
-    if footer.is_empty() || available_len == 0 {
-        return Ok(FooterSearchResult {
-            length: None,
-            bytes_read: 0,
-        });
+fn validate_jpeg_candidate(bytes: &[u8], limit_hit: bool) -> CarvedLength {
+    if bytes.len() < 4 || !bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return CarvedLength::rejected("JPEG SOI/header is incomplete");
     }
-    reader.seek(SeekFrom::Start(start))?;
-    let mut buffer = vec![0_u8; CARVE_LENGTH_CHUNK_BYTES];
-    let mut tail = Vec::new();
-    let mut bytes_read = 0_u64;
-    let keep = footer.len().saturating_add(trailing).saturating_sub(1);
-
-    while bytes_read < available_len {
-        let wanted = usize::try_from((available_len - bytes_read).min(buffer.len() as u64))
-            .unwrap_or(buffer.len());
-        let read = reader.read(&mut buffer[..wanted])?;
-        if read == 0 {
+    let mut cursor = 2_usize;
+    let mut in_scan = false;
+    let mut saw_frame = false;
+    let mut saw_scan = false;
+    while cursor < bytes.len() {
+        if in_scan && bytes[cursor] != 0xFF {
+            cursor += 1;
+            continue;
+        }
+        if bytes[cursor] != 0xFF {
+            return CarvedLength::partial(
+                bytes.len(),
+                "JPEG marker stream is malformed",
+                false,
+                serde_json::json!({"saw_frame": saw_frame, "saw_scan": saw_scan}),
+            );
+        }
+        while cursor < bytes.len() && bytes[cursor] == 0xFF {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
             break;
         }
-        let window_base = bytes_read.saturating_sub(tail.len() as u64);
-        let mut window = std::mem::take(&mut tail);
-        window.extend_from_slice(&buffer[..read]);
-        bytes_read += read as u64;
-
-        if window.len() >= footer.len().saturating_add(trailing) {
-            for pos in 0..=window.len() - footer.len() {
-                if &window[pos..pos + footer.len()] != footer {
-                    continue;
+        let marker = bytes[cursor];
+        cursor += 1;
+        if in_scan {
+            match marker {
+                0x00 | 0xD0..=0xD7 => continue,
+                0xD9 if saw_frame && saw_scan => {
+                    return CarvedLength::validated(
+                        cursor,
+                        "JPEG marker structure reached EOI after SOF and SOS",
+                        serde_json::json!({"saw_frame": true, "saw_scan": true}),
+                    );
                 }
-                let end = pos.saturating_add(footer.len()).saturating_add(trailing);
-                if end > window.len() {
-                    continue;
-                }
-                let length = window_base.saturating_add(end as u64);
-                return Ok(FooterSearchResult {
-                    length: Some(length),
-                    bytes_read,
-                });
+                _ => in_scan = false,
             }
         }
-
-        let keep_now = keep.min(window.len());
-        tail = window.split_off(window.len() - keep_now);
+        match marker {
+            0xD9 if saw_frame && saw_scan => {
+                return CarvedLength::validated(
+                    cursor,
+                    "JPEG marker structure reached EOI after SOF and SOS",
+                    serde_json::json!({"saw_frame": true, "saw_scan": true}),
+                );
+            }
+            0x01 | 0xD0..=0xD7 => continue,
+            0xD8 | 0xD9 | 0x00 => {
+                return CarvedLength::partial(
+                    bytes.len(),
+                    format!("JPEG contains invalid marker FF {marker:02X}"),
+                    false,
+                    serde_json::json!({"saw_frame": saw_frame, "saw_scan": saw_scan}),
+                );
+            }
+            _ => {}
+        }
+        if cursor.checked_add(2).is_none_or(|end| end > bytes.len()) {
+            break;
+        }
+        let segment_len = usize::from(u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]));
+        if segment_len < 2 {
+            return CarvedLength::partial(
+                bytes.len(),
+                "JPEG segment length is smaller than its two-byte length field",
+                false,
+                serde_json::json!({"marker": format!("FF {marker:02X}")}),
+            );
+        }
+        let end = match cursor.checked_add(segment_len) {
+            Some(end) if end <= bytes.len() => end,
+            _ => break,
+        };
+        if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
+            saw_frame = true;
+        }
+        if marker == 0xDA {
+            saw_scan = true;
+            in_scan = true;
+        }
+        cursor = end;
     }
+    CarvedLength::partial(
+        bytes.len(),
+        "JPEG did not reach a structurally valid EOI after SOF and SOS",
+        limit_hit,
+        serde_json::json!({"saw_frame": saw_frame, "saw_scan": saw_scan}),
+    )
+}
 
-    Ok(FooterSearchResult {
-        length: None,
-        bytes_read,
+fn crc32_ieee(parts: &[&[u8]]) -> u32 {
+    let mut crc = u32::MAX;
+    for part in parts {
+        for byte in *part {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320_u32 & (0_u32.wrapping_sub(crc & 1)));
+            }
+        }
+    }
+    !crc
+}
+
+fn validate_png_candidate(bytes: &[u8], limit_hit: bool) -> CarvedLength {
+    const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    if !bytes.starts_with(SIGNATURE) {
+        return CarvedLength::rejected("PNG signature mismatch");
+    }
+    let mut cursor = SIGNATURE.len();
+    let mut chunk_count = 0_usize;
+    let mut saw_ihdr = false;
+    let mut saw_idat = false;
+    while cursor.checked_add(12).is_some_and(|end| end <= bytes.len()) {
+        let length = u32::from_be_bytes([
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ]) as usize;
+        let kind = &bytes[cursor + 4..cursor + 8];
+        if !kind.iter().all(u8::is_ascii_alphabetic) {
+            return CarvedLength::partial(
+                bytes.len(),
+                "PNG chunk type contains non-alphabetic bytes",
+                false,
+                serde_json::json!({"chunks_validated": chunk_count}),
+            );
+        }
+        let data_start = cursor + 8;
+        let Some(data_end) = data_start.checked_add(length) else {
+            return CarvedLength::partial(
+                bytes.len(),
+                "PNG chunk length overflow",
+                false,
+                serde_json::json!({}),
+            );
+        };
+        let Some(chunk_end) = data_end.checked_add(4) else {
+            return CarvedLength::partial(
+                bytes.len(),
+                "PNG chunk end overflow",
+                false,
+                serde_json::json!({}),
+            );
+        };
+        if chunk_end > bytes.len() {
+            break;
+        }
+        let expected_crc = u32::from_be_bytes([
+            bytes[data_end],
+            bytes[data_end + 1],
+            bytes[data_end + 2],
+            bytes[data_end + 3],
+        ]);
+        let actual_crc = crc32_ieee(&[kind, &bytes[data_start..data_end]]);
+        if expected_crc != actual_crc {
+            return CarvedLength::partial(
+                chunk_end,
+                format!("PNG {} chunk CRC32 mismatch", String::from_utf8_lossy(kind)),
+                false,
+                serde_json::json!({"chunks_validated": chunk_count, "expected_crc32": expected_crc, "actual_crc32": actual_crc}),
+            );
+        }
+        chunk_count = chunk_count.saturating_add(1);
+        if chunk_count == 1 {
+            if kind != b"IHDR" || length != 13 {
+                return CarvedLength::partial(
+                    chunk_end,
+                    "PNG first chunk is not a 13-byte IHDR",
+                    false,
+                    serde_json::json!({}),
+                );
+            }
+            let width = u32::from_be_bytes([
+                bytes[data_start],
+                bytes[data_start + 1],
+                bytes[data_start + 2],
+                bytes[data_start + 3],
+            ]);
+            let height = u32::from_be_bytes([
+                bytes[data_start + 4],
+                bytes[data_start + 5],
+                bytes[data_start + 6],
+                bytes[data_start + 7],
+            ]);
+            if width == 0
+                || height == 0
+                || bytes[data_start + 10] != 0
+                || bytes[data_start + 11] != 0
+                || bytes[data_start + 12] > 1
+            {
+                return CarvedLength::partial(
+                    chunk_end,
+                    "PNG IHDR fields are structurally invalid",
+                    false,
+                    serde_json::json!({"width": width, "height": height}),
+                );
+            }
+            saw_ihdr = true;
+        }
+        if kind == b"IDAT" {
+            saw_idat = true;
+        }
+        if kind == b"IEND" {
+            if length != 0 || !saw_ihdr || !saw_idat {
+                return CarvedLength::partial(
+                    chunk_end,
+                    "PNG IEND appeared before required IHDR/IDAT structure",
+                    false,
+                    serde_json::json!({"chunks_validated": chunk_count}),
+                );
+            }
+            return CarvedLength::validated(
+                chunk_end,
+                "PNG chunk sequence and CRC32 values validated through IEND",
+                serde_json::json!({"chunks_validated": chunk_count, "crc32_validated": true}),
+            );
+        }
+        cursor = chunk_end;
+    }
+    CarvedLength::partial(
+        bytes.len(),
+        "PNG did not reach a CRC32-validated IEND chunk",
+        limit_hit,
+        serde_json::json!({"chunks_validated": chunk_count, "saw_ihdr": saw_ihdr, "saw_idat": saw_idat}),
+    )
+}
+
+fn skip_gif_sub_blocks(bytes: &[u8], cursor: &mut usize) -> bool {
+    loop {
+        let Some(&length) = bytes.get(*cursor) else {
+            return false;
+        };
+        *cursor += 1;
+        if length == 0 {
+            return true;
+        }
+        let Some(end) = (*cursor).checked_add(usize::from(length)) else {
+            return false;
+        };
+        if end > bytes.len() {
+            return false;
+        }
+        *cursor = end;
+    }
+}
+
+fn validate_gif_candidate(bytes: &[u8], limit_hit: bool) -> CarvedLength {
+    if !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return CarvedLength::rejected("GIF header is neither GIF87a nor GIF89a");
+    }
+    if bytes.len() < 13 {
+        return CarvedLength::partial(
+            bytes.len(),
+            "GIF logical screen descriptor is incomplete",
+            limit_hit,
+            serde_json::json!({}),
+        );
+    }
+    let width = u16::from_le_bytes([bytes[6], bytes[7]]);
+    let height = u16::from_le_bytes([bytes[8], bytes[9]]);
+    if width == 0 || height == 0 {
+        return CarvedLength::partial(
+            bytes.len(),
+            "GIF logical dimensions are zero",
+            false,
+            serde_json::json!({"width": width, "height": height}),
+        );
+    }
+    let packed = bytes[10];
+    let mut cursor = 13_usize;
+    if packed & 0x80 != 0 {
+        let table = 3_usize << usize::from((packed & 0x07) + 1);
+        cursor = match cursor.checked_add(table) {
+            Some(end) if end <= bytes.len() => end,
+            _ => {
+                return CarvedLength::partial(
+                    bytes.len(),
+                    "GIF global color table is incomplete",
+                    limit_hit,
+                    serde_json::json!({}),
+                )
+            }
+        };
+    }
+    let mut images = 0_usize;
+    while let Some(&introducer) = bytes.get(cursor) {
+        cursor += 1;
+        match introducer {
+            0x3B => {
+                return CarvedLength::validated(
+                    cursor,
+                    "GIF block stream reached trailer",
+                    serde_json::json!({"image_descriptors": images, "version": String::from_utf8_lossy(&bytes[..6])}),
+                )
+            }
+            0x21 => {
+                if bytes.get(cursor).is_none() {
+                    break;
+                }
+                cursor += 1;
+                if !skip_gif_sub_blocks(bytes, &mut cursor) {
+                    break;
+                }
+            }
+            0x2C => {
+                if cursor.checked_add(9).is_none_or(|end| end > bytes.len()) {
+                    break;
+                }
+                let local_packed = bytes[cursor + 8];
+                cursor += 9;
+                if local_packed & 0x80 != 0 {
+                    let table = 3_usize << usize::from((local_packed & 0x07) + 1);
+                    cursor = match cursor.checked_add(table) {
+                        Some(end) if end <= bytes.len() => end,
+                        _ => break,
+                    };
+                }
+                let Some(&minimum_code_size) = bytes.get(cursor) else {
+                    break;
+                };
+                if !(2..=8).contains(&minimum_code_size) {
+                    return CarvedLength::partial(
+                        cursor + 1,
+                        "GIF LZW minimum code size is invalid",
+                        false,
+                        serde_json::json!({"minimum_code_size": minimum_code_size}),
+                    );
+                }
+                cursor += 1;
+                if !skip_gif_sub_blocks(bytes, &mut cursor) {
+                    break;
+                }
+                images = images.saturating_add(1);
+            }
+            _ => {
+                return CarvedLength::partial(
+                    cursor,
+                    format!("GIF contains unknown block introducer 0x{introducer:02X}"),
+                    false,
+                    serde_json::json!({"image_descriptors": images}),
+                )
+            }
+        }
+    }
+    CarvedLength::partial(
+        bytes.len(),
+        "GIF block stream did not reach a trailer",
+        limit_hit,
+        serde_json::json!({"image_descriptors": images}),
+    )
+}
+
+fn validate_pdf_candidate(bytes: &[u8], limit_hit: bool) -> CarvedLength {
+    let valid_version = bytes.get(0..8).is_some_and(|header| {
+        header.starts_with(b"%PDF-")
+            && matches!(
+                (header[5], header[6], header[7]),
+                (b'1', b'.', b'0'..=b'7') | (b'2', b'.', b'0')
+            )
+    });
+    if !valid_version {
+        return CarvedLength::rejected(
+            "PDF header version is not a supported PDF 1.0-1.7 or 2.0 form",
+        );
+    }
+    let marker = b"%%EOF";
+    for eof in 8..bytes.len().saturating_sub(marker.len()).saturating_add(1) {
+        if bytes.get(eof..eof + marker.len()) != Some(marker.as_slice())
+            || (eof > 0 && !matches!(bytes[eof - 1], b'\r' | b'\n'))
+            || bytes
+                .get(eof + marker.len())
+                .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            continue;
+        }
+        let before = &bytes[..eof];
+        let Some(startxref) = before.windows(9).rposition(|window| window == b"startxref") else {
+            continue;
+        };
+        let mut number = startxref + 9;
+        while bytes.get(number).is_some_and(u8::is_ascii_whitespace) {
+            number += 1;
+        }
+        let digits_start = number;
+        while bytes.get(number).is_some_and(u8::is_ascii_digit) {
+            number += 1;
+        }
+        if number == digits_start {
+            continue;
+        }
+        let Ok(xref_text) = std::str::from_utf8(&bytes[digits_start..number]) else {
+            continue;
+        };
+        let Ok(xref_offset) = xref_text.parse::<usize>() else {
+            continue;
+        };
+        if xref_offset >= startxref || xref_offset >= bytes.len() {
+            continue;
+        }
+        let xref_probe = &bytes[xref_offset..bytes.len().min(xref_offset.saturating_add(64))];
+        if !xref_probe.starts_with(b"xref")
+            && !xref_probe.windows(4).any(|window| window == b" obj")
+        {
+            continue;
+        }
+        let mut end = eof + marker.len();
+        if bytes.get(end) == Some(&b'\r') {
+            end += 1;
+        }
+        if bytes.get(end) == Some(&b'\n') {
+            end += 1;
+        }
+        return CarvedLength::validated(
+            end,
+            "PDF header, startxref target, and line-delimited EOF validated",
+            serde_json::json!({"startxref": xref_offset, "pdf_version": String::from_utf8_lossy(&bytes[5..8])}),
+        );
+    }
+    CarvedLength::partial(
+        bytes.len(),
+        "PDF did not reach a valid startxref/EOF revision boundary",
+        limit_hit,
+        serde_json::json!({"pdf_version": String::from_utf8_lossy(&bytes[5..8])}),
+    )
+}
+
+fn u16_le_at(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn u32_le_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn u64_le_at(bytes: &[u8], offset: usize) -> Option<u64> {
+    Some(u64::from_le_bytes(
+        bytes.get(offset..offset + 8)?.try_into().ok()?,
+    ))
+}
+
+fn validate_bmp_candidate(bytes: &[u8], available_len: u64) -> CarvedLength {
+    if bytes.len() < 26 || !bytes.starts_with(b"BM") {
+        return CarvedLength::rejected("BMP file/DIB header is incomplete");
+    }
+    let declared = u64::from(u32_le_at(bytes, 2).unwrap_or(0));
+    let pixel_offset = u64::from(u32_le_at(bytes, 10).unwrap_or(0));
+    let dib_size = u64::from(u32_le_at(bytes, 14).unwrap_or(0));
+    let structural = if dib_size == 12 {
+        u16_le_at(bytes, 18).is_some_and(|value| value > 0)
+            && u16_le_at(bytes, 20).is_some_and(|value| value > 0)
+            && u16_le_at(bytes, 22) == Some(1)
+    } else if matches!(dib_size, 40 | 52 | 56 | 108 | 124) && bytes.len() >= 54 {
+        let width = i32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]);
+        let height = i32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]);
+        width != 0
+            && height != 0
+            && u16_le_at(bytes, 26) == Some(1)
+            && u16_le_at(bytes, 28).is_some_and(|bpp| matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32))
+            && u32_le_at(bytes, 30).is_some_and(|compression| compression <= 6)
+    } else {
+        return CarvedLength::unsupported(
+            bytes.len().min(64),
+            format!(
+                "BMP DIB header size {dib_size} is recognized but not validated by this parser"
+            ),
+            serde_json::json!({"dib_header_size": dib_size}),
+        );
+    };
+    if !structural || declared < pixel_offset || pixel_offset < 14_u64.saturating_add(dib_size) {
+        return CarvedLength::rejected(
+            "BMP dimensions, planes, bit depth, compression, or offsets are structurally invalid",
+        );
+    }
+    if declared > available_len {
+        return CarvedLength::partial(
+            bytes.len(),
+            "BMP declared size exceeds available decoded media",
+            false,
+            serde_json::json!({"declared_size": declared, "available_size": available_len, "pixel_offset": pixel_offset, "dib_header_size": dib_size}),
+        );
+    }
+    CarvedLength::validated(
+        declared as usize,
+        "BMP file and DIB headers provide a bounded declared extent",
+        serde_json::json!({"declared_size": declared, "pixel_offset": pixel_offset, "dib_header_size": dib_size}),
+    )
+}
+
+struct Zip64ExtraValues {
+    uncompressed_size: Option<u64>,
+    compressed_size: Option<u64>,
+    local_header_offset: Option<u64>,
+    disk_number: Option<u32>,
+}
+
+fn zip64_extra_values(
+    extra: &[u8],
+    need_uncompressed: bool,
+    need_compressed: bool,
+    need_offset: bool,
+    need_disk: bool,
+) -> Option<Zip64ExtraValues> {
+    let mut cursor = 0_usize;
+    while cursor.checked_add(4).is_some_and(|end| end <= extra.len()) {
+        let id = u16_le_at(extra, cursor)?;
+        let length = usize::from(u16_le_at(extra, cursor + 2)?);
+        cursor += 4;
+        let end = cursor.checked_add(length)?;
+        if end > extra.len() {
+            return None;
+        }
+        if id == 0x0001 {
+            let data = &extra[cursor..end];
+            let mut position = 0_usize;
+            let mut next_u64 = || {
+                let value = u64_le_at(data, position)?;
+                position = position.checked_add(8)?;
+                Some(value)
+            };
+            let uncompressed = if need_uncompressed {
+                Some(next_u64()?)
+            } else {
+                None
+            };
+            let compressed = if need_compressed {
+                Some(next_u64()?)
+            } else {
+                None
+            };
+            let offset = if need_offset { Some(next_u64()?) } else { None };
+            let disk = if need_disk {
+                u32_le_at(data, position)
+            } else {
+                None
+            };
+            return Some(Zip64ExtraValues {
+                uncompressed_size: uncompressed,
+                compressed_size: compressed,
+                local_header_offset: offset,
+                disk_number: disk,
+            });
+        }
+        cursor = end;
+    }
+    None
+}
+
+struct ZipCarveCoverage {
+    stored_member_crc32_validated: usize,
+    compressed_members_not_decoded: usize,
+    encrypted_members_not_decoded: usize,
+    data_descriptor_members: usize,
+}
+
+fn validate_zip_central(
+    bytes: &[u8],
+    cd_offset: u64,
+    cd_size: u64,
+    entries: u64,
+) -> Result<ZipCarveCoverage> {
+    let cd_start = usize::try_from(cd_offset)
+        .map_err(|_| anyhow!("ZIP central offset exceeds addressable memory"))?;
+    let cd_end = usize::try_from(
+        cd_offset
+            .checked_add(cd_size)
+            .context("ZIP central-directory end overflow")?,
+    )
+    .map_err(|_| anyhow!("ZIP central end exceeds addressable memory"))?;
+    if cd_end > bytes.len() || entries == 0 || entries > 1_000_000 {
+        bail!("ZIP central-directory bounds or entry count are invalid");
+    }
+    let mut cursor = cd_start;
+    let mut stored_crc_validated = 0_usize;
+    let mut compressed_members_not_decoded = 0_usize;
+    let mut encrypted_members_not_decoded = 0_usize;
+    let mut data_descriptor_members = 0_usize;
+    for _ in 0..entries {
+        if bytes.get(cursor..cursor + 4) != Some(b"PK\x01\x02".as_slice())
+            || cursor.checked_add(46).is_none_or(|end| end > cd_end)
+        {
+            bail!("ZIP central-directory header is missing or truncated");
+        }
+        let flags = u16_le_at(bytes, cursor + 8).context("ZIP flags")?;
+        let method = u16_le_at(bytes, cursor + 10).context("ZIP method")?;
+        let crc = u32_le_at(bytes, cursor + 16).context("ZIP CRC32")?;
+        let compressed32 = u32_le_at(bytes, cursor + 20).context("ZIP compressed size")?;
+        let uncompressed32 = u32_le_at(bytes, cursor + 24).context("ZIP uncompressed size")?;
+        let name_len = usize::from(u16_le_at(bytes, cursor + 28).context("ZIP name length")?);
+        let extra_len = usize::from(u16_le_at(bytes, cursor + 30).context("ZIP extra length")?);
+        let comment_len = usize::from(u16_le_at(bytes, cursor + 32).context("ZIP comment length")?);
+        let disk32 = u32::from(u16_le_at(bytes, cursor + 34).context("ZIP disk")?);
+        let local32 = u32_le_at(bytes, cursor + 42).context("ZIP local offset")?;
+        let name_start = cursor + 46;
+        let extra_start = name_start
+            .checked_add(name_len)
+            .context("ZIP name end overflow")?;
+        let extra_end = extra_start
+            .checked_add(extra_len)
+            .context("ZIP extra end overflow")?;
+        let next = extra_end
+            .checked_add(comment_len)
+            .context("ZIP comment end overflow")?;
+        if next > cd_end {
+            bail!("ZIP central-directory variable fields exceed its declared extent");
+        }
+        let zip64 = zip64_extra_values(
+            &bytes[extra_start..extra_end],
+            uncompressed32 == u32::MAX,
+            compressed32 == u32::MAX,
+            local32 == u32::MAX,
+            disk32 == u32::from(u16::MAX),
+        );
+        let compressed = if compressed32 == u32::MAX {
+            zip64
+                .as_ref()
+                .and_then(|value| value.compressed_size)
+                .context("ZIP64 compressed size missing")?
+        } else {
+            u64::from(compressed32)
+        };
+        let uncompressed = if uncompressed32 == u32::MAX {
+            zip64
+                .as_ref()
+                .and_then(|value| value.uncompressed_size)
+                .context("ZIP64 uncompressed size missing")?
+        } else {
+            u64::from(uncompressed32)
+        };
+        let local_offset = if local32 == u32::MAX {
+            zip64
+                .as_ref()
+                .and_then(|value| value.local_header_offset)
+                .context("ZIP64 local offset missing")?
+        } else {
+            u64::from(local32)
+        };
+        let disk = if disk32 == u32::from(u16::MAX) {
+            zip64
+                .as_ref()
+                .and_then(|value| value.disk_number)
+                .context("ZIP64 disk number missing")?
+        } else {
+            disk32
+        };
+        if disk != 0 {
+            bail!("multi-disk ZIP member is unsupported");
+        }
+        let local = usize::try_from(local_offset).context("ZIP local offset conversion")?;
+        if bytes.get(local..local + 4) != Some(b"PK\x03\x04".as_slice())
+            || local.checked_add(30).is_none_or(|end| end > cd_start)
+        {
+            bail!("ZIP local header offset does not identify a bounded local header");
+        }
+        let local_flags = u16_le_at(bytes, local + 6).context("ZIP local flags")?;
+        let local_method = u16_le_at(bytes, local + 8).context("ZIP local method")?;
+        if local_flags != flags || local_method != method {
+            bail!("ZIP local and central compression/encryption flags differ");
+        }
+        let local_name_len =
+            usize::from(u16_le_at(bytes, local + 26).context("ZIP local name length")?);
+        let local_extra_len =
+            usize::from(u16_le_at(bytes, local + 28).context("ZIP local extra length")?);
+        let data_start = local
+            .checked_add(30)
+            .and_then(|value| value.checked_add(local_name_len))
+            .and_then(|value| value.checked_add(local_extra_len))
+            .context("ZIP local data offset overflow")?;
+        let data_end = u64::try_from(data_start)
+            .ok()
+            .and_then(|value| value.checked_add(compressed))
+            .and_then(|value| usize::try_from(value).ok())
+            .context("ZIP compressed-data end overflow")?;
+        if data_end > cd_start
+            || bytes.get(name_start..extra_start)
+                != bytes.get(local + 30..local + 30 + local_name_len)
+        {
+            bail!("ZIP member data overlaps the central directory or local/central names differ");
+        }
+        if method == 0 && flags & 1 == 0 && compressed == uncompressed {
+            let actual = crc32_ieee(&[&bytes[data_start..data_end]]);
+            if actual != crc {
+                bail!("stored ZIP member CRC32 mismatch");
+            }
+            stored_crc_validated = stored_crc_validated.saturating_add(1);
+        } else if flags & 1 != 0 {
+            encrypted_members_not_decoded = encrypted_members_not_decoded.saturating_add(1);
+        } else {
+            compressed_members_not_decoded = compressed_members_not_decoded.saturating_add(1);
+        }
+        if flags & (1 << 3) != 0 {
+            data_descriptor_members = data_descriptor_members.saturating_add(1);
+        }
+        cursor = next;
+    }
+    if cursor != cd_end {
+        bail!("ZIP central-directory size does not equal the validated entry sequence");
+    }
+    Ok(ZipCarveCoverage {
+        stored_member_crc32_validated: stored_crc_validated,
+        compressed_members_not_decoded,
+        encrypted_members_not_decoded,
+        data_descriptor_members,
     })
+}
+
+fn validate_zip_candidate(bytes: &[u8], limit_hit: bool) -> CarvedLength {
+    if bytes.len() < 30 || !bytes.starts_with(b"PK\x03\x04") {
+        return CarvedLength::rejected("ZIP local header is incomplete");
+    }
+    let mut unsupported = None::<String>;
+    for eocd in 30..bytes.len().saturating_sub(21) {
+        if bytes.get(eocd..eocd + 4) != Some(b"PK\x05\x06".as_slice()) {
+            continue;
+        }
+        let Some(comment_len) = u16_le_at(bytes, eocd + 20).map(usize::from) else {
+            continue;
+        };
+        let Some(end) = eocd
+            .checked_add(22)
+            .and_then(|value| value.checked_add(comment_len))
+        else {
+            continue;
+        };
+        if end > bytes.len() {
+            continue;
+        }
+        let disk = u16_le_at(bytes, eocd + 4).unwrap_or(u16::MAX);
+        let cd_disk = u16_le_at(bytes, eocd + 6).unwrap_or(u16::MAX);
+        let disk_entries = u16_le_at(bytes, eocd + 8).unwrap_or(0);
+        let total_entries = u16_le_at(bytes, eocd + 10).unwrap_or(0);
+        if disk != 0 || cd_disk != 0 || disk_entries != total_entries {
+            unsupported = Some("multi-disk ZIP EOCD is recognized but unsupported".to_string());
+            continue;
+        }
+        let mut entries = u64::from(total_entries);
+        let mut cd_size = u64::from(u32_le_at(bytes, eocd + 12).unwrap_or(u32::MAX));
+        let mut cd_offset = u64::from(u32_le_at(bytes, eocd + 16).unwrap_or(u32::MAX));
+        let mut uses_zip64 = false;
+        if total_entries == u16::MAX
+            || cd_size == u64::from(u32::MAX)
+            || cd_offset == u64::from(u32::MAX)
+        {
+            uses_zip64 = true;
+            if eocd < 20 || bytes.get(eocd - 20..eocd - 16) != Some(b"PK\x06\x07".as_slice()) {
+                continue;
+            }
+            if u32_le_at(bytes, eocd - 16) != Some(0) || u32_le_at(bytes, eocd - 4) != Some(1) {
+                unsupported =
+                    Some("multi-disk ZIP64 locator is recognized but unsupported".to_string());
+                continue;
+            }
+            let Some(zip64_offset) =
+                u64_le_at(bytes, eocd - 12).and_then(|value| usize::try_from(value).ok())
+            else {
+                continue;
+            };
+            if bytes.get(zip64_offset..zip64_offset + 4) != Some(b"PK\x06\x06".as_slice())
+                || zip64_offset
+                    .checked_add(56)
+                    .is_none_or(|value| value > eocd - 20)
+            {
+                continue;
+            }
+            let record_size = u64_le_at(bytes, zip64_offset + 4).unwrap_or(0);
+            let Some(record_end) = u64::try_from(zip64_offset)
+                .ok()
+                .and_then(|value| value.checked_add(12))
+                .and_then(|value| value.checked_add(record_size))
+                .and_then(|value| usize::try_from(value).ok())
+            else {
+                continue;
+            };
+            if record_size < 44
+                || record_end != eocd - 20
+                || u32_le_at(bytes, zip64_offset + 16) != Some(0)
+                || u32_le_at(bytes, zip64_offset + 20) != Some(0)
+            {
+                continue;
+            }
+            let disk_entries64 = u64_le_at(bytes, zip64_offset + 24).unwrap_or(0);
+            entries = u64_le_at(bytes, zip64_offset + 32).unwrap_or(0);
+            if disk_entries64 != entries {
+                continue;
+            }
+            cd_size = u64_le_at(bytes, zip64_offset + 40).unwrap_or(u64::MAX);
+            cd_offset = u64_le_at(bytes, zip64_offset + 48).unwrap_or(u64::MAX);
+        }
+        match validate_zip_central(bytes, cd_offset, cd_size, entries) {
+            Ok(coverage) => return CarvedLength::validated(
+                end,
+                "ZIP local headers, central directory, and EOCD bound the archive extent; only unencrypted stored-member payload CRC32 values were checked",
+                serde_json::json!({
+                    "entry_count": entries,
+                    "uses_zip64": uses_zip64,
+                    "extent_structurally_validated": true,
+                    "member_payload_integrity_complete": coverage.stored_member_crc32_validated as u64 == entries,
+                    "stored_member_crc32_validated": coverage.stored_member_crc32_validated,
+                    "compressed_members_not_decoded": coverage.compressed_members_not_decoded,
+                    "encrypted_members_not_decoded": coverage.encrypted_members_not_decoded,
+                    "data_descriptor_members": coverage.data_descriptor_members,
+                    "compressed_or_encrypted_member_crc32_validation": "not claimed by the carver; use the archive parser"
+                }),
+            ),
+            Err(error) => unsupported = Some(error.to_string()),
+        }
+    }
+    if let Some(reason) = unsupported {
+        return CarvedLength::partial(
+            bytes.len(),
+            format!("ZIP structure was recognized but not validated: {reason}"),
+            limit_hit,
+            serde_json::json!({}),
+        );
+    }
+    CarvedLength::partial(
+        bytes.len(),
+        "ZIP local header did not lead to a validated central directory and EOCD",
+        limit_hit,
+        serde_json::json!({}),
+    )
+}
+
+fn validate_gzip_candidate(bytes: &[u8], limit_hit: bool) -> CarvedLength {
+    if bytes.len() < 10 || !bytes.starts_with(&[0x1F, 0x8B, 0x08]) || bytes[3] & 0xE0 != 0 {
+        return CarvedLength::rejected("GZIP fixed header or reserved flags are invalid");
+    }
+    let mut cursor = 0_usize;
+    let mut decoded_total = 0_u64;
+    let mut members = 0_usize;
+    loop {
+        let remaining = &bytes[cursor..];
+        if !remaining.starts_with(&[0x1F, 0x8B, 0x08]) {
+            break;
+        }
+        let mut decoder = GzDecoder::new(remaining);
+        let mut scratch = [0_u8; CARVE_LENGTH_CHUNK_BYTES];
+        loop {
+            let read = match decoder.read(&mut scratch) {
+                Ok(read) => read,
+                Err(error) => {
+                    return CarvedLength::partial(
+                        bytes.len(),
+                        format!("GZIP member failed bounded CRC32/ISIZE validation: {error}"),
+                        limit_hit,
+                        serde_json::json!({"members_validated": members}),
+                    )
+                }
+            };
+            if read == 0 {
+                break;
+            }
+            decoded_total = decoded_total.saturating_add(read as u64);
+            if decoded_total > CARVE_GZIP_DECODED_MAX_BYTES {
+                return CarvedLength::partial(
+                    bytes.len(),
+                    "GZIP decoded-size validation limit reached",
+                    false,
+                    serde_json::json!({"decoded_limit_bytes": CARVE_GZIP_DECODED_MAX_BYTES, "members_validated": members}),
+                );
+            }
+        }
+        let consumed = remaining.len().saturating_sub(decoder.get_ref().len());
+        if consumed == 0 {
+            return CarvedLength::partial(
+                bytes.len(),
+                "GZIP decoder made no progress",
+                limit_hit,
+                serde_json::json!({"members_validated": members}),
+            );
+        }
+        cursor = cursor.saturating_add(consumed);
+        members = members.saturating_add(1);
+        if !bytes[cursor..].starts_with(&[0x1F, 0x8B, 0x08]) {
+            break;
+        }
+    }
+    if members == 0 {
+        CarvedLength::rejected("GZIP candidate did not contain a complete member")
+    } else {
+        CarvedLength::validated(
+            cursor,
+            "GZIP member trailers validated CRC32 and ISIZE through stream EOF",
+            serde_json::json!({"member_count": members, "decoded_bytes_validated": decoded_total, "concatenated_members": members > 1}),
+        )
+    }
+}
+
+fn validate_rar_candidate(bytes: &[u8]) -> CarvedLength {
+    if bytes.starts_with(b"Rar!\x1A\x07\x00") {
+        CarvedLength::unsupported(
+            7,
+            "RAR 4.x signature is valid; bounded archive-end validation is not implemented",
+            serde_json::json!({"rar_version": 4}),
+        )
+    } else if bytes.starts_with(b"Rar!\x1A\x07\x01\x00") {
+        CarvedLength::unsupported(
+            8,
+            "RAR 5.x signature is valid; bounded archive-end validation is not implemented",
+            serde_json::json!({"rar_version": 5}),
+        )
+    } else {
+        CarvedLength::rejected("RAR signature version bytes are invalid")
+    }
 }
 
 pub fn remove_evidence(case_path: &Path, evidence_id: i64) -> Result<RemoveEvidenceResult> {
@@ -5669,6 +8918,49 @@ fn unlimited_if_zero(max_entries: usize) -> usize {
     }
 }
 
+/// Returns the number of currently published rows only when at least one row
+/// belongs to a filesystem-index job that is provably complete. The row/job
+/// join prevents an older completed job from blessing a newer partial
+/// replacement that has already removed every row from that generation.
+fn complete_image_snapshot_entry_count(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+) -> Result<usize> {
+    let (entry_count, has_complete_generation): (i64, i64) = conn.query_row(
+        "SELECT
+             (SELECT COUNT(*)
+                FROM filesystem_entries fe
+               WHERE fe.case_id = ?1 AND fe.evidence_id = ?2),
+             EXISTS(
+                 SELECT 1
+                   FROM filesystem_entries fe
+                   JOIN evidence_jobs j ON j.id = fe.discovered_by_job_id
+                   JOIN evidence_sources es ON es.id = fe.evidence_id
+                  WHERE fe.case_id = ?1
+                    AND fe.evidence_id = ?2
+                    AND es.case_id = ?1
+                    AND es.indexed_at IS NOT NULL
+                    AND j.case_id = ?1
+                    AND j.evidence_id = ?2
+                    AND j.job_type = 'filesystem_index'
+                    AND (
+                        json_extract(j.parameters_json, '$.canonical_generation_complete') = 1
+                        OR (
+                            json_type(j.parameters_json, '$.canonical_generation_complete') IS NULL
+                            AND j.status = 'completed'
+                        )
+                    )
+             )",
+        params![case_id, evidence_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if entry_count <= 0 || has_complete_generation == 0 {
+        return Ok(0);
+    }
+    Ok(usize::try_from(entry_count).unwrap_or(usize::MAX))
+}
+
 pub fn process_evidence(
     case_path: &Path,
     options: ProcessEvidenceOptions,
@@ -5764,13 +9056,15 @@ pub fn record_job_progress_summary(
     let progress_json = serde_json::to_string(snapshot).context("serializing job progress")?;
     let status = match snapshot.state {
         progress::JobProgressState::Complete => "completed",
+        progress::JobProgressState::CompleteWithDiagnostics => "completed_with_diagnostics",
         progress::JobProgressState::Truncated => "truncated",
         progress::JobProgressState::Cancelled => "cancelled",
         progress::JobProgressState::Failed => "failed",
         progress::JobProgressState::Active => bail!("active job progress cannot be persisted"),
     };
     let telemetry_reason = match snapshot.state {
-        progress::JobProgressState::Truncated => {
+        progress::JobProgressState::Truncated
+        | progress::JobProgressState::CompleteWithDiagnostics => {
             let mut reasons = snapshot.truncation_reasons.join("; ");
             if snapshot.truncation_reasons_omitted > 0 {
                 if !reasons.is_empty() {
@@ -5782,10 +9076,13 @@ pub fn record_job_progress_summary(
                 ));
             }
             if reasons.is_empty() {
-                Some(
-                    "job completed with partial coverage; see persisted progress telemetry"
-                        .to_string(),
-                )
+                Some(if snapshot.state == progress::JobProgressState::Truncated {
+                    "job stopped at a configured processing limit; see persisted progress telemetry"
+                        .to_string()
+                } else {
+                    "processing completed; one or more artifact parsers recorded bounded diagnostics"
+                        .to_string()
+                })
             } else {
                 Some(reasons)
             }
@@ -5807,12 +9104,33 @@ pub fn record_job_progress_summary(
                  WHEN instr(error, ?5) > 0 THEN error
                  ELSE error || '; ' || ?5
              END,
-             finished_at = COALESCE(finished_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE case_id = ?1 AND id = ?2",
         params![case_id, job_id, progress_json, status, telemetry_reason],
     )?;
     if updated == 0 {
         bail!("evidence job does not exist in the active case: {job_id}");
+    }
+    if matches!(
+        snapshot.state,
+        progress::JobProgressState::Complete | progress::JobProgressState::CompleteWithDiagnostics
+    ) {
+        // A filesystem inventory that reached finalization is usable even when
+        // optional artifact classes recorded diagnostics. Older code left
+        // `indexed_at` NULL whenever any auxiliary recovery/parser warned,
+        // making a committed snapshot appear not to have been indexed. Do not
+        // apply this to signature/hash/other jobs or to a genuinely bounded,
+        // cancelled, or failed filesystem run.
+        conn.execute(
+            "UPDATE evidence_sources
+             SET indexed_at = COALESCE(indexed_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             WHERE case_id = ?1
+               AND id = (
+                   SELECT evidence_id FROM evidence_jobs
+                   WHERE case_id = ?1 AND id = ?2 AND job_type = 'filesystem_index'
+               )",
+            params![case_id, job_id],
+        )?;
     }
     Ok(())
 }
@@ -5849,6 +9167,11 @@ fn process_evidence_with_profile_inner(
     progress::progress_set_evidence_id(evidence.id);
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let actor = audit_actor(&tx, case_id)?;
+    let prior_complete_image_entry_count = if evidence.source_kind == "image" {
+        complete_image_snapshot_entry_count(&tx, case_id, evidence.id)?
+    } else {
+        0
+    };
     let requested_entry_limit = options.max_entries;
     let effective_entry_limit = (requested_entry_limit != 0).then_some(requested_entry_limit);
     let parameters_json = serde_json::json!({
@@ -5867,6 +9190,18 @@ fn process_evidence_with_profile_inner(
     let job_id = tx.last_insert_rowid();
     progress::progress_set_job_id(job_id);
 
+    // Image processing is destructive inside the transaction because its
+    // first step replaces the filesystem snapshot. Keep that replacement in
+    // a nested savepoint whenever a provably complete prior generation
+    // exists. A hard failure already rolls back the outer transaction; this
+    // savepoint additionally lets a successful-but-incomplete attempt retain
+    // the prior canonical rows while preserving the attempt's job record.
+    const IMAGE_REPLACEMENT_SAVEPOINT: &str = "kdft_image_generation_replacement";
+    let image_replacement_staged = prior_complete_image_entry_count > 0;
+    if image_replacement_staged {
+        tx.execute_batch(&format!("SAVEPOINT {IMAGE_REPLACEMENT_SAVEPOINT}"))?;
+    }
+
     let processing_result = match evidence.source_kind.as_str() {
         "file" => process_file_evidence(&tx, case_id, &evidence, job_id, max_entries),
         "folder" => process_folder_evidence(&tx, case_id, &evidence, job_id, max_entries),
@@ -5875,7 +9210,7 @@ fn process_evidence_with_profile_inner(
             "unsupported evidence source kind for processing: {other}"
         )),
     };
-    let (entries_indexed, truncated) = match processing_result {
+    let (attempt_entries_indexed, processing_reported_partial_coverage) = match processing_result {
         Ok(result) => result,
         Err(error) => {
             progress::progress_error(Some(evidence.source_path.clone()));
@@ -5939,59 +9274,168 @@ fn process_evidence_with_profile_inner(
             return Err(error);
         }
     };
-    let bookmark_items_relinked = relink_bookmark_items_tx(&tx, case_id, evidence.id)?;
-    let status = if truncated { "truncated" } else { "completed" };
-    if truncated && requested_entry_limit != 0 && entries_indexed >= requested_entry_limit {
-        progress::progress_truncated(format!(
-            "entry limit reached (examiner requested at most {requested_entry_limit} entries)"
-        ));
-    }
     let mut progress_truncation_reasons = progress::active_truncation_reasons();
-    if truncated && progress_truncation_reasons.is_empty() {
+    let explicit_examiner_limit = progress_truncation_reasons
+        .iter()
+        .any(|reason| processing_reason_reports_examiner_limit(reason));
+    let stopped_at_examiner_limit = processing_reported_partial_coverage
+        && requested_entry_limit != 0
+        && (explicit_examiner_limit
+            // Compatibility for simple folder indexing and historical parser
+            // paths that returned the bounded flag before recording a reason.
+            || (progress_truncation_reasons.is_empty()
+                && attempt_entries_indexed >= requested_entry_limit));
+    let completed_with_diagnostics =
+        processing_reported_partial_coverage && !stopped_at_examiner_limit;
+    let status = if stopped_at_examiner_limit {
+        "truncated"
+    } else if completed_with_diagnostics {
+        "completed_with_diagnostics"
+    } else {
+        "completed"
+    };
+    if stopped_at_examiner_limit {
+        let limit_reason = format!(
+            "entry limit reached (examiner requested at most {requested_entry_limit} entries)"
+        );
+        progress::progress_truncated(limit_reason.clone());
+        if !progress_truncation_reasons
+            .iter()
+            .any(|reason| reason == &limit_reason)
+        {
+            progress_truncation_reasons.push(limit_reason);
+        }
+    }
+    if processing_reported_partial_coverage && progress_truncation_reasons.is_empty() {
         progress_truncation_reasons
             .push("parser reported partial processing before the end of the source".to_string());
     }
-    let truncation_reason = truncated.then(|| progress_truncation_reasons.join("; "));
+    let truncation_reason =
+        processing_reported_partial_coverage.then(|| progress_truncation_reasons.join("; "));
+    let canonical_generation_preserved =
+        image_replacement_staged && processing_reported_partial_coverage;
+    if image_replacement_staged {
+        if canonical_generation_preserved {
+            tx.execute_batch(&format!(
+                "ROLLBACK TO {IMAGE_REPLACEMENT_SAVEPOINT}; RELEASE {IMAGE_REPLACEMENT_SAVEPOINT};"
+            ))?;
+        } else {
+            tx.execute_batch(&format!("RELEASE {IMAGE_REPLACEMENT_SAVEPOINT}"))?;
+        }
+    }
+    let replacement_committed = !canonical_generation_preserved;
+    let entries_indexed = if canonical_generation_preserved {
+        0
+    } else {
+        attempt_entries_indexed
+    };
+    let retained_entry_count = if canonical_generation_preserved {
+        prior_complete_image_entry_count
+    } else {
+        usize::try_from(tx.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2",
+            params![case_id, evidence.id],
+            |row| row.get::<_, i64>(0),
+        )?)
+        .unwrap_or(usize::MAX)
+    };
+    // Relinking is part of publishing a new generation. The retained prior
+    // generation already has stable bookmark targets and must not be touched
+    // by a rejected staging attempt.
+    let bookmark_items_relinked = if replacement_committed {
+        relink_bookmark_items_tx(&tx, case_id, evidence.id)?
+    } else {
+        0
+    };
     tx.execute(
         "UPDATE evidence_jobs
          SET status = ?1,
              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
              error = ?2,
-             parameters_json = json_set(parameters_json, '$.entries_indexed', ?3)
-         WHERE id = ?4",
+             parameters_json = json_set(
+                 parameters_json,
+                 '$.entries_indexed', ?3,
+                 '$.attempt_entries_indexed', ?4,
+                 '$.replacement_committed', json(?5),
+                 '$.canonical_generation_preserved', json(?6),
+                 '$.retained_entry_count', ?7,
+                 '$.canonical_generation_complete', json(?8)
+             )
+         WHERE id = ?9",
         params![
             status,
             truncation_reason,
             i64::try_from(entries_indexed).unwrap_or(i64::MAX),
+            i64::try_from(attempt_entries_indexed).unwrap_or(i64::MAX),
+            if replacement_committed {
+                "true"
+            } else {
+                "false"
+            },
+            if canonical_generation_preserved {
+                "true"
+            } else {
+                "false"
+            },
+            i64::try_from(retained_entry_count).unwrap_or(i64::MAX),
+            if replacement_committed && !processing_reported_partial_coverage {
+                "true"
+            } else {
+                "false"
+            },
             job_id
         ],
     )?;
     tx.execute(
         "UPDATE evidence_sources
-         SET indexed_at = CASE WHEN ?3 = 0
+         SET indexed_at = CASE
+             WHEN ?3 != 0 THEN indexed_at
+             WHEN ?4 = 0
              THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              ELSE NULL
          END
          WHERE id = ?1 AND case_id = ?2",
-        params![evidence.id, case_id, if truncated { 1 } else { 0 }],
+        params![
+            evidence.id,
+            case_id,
+            if canonical_generation_preserved { 1 } else { 0 },
+            if stopped_at_examiner_limit { 1 } else { 0 }
+        ],
     )?;
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'evidence.process', ?2, 'evidence', ?3,
-                 json_object('job_id', ?4, 'entries_indexed', ?5, 'truncated', ?6,
-                             'status', ?7, 'requested_entry_limit', ?8,
-                             'truncation_reason', ?9, 'bookmark_items_relinked', ?10))",
+                 json_object('job_id', ?4, 'entries_indexed', ?5,
+                             'attempt_entries_indexed', ?6, 'truncated', ?7,
+                             'status', ?8, 'requested_entry_limit', ?9,
+                             'truncation_reason', ?10, 'bookmark_items_relinked', ?11,
+                             'partial_artifact_coverage', ?12,
+                             'completed_with_diagnostics', ?13,
+                             'replacement_committed', ?14,
+                             'canonical_generation_preserved', ?15,
+                             'retained_entry_count', ?16))",
         params![
             case_id,
             actor,
             evidence.id,
             job_id,
             entries_indexed as i64,
-            if truncated { 1 } else { 0 },
+            i64::try_from(attempt_entries_indexed).unwrap_or(i64::MAX),
+            if stopped_at_examiner_limit { 1 } else { 0 },
             status,
             i64::try_from(requested_entry_limit).unwrap_or(i64::MAX),
             truncation_reason,
             bookmark_items_relinked as i64,
+            if processing_reported_partial_coverage {
+                1
+            } else {
+                0
+            },
+            if completed_with_diagnostics { 1 } else { 0 },
+            if replacement_committed { 1 } else { 0 },
+            if canonical_generation_preserved { 1 } else { 0 },
+            i64::try_from(retained_entry_count).unwrap_or(i64::MAX),
         ],
     )?;
     tx.commit()?;
@@ -6000,7 +9444,13 @@ fn process_evidence_with_profile_inner(
         job_id,
         evidence_id: evidence.id,
         entries_indexed,
-        truncated,
+        attempt_entries_indexed,
+        replacement_committed,
+        canonical_generation_preserved,
+        retained_entry_count,
+        truncated: stopped_at_examiner_limit,
+        partial_artifact_coverage: processing_reported_partial_coverage,
+        completed_with_diagnostics,
         status: status.to_string(),
         bookmark_items_relinked,
         truncation_reasons: progress_truncation_reasons,
@@ -6015,9 +9465,16 @@ fn process_evidence_with_profile_inner(
 /// forensically important "renamed extension / bad signature" case.
 // Internal memory/transaction bound only. Keyset iteration continues until every selected
 // candidate has been visited; this value is never a forensic coverage limit.
-const SIGNATURE_ANALYSIS_PAGE_SIZE: usize = 128;
+const SIGNATURE_ANALYSIS_PAGE_SIZE: usize = 512;
 const SIGNATURE_ANALYSIS_ERROR_DISPLAY_LIMIT: usize = 32;
-const SIGNATURE_ANALYSIS_VERSION: &str = "signature_magic_and_text_v2";
+const SIGNATURE_ANALYSIS_VERSION: &str = "signature_magic_and_text_v3";
+const SIGNATURE_ANALYSIS_STAGING_MODEL: &str = "temp_merge_patch_v1";
+const SIGNATURE_ANALYSIS_MAX_WORKERS: usize = 8;
+const SIGNATURE_ANALYSIS_HEADER_BYTES: usize = 1024;
+const SIGNATURE_ANALYSIS_CONTENT_IDENTITY_CACHE_SIZE: usize = 4096;
+const SIGNATURE_ANALYSIS_MAX_SNAPSHOT_ROWS: usize = 5_000_000;
+const SIGNATURE_ANALYSIS_MAX_PATCH_BYTES_PER_ROW: usize = 32 * 1024;
+const SIGNATURE_ANALYSIS_MAX_STAGED_PATCH_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Debug)]
 struct SignatureAnalysisCandidate {
@@ -6026,7 +9483,9 @@ struct SignatureAnalysisCandidate {
     logical_path: String,
     name: String,
     metadata_json: String,
-    size_bytes: u64,
+    // Preserve SQL NULL instead of coercing it to zero. A missing size is not affirmative
+    // evidence of an empty logical file and must still receive an authoritative read attempt.
+    size_bytes: Option<u64>,
     content_head: Option<Vec<u8>>,
 }
 
@@ -6041,6 +9500,10 @@ struct SignatureAnalysisCursor {
 struct SignatureAnalysisStats {
     candidates_processed: usize,
     files_examined: usize,
+    not_applicable: usize,
+    not_applicable_wof_auxiliary_streams: usize,
+    not_applicable_ntfs_no_unnamed_stream: usize,
+    not_applicable_non_file_rows: usize,
     files_skipped: usize,
     matches: usize,
     aliases: usize,
@@ -6049,11 +9512,1540 @@ struct SignatureAnalysisStats {
     no_extension: usize,
     unreadable: usize,
     metadata_parse_errors: usize,
+    authoritative_header_reads: usize,
+    captured_headers_reused: usize,
+    content_identity_headers_reused: usize,
+    metadata_updates_staged: usize,
+    metadata_patch_bytes_staged: usize,
     errors: Vec<String>,
     errors_omitted: usize,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SignatureNotApplicableReason {
+    WofAuxiliaryStream,
+    NtfsNoUnnamedDataStream,
+    UnallocatedSpace,
+    InternalDiagnostic,
+    EmptyLogicalFile,
+}
+
+impl SignatureNotApplicableReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::WofAuxiliaryStream => "wof_auxiliary_stream",
+            Self::NtfsNoUnnamedDataStream => "ntfs_no_unnamed_data_stream",
+            Self::UnallocatedSpace => "unallocated_space_extent",
+            Self::InternalDiagnostic => "internal_diagnostic_row",
+            Self::EmptyLogicalFile => "empty_logical_file",
+        }
+    }
+
+    fn explanation(self) -> &'static str {
+        match self {
+            Self::WofAuxiliaryStream => {
+                "WOF backing stream is auxiliary compressed storage; signature verification applies to the reconstructed logical file"
+            }
+            Self::NtfsNoUnnamedDataStream => {
+                "NTFS filesystem row has no unnamed $DATA stream; it is a metadata-only name/record reference rather than a readable logical-file byte stream"
+            }
+            Self::UnallocatedSpace => {
+                "Synthetic unallocated-space extent is not a logical file; use carving or raw-byte search for this storage area"
+            }
+            Self::InternalDiagnostic => {
+                "Internal parser-diagnostic row is metadata, not a logical-file byte stream"
+            }
+            Self::EmptyLogicalFile => {
+                "The indexed logical file is exactly zero bytes and has no content signature to verify"
+            }
+        }
+    }
+
+    fn is_non_file_row(self) -> bool {
+        matches!(
+            self,
+            Self::UnallocatedSpace | Self::InternalDiagnostic | Self::EmptyLogicalFile
+        )
+    }
+}
+
+fn ntfs_metadata_proves_no_unnamed_data_stream(
+    metadata: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    if metadata.get("ntfs_file_record_number").is_none()
+        || metadata
+            .get("ntfs_data_stream_name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| !name.is_empty())
+        || metadata
+            .get("mft_attribute_parse_error_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        || metadata
+            .get("mft_attribute_list_present")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+    {
+        return false;
+    }
+
+    let Some(streams) = metadata
+        .get("ntfs_data_streams")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    // Treat malformed stream inventories as unknown, never as proof of non-applicability.
+    let mut names = Vec::with_capacity(streams.len());
+    for stream in streams {
+        let Some(name) = stream
+            .as_object()
+            .and_then(|object| object.get("name"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return false;
+        };
+        names.push(name);
+    }
+    !names.iter().any(|name| name.is_empty())
+}
+
+fn signature_not_applicable_from_metadata(
+    metadata: &serde_json::Map<String, serde_json::Value>,
+    has_captured_header: bool,
+) -> Option<(SignatureNotApplicableReason, &'static str)> {
+    if is_wof_backing_stream_metadata(metadata) {
+        return Some((
+            SignatureNotApplicableReason::WofAuxiliaryStream,
+            "metadata_auxiliary_stream_identity",
+        ));
+    }
+    match metadata
+        .get("artifact_kind")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("unallocated_space") => {
+            return Some((
+                SignatureNotApplicableReason::UnallocatedSpace,
+                "metadata_artifact_kind",
+            ));
+        }
+        Some("filesystem_parser_error" | "filesystem_parser_summary") => {
+            return Some((
+                SignatureNotApplicableReason::InternalDiagnostic,
+                "metadata_artifact_kind",
+            ));
+        }
+        _ => {}
+    }
+    // A captured header is affirmative evidence that readable logical-file bytes exist. It wins
+    // over an incomplete/stale MFT inventory and preserves signature coverage for reconstructed
+    // WOF-backed files and other ordinary files.
+    if !has_captured_header && ntfs_metadata_proves_no_unnamed_data_stream(metadata) {
+        return Some((
+            SignatureNotApplicableReason::NtfsNoUnnamedDataStream,
+            "complete_mft_data_stream_inventory",
+        ));
+    }
+    None
+}
+
+fn signature_error_is_ntfs_no_unnamed_data_stream(error: &anyhow::Error) -> bool {
+    const ERROR_PREFIX: &str = "NTFS entry has no unnamed data stream:";
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with(ERROR_PREFIX))
+}
+
+fn stamp_signature_not_applicable(
+    metadata: &mut serde_json::Value,
+    reason: SignatureNotApplicableReason,
+    basis: &str,
+) {
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "file_extension",
+        "detected_signature",
+        "signature_description",
+        "signature_category",
+        "expected_signature",
+        "signature_detection_basis",
+        "signature_detection_confidence",
+        "signature_status_confidence",
+        "signature_mismatch_basis",
+    ] {
+        object.remove(key);
+    }
+    object.insert(
+        "signature_status".to_string(),
+        serde_json::json!("not_applicable"),
+    );
+    object.insert(
+        "signature_not_applicable_reason_code".to_string(),
+        serde_json::json!(reason.code()),
+    );
+    object.insert(
+        "signature_applicability_basis".to_string(),
+        serde_json::json!(basis),
+    );
+    object.insert(
+        "signature_reason".to_string(),
+        serde_json::json!(reason.explanation()),
+    );
+    object.insert(
+        "signature_analysis".to_string(),
+        serde_json::json!(SIGNATURE_ANALYSIS_VERSION),
+    );
+}
+
+fn record_signature_not_applicable(
+    stats: &mut SignatureAnalysisStats,
+    reason: SignatureNotApplicableReason,
+) {
+    stats.files_skipped = stats.files_skipped.saturating_add(1);
+    stats.not_applicable = stats.not_applicable.saturating_add(1);
+    match reason {
+        SignatureNotApplicableReason::WofAuxiliaryStream => {
+            stats.not_applicable_wof_auxiliary_streams =
+                stats.not_applicable_wof_auxiliary_streams.saturating_add(1);
+        }
+        SignatureNotApplicableReason::NtfsNoUnnamedDataStream => {
+            stats.not_applicable_ntfs_no_unnamed_stream = stats
+                .not_applicable_ntfs_no_unnamed_stream
+                .saturating_add(1);
+        }
+        reason if reason.is_non_file_row() => {
+            stats.not_applicable_non_file_rows =
+                stats.not_applicable_non_file_rows.saturating_add(1);
+        }
+        _ => {}
+    }
+}
+
 pub fn analyze_signatures(
+    case_path: &Path,
+    options: AnalyzeSignaturesOptions,
+) -> Result<AnalyzeSignaturesResult> {
+    analyze_signatures_atomic(case_path, options)
+}
+
+fn analyze_signatures_atomic(
+    case_path: &Path,
+    options: AnalyzeSignaturesOptions,
+) -> Result<AnalyzeSignaturesResult> {
+    let requested_max_entries = options.max_entries;
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    if let Some(evidence_id) = options.evidence_id {
+        ensure_evidence_source(&conn, case_id, evidence_id)?;
+    }
+    let interrupted_attempts_reconciled =
+        reconcile_interrupted_signature_attempts(&mut conn, case_id, options.evidence_id)?;
+    let snapshot = prepare_signature_analysis_snapshot(&conn, case_id, options.evidence_id)?;
+    let candidates_to_process = if requested_max_entries == 0 {
+        snapshot.candidates_total
+    } else {
+        snapshot.candidates_total.min(requested_max_entries)
+    };
+    let examiner_limit_reached =
+        requested_max_entries > 0 && snapshot.candidates_total > requested_max_entries;
+    let worker_threads = signature_analysis_worker_count(candidates_to_process);
+    let up_to_date_files_skipped = snapshot
+        .eligible_files_total
+        .saturating_sub(snapshot.candidates_total);
+
+    progress::progress_set_unit("files");
+    progress::progress_set_total(Some(
+        u64::try_from(candidates_to_process).unwrap_or(u64::MAX),
+    ));
+    if examiner_limit_reached {
+        progress::progress_truncated(format!(
+            "signature analysis stopped at the examiner-requested {requested_max_entries} entry limit"
+        ));
+    }
+
+    let initial_parameters = serde_json::json!({
+        "evidence_id": options.evidence_id,
+        "max_entries": requested_max_entries,
+        "candidates_total": snapshot.candidates_total,
+        "eligible_files_total": snapshot.eligible_files_total,
+        "up_to_date_files_skipped": up_to_date_files_skipped,
+        "internal_page_size": SIGNATURE_ANALYSIS_PAGE_SIZE,
+        "signature_analysis_version": SIGNATURE_ANALYSIS_VERSION,
+        "staging_model": SIGNATURE_ANALYSIS_STAGING_MODEL,
+        "temp_store": "memory",
+        "max_snapshot_rows": SIGNATURE_ANALYSIS_MAX_SNAPSHOT_ROWS,
+        "max_patch_bytes_per_row": SIGNATURE_ANALYSIS_MAX_PATCH_BYTES_PER_ROW,
+        "max_staged_patch_bytes": SIGNATURE_ANALYSIS_MAX_STAGED_PATCH_BYTES,
+        "prior_signature_metadata_rows": snapshot.prior_signature_metadata_rows,
+        "prior_complete_signature_job_id": snapshot.prior_complete_job_id,
+        "interrupted_attempts_reconciled": interrupted_attempts_reconciled,
+        "worker_threads": worker_threads,
+        "process_id": std::process::id(),
+    });
+    conn.execute(
+        "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json, started_at)
+         VALUES (?1, ?2, 'signature_analysis', 'running', ?3,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![case_id, options.evidence_id, initial_parameters.to_string()],
+    )?;
+    let job_id = conn.last_insert_rowid();
+    progress::progress_set_job_id(job_id);
+
+    let mut stats = SignatureAnalysisStats::default();
+    if let Err(error) = analyze_signature_snapshot_pages(
+        case_path,
+        &mut conn,
+        case_id,
+        options.evidence_id,
+        job_id,
+        candidates_to_process,
+        worker_threads,
+        &mut stats,
+    ) {
+        let error_text = format!("{error:#}");
+        progress::progress_error(None);
+        if let Err(status_error) =
+            mark_signature_analysis_failed(case_path, job_id, &error_text, &stats)
+        {
+            return Err(error.context(format!(
+                "also failed to mark signature-analysis job {job_id} failed: {status_error:#}"
+            )));
+        }
+        return Err(error);
+    }
+
+    let has_diagnostics = stats.unreadable > 0 || stats.metadata_parse_errors > 0;
+    let completed_with_diagnostics = !examiner_limit_reached && has_diagnostics;
+    let status = if examiner_limit_reached {
+        "truncated"
+    } else if completed_with_diagnostics {
+        "completed_with_diagnostics"
+    } else {
+        "completed"
+    };
+    let complete_generation = !examiner_limit_reached
+        && !has_diagnostics
+        && stats.candidates_processed == snapshot.candidates_total;
+    if complete_generation {
+        let drift = signature_analysis_snapshot_drift_count(&conn, case_id, options.evidence_id)?;
+        if drift != 0 {
+            let error = anyhow!(
+                "signature-analysis candidate snapshot changed before publication ({drift} differing row(s)); prior metadata was preserved"
+            );
+            let error_text = format!("{error:#}");
+            progress::progress_error(None);
+            if let Err(status_error) =
+                mark_signature_analysis_failed(case_path, job_id, &error_text, &stats)
+            {
+                return Err(error.context(format!(
+                    "also failed to mark signature-analysis job {job_id} failed: {status_error:#}"
+                )));
+            }
+            return Err(error);
+        }
+    }
+
+    let canonical_generation_preserved =
+        !complete_generation && snapshot.prior_signature_metadata_rows > 0;
+    // A first-ever partial pass may publish its per-entry, job-stamped outcomes truthfully. A
+    // later partial/diagnostic attempt never mixes generations or erases an earlier result.
+    let publish_staged = complete_generation || !canonical_generation_preserved;
+    let anticipated_committed_updates = if publish_staged {
+        stats.metadata_updates_staged
+    } else {
+        0
+    };
+    let replacement_committed = anticipated_committed_updates > 0;
+    let mut status_reasons = Vec::new();
+    if examiner_limit_reached {
+        status_reasons.push(format!(
+            "examiner-requested entry limit reached ({requested_max_entries} of {})",
+            snapshot.candidates_total
+        ));
+    }
+    if stats.unreadable > 0 {
+        status_reasons.push(format!(
+            "{} file(s) could not be read for signature verification",
+            stats.unreadable
+        ));
+    }
+    if stats.metadata_parse_errors > 0 {
+        status_reasons.push(format!(
+            "{} metadata value(s) were invalid JSON objects",
+            stats.metadata_parse_errors
+        ));
+    }
+    if canonical_generation_preserved {
+        status_reasons.push(
+            "prior canonical signature metadata was preserved; this attempt published no per-entry changes"
+                .to_string(),
+        );
+    }
+    let status_note = (!status_reasons.is_empty()).then(|| status_reasons.join("; "));
+    let errors_json = serde_json::to_value(&stats.errors)
+        .context("serializing signature-analysis diagnostics")?;
+    let final_parameters = serde_json::json!({
+        "evidence_id": options.evidence_id,
+        "max_entries": requested_max_entries,
+        "candidates_total": snapshot.candidates_total,
+        "eligible_files_total": snapshot.eligible_files_total,
+        "up_to_date_files_skipped": up_to_date_files_skipped,
+        "candidates_processed": stats.candidates_processed,
+        "files_examined": stats.files_examined,
+        "not_applicable": stats.not_applicable,
+        "not_applicable_wof_auxiliary_streams": stats.not_applicable_wof_auxiliary_streams,
+        "not_applicable_ntfs_no_unnamed_stream": stats.not_applicable_ntfs_no_unnamed_stream,
+        "not_applicable_non_file_rows": stats.not_applicable_non_file_rows,
+        "files_skipped": stats.files_skipped,
+        "matches": stats.matches,
+        "aliases": stats.aliases,
+        "mismatches": stats.mismatches,
+        "unknown": stats.unknown,
+        "no_extension": stats.no_extension,
+        "unreadable": stats.unreadable,
+        "metadata_parse_errors": stats.metadata_parse_errors,
+        "authoritative_header_reads": stats.authoritative_header_reads,
+        "captured_headers_reused": stats.captured_headers_reused,
+        "content_identity_headers_reused": stats.content_identity_headers_reused,
+        "metadata_updates_staged": stats.metadata_updates_staged,
+        "metadata_patch_bytes_staged": stats.metadata_patch_bytes_staged,
+        "metadata_updates_committed": anticipated_committed_updates,
+        "errors": errors_json,
+        "errors_omitted": stats.errors_omitted,
+        "truncated": examiner_limit_reached,
+        "completed_with_diagnostics": completed_with_diagnostics,
+        "replacement_committed": replacement_committed,
+        "canonical_generation_preserved": canonical_generation_preserved,
+        "prior_signature_metadata_rows": snapshot.prior_signature_metadata_rows,
+        "prior_complete_signature_job_id": snapshot.prior_complete_job_id,
+        "interrupted_attempts_reconciled": interrupted_attempts_reconciled,
+        "internal_page_size": SIGNATURE_ANALYSIS_PAGE_SIZE,
+        "signature_analysis_version": SIGNATURE_ANALYSIS_VERSION,
+        "staging_model": SIGNATURE_ANALYSIS_STAGING_MODEL,
+        "temp_store": "memory",
+        "max_snapshot_rows": SIGNATURE_ANALYSIS_MAX_SNAPSHOT_ROWS,
+        "max_patch_bytes_per_row": SIGNATURE_ANALYSIS_MAX_PATCH_BYTES_PER_ROW,
+        "max_staged_patch_bytes": SIGNATURE_ANALYSIS_MAX_STAGED_PATCH_BYTES,
+        "worker_threads": worker_threads,
+        "process_id": std::process::id(),
+    });
+    let audit_details = serde_json::json!({
+        "job_id": job_id,
+        "status": status,
+        "parameters": final_parameters,
+        "canonical_signature_metadata_changed": replacement_committed,
+    });
+    let metadata_updates_committed = match finalize_signature_analysis_attempt(
+        &mut conn,
+        case_id,
+        options.evidence_id,
+        job_id,
+        status,
+        status_note.as_deref(),
+        &final_parameters.to_string(),
+        &audit_details.to_string(),
+        publish_staged,
+    ) {
+        Ok(count) => count,
+        Err(error) => {
+            let error_text = format!("{error:#}");
+            progress::progress_error(None);
+            if let Err(status_error) =
+                mark_signature_analysis_failed(case_path, job_id, &error_text, &stats)
+            {
+                return Err(error.context(format!(
+                    "also failed to mark signature-analysis job {job_id} failed: {status_error:#}"
+                )));
+            }
+            return Err(error);
+        }
+    };
+    if metadata_updates_committed != anticipated_committed_updates {
+        bail!(
+            "signature-analysis committed update count changed after finalization: expected {anticipated_committed_updates}, got {metadata_updates_committed}"
+        );
+    }
+
+    Ok(AnalyzeSignaturesResult {
+        job_id,
+        evidence_id: options.evidence_id,
+        eligible_files_total: snapshot.eligible_files_total,
+        up_to_date_files_skipped,
+        candidates_total: snapshot.candidates_total,
+        candidates_processed: stats.candidates_processed,
+        files_examined: stats.files_examined,
+        not_applicable: stats.not_applicable,
+        not_applicable_wof_auxiliary_streams: stats.not_applicable_wof_auxiliary_streams,
+        not_applicable_ntfs_no_unnamed_stream: stats.not_applicable_ntfs_no_unnamed_stream,
+        not_applicable_non_file_rows: stats.not_applicable_non_file_rows,
+        files_skipped: stats.files_skipped,
+        matches: stats.matches,
+        aliases: stats.aliases,
+        mismatches: stats.mismatches,
+        unknown: stats.unknown,
+        no_extension: stats.no_extension,
+        unreadable: stats.unreadable,
+        metadata_parse_errors: stats.metadata_parse_errors,
+        errors: stats.errors,
+        errors_omitted: stats.errors_omitted,
+        metadata_updates_committed,
+        replacement_committed,
+        canonical_generation_preserved,
+        completed_with_diagnostics,
+        truncated: examiner_limit_reached,
+        status: status.to_string(),
+    })
+}
+
+#[derive(Debug)]
+struct SignatureAnalysisRunSnapshot {
+    eligible_files_total: usize,
+    candidates_total: usize,
+    prior_signature_metadata_rows: usize,
+    prior_complete_job_id: Option<i64>,
+}
+
+fn reconcile_interrupted_signature_attempts(
+    conn: &mut Connection,
+    case_id: i64,
+    evidence_id: Option<i64>,
+) -> Result<usize> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    let changed = tx.execute(
+        "UPDATE evidence_jobs
+         SET status = 'failed',
+             finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             error = CASE
+                 WHEN json_extract(parameters_json, '$.staging_model') = ?3 THEN
+                     'Interrupted before atomic signature metadata publication; the prior canonical signature generation was preserved'
+                 ELSE
+                     'Interrupted legacy signature analysis; legacy page writes may have left partial signature metadata'
+             END,
+             parameters_json = json_set(
+                 parameters_json,
+                 '$.interrupted_before_finalization', json('true'),
+                 '$.replacement_committed', json('false'),
+                 '$.canonical_generation_preserved',
+                    CASE
+                        WHEN COALESCE(json_extract(parameters_json, '$.prior_signature_metadata_rows'), 0) > 0
+                        THEN json('true') ELSE json('false')
+                    END,
+                 '$.legacy_partial_updates_possible',
+                    CASE
+                        WHEN json_extract(parameters_json, '$.staging_model') = ?3
+                        THEN json('false') ELSE json('true')
+                    END)
+         WHERE case_id = ?1
+           AND (?2 IS NULL OR evidence_id = ?2)
+           AND job_type = 'signature_analysis'
+           AND status = 'running'",
+        params![case_id, evidence_id, SIGNATURE_ANALYSIS_STAGING_MODEL],
+    )?;
+    if changed > 0 {
+        tx.execute(
+            "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+             VALUES (?1, 'evidence.signature_analysis.interrupted', ?2, 'evidence', ?3,
+                     json_object('attempts_reconciled', ?4,
+                                 'canonical_signature_metadata_changed', json('false'))) ",
+            params![
+                case_id,
+                actor,
+                evidence_id,
+                i64::try_from(changed).unwrap_or(i64::MAX)
+            ],
+        )?;
+    }
+    tx.commit()
+        .context("reconciling interrupted signature-analysis attempts")?;
+    Ok(changed)
+}
+
+fn prepare_signature_analysis_snapshot(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: Option<i64>,
+) -> Result<SignatureAnalysisRunSnapshot> {
+    let candidates_total: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM filesystem_entries
+         WHERE case_id = ?1
+           AND (?2 IS NULL OR evidence_id = ?2)
+           AND entry_kind = 'file'
+           AND CASE
+                   WHEN json_valid(metadata_json)
+                   THEN COALESCE(json_extract(metadata_json, '$.signature_analysis'), '')
+                   ELSE ''
+               END <> ?3",
+        params![case_id, evidence_id, SIGNATURE_ANALYSIS_VERSION],
+        |row| row.get(0),
+    )?;
+    let candidates_total = usize::try_from(candidates_total)
+        .context("signature-analysis candidate count exceeds usize")?;
+    if candidates_total > SIGNATURE_ANALYSIS_MAX_SNAPSHOT_ROWS {
+        bail!(
+            "signature-analysis snapshot contains {candidates_total} rows, exceeding the explicit in-memory safety bound of {SIGNATURE_ANALYSIS_MAX_SNAPSHOT_ROWS}; split the pass by evidence rather than spilling forensic findings to a host temp file"
+        );
+    }
+    // MEMORY-backed TEMP storage prevents compact findings from spilling into an OS temp file
+    // with host-dependent ACL semantics. Explicit row/per-patch/aggregate bounds keep this
+    // security choice predictable on 16 GiB examiner workstations.
+    conn.execute_batch(
+        "PRAGMA temp_store = MEMORY;
+         CREATE TEMP TABLE signature_analysis_candidates(
+             entry_id INTEGER PRIMARY KEY
+         ) WITHOUT ROWID;
+         CREATE TEMP TABLE signature_analysis_stage(
+             entry_id INTEGER PRIMARY KEY,
+             metadata_patch_json TEXT NOT NULL
+         ) WITHOUT ROWID;",
+    )
+    .context("creating bounded signature-analysis staging tables")?;
+    conn.execute(
+        "INSERT INTO temp.signature_analysis_candidates(entry_id)
+         SELECT id
+         FROM filesystem_entries
+         WHERE case_id = ?1
+           AND (?2 IS NULL OR evidence_id = ?2)
+           AND entry_kind = 'file'
+           AND CASE
+                   WHEN json_valid(metadata_json)
+                   THEN COALESCE(json_extract(metadata_json, '$.signature_analysis'), '')
+                   ELSE ''
+               END <> ?3
+         ORDER BY evidence_id, logical_path, id",
+        params![case_id, evidence_id, SIGNATURE_ANALYSIS_VERSION],
+    )
+    .context("snapshotting signature-analysis candidate ids")?;
+    let eligible_files_total: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM filesystem_entries
+         WHERE case_id = ?1
+           AND (?2 IS NULL OR evidence_id = ?2)
+           AND entry_kind = 'file'",
+        params![case_id, evidence_id],
+        |row| row.get(0),
+    )?;
+    let snapshotted_candidates: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM temp.signature_analysis_candidates",
+        [],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(snapshotted_candidates).ok() != Some(candidates_total) {
+        bail!(
+            "signature-analysis candidate snapshot changed during creation: counted {candidates_total}, captured {snapshotted_candidates}"
+        );
+    }
+    let prior_signature_metadata_rows: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM filesystem_entries
+         WHERE case_id = ?1
+           AND (?2 IS NULL OR evidence_id = ?2)
+           AND entry_kind = 'file'
+           AND json_valid(metadata_json)
+           AND COALESCE(json_extract(metadata_json, '$.signature_analysis'), '') <> ''",
+        params![case_id, evidence_id],
+        |row| row.get(0),
+    )?;
+    let prior_complete_job_id = conn
+        .query_row(
+            "SELECT id
+             FROM evidence_jobs
+             WHERE case_id = ?1
+               AND (?2 IS NULL OR evidence_id = ?2)
+               AND job_type = 'signature_analysis'
+               AND status = 'completed'
+             ORDER BY id DESC
+             LIMIT 1",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(SignatureAnalysisRunSnapshot {
+        eligible_files_total: usize::try_from(eligible_files_total)
+            .context("signature-analysis eligible-file count exceeds usize")?,
+        candidates_total,
+        prior_signature_metadata_rows: usize::try_from(prior_signature_metadata_rows)
+            .context("prior signature metadata count exceeds usize")?,
+        prior_complete_job_id,
+    })
+}
+
+fn signature_metadata_merge_patch(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> Result<String> {
+    let before = before
+        .as_object()
+        .context("signature metadata before-state is not an object")?;
+    let after = after
+        .as_object()
+        .context("signature metadata after-state is not an object")?;
+    let mut patch = serde_json::Map::new();
+    for (key, before_value) in before {
+        match after.get(key) {
+            Some(after_value) if after_value == before_value => {}
+            Some(after_value) => {
+                patch.insert(key.clone(), after_value.clone());
+            }
+            None => {
+                // JSON Merge Patch uses null to remove a stale top-level key.
+                patch.insert(key.clone(), serde_json::Value::Null);
+            }
+        }
+    }
+    for (key, after_value) in after {
+        if !before.contains_key(key) {
+            patch.insert(key.clone(), after_value.clone());
+        }
+    }
+    Ok(serde_json::Value::Object(patch).to_string())
+}
+
+fn stage_signature_analysis_updates(
+    conn: &mut Connection,
+    updates: &[(i64, String)],
+    already_staged_patch_bytes: usize,
+) -> Result<usize> {
+    if updates.is_empty() {
+        return Ok(0);
+    }
+    let mut batch_patch_bytes = 0_usize;
+    for (entry_id, metadata_patch_json) in updates {
+        if metadata_patch_json.len() > SIGNATURE_ANALYSIS_MAX_PATCH_BYTES_PER_ROW {
+            bail!(
+                "signature metadata patch for entry {entry_id} is {} bytes, exceeding the explicit per-row bound of {} bytes",
+                metadata_patch_json.len(),
+                SIGNATURE_ANALYSIS_MAX_PATCH_BYTES_PER_ROW
+            );
+        }
+        batch_patch_bytes = batch_patch_bytes
+            .checked_add(metadata_patch_json.len())
+            .context("signature metadata patch batch size exceeds usize")?;
+    }
+    let total_patch_bytes = already_staged_patch_bytes
+        .checked_add(batch_patch_bytes)
+        .context("signature metadata staging size exceeds usize")?;
+    if total_patch_bytes > SIGNATURE_ANALYSIS_MAX_STAGED_PATCH_BYTES {
+        bail!(
+            "signature metadata staging requires {total_patch_bytes} bytes, exceeding the explicit in-memory bound of {SIGNATURE_ANALYSIS_MAX_STAGED_PATCH_BYTES} bytes; prior canonical metadata was not changed"
+        );
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let mut statement = tx.prepare_cached(
+        "INSERT INTO temp.signature_analysis_stage(entry_id, metadata_patch_json)
+         SELECT ?1, ?2
+         WHERE EXISTS(
+             SELECT 1 FROM temp.signature_analysis_candidates WHERE entry_id = ?1
+         )
+         ON CONFLICT(entry_id) DO UPDATE SET metadata_patch_json = excluded.metadata_patch_json",
+    )?;
+    for (entry_id, metadata_patch_json) in updates {
+        let changed = statement
+            .execute(params![entry_id, metadata_patch_json])
+            .with_context(|| format!("staging signature metadata for entry {entry_id}"))?;
+        if changed != 1 {
+            bail!("staging signature metadata for entry {entry_id} affected {changed} rows");
+        }
+    }
+    drop(statement);
+    tx.commit()
+        .context("committing a temporary signature-analysis page")?;
+    Ok(batch_patch_bytes)
+}
+
+fn stamp_signature_analysis_job(metadata: &mut serde_json::Value, job_id: i64) {
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "signature_analysis_job_id".to_string(),
+            serde_json::json!(job_id),
+        );
+    }
+}
+
+fn apply_signature_finding_metadata(
+    metadata: &mut serde_json::Value,
+    candidate: &SignatureAnalysisCandidate,
+    finding: &SignatureFinding,
+    job_id: i64,
+) -> Result<()> {
+    let object = metadata
+        .as_object_mut()
+        .context("signature candidate metadata ceased to be an object")?;
+    object.remove("signature_not_applicable_reason_code");
+    object.remove("signature_applicability_basis");
+    object.insert(
+        "signature_status".to_string(),
+        serde_json::Value::String(finding.status.to_string()),
+    );
+    match &finding.extension {
+        Some(extension) => {
+            object.insert(
+                "file_extension".to_string(),
+                serde_json::Value::String(extension.clone()),
+            );
+        }
+        None => {
+            object.insert("file_extension".to_string(), serde_json::Value::Null);
+        }
+    }
+    insert_opt_str(object, "detected_signature", finding.detected_label);
+    insert_opt_str(
+        object,
+        "signature_description",
+        finding.detected_description,
+    );
+    insert_opt_str(object, "signature_category", finding.detected_category);
+    insert_opt_str(object, "expected_signature", finding.expected_label);
+    insert_opt_str(object, "signature_detection_basis", finding.detection_basis);
+    insert_opt_str(
+        object,
+        "signature_detection_confidence",
+        match finding.detection_basis {
+            Some("magic") => Some("high"),
+            Some("content_heuristic") => Some("medium"),
+            Some(_) => Some("low"),
+            None => None,
+        },
+    );
+    insert_opt_str(object, "signature_mismatch_basis", finding.mismatch_basis);
+    insert_opt_str(object, "signature_reason", finding.reason);
+    object.insert(
+        "signature_status_confidence".to_string(),
+        serde_json::Value::String(
+            match (finding.status, finding.detection_basis) {
+                ("match" | "alias" | "mismatch", Some("magic")) => "high",
+                ("match" | "alias" | "mismatch", Some("content_heuristic")) => "medium",
+                ("mismatch", None) => "high",
+                ("no_extension", _) => "high",
+                _ => "indeterminate",
+            }
+            .to_string(),
+        ),
+    );
+    object.insert(
+        "signature_analysis".to_string(),
+        serde_json::Value::String(SIGNATURE_ANALYSIS_VERSION.to_string()),
+    );
+    object.insert(
+        "signature_analysis_job_id".to_string(),
+        serde_json::json!(job_id),
+    );
+    // A complete signature replacement also recomputes category fields. This both applies
+    // content-verified overrides and removes a stale prior override when the new outcome is
+    // unknown/not-applicable.
+    add_entry_category(metadata, &candidate.logical_path, &candidate.name, "file");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SignatureHeaderReadTask {
+    entry_id: i64,
+}
+
+#[derive(Debug, Clone)]
+enum SignatureHeaderReadDisposition {
+    Read(SignatureHeaderSample),
+    NtfsNoUnnamedDataStream,
+    Error(String),
+}
+
+#[derive(Debug)]
+struct SignatureHeaderReadOutcome {
+    entry_id: i64,
+    disposition: SignatureHeaderReadDisposition,
+}
+
+enum SignatureWorkerReadSession {
+    Ready(EvidenceReadSession),
+    Failed(String),
+}
+
+struct SignatureHeaderReadPool {
+    task_sender: Option<std::sync::mpsc::Sender<SignatureHeaderReadTask>>,
+    outcome_receiver: std::sync::mpsc::Receiver<SignatureHeaderReadOutcome>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl SignatureHeaderReadPool {
+    fn new(case_path: &Path, worker_count: usize) -> Result<Self> {
+        if worker_count == 0 {
+            bail!("signature header worker count must be positive");
+        }
+        let (task_sender, task_receiver) = std::sync::mpsc::channel::<SignatureHeaderReadTask>();
+        let task_receiver = Arc::new(Mutex::new(task_receiver));
+        let (outcome_sender, outcome_receiver) = std::sync::mpsc::channel();
+        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let worker_tasks = task_receiver.clone();
+            let worker_outcomes = outcome_sender.clone();
+            let worker_case_path = case_path.to_path_buf();
+            let worker = match std::thread::Builder::new()
+                .name(format!("kdft-signature-{index}"))
+                .spawn(move || {
+                    let mut session =
+                        match EvidenceReadSession::open_worker_read_only(&worker_case_path) {
+                            Ok(session) => SignatureWorkerReadSession::Ready(session),
+                            Err(error) => SignatureWorkerReadSession::Failed(format!("{error:#}")),
+                        };
+                    loop {
+                        let task = {
+                            let receiver = worker_tasks
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            receiver.recv()
+                        };
+                        let Ok(task) = task else {
+                            break;
+                        };
+                        let disposition = match &mut session {
+                            SignatureWorkerReadSession::Ready(session) => {
+                                match read_entry_signature_header_in_session(
+                                    session,
+                                    task.entry_id,
+                                    SIGNATURE_ANALYSIS_HEADER_BYTES,
+                                ) {
+                                    Ok(header) => SignatureHeaderReadDisposition::Read(header),
+                                    Err(error)
+                                        if signature_error_is_ntfs_no_unnamed_data_stream(
+                                            &error,
+                                        ) =>
+                                    {
+                                        SignatureHeaderReadDisposition::NtfsNoUnnamedDataStream
+                                    }
+                                    Err(error) => {
+                                        SignatureHeaderReadDisposition::Error(format!("{error:#}"))
+                                    }
+                                }
+                            }
+                            SignatureWorkerReadSession::Failed(error) => {
+                                SignatureHeaderReadDisposition::Error(error.clone())
+                            }
+                        };
+                        if worker_outcomes
+                            .send(SignatureHeaderReadOutcome {
+                                entry_id: task.entry_id,
+                                disposition,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    drop(task_sender);
+                    for worker in workers {
+                        let _ = worker.join();
+                    }
+                    return Err(error).context("starting a signature header worker");
+                }
+            };
+            workers.push(worker);
+        }
+        drop(outcome_sender);
+        Ok(Self {
+            task_sender: Some(task_sender),
+            outcome_receiver,
+            workers,
+        })
+    }
+
+    fn read_batch(
+        &self,
+        tasks: Vec<SignatureHeaderReadTask>,
+    ) -> Result<HashMap<i64, SignatureHeaderReadDisposition>> {
+        let expected = tasks.len();
+        let sender = self
+            .task_sender
+            .as_ref()
+            .context("signature header worker pool is closed")?;
+        for task in tasks {
+            sender
+                .send(task)
+                .context("sending work to a signature header worker")?;
+        }
+        let mut outcomes = HashMap::with_capacity(expected);
+        for _ in 0..expected {
+            let outcome = self
+                .outcome_receiver
+                .recv()
+                .context("signature header worker stopped before returning every result")?;
+            if outcomes
+                .insert(outcome.entry_id, outcome.disposition)
+                .is_some()
+            {
+                bail!(
+                    "signature header worker returned duplicate entry id {}",
+                    outcome.entry_id
+                );
+            }
+        }
+        Ok(outcomes)
+    }
+}
+
+impl Drop for SignatureHeaderReadPool {
+    fn drop(&mut self) {
+        self.task_sender.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct SignatureContentIdentity {
+    sha256: String,
+    size_bytes: u64,
+}
+
+fn signature_content_identity(
+    metadata: &serde_json::Map<String, serde_json::Value>,
+    size_bytes: Option<u64>,
+) -> Option<SignatureContentIdentity> {
+    let size_bytes = size_bytes?;
+    let sha256 = metadata
+        .get("file_sha256")
+        .and_then(serde_json::Value::as_str)?;
+    let complete_input = metadata
+        .get("file_sha256_input")
+        .and_then(serde_json::Value::as_str)
+        == Some("complete reconstructed file content");
+    if !complete_input || sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(SignatureContentIdentity {
+        sha256: sha256.to_ascii_lowercase(),
+        size_bytes,
+    })
+}
+
+#[derive(Default)]
+struct SignatureContentHeaderCache {
+    headers: HashMap<SignatureContentIdentity, SignatureHeaderSample>,
+    insertion_order: std::collections::VecDeque<SignatureContentIdentity>,
+}
+
+impl SignatureContentHeaderCache {
+    fn get(&self, identity: &SignatureContentIdentity) -> Option<SignatureHeaderSample> {
+        self.headers.get(identity).cloned()
+    }
+
+    fn insert(&mut self, identity: SignatureContentIdentity, header: SignatureHeaderSample) {
+        if self.headers.contains_key(&identity) {
+            return;
+        }
+        while self.headers.len() >= SIGNATURE_ANALYSIS_CONTENT_IDENTITY_CACHE_SIZE {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.headers.remove(&oldest);
+        }
+        self.insertion_order.push_back(identity.clone());
+        self.headers.insert(identity, header);
+    }
+}
+
+fn signature_analysis_worker_count(candidate_count: usize) -> usize {
+    if candidate_count == 0 {
+        return 0;
+    }
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(SIGNATURE_ANALYSIS_MAX_WORKERS)
+        .min(candidate_count)
+        .max(1)
+}
+
+fn analyze_signature_snapshot_pages(
+    case_path: &Path,
+    conn: &mut Connection,
+    case_id: i64,
+    evidence_id: Option<i64>,
+    job_id: i64,
+    candidates_to_process: usize,
+    worker_count: usize,
+    stats: &mut SignatureAnalysisStats,
+) -> Result<()> {
+    let mut cursor: Option<SignatureAnalysisCursor> = None;
+    let read_pool = (worker_count > 0)
+        .then(|| SignatureHeaderReadPool::new(case_path, worker_count))
+        .transpose()?;
+    let mut identity_cache = SignatureContentHeaderCache::default();
+
+    while stats.candidates_processed < candidates_to_process {
+        let remaining = candidates_to_process - stats.candidates_processed;
+        let page_limit = remaining.min(SIGNATURE_ANALYSIS_PAGE_SIZE);
+        let candidates = signature_analysis_snapshot_page(
+            conn,
+            case_id,
+            evidence_id,
+            cursor.as_ref(),
+            page_limit,
+        )?;
+        if candidates.is_empty() {
+            bail!(
+                "signature-analysis snapshot changed during processing: expected {} more row(s) after processing {}",
+                remaining,
+                stats.candidates_processed
+            );
+        }
+        let next_cursor = candidates
+            .last()
+            .map(|candidate| SignatureAnalysisCursor {
+                evidence_id: candidate.evidence_id,
+                logical_path: candidate.logical_path.clone(),
+                entry_id: candidate.entry_id,
+            })
+            .ok_or_else(|| anyhow!("signature-analysis page was unexpectedly empty"))?;
+        let mut read_tasks = Vec::new();
+        let mut scheduled_content_identities = HashSet::new();
+        for candidate in &candidates {
+            let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&candidate.metadata_json)
+            else {
+                continue;
+            };
+            let Some(object) = metadata.as_object() else {
+                continue;
+            };
+            let has_captured_header = candidate
+                .content_head
+                .as_ref()
+                .is_some_and(|bytes| !bytes.is_empty());
+            if has_captured_header
+                || candidate.size_bytes == Some(0)
+                || signature_not_applicable_from_metadata(object, false).is_some()
+            {
+                continue;
+            }
+            if let Some(identity) = signature_content_identity(object, candidate.size_bytes) {
+                if identity_cache.get(&identity).is_some()
+                    || !scheduled_content_identities.insert(identity)
+                {
+                    continue;
+                }
+            }
+            read_tasks.push(SignatureHeaderReadTask {
+                entry_id: candidate.entry_id,
+            });
+        }
+        stats.authoritative_header_reads = stats
+            .authoritative_header_reads
+            .checked_add(read_tasks.len())
+            .context("signature authoritative read count exceeds usize")?;
+        let mut parallel_headers = if read_tasks.is_empty() {
+            HashMap::new()
+        } else {
+            read_pool
+                .as_ref()
+                .context("signature header worker pool is unavailable")?
+                .read_batch(read_tasks)?
+        };
+        let mut updates = Vec::with_capacity(candidates.len());
+
+        for candidate in candidates {
+            stats.candidates_processed = stats.candidates_processed.saturating_add(1);
+            progress::progress_current(candidate.logical_path.clone());
+            let original_metadata: serde_json::Value =
+                match serde_json::from_str::<serde_json::Value>(&candidate.metadata_json) {
+                    Ok(metadata) if metadata.is_object() => metadata,
+                    Ok(_) => {
+                        let message = format!(
+                            "{} (entry {}): metadata_json is valid JSON but is not an object",
+                            candidate.logical_path, candidate.entry_id
+                        );
+                        stats.metadata_parse_errors = stats.metadata_parse_errors.saturating_add(1);
+                        stats.files_skipped = stats.files_skipped.saturating_add(1);
+                        record_signature_analysis_error(stats, message);
+                        progress::progress_error(Some(candidate.logical_path.clone()));
+                        progress::progress_skip(Some(candidate.logical_path.clone()));
+                        progress::progress_advance(candidate.logical_path);
+                        continue;
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "{} (entry {}): invalid metadata_json: {error}",
+                            candidate.logical_path, candidate.entry_id
+                        );
+                        stats.metadata_parse_errors = stats.metadata_parse_errors.saturating_add(1);
+                        stats.files_skipped = stats.files_skipped.saturating_add(1);
+                        record_signature_analysis_error(stats, message);
+                        progress::progress_error(Some(candidate.logical_path.clone()));
+                        progress::progress_skip(Some(candidate.logical_path.clone()));
+                        progress::progress_advance(candidate.logical_path);
+                        continue;
+                    }
+                };
+            let mut metadata = original_metadata.clone();
+            let content_identity = original_metadata
+                .as_object()
+                .and_then(|object| signature_content_identity(object, candidate.size_bytes));
+            let has_captured_header = candidate
+                .content_head
+                .as_ref()
+                .is_some_and(|bytes| !bytes.is_empty());
+            let metadata_reason = metadata.as_object().and_then(|object| {
+                signature_not_applicable_from_metadata(object, has_captured_header)
+            });
+            let not_applicable = metadata_reason.or_else(|| {
+                (candidate.size_bytes == Some(0) && !has_captured_header).then_some((
+                    SignatureNotApplicableReason::EmptyLogicalFile,
+                    "indexed_logical_size",
+                ))
+            });
+            if let Some((reason, basis)) = not_applicable {
+                stamp_signature_not_applicable(&mut metadata, reason, basis);
+                stamp_signature_analysis_job(&mut metadata, job_id);
+                if let Some(object) = metadata.as_object_mut() {
+                    object.insert(
+                        "signature_status_confidence".to_string(),
+                        serde_json::json!("high"),
+                    );
+                }
+                add_entry_category(
+                    &mut metadata,
+                    &candidate.logical_path,
+                    &candidate.name,
+                    "file",
+                );
+                updates.push((
+                    candidate.entry_id,
+                    signature_metadata_merge_patch(&original_metadata, &metadata)?,
+                ));
+                record_signature_not_applicable(stats, reason);
+                progress::progress_skip(Some(candidate.logical_path.clone()));
+                progress::progress_advance(candidate.logical_path);
+                continue;
+            }
+
+            let captured_header = candidate.content_head.as_ref().and_then(|content_head| {
+                (!content_head.is_empty()).then(|| {
+                    let length = content_head.len().min(SIGNATURE_ANALYSIS_HEADER_BYTES);
+                    SignatureHeaderSample {
+                        bytes: content_head[..length].to_vec(),
+                        window_complete: length >= SIGNATURE_ANALYSIS_HEADER_BYTES
+                            || candidate.size_bytes.is_some_and(|size_bytes| {
+                                size_bytes <= u64::try_from(length).unwrap_or(u64::MAX)
+                            }),
+                    }
+                })
+            });
+            let header_disposition = if let Some(header) = captured_header {
+                stats.captured_headers_reused = stats.captured_headers_reused.saturating_add(1);
+                if let Some(identity) = content_identity.clone() {
+                    identity_cache.insert(identity, header.clone());
+                }
+                SignatureHeaderReadDisposition::Read(header)
+            } else if let Some(header) = content_identity
+                .as_ref()
+                .and_then(|identity| identity_cache.get(identity))
+            {
+                stats.content_identity_headers_reused =
+                    stats.content_identity_headers_reused.saturating_add(1);
+                SignatureHeaderReadDisposition::Read(header)
+            } else {
+                match parallel_headers.remove(&candidate.entry_id) {
+                    Some(disposition) => disposition,
+                    None => {
+                        // A same-content representative may have failed to read from its own
+                        // filesystem instance. Do not turn that per-instance error into a claim
+                        // about this row: probe this entry independently unless a successful,
+                        // SHA-256-proven header has reached the cache.
+                        stats.authoritative_header_reads =
+                            stats.authoritative_header_reads.saturating_add(1);
+                        let mut retry = read_pool
+                            .as_ref()
+                            .context("signature header worker pool is unavailable")?
+                            .read_batch(vec![SignatureHeaderReadTask {
+                                entry_id: candidate.entry_id,
+                            }])?;
+                        retry.remove(&candidate.entry_id).ok_or_else(|| {
+                            anyhow!(
+                                "signature header worker returned no retry result for entry {}",
+                                candidate.entry_id
+                            )
+                        })?
+                    }
+                }
+            };
+            let header = match header_disposition {
+                SignatureHeaderReadDisposition::Read(header) => {
+                    if let Some(identity) = content_identity {
+                        identity_cache.insert(identity, header.clone());
+                    }
+                    header
+                }
+                SignatureHeaderReadDisposition::NtfsNoUnnamedDataStream => {
+                    let reason = SignatureNotApplicableReason::NtfsNoUnnamedDataStream;
+                    stamp_signature_not_applicable(
+                        &mut metadata,
+                        reason,
+                        "authoritative_evidence_reader",
+                    );
+                    stamp_signature_analysis_job(&mut metadata, job_id);
+                    if let Some(object) = metadata.as_object_mut() {
+                        object.insert(
+                            "signature_status_confidence".to_string(),
+                            serde_json::json!("high"),
+                        );
+                    }
+                    add_entry_category(
+                        &mut metadata,
+                        &candidate.logical_path,
+                        &candidate.name,
+                        "file",
+                    );
+                    updates.push((
+                        candidate.entry_id,
+                        signature_metadata_merge_patch(&original_metadata, &metadata)?,
+                    ));
+                    record_signature_not_applicable(stats, reason);
+                    progress::progress_skip(Some(candidate.logical_path.clone()));
+                    progress::progress_advance(candidate.logical_path);
+                    continue;
+                }
+                SignatureHeaderReadDisposition::Error(error) => {
+                    let message = format!(
+                        "{} (entry {}): unable to read signature header: {error}",
+                        candidate.logical_path, candidate.entry_id
+                    );
+                    stats.unreadable = stats.unreadable.saturating_add(1);
+                    stats.files_skipped = stats.files_skipped.saturating_add(1);
+                    record_signature_analysis_error(stats, message);
+                    progress::progress_error(Some(candidate.logical_path.clone()));
+                    progress::progress_skip(Some(candidate.logical_path.clone()));
+                    progress::progress_advance(candidate.logical_path);
+                    continue;
+                }
+            };
+            stats.files_examined = stats.files_examined.saturating_add(1);
+            let finding = evaluate_signature_with_completeness(
+                &candidate.name,
+                &header.bytes,
+                header.window_complete,
+            );
+            match finding.status {
+                "match" => stats.matches = stats.matches.saturating_add(1),
+                "alias" => stats.aliases = stats.aliases.saturating_add(1),
+                "mismatch" => stats.mismatches = stats.mismatches.saturating_add(1),
+                "unknown" => stats.unknown = stats.unknown.saturating_add(1),
+                "no_extension" => stats.no_extension = stats.no_extension.saturating_add(1),
+                status => bail!("unsupported signature-analysis disposition: {status}"),
+            }
+            apply_signature_finding_metadata(&mut metadata, &candidate, &finding, job_id)?;
+            updates.push((
+                candidate.entry_id,
+                signature_metadata_merge_patch(&original_metadata, &metadata)?,
+            ));
+            progress::progress_advance(candidate.logical_path);
+        }
+
+        let batch_patch_bytes =
+            stage_signature_analysis_updates(conn, &updates, stats.metadata_patch_bytes_staged)?;
+        stats.metadata_updates_staged = stats
+            .metadata_updates_staged
+            .checked_add(updates.len())
+            .context("signature staged-update count exceeds usize")?;
+        stats.metadata_patch_bytes_staged = stats
+            .metadata_patch_bytes_staged
+            .checked_add(batch_patch_bytes)
+            .context("signature staged patch byte count exceeds usize")?;
+        cursor = Some(next_cursor);
+    }
+
+    if stats.files_examined.saturating_add(stats.files_skipped) != stats.candidates_processed {
+        bail!(
+            "signature-analysis accounting mismatch: {} examined + {} skipped != {} visited",
+            stats.files_examined,
+            stats.files_skipped,
+            stats.candidates_processed
+        );
+    }
+    let classified = stats
+        .matches
+        .saturating_add(stats.aliases)
+        .saturating_add(stats.mismatches)
+        .saturating_add(stats.unknown)
+        .saturating_add(stats.no_extension);
+    if classified != stats.files_examined {
+        bail!(
+            "signature-analysis disposition mismatch: {classified} outcomes for {} examined files",
+            stats.files_examined
+        );
+    }
+    Ok(())
+}
+
+fn signature_analysis_snapshot_page(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: Option<i64>,
+    cursor: Option<&SignatureAnalysisCursor>,
+    page_limit: usize,
+) -> Result<Vec<SignatureAnalysisCandidate>> {
+    let cursor_evidence_id = cursor.map(|value| value.evidence_id);
+    let cursor_logical_path = cursor.map(|value| value.logical_path.as_str());
+    let cursor_entry_id = cursor.map(|value| value.entry_id);
+    let mut stmt = conn.prepare(
+        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.metadata_json,
+                fe.size_bytes, fe.content_head
+         FROM filesystem_entries AS fe
+         INNER JOIN temp.signature_analysis_candidates AS snapshot
+                 ON snapshot.entry_id = fe.id
+         WHERE fe.case_id = ?1
+           AND (?2 IS NULL OR fe.evidence_id = ?2)
+           AND (
+               ?3 IS NULL
+               OR fe.evidence_id > ?3
+               OR (fe.evidence_id = ?3 AND fe.logical_path > ?4)
+               OR (fe.evidence_id = ?3 AND fe.logical_path = ?4 AND fe.id > ?5)
+           )
+         ORDER BY fe.evidence_id, fe.logical_path, fe.id
+         LIMIT ?6",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            case_id,
+            evidence_id,
+            cursor_evidence_id,
+            cursor_logical_path,
+            cursor_entry_id,
+            i64::try_from(page_limit).unwrap_or(i64::MAX),
+        ],
+        |row| {
+            Ok(SignatureAnalysisCandidate {
+                entry_id: row.get(0)?,
+                evidence_id: row.get(1)?,
+                logical_path: row.get(2)?,
+                name: row.get(3)?,
+                metadata_json: row.get(4)?,
+                size_bytes: row
+                    .get::<_, Option<i64>>(5)?
+                    .map(|value| u64::try_from(value.max(0)).unwrap_or(0)),
+                content_head: row.get(6)?,
+            })
+        },
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("listing a stable signature-analysis candidate page")
+}
+
+fn signature_analysis_snapshot_drift_count(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: Option<i64>,
+) -> Result<usize> {
+    let unexpected_current: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM filesystem_entries AS fe
+         LEFT JOIN temp.signature_analysis_candidates AS snapshot
+                ON snapshot.entry_id = fe.id
+         WHERE fe.case_id = ?1
+           AND (?2 IS NULL OR fe.evidence_id = ?2)
+           AND fe.entry_kind = 'file'
+           AND CASE
+                   WHEN json_valid(fe.metadata_json)
+                   THEN COALESCE(json_extract(fe.metadata_json, '$.signature_analysis'), '')
+                   ELSE ''
+               END <> ?3
+           AND snapshot.entry_id IS NULL",
+        params![case_id, evidence_id, SIGNATURE_ANALYSIS_VERSION],
+        |row| row.get(0),
+    )?;
+    let missing_snapshot: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM temp.signature_analysis_candidates AS snapshot
+         LEFT JOIN filesystem_entries AS fe ON fe.id = snapshot.entry_id
+         WHERE fe.id IS NULL
+            OR fe.case_id <> ?1
+            OR (?2 IS NOT NULL AND fe.evidence_id <> ?2)
+            OR fe.entry_kind <> 'file'
+            OR CASE
+                   WHEN json_valid(fe.metadata_json)
+                   THEN COALESCE(json_extract(fe.metadata_json, '$.signature_analysis'), '')
+                   ELSE ''
+               END = ?3",
+        params![case_id, evidence_id, SIGNATURE_ANALYSIS_VERSION],
+        |row| row.get(0),
+    )?;
+    usize::try_from(unexpected_current.saturating_add(missing_snapshot))
+        .context("signature snapshot drift count exceeds usize")
+}
+
+fn finalize_signature_analysis_attempt(
+    conn: &mut Connection,
+    case_id: i64,
+    evidence_id: Option<i64>,
+    job_id: i64,
+    status: &str,
+    status_note: Option<&str>,
+    parameters_json: &str,
+    audit_details_json: &str,
+    publish_staged: bool,
+) -> Result<usize> {
+    let staged_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM temp.signature_analysis_stage",
+        [],
+        |row| row.get(0),
+    )?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+    let metadata_updates_committed = if publish_staged {
+        let changed = tx.execute(
+            "UPDATE filesystem_entries
+             SET metadata_json = json_patch(
+                 metadata_json,
+                 (SELECT stage.metadata_patch_json
+                  FROM temp.signature_analysis_stage AS stage
+                  WHERE stage.entry_id = filesystem_entries.id)
+             )
+             WHERE case_id = ?1
+               AND id IN (SELECT entry_id FROM temp.signature_analysis_stage)",
+            params![case_id],
+        )?;
+        let changed = i64::try_from(changed).unwrap_or(i64::MAX);
+        if changed != staged_count {
+            bail!(
+                "publishing signature-analysis metadata affected {changed} rows; expected {staged_count}"
+            );
+        }
+        usize::try_from(changed).context("published signature update count exceeds usize")?
+    } else {
+        0
+    };
+    let changed = tx.execute(
+        "UPDATE evidence_jobs
+         SET status = ?1,
+             finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             error = ?2,
+             parameters_json = ?3
+         WHERE id = ?4 AND status = 'running'",
+        params![status, status_note, parameters_json, job_id],
+    )?;
+    if changed != 1 {
+        bail!(
+            "finalizing running signature-analysis job {job_id} affected {changed} rows; metadata publication was rolled back"
+        );
+    }
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'evidence.signature_analysis', ?2, 'evidence', ?3, json(?4))",
+        params![case_id, actor, evidence_id, audit_details_json],
+    )?;
+    tx.commit()
+        .context("atomically publishing signature-analysis metadata and job finalization")?;
+    Ok(metadata_updates_committed)
+}
+
+#[allow(dead_code)]
+fn analyze_signatures_legacy(
     case_path: &Path,
     options: AnalyzeSignaturesOptions,
 ) -> Result<AnalyzeSignaturesResult> {
@@ -6190,19 +11182,27 @@ pub fn analyze_signatures(
                      parameters_json,
                      '$.candidates_processed', ?3,
                      '$.files_examined', ?4,
-                     '$.files_skipped', ?5,
-                     '$.unreadable', ?6,
-                     '$.metadata_parse_errors', ?7,
-                     '$.errors', json(?8),
-                     '$.errors_omitted', ?9,
-                     '$.truncated', json(?10)
-                 )
-             WHERE id = ?11",
+                     '$.not_applicable', ?5,
+                     '$.not_applicable_wof_auxiliary_streams', ?6,
+                     '$.not_applicable_ntfs_no_unnamed_stream', ?7,
+                     '$.not_applicable_non_file_rows', ?8,
+                     '$.files_skipped', ?9,
+                     '$.unreadable', ?10,
+                     '$.metadata_parse_errors', ?11,
+                     '$.errors', json(?12),
+                     '$.errors_omitted', ?13,
+                     '$.truncated', json(?14)
+                  )
+             WHERE id = ?15",
             params![
                 status,
                 status_error,
                 i64::try_from(stats.candidates_processed).unwrap_or(i64::MAX),
                 i64::try_from(stats.files_examined).unwrap_or(i64::MAX),
+                i64::try_from(stats.not_applicable).unwrap_or(i64::MAX),
+                i64::try_from(stats.not_applicable_wof_auxiliary_streams).unwrap_or(i64::MAX),
+                i64::try_from(stats.not_applicable_ntfs_no_unnamed_stream).unwrap_or(i64::MAX),
+                i64::try_from(stats.not_applicable_non_file_rows).unwrap_or(i64::MAX),
                 i64::try_from(stats.files_skipped).unwrap_or(i64::MAX),
                 i64::try_from(stats.unreadable).unwrap_or(i64::MAX),
                 i64::try_from(stats.metadata_parse_errors).unwrap_or(i64::MAX),
@@ -6220,9 +11220,13 @@ pub fn analyze_signatures(
              VALUES (?1, 'evidence.signature_analysis', ?2, 'evidence', ?3,
                      json_object('job_id', ?4, 'candidates_total', ?5,
                                  'candidates_processed', ?6, 'files_examined', ?7,
-                                 'files_skipped', ?8, 'mismatches', ?9,
-                                 'unreadable', ?10, 'metadata_parse_errors', ?11,
-                                 'errors_omitted', ?12, 'truncated', ?13, 'status', ?14))",
+                                 'not_applicable', ?8,
+                                 'not_applicable_wof_auxiliary_streams', ?9,
+                                 'not_applicable_ntfs_no_unnamed_stream', ?10,
+                                 'not_applicable_non_file_rows', ?11,
+                                 'files_skipped', ?12, 'mismatches', ?13,
+                                 'unreadable', ?14, 'metadata_parse_errors', ?15,
+                                 'errors_omitted', ?16, 'truncated', ?17, 'status', ?18))",
             params![
                 case_id,
                 actor,
@@ -6231,6 +11235,10 @@ pub fn analyze_signatures(
                 i64::try_from(candidates_total).unwrap_or(i64::MAX),
                 i64::try_from(stats.candidates_processed).unwrap_or(i64::MAX),
                 i64::try_from(stats.files_examined).unwrap_or(i64::MAX),
+                i64::try_from(stats.not_applicable).unwrap_or(i64::MAX),
+                i64::try_from(stats.not_applicable_wof_auxiliary_streams).unwrap_or(i64::MAX),
+                i64::try_from(stats.not_applicable_ntfs_no_unnamed_stream).unwrap_or(i64::MAX),
+                i64::try_from(stats.not_applicable_non_file_rows).unwrap_or(i64::MAX),
                 i64::try_from(stats.files_skipped).unwrap_or(i64::MAX),
                 i64::try_from(stats.mismatches).unwrap_or(i64::MAX),
                 i64::try_from(stats.unreadable).unwrap_or(i64::MAX),
@@ -6265,6 +11273,10 @@ pub fn analyze_signatures(
         candidates_total,
         candidates_processed: stats.candidates_processed,
         files_examined: stats.files_examined,
+        not_applicable: stats.not_applicable,
+        not_applicable_wof_auxiliary_streams: stats.not_applicable_wof_auxiliary_streams,
+        not_applicable_ntfs_no_unnamed_stream: stats.not_applicable_ntfs_no_unnamed_stream,
+        not_applicable_non_file_rows: stats.not_applicable_non_file_rows,
         files_skipped: stats.files_skipped,
         matches: stats.matches,
         aliases: stats.aliases,
@@ -6275,6 +11287,10 @@ pub fn analyze_signatures(
         metadata_parse_errors: stats.metadata_parse_errors,
         errors: stats.errors,
         errors_omitted: stats.errors_omitted,
+        metadata_updates_committed: stats.metadata_updates_staged,
+        replacement_committed: true,
+        canonical_generation_preserved: false,
+        completed_with_diagnostics: incomplete_errors,
         truncated,
         status: status.to_string(),
     })
@@ -6357,42 +11373,16 @@ fn analyze_signature_candidate_pages(
                     }
                 };
 
-            // Skip synthetic rows that are not real byte files.
-            let artifact_kind = metadata
-                .get("artifact_kind")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            if artifact_kind == "unallocated_space" {
-                stats.files_skipped = stats.files_skipped.saturating_add(1);
-                progress::progress_skip(Some(candidate.logical_path.clone()));
-                progress::progress_advance(candidate.logical_path);
-                continue;
-            }
-
-            // :WofCompressedData is the compressed implementation stream for
-            // a separate logical file. Its magic describes WOF storage, not
-            // the evidence file's true type, so treating it as another file
-            // produces duplicate and misleading signature findings.
-            if metadata
-                .as_object()
-                .is_some_and(is_wof_backing_stream_metadata)
-            {
-                if let Some(object) = metadata.as_object_mut() {
-                    object.insert(
-                        "signature_status".to_string(),
-                        serde_json::json!("not_applicable"),
-                    );
-                    object.insert(
-                        "signature_reason".to_string(),
-                        serde_json::json!("WOF backing stream is auxiliary compressed storage; signature verification applies to the reconstructed logical file"),
-                    );
-                    object.insert(
-                        "signature_analysis".to_string(),
-                        serde_json::json!(SIGNATURE_ANALYSIS_VERSION),
-                    );
-                }
+            let has_captured_header = candidate
+                .content_head
+                .as_ref()
+                .is_some_and(|bytes| !bytes.is_empty());
+            if let Some((reason, basis)) = metadata.as_object().and_then(|object| {
+                signature_not_applicable_from_metadata(object, has_captured_header)
+            }) {
+                stamp_signature_not_applicable(&mut metadata, reason, basis);
                 updates.push((candidate.entry_id, metadata.to_string()));
-                stats.files_skipped = stats.files_skipped.saturating_add(1);
+                record_signature_not_applicable(stats, reason);
                 progress::progress_skip(Some(candidate.logical_path.clone()));
                 progress::progress_advance(candidate.logical_path);
                 continue;
@@ -6410,7 +11400,9 @@ fn analyze_signature_candidate_pages(
                     SignatureHeaderSample {
                         bytes: content_head[..length].to_vec(),
                         window_complete: length >= 1024
-                            || candidate.size_bytes <= u64::try_from(length).unwrap_or(u64::MAX),
+                            || candidate.size_bytes.is_some_and(|size_bytes| {
+                                size_bytes <= u64::try_from(length).unwrap_or(u64::MAX)
+                            }),
                     }
                 })
             });
@@ -6420,6 +11412,19 @@ fn analyze_signature_candidate_pages(
             let header = match header_result {
                 Ok(header) => header,
                 Err(error) => {
+                    if signature_error_is_ntfs_no_unnamed_data_stream(&error) {
+                        let reason = SignatureNotApplicableReason::NtfsNoUnnamedDataStream;
+                        stamp_signature_not_applicable(
+                            &mut metadata,
+                            reason,
+                            "authoritative_evidence_reader",
+                        );
+                        updates.push((candidate.entry_id, metadata.to_string()));
+                        record_signature_not_applicable(stats, reason);
+                        progress::progress_skip(Some(candidate.logical_path.clone()));
+                        progress::progress_advance(candidate.logical_path);
+                        continue;
+                    }
                     let message = format!(
                         "{} (entry {}): unable to read signature header: {error:#}",
                         candidate.logical_path, candidate.entry_id
@@ -6463,6 +11468,8 @@ fn analyze_signature_candidate_pages(
                 progress::progress_advance(candidate.logical_path);
                 continue;
             };
+            object.remove("signature_not_applicable_reason_code");
+            object.remove("signature_applicability_basis");
             object.insert(
                 "signature_status".to_string(),
                 serde_json::Value::String(finding.status.to_string()),
@@ -6492,6 +11499,16 @@ fn analyze_signature_candidate_pages(
             object.insert(
                 "signature_analysis".to_string(),
                 serde_json::Value::String(SIGNATURE_ANALYSIS_VERSION.to_string()),
+            );
+            // Categories are stamped during the initial filesystem walk, before
+            // file-type verification. Re-run the classifier after a signature
+            // finding so a verified mismatch (for example CSV bytes named
+            // `.pdf`) cannot remain in an extension-only category.
+            add_entry_category(
+                &mut metadata,
+                &candidate.logical_path,
+                &candidate.name,
+                "file",
             );
             updates.push((candidate.entry_id, metadata.to_string()));
             progress::progress_advance(candidate.logical_path);
@@ -6550,7 +11567,7 @@ fn signature_analysis_candidate_page(
                 logical_path: row.get(2)?,
                 name: row.get(3)?,
                 metadata_json: row.get(4)?,
-                size_bytes: u64::try_from(row.get::<_, i64>(5)?.max(0)).unwrap_or(0),
+                size_bytes: Some(u64::try_from(row.get::<_, i64>(5)?.max(0)).unwrap_or(0)),
                 content_head: row.get(6)?,
             })
         },
@@ -6622,21 +11639,57 @@ fn mark_signature_analysis_failed(
                  parameters_json,
                  '$.candidates_processed', ?2,
                  '$.files_examined', ?3,
-                 '$.files_skipped', ?4,
-                 '$.unreadable', ?5,
-                 '$.metadata_parse_errors', ?6,
-                 '$.errors', json(?7),
-                 '$.errors_omitted', ?8,
+                 '$.not_applicable', ?4,
+                 '$.not_applicable_wof_auxiliary_streams', ?5,
+                 '$.not_applicable_ntfs_no_unnamed_stream', ?6,
+                 '$.not_applicable_non_file_rows', ?7,
+                 '$.files_skipped', ?8,
+                 '$.matches', ?9,
+                 '$.aliases', ?10,
+                 '$.mismatches', ?11,
+                 '$.unknown', ?12,
+                 '$.no_extension', ?13,
+                 '$.unreadable', ?14,
+                 '$.metadata_parse_errors', ?15,
+                 '$.authoritative_header_reads', ?16,
+                 '$.captured_headers_reused', ?17,
+                 '$.content_identity_headers_reused', ?18,
+                 '$.metadata_updates_staged', ?19,
+                 '$.metadata_patch_bytes_staged', ?20,
+                 '$.metadata_updates_committed', 0,
+                 '$.replacement_committed', json('false'),
+                 '$.canonical_generation_preserved',
+                    CASE
+                        WHEN COALESCE(json_extract(parameters_json, '$.prior_signature_metadata_rows'), 0) > 0
+                        THEN json('true') ELSE json('false')
+                    END,
+                 '$.completed_with_diagnostics', json('false'),
+                 '$.errors', json(?21),
+                 '$.errors_omitted', ?22,
                  '$.truncated', json('false')
              )
-         WHERE id = ?9",
+         WHERE id = ?23 AND status = 'running'",
         params![
             error,
             i64::try_from(stats.candidates_processed).unwrap_or(i64::MAX),
             i64::try_from(stats.files_examined).unwrap_or(i64::MAX),
+            i64::try_from(stats.not_applicable).unwrap_or(i64::MAX),
+            i64::try_from(stats.not_applicable_wof_auxiliary_streams).unwrap_or(i64::MAX),
+            i64::try_from(stats.not_applicable_ntfs_no_unnamed_stream).unwrap_or(i64::MAX),
+            i64::try_from(stats.not_applicable_non_file_rows).unwrap_or(i64::MAX),
             i64::try_from(stats.files_skipped).unwrap_or(i64::MAX),
+            i64::try_from(stats.matches).unwrap_or(i64::MAX),
+            i64::try_from(stats.aliases).unwrap_or(i64::MAX),
+            i64::try_from(stats.mismatches).unwrap_or(i64::MAX),
+            i64::try_from(stats.unknown).unwrap_or(i64::MAX),
+            i64::try_from(stats.no_extension).unwrap_or(i64::MAX),
             i64::try_from(stats.unreadable).unwrap_or(i64::MAX),
             i64::try_from(stats.metadata_parse_errors).unwrap_or(i64::MAX),
+            i64::try_from(stats.authoritative_header_reads).unwrap_or(i64::MAX),
+            i64::try_from(stats.captured_headers_reused).unwrap_or(i64::MAX),
+            i64::try_from(stats.content_identity_headers_reused).unwrap_or(i64::MAX),
+            i64::try_from(stats.metadata_updates_staged).unwrap_or(i64::MAX),
+            i64::try_from(stats.metadata_patch_bytes_staged).unwrap_or(i64::MAX),
             errors_json,
             i64::try_from(stats.errors_omitted).unwrap_or(i64::MAX),
             job_id
@@ -6743,20 +11796,12 @@ fn persist_browser_history_import(
     let counts = import_data.records.counts;
     let visit_limit_reached = import_data.total_visits > counts.visits;
     let artifact_limit_reached = import_data.examiner_artifact_limit_reached;
-    let parser_errors_present = import_data.parse_error_count > 0;
-    let truncated = visit_limit_reached || artifact_limit_reached || parser_errors_present;
-    let mut truncation_reasons = Vec::with_capacity(3);
-    if visit_limit_reached {
-        truncation_reasons.push("examiner visit limit reached");
-    }
-    if artifact_limit_reached {
-        truncation_reasons.push("examiner per-artifact row limit reached");
-    }
-    if parser_errors_present {
-        truncation_reasons.push("one or more browser artifact tables could not be parsed");
-    }
-    let truncation_reason = (!truncation_reasons.is_empty()).then(|| truncation_reasons.join("; "));
-    let entries_indexed = counts.total();
+    let disposition = BrowserImportDisposition::classify(
+        visit_limit_reached,
+        artifact_limit_reached,
+        import_data.parse_error_count,
+    );
+    let attempt_entries_parsed = counts.total();
     let visits_indexed = counts.visits;
     let bookmarks_indexed = counts.bookmarks;
     let preferences_indexed = counts.preferences;
@@ -6774,76 +11819,99 @@ fn persist_browser_history_import(
         import_data.family,
         i64::try_from(source_metadata.len()).context("history database size exceeds i64")?,
     )?;
+    let (visible_entries_before, prior_complete_entries) =
+        browser_dataset_generation_counts(&tx, case_id, evidence_id, None)?;
+    let canonical_generation_preserved =
+        !disposition.complete_generation() && prior_complete_entries > 0;
+    let entries_indexed = if canonical_generation_preserved {
+        visible_entries_before
+    } else {
+        attempt_entries_parsed
+    };
+    let parameters_json = annotate_browser_import_attempt(
+        &import_data.parameters_json,
+        &disposition,
+        attempt_entries_parsed,
+        entries_indexed,
+        prior_complete_entries,
+        canonical_generation_preserved,
+        !canonical_generation_preserved,
+    )?;
     tx.execute(
         "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json, started_at)
          VALUES (?1, ?2, 'browser_history_import', 'running', ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        params![case_id, evidence_id, import_data.parameters_json],
+        params![case_id, evidence_id, parameters_json],
     )?;
     let job_id = tx.last_insert_rowid();
 
-    tx.execute(
-        "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
-        params![case_id, evidence_id],
-    )?;
-    import_data.records.for_each_record(|record| {
-        let metadata_json: serde_json::Value = serde_json::from_str(&record.metadata_json)
-            .with_context(|| format!("parsing browser metadata for {}", record.logical_path))?;
-        let metadata_json = metadata_json.to_string();
-        upsert_filesystem_entry(
-            &tx,
-            case_id,
-            evidence_id,
-            &record.logical_path,
-            &record.display_name,
-            "record",
-            None,
-            &metadata_json,
-            job_id,
+    if !canonical_generation_preserved {
+        tx.execute(
+            "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+            params![case_id, evidence_id],
         )?;
-        Ok(())
-    })?;
-    relink_bookmark_items_tx(&tx, case_id, evidence_id)?;
-    let status = if truncated { "truncated" } else { "completed" };
+        import_data.records.for_each_record(|record| {
+            let metadata_json: serde_json::Value = serde_json::from_str(&record.metadata_json)
+                .with_context(|| format!("parsing browser metadata for {}", record.logical_path))?;
+            let metadata_json = metadata_json.to_string();
+            upsert_filesystem_entry(
+                &tx,
+                case_id,
+                evidence_id,
+                &record.logical_path,
+                &record.display_name,
+                "record",
+                None,
+                &metadata_json,
+                job_id,
+            )?;
+            Ok(())
+        })?;
+        relink_bookmark_items_tx(&tx, case_id, evidence_id)?;
+    }
+    let status = disposition.status;
     tx.execute(
         "UPDATE evidence_jobs
          SET status = ?1,
              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-             error = ?2,
-             parameters_json = json_set(parameters_json, '$.entries_indexed', ?3)
-         WHERE id = ?4",
-        params![
-            status,
-            truncation_reason,
-            i64::try_from(entries_indexed).unwrap_or(i64::MAX),
-            job_id
-        ],
+             error = ?2
+         WHERE id = ?3",
+        params![status, disposition.reason, job_id],
     )?;
     tx.execute(
         "UPDATE evidence_sources
-         SET indexed_at = CASE WHEN ?3 = 0
-             THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             ELSE NULL
+         SET indexed_at = CASE
+             WHEN ?3 != 0 THEN indexed_at
+             WHEN ?4 != 0 THEN NULL
+             ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          END
          WHERE id = ?1 AND case_id = ?2",
-        params![evidence_id, case_id, if truncated { 1 } else { 0 }],
+        params![
+            evidence_id,
+            case_id,
+            if canonical_generation_preserved { 1 } else { 0 },
+            if disposition.truncated { 1 } else { 0 },
+        ],
     )?;
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'browser_history.import', ?2, 'evidence', ?3,
-                 json_object('job_id', ?4, 'entries_indexed', ?5, 'truncated', ?6,
-                             'status', ?7, 'truncation_reason', ?8, 'source_path', ?9,
-                             'parse_errors', ?10))",
+                 json_object('job_id', ?4, 'entries_indexed', ?5, 'attempt_entries_parsed', ?6,
+                             'truncated', ?7,
+                             'status', ?8, 'status_reason', ?9, 'source_path', ?10,
+                             'parse_errors', ?11, 'canonical_generation_preserved', ?12))",
         params![
             case_id,
             actor,
             evidence_id,
             job_id,
             entries_indexed as i64,
-            if truncated { 1 } else { 0 },
+            attempt_entries_parsed as i64,
+            if disposition.truncated { 1 } else { 0 },
             status,
-            truncation_reason,
+            disposition.reason,
             import_data.source_path,
             parse_error_count,
+            if canonical_generation_preserved { 1 } else { 0 },
         ],
     )?;
     tx.commit()?;
@@ -6856,7 +11924,7 @@ fn persist_browser_history_import(
         visits_indexed,
         bookmarks_indexed,
         preferences_indexed,
-        truncated,
+        truncated: disposition.truncated,
         visit_limit_reached,
         artifact_limit_reached,
         limited_artifact_kinds: import_data.limited_artifact_kinds,
@@ -6885,19 +11953,12 @@ fn persist_browser_artifacts_into_evidence(
     let counts = import_data.records.counts;
     let visit_limit_reached = import_data.total_visits > counts.visits;
     let artifact_limit_reached = import_data.examiner_artifact_limit_reached;
-    let parser_errors_present = import_data.parse_error_count > 0;
-    let truncated = visit_limit_reached || artifact_limit_reached || parser_errors_present;
-    let mut truncation_reasons = Vec::with_capacity(3);
-    if visit_limit_reached {
-        truncation_reasons.push("examiner visit limit reached");
-    }
-    if artifact_limit_reached {
-        truncation_reasons.push("examiner per-artifact row limit reached");
-    }
-    if parser_errors_present {
-        truncation_reasons.push("one or more browser artifact tables could not be parsed");
-    }
-    let truncation_reason = (!truncation_reasons.is_empty()).then(|| truncation_reasons.join("; "));
+    let disposition = BrowserImportDisposition::classify(
+        visit_limit_reached,
+        artifact_limit_reached,
+        import_data.parse_error_count,
+    );
+    let attempt_entries_parsed = counts.total();
     let visits_indexed = counts.visits;
     let bookmarks_indexed = counts.bookmarks;
     let preferences_indexed = counts.preferences;
@@ -6924,6 +11985,19 @@ fn persist_browser_artifacts_into_evidence(
         &options.source_profile_path,
         options.volume_index_zero_based,
     )?;
+    let (visible_entries_before, prior_complete_entries) = browser_dataset_generation_counts(
+        &tx,
+        case_id,
+        options.evidence_id,
+        Some(&derivation_key),
+    )?;
+    let canonical_generation_preserved =
+        !disposition.complete_generation() && prior_complete_entries > 0;
+    let retained_entries = if canonical_generation_preserved {
+        visible_entries_before
+    } else {
+        attempt_entries_parsed
+    };
     let mut parameters: serde_json::Value = serde_json::from_str(&import_data.parameters_json)
         .context("parsing browser import job parameters")?;
     if let Some(object) = parameters.as_object_mut() {
@@ -6944,88 +12018,104 @@ fn persist_browser_artifacts_into_evidence(
             serde_json::json!(options.volume_index_zero_based),
         );
     }
+    let parameters = annotate_browser_import_attempt(
+        &parameters.to_string(),
+        &disposition,
+        attempt_entries_parsed,
+        retained_entries,
+        prior_complete_entries,
+        canonical_generation_preserved,
+        !canonical_generation_preserved,
+    )?;
     tx.execute(
         "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json, started_at)
          VALUES (?1, ?2, 'browser_history_import', 'running', ?3,
                  strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        params![case_id, options.evidence_id, parameters.to_string()],
+        params![case_id, options.evidence_id, parameters],
     )?;
     let job_id = tx.last_insert_rowid();
 
     // One profile is one replaceable derived dataset. This makes both a
     // repeated parser run and a full evidence reprocess idempotent.
-    tx.execute(
-        "DELETE FROM filesystem_entries
-         WHERE case_id = ?1 AND evidence_id = ?2
-           AND json_extract(metadata_json, '$.browser_derivation_key') = ?3",
-        params![case_id, options.evidence_id, derivation_key],
-    )?;
-    let context = BrowserDerivedImportContext {
-        evidence_id: options.evidence_id,
-        derivation_key: &derivation_key,
-        logical_prefix: &logical_prefix,
-        source_profile_path: &options.source_profile_path,
-        volume_index_zero_based: options.volume_index_zero_based,
-        staging_path: &options.history_path,
-        source_files: &source_files,
-    };
-    let entries_indexed = insert_browser_history_records_into_evidence(
-        &tx,
-        case_id,
-        options.evidence_id,
-        job_id,
-        &import_data,
-        Some(&context),
-    )?;
-    let _retired_staging_paths = if let Some(legacy_name) = options
-        .legacy_evidence_name
-        .as_deref()
-        .filter(|name| name.contains("(auto-parsed from "))
-    {
-        retire_legacy_browser_evidence(
+    let entries_indexed = if canonical_generation_preserved {
+        visible_entries_before
+    } else {
+        tx.execute(
+            "DELETE FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_extract(metadata_json, '$.browser_derivation_key') = ?3",
+            params![case_id, options.evidence_id, derivation_key],
+        )?;
+        let context = BrowserDerivedImportContext {
+            evidence_id: options.evidence_id,
+            derivation_key: &derivation_key,
+            logical_prefix: &logical_prefix,
+            source_profile_path: &options.source_profile_path,
+            volume_index_zero_based: options.volume_index_zero_based,
+            staging_path: &options.history_path,
+            source_files: &source_files,
+        };
+        insert_browser_history_records_into_evidence(
             &tx,
             case_id,
             options.evidence_id,
-            legacy_name,
-            &logical_prefix,
+            job_id,
+            &import_data,
+            Some(&context),
         )?
+    };
+    let _retired_staging_paths = if !canonical_generation_preserved {
+        if let Some(legacy_name) = options
+            .legacy_evidence_name
+            .as_deref()
+            .filter(|name| name.contains("(auto-parsed from "))
+        {
+            retire_legacy_browser_evidence(
+                &tx,
+                case_id,
+                options.evidence_id,
+                legacy_name,
+                &logical_prefix,
+            )?
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
-    relink_bookmark_items_tx(&tx, case_id, options.evidence_id)?;
+    if !canonical_generation_preserved {
+        relink_bookmark_items_tx(&tx, case_id, options.evidence_id)?;
+    }
 
-    let status = if truncated { "truncated" } else { "completed" };
+    let status = disposition.status;
     tx.execute(
         "UPDATE evidence_jobs
          SET status = ?1,
              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-             error = ?2,
-             parameters_json = json_set(parameters_json, '$.entries_indexed', ?3)
-         WHERE id = ?4",
-        params![
-            status,
-            truncation_reason,
-            i64::try_from(entries_indexed).unwrap_or(i64::MAX),
-            job_id,
-        ],
+             error = ?2
+         WHERE id = ?3",
+        params![status, disposition.reason, job_id],
     )?;
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'browser_history.derive', ?2, 'evidence', ?3,
-                 json_object('job_id', ?4, 'entries_indexed', ?5, 'truncated', ?6,
-                             'status', ?7, 'source_profile_path', ?8,
-                             'browser_derivation_key', ?9, 'parse_errors', ?10))",
+                 json_object('job_id', ?4, 'entries_indexed', ?5, 'attempt_entries_parsed', ?6,
+                             'truncated', ?7, 'status', ?8, 'source_profile_path', ?9,
+                             'browser_derivation_key', ?10, 'parse_errors', ?11,
+                             'canonical_generation_preserved', ?12))",
         params![
             case_id,
             actor,
             options.evidence_id,
             job_id,
             i64::try_from(entries_indexed).unwrap_or(i64::MAX),
-            if truncated { 1 } else { 0 },
+            i64::try_from(attempt_entries_parsed).unwrap_or(i64::MAX),
+            if disposition.truncated { 1 } else { 0 },
             status,
             options.source_profile_path,
             derivation_key,
             parse_error_count,
+            if canonical_generation_preserved { 1 } else { 0 },
         ],
     )?;
     tx.commit()?;
@@ -7038,7 +12128,7 @@ fn persist_browser_artifacts_into_evidence(
         visits_indexed,
         bookmarks_indexed,
         preferences_indexed,
-        truncated,
+        truncated: disposition.truncated,
         visit_limit_reached,
         artifact_limit_reached,
         limited_artifact_kinds: import_data.limited_artifact_kinds,
@@ -7626,6 +12716,8 @@ fn path_search_page_results(
             selection_offset: None,
             selection_length: None,
             data_preview: preview,
+            parsed_segment_kind: None,
+            parsed_segment_provenance: None,
         });
     }
     let exhausted = results.len() < limit;
@@ -7645,7 +12737,8 @@ fn parsed_text_search_page_results(
 ) -> Result<DeepSearchPhaseBatch> {
     let mut stmt = conn.prepare(&format!(
         "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
-                fe.metadata_json, segments.part_name, segments.content
+                fe.metadata_json, segments.parser_name, segments.part_name,
+                segments.segment_kind, segments.provenance_json, segments.content
          FROM filesystem_entry_text_segments segments
          JOIN filesystem_entries fe ON fe.id = segments.entry_id
          WHERE fe.case_id = ?1
@@ -7680,14 +12773,20 @@ fn parsed_text_search_page_results(
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
-                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Vec<u8>>(10)?,
             ))
         },
     )?;
     let mut results = Vec::new();
     let mut matched_entry = None;
     let mut previous_entry_id = None;
+    let mut previous_parser = String::new();
     let mut previous_part = String::new();
+    let mut previous_kind = String::new();
+    let mut previous_provenance = String::new();
     let mut previous_tail = Vec::new();
     let mut exhausted = true;
     for row in rows {
@@ -7698,13 +12797,19 @@ fn parsed_text_search_page_results(
             display_name,
             entry_kind,
             metadata_json,
+            parser_name,
             part_name,
+            segment_kind,
+            segment_provenance,
             segment_content,
         ) = row.context("reading paged parser-derived search candidate")?;
         if previous_entry_id != Some(entry_id) {
             previous_entry_id = Some(entry_id);
             matched_entry = None;
+            previous_parser.clear();
             previous_part.clear();
+            previous_kind.clear();
+            previous_provenance.clear();
             previous_tail.clear();
         }
         if matched_entry == Some(entry_id) {
@@ -7712,7 +12817,11 @@ fn parsed_text_search_page_results(
         }
         let mut searchable =
             Vec::with_capacity(previous_tail.len().saturating_add(segment_content.len()));
-        if previous_part == part_name {
+        if previous_parser == parser_name
+            && previous_part == part_name
+            && previous_kind == segment_kind
+            && previous_provenance == segment_provenance
+        {
             searchable.extend_from_slice(&previous_tail);
         }
         searchable.extend_from_slice(&segment_content);
@@ -7730,7 +12839,12 @@ fn parsed_text_search_page_results(
                 match_kind: "parsed_content".to_string(),
                 selection_offset: None,
                 selection_length: None,
-                data_preview: Some(format!("{}: {}", part_name, hit.data_preview)),
+                data_preview: Some(format!(
+                    "{} [{}]: {}",
+                    part_name, segment_kind, hit.data_preview
+                )),
+                parsed_segment_kind: Some(segment_kind),
+                parsed_segment_provenance: serde_json::from_str(&segment_provenance).ok(),
             });
             matched_entry = Some(entry_id);
             if results.len() >= limit {
@@ -7739,7 +12853,10 @@ fn parsed_text_search_page_results(
             }
             continue;
         }
+        previous_parser = parser_name;
         previous_part = part_name;
+        previous_kind = segment_kind;
+        previous_provenance = segment_provenance;
         previous_tail = byte_tail(&searchable, content_search_overlap_bytes(query));
     }
     Ok(DeepSearchPhaseBatch { results, exhausted })
@@ -7796,7 +12913,7 @@ fn content_search_page_results(
         },
     )?;
     let mut parsed_match_stmt = conn.prepare(
-        "SELECT part_name, content
+        "SELECT parser_name, part_name, segment_kind, provenance_json, content
          FROM filesystem_entry_text_segments
          WHERE entry_id = ?1
          ORDER BY parser_name, segment_index",
@@ -7850,21 +12967,38 @@ fn parsed_text_entry_matches(
     query: &str,
 ) -> Result<bool> {
     let rows = stmt.query_map([entry_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+        ))
     })?;
+    let mut previous_parser = String::new();
     let mut previous_part = String::new();
+    let mut previous_kind = String::new();
+    let mut previous_provenance = String::new();
     let mut previous_tail = Vec::new();
     for row in rows {
-        let (part_name, content) = row.context("reading parser text for search precedence")?;
+        let (parser_name, part_name, segment_kind, provenance, content) =
+            row.context("reading parser text for search precedence")?;
         let mut searchable = Vec::with_capacity(previous_tail.len().saturating_add(content.len()));
-        if previous_part == part_name {
+        if previous_parser == parser_name
+            && previous_part == part_name
+            && previous_kind == segment_kind
+            && previous_provenance == provenance
+        {
             searchable.extend_from_slice(&previous_tail);
         }
         searchable.extend_from_slice(&content);
         if content_search_hit(&searchable, query).is_some() {
             return Ok(true);
         }
+        previous_parser = parser_name;
         previous_part = part_name;
+        previous_kind = segment_kind;
+        previous_provenance = provenance;
         previous_tail = byte_tail(&searchable, content_search_overlap_bytes(query));
     }
     Ok(false)
@@ -7943,6 +13077,8 @@ fn content_hex_search_page_results(
                     offset,
                     needle.len(),
                 )),
+                parsed_segment_kind: None,
+                parsed_segment_provenance: None,
             });
             if results.len() >= limit {
                 exhausted = false;
@@ -7964,7 +13100,8 @@ fn parsed_text_search_results(
 ) -> Result<()> {
     let mut stmt = conn.prepare(&format!(
         "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
-                fe.metadata_json, segments.part_name, segments.content
+                fe.metadata_json, segments.parser_name, segments.part_name,
+                segments.segment_kind, segments.provenance_json, segments.content
          FROM filesystem_entry_text_segments segments
          JOIN filesystem_entries fe ON fe.id = segments.entry_id
          WHERE fe.case_id = ?1
@@ -7983,7 +13120,10 @@ fn parsed_text_search_results(
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
-            row.get::<_, Vec<u8>>(7)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, Vec<u8>>(10)?,
         ))
     })?;
 
@@ -7993,7 +13133,10 @@ fn parsed_text_search_results(
         .collect::<HashSet<_>>();
     let mut parsed_matched = HashSet::new();
     let mut previous_entry_id = None;
+    let mut previous_parser = String::new();
     let mut previous_part = String::new();
+    let mut previous_kind = String::new();
+    let mut previous_provenance = String::new();
     let mut previous_tail = Vec::new();
     for row in rows {
         if results.len() >= max_results {
@@ -8006,12 +13149,18 @@ fn parsed_text_search_results(
             display_name,
             entry_kind,
             metadata_json,
+            parser_name,
             part_name,
+            segment_kind,
+            segment_provenance,
             segment_content,
         ) = row.context("reading parser-derived text search candidate")?;
         if previous_entry_id != Some(entry_id) {
             previous_entry_id = Some(entry_id);
+            previous_parser.clear();
             previous_part.clear();
+            previous_kind.clear();
+            previous_provenance.clear();
             previous_tail.clear();
         }
         if already_matched.contains(&entry_id) || parsed_matched.contains(&entry_id) {
@@ -8020,12 +13169,16 @@ fn parsed_text_search_results(
 
         let mut searchable =
             Vec::with_capacity(previous_tail.len().saturating_add(segment_content.len()));
-        if previous_part == part_name {
+        if previous_parser == parser_name
+            && previous_part == part_name
+            && previous_kind == segment_kind
+            && previous_provenance == segment_provenance
+        {
             searchable.extend_from_slice(&previous_tail);
         }
         searchable.extend_from_slice(&segment_content);
         if let Some(hit) = content_search_hit(&searchable, query) {
-            let preview = format!("{}: {}", part_name, hit.data_preview);
+            let preview = format!("{} [{}]: {}", part_name, segment_kind, hit.data_preview);
             results.push(DeepSearchResult {
                 evidence_id,
                 entry_id,
@@ -8042,12 +13195,17 @@ fn parsed_text_search_results(
                 selection_offset: None,
                 selection_length: None,
                 data_preview: Some(preview),
+                parsed_segment_kind: Some(segment_kind),
+                parsed_segment_provenance: serde_json::from_str(&segment_provenance).ok(),
             });
             parsed_matched.insert(entry_id);
             continue;
         }
 
+        previous_parser = parser_name;
         previous_part = part_name;
+        previous_kind = segment_kind;
+        previous_provenance = segment_provenance;
         let tail_bytes = content_search_overlap_bytes(query);
         previous_tail = byte_tail(&searchable, tail_bytes);
     }
@@ -8336,8 +13494,12 @@ fn classify_raw_hit_location(
     }
 
     for volume in volumes {
-        let volume_end = volume.start_offset.saturating_add(volume.size_bytes);
-        if offset >= volume.start_offset && offset < volume_end {
+        if offset >= volume.start_offset
+            && volume
+                .start_offset
+                .checked_add(volume.size_bytes)
+                .is_some_and(|volume_end| offset < volume_end)
+        {
             return RawHitLocation {
                 partition_index: Some(volume.volume_index_zero_based),
                 volume_index_zero_based: Some(volume.volume_index_zero_based),
@@ -9780,6 +14942,7 @@ fn unavailable_entry_disk_location(
         file_relative_offset: None,
         contiguous_bytes: None,
         exact_start: false,
+        direct_logical_mapping: false,
         basis: "unavailable".to_string(),
         warning: Some(reason.into()),
     }
@@ -9817,6 +14980,14 @@ pub fn filesystem_entry_disk_location(
                 "ext entry has no partition start offset",
             ));
         };
+        let Some(partition_size) =
+            metadata_u64_or_i64(&entry.metadata_json, "partition_size_bytes")
+        else {
+            return Ok(unavailable_entry_disk_location(
+                &entry,
+                "ext entry has no authoritative partition size; its data location cannot be resolved without a bounded decoded-media slice",
+            ));
+        };
         let Some(inode_number) = entry.metadata_json["ext_inode_number"]
             .as_u64()
             .and_then(|value| u32::try_from(value).ok())
@@ -9827,7 +14998,11 @@ pub fn filesystem_entry_disk_location(
             ));
         };
         let resolved = (|| -> Result<Option<ext4::DataLocation>> {
-            let filesystem = open_ext4_superblock(Path::new(&entry.source_path), partition_start)?;
+            let filesystem = open_ext4_superblock_bounded(
+                Path::new(&entry.source_path),
+                partition_start,
+                partition_size,
+            )?;
             let inode = filesystem
                 .load_inode(inode_number)
                 .map_err(|err| anyhow!("loading ext inode {inode_number}: {err}"))?;
@@ -9849,16 +15024,37 @@ pub fn filesystem_entry_disk_location(
                     .unwrap_or(location.contiguous_bytes)
                     .saturating_sub(location.file_offset);
                 let contiguous_bytes = location.contiguous_bytes.min(remaining);
+                let Some(decoded_media_offset) =
+                    partition_start.checked_add(location.filesystem_offset)
+                else {
+                    return Ok(unavailable_entry_disk_location(
+                        &entry,
+                        "ext data location overflows the decoded-media coordinate space",
+                    ));
+                };
+                if location.filesystem_offset >= partition_size
+                    || decoded_media_offset
+                        .checked_add(contiguous_bytes)
+                        .is_none_or(|end| {
+                            partition_start
+                                .checked_add(partition_size)
+                                .is_none_or(|partition_end| end > partition_end)
+                        })
+                {
+                    return Ok(unavailable_entry_disk_location(
+                        &entry,
+                        "ext data location is outside the authoritative partition slice",
+                    ));
+                }
                 Ok(EntryDiskLocation {
                     entry_id: entry.entry_id,
                     evidence_id: entry.evidence_id,
                     available: true,
-                    decoded_media_offset: Some(
-                        partition_start.saturating_add(location.filesystem_offset),
-                    ),
+                    decoded_media_offset: Some(decoded_media_offset),
                     file_relative_offset: Some(location.file_offset),
                     contiguous_bytes: Some(contiguous_bytes),
                     exact_start: true,
+                    direct_logical_mapping: true,
                     basis: storage.to_string(),
                     warning: (location.storage == ext4::DataLocationStorage::Extent).then(|| {
                         "The start is exact. Bytes beyond the reported contiguous range are raw adjacent media, not reconstructed file fragments."
@@ -9877,9 +15073,12 @@ pub fn filesystem_entry_disk_location(
         };
     }
 
-    let Some(decoded_media_offset) =
-        metadata_u64_or_i64(&entry.metadata_json, "file_data_physical_offset")
-    else {
+    let recovery_read = entry.metadata_json["recovery_read"].as_str();
+    let uses_decoded_media_extent = recovery_read == Some("decoded_media_extent");
+    let decoded_media_offset =
+        metadata_u64_or_i64(&entry.metadata_json, "file_data_decoded_media_offset")
+            .or_else(|| metadata_u64_or_i64(&entry.metadata_json, "file_data_physical_offset"));
+    let Some(decoded_media_offset) = decoded_media_offset else {
         let reason = if entry.metadata_json["mft_record_physical_offset"].is_number() {
             "only the filesystem metadata-record offset is known; the file-data offset is unavailable"
         } else {
@@ -9891,21 +15090,98 @@ pub fn filesystem_entry_disk_location(
         metadata_u64_or_i64(&entry.metadata_json, "file_data_file_offset").unwrap_or(0);
     let contiguous_bytes = metadata_u64_or_i64(&entry.metadata_json, "file_data_contiguous_bytes")
         .or_else(|| {
-            (entry.metadata_json["recovery_read"].as_str() == Some("physical_extent"))
-                .then(|| entry.size_bytes.and_then(|value| u64::try_from(value).ok()))
-                .flatten()
+            matches!(
+                recovery_read,
+                Some("physical_extent" | "decoded_media_extent")
+            )
+            .then(|| entry.size_bytes.and_then(|value| u64::try_from(value).ok()))
+            .flatten()
         });
     let parser = entry.metadata_json["filesystem_parser"]
         .as_str()
         .unwrap_or("");
-    let basis = entry.metadata_json["physical_offset_basis"]
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| match parser {
-            "ntfs" => "NTFS first data run or resident data value".to_string(),
-            "fatfs" => "FAT first data cluster".to_string(),
-            _ => "parser-recorded first file-data offset".to_string(),
-        });
+    let opened = open_disk_image(Path::new(&entry.source_path))?;
+    if decoded_media_offset >= opened.decoded_size {
+        return Ok(unavailable_entry_disk_location(
+            &entry,
+            format!(
+                "recorded file-data offset {decoded_media_offset} is outside the {}-byte decoded evidence stream",
+                opened.decoded_size
+            ),
+        ));
+    }
+    if matches!(parser, "ntfs" | "fatfs") {
+        let Some(partition_start) = entry.metadata_json["partition_start_offset"].as_u64() else {
+            return Ok(unavailable_entry_disk_location(
+                &entry,
+                "filesystem entry has no authoritative partition start offset",
+            ));
+        };
+        let Some(partition_size) =
+            metadata_u64_or_i64(&entry.metadata_json, "partition_size_bytes")
+        else {
+            return Ok(unavailable_entry_disk_location(
+                &entry,
+                "filesystem entry has no authoritative partition size",
+            ));
+        };
+        let partition_end = match validate_partition_range(
+            opened.decoded_size,
+            partition_start,
+            partition_size,
+            "indexed filesystem partition",
+        ) {
+            Ok(end) => end,
+            Err(error) => {
+                return Ok(unavailable_entry_disk_location(
+                    &entry,
+                    format!("recorded partition geometry is invalid: {error}"),
+                ))
+            }
+        };
+        if decoded_media_offset < partition_start || decoded_media_offset >= partition_end {
+            return Ok(unavailable_entry_disk_location(
+                &entry,
+                format!(
+                    "recorded file-data offset {decoded_media_offset} is outside partition {partition_start}..{partition_end}"
+                ),
+            ));
+        }
+        if contiguous_bytes.is_some_and(|length| {
+            decoded_media_offset
+                .checked_add(length)
+                .is_none_or(|end| end > partition_end)
+        }) {
+            return Ok(unavailable_entry_disk_location(
+                &entry,
+                "recorded contiguous file-data range exceeds its partition",
+            ));
+        }
+    } else if contiguous_bytes.is_some_and(|length| {
+        decoded_media_offset
+            .checked_add(length)
+            .is_none_or(|end| end > opened.decoded_size)
+    }) {
+        return Ok(unavailable_entry_disk_location(
+            &entry,
+            "recorded contiguous file-data range exceeds the decoded evidence stream",
+        ));
+    }
+    let basis = if uses_decoded_media_extent {
+        "signature-carved structurally validated decoded-media extent".to_string()
+    } else {
+        entry.metadata_json["physical_offset_basis"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| match parser {
+                "ntfs" => "NTFS first data run or resident data value".to_string(),
+                "fatfs" => "FAT first data cluster".to_string(),
+                _ => "parser-recorded first file-data offset".to_string(),
+            })
+    };
+    let direct_logical_mapping = entry.metadata_json["file_data_direct_logical_mapping"]
+        .as_bool()
+        .unwrap_or(true);
     Ok(EntryDiskLocation {
         entry_id: entry.entry_id,
         evidence_id: entry.evidence_id,
@@ -9914,11 +15190,24 @@ pub fn filesystem_entry_disk_location(
         file_relative_offset: Some(file_relative_offset),
         contiguous_bytes,
         exact_start: true,
+        direct_logical_mapping,
         basis,
-        warning: contiguous_bytes.is_none().then(|| {
-            "The start is exact; contiguous length is unknown, so later raw bytes may belong to another fragment or allocation."
-                .to_string()
-        }),
+        warning: if uses_decoded_media_extent {
+            Some(
+                "The offset is exact in the decoded evidence-media byte stream. It is not an E01 segment/container-file physical offset, and no one-to-one container mapping is asserted."
+                    .to_string(),
+            )
+        } else if !direct_logical_mapping {
+            Some(
+                "The raw allocation start is exact, but it is not a direct logical-file byte mapping; use the filesystem reader to reconstruct decoded content."
+                    .to_string(),
+            )
+        } else {
+            contiguous_bytes.is_none().then(|| {
+                "The start is exact; contiguous length is unknown, so later raw bytes may belong to another fragment or allocation."
+                    .to_string()
+            })
+        },
     })
 }
 
@@ -10645,8 +15934,39 @@ pub fn report_data(case_path: &Path) -> Result<ReportData> {
     })
 }
 
-fn processing_status_is_incomplete(status: Option<&str>) -> bool {
-    matches!(status, Some("truncated" | "failed" | "running"))
+fn processing_status_stopped_early(
+    status: Option<&str>,
+    requested_limit: Option<i64>,
+    reason: Option<&str>,
+) -> bool {
+    match status {
+        Some("failed" | "running" | "cancelled") => true,
+        // Historical releases used `truncated` for any artifact-level warning.
+        // Prefer an explicit examiner-limit reason. A positive recorded limit
+        // is only a compatibility fallback for old jobs that stored no reason.
+        Some("truncated") => reason.map_or_else(
+            || requested_limit.is_some_and(|limit| limit > 0),
+            processing_reason_reports_examiner_limit,
+        ),
+        _ => false,
+    }
+}
+
+fn processing_status_has_diagnostics(
+    status: Option<&str>,
+    requested_limit: Option<i64>,
+    reason: Option<&str>,
+) -> bool {
+    matches!(
+        status,
+        Some("completed_with_diagnostics" | "completed_with_errors" | "partial")
+    ) || matches!(status, Some("truncated"))
+        && !processing_status_stopped_early(status, requested_limit, reason)
+}
+
+fn processing_reason_reports_examiner_limit(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("examiner") && reason.contains("limit")
 }
 
 fn processing_requested_limit_label(limit: Option<i64>) -> String {
@@ -10674,16 +15994,29 @@ fn processing_coverage_text(
         Some("completed") => format!(
             "Complete indexing job: latest {job_type} completed with {entries} indexed entries and did not report truncation or failure. Requested limit: {limit}."
         ),
+        Some("completed_with_diagnostics" | "completed_with_errors" | "partial") => format!(
+            "Processing completed: latest {job_type} committed {entries} indexed entries. Some optional artifact classes recorded diagnostics or have explicitly limited parser coverage; validated findings remain attributable to their cited source locations. Requested limit: {limit}. Detailed parser diagnostics are retained in the case audit log."
+        ),
+        Some("truncated")
+            if processing_status_stopped_early(status, requested_limit, reason) =>
+        {
+            format!(
+            "Examiner-bounded processing: latest {job_type} stopped at the requested limit after {entries} indexed entries. Requested limit: {limit}. Reason: {}. Absence of additional findings must not be treated as exhaustive.",
+            reason.unwrap_or("the configured processing limit was reached")
+        )
+        }
         Some("truncated") => format!(
-            "PARTIAL INDEXING ONLY: latest {job_type} stopped after {entries} indexed entries. Requested limit: {limit}. Reason: {}. Findings from this index do not represent full source coverage.",
-            reason.unwrap_or("processing reported truncation without a stored reason")
+            "Processing completed: latest {job_type} committed {entries} indexed entries. This historical job used the legacy 'truncated' label for artifact-level diagnostics even though no examiner entry limit was set. Validated findings remain attributable to their cited source locations. Detailed parser diagnostics are retained in the case audit log."
         ),
         Some("failed") => format!(
-            "FAILED INDEXING: latest {job_type} failed; {entries} entries from that attempt were committed. Requested limit: {limit}. Reason: {}. Findings must not be treated as complete source coverage.",
+            "Processing did not complete: latest {job_type} failed after recording {entries} entries. Requested limit: {limit}. Reason: {}. Recorded findings remain attributable to their cited source locations, while absence of additional findings cannot be treated as exhaustive.",
             reason.unwrap_or("processing failed without a stored reason")
         ),
         Some("running") => format!(
-            "PROCESSING INCOMPLETE: latest {job_type} is still marked running. Requested limit: {limit}. Current recorded entry count: {entries}. Findings must not be treated as complete source coverage."
+            "Processing is not finalized: latest {job_type} is still marked running. Requested limit: {limit}. Current recorded entry count: {entries}. Recorded findings remain attributable to their cited source locations, while absence of additional findings cannot yet be treated as exhaustive."
+        ),
+        Some("cancelled") => format!(
+            "Processing was cancelled: latest {job_type} ended with {entries} recorded entries. Requested limit: {limit}. Recorded findings remain attributable to their cited source locations, while absence of additional findings cannot be treated as exhaustive."
         ),
         Some(other) => format!(
             "Processing coverage is unknown: latest {job_type} has unrecognized status '{other}', with {entries} recorded entries and requested limit {limit}."
@@ -10701,7 +16034,15 @@ fn bookmark_item_processing_warning(
         .get("index_job_status")
         .and_then(|value| value.as_str());
     if let Some(status) = captured_status {
-        return processing_status_is_incomplete(Some(status)).then(|| {
+        let requested_limit = item
+            .item_ref_json
+            .get("index_requested_entry_limit")
+            .and_then(|value| value.as_i64());
+        let reason = item
+            .item_ref_json
+            .get("index_truncation_reason")
+            .and_then(|value| value.as_str());
+        return processing_status_stopped_early(Some(status), requested_limit, reason).then(|| {
             item.item_ref_json
                 .get("index_processing_coverage")
                 .and_then(|value| value.as_str())
@@ -10711,7 +16052,11 @@ fn bookmark_item_processing_warning(
     }
     evidence
         .filter(|evidence| {
-            processing_status_is_incomplete(evidence.latest_process_job_status.as_deref())
+            processing_status_stopped_early(
+                evidence.latest_process_job_status.as_deref(),
+                evidence.requested_entry_limit,
+                evidence.processing_truncation_reason.as_deref(),
+            )
         })
         .map(|evidence| evidence.processing_coverage.clone())
 }
@@ -11011,7 +16356,7 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
     html.push_str("</title><style>");
     html.push_str("body{font-family:Segoe UI,Arial,sans-serif;margin:32px;line-height:1.4;color:#1f2933}h1{margin-bottom:0}h2{border-bottom:1px solid #cfd7df;padding-bottom:4px;margin-top:28px}article{margin:16px 0;padding:12px 0;border-bottom:1px solid #e6ebf0}.meta{color:#5b6773;font-size:0.9em}.comment{white-space:pre-wrap}.items{border-collapse:collapse;width:100%;margin-top:8px}.items th,.items td{border:1px solid #d9e1e8;padding:6px;text-align:left;vertical-align:top}.items th{background:#f3f6f8}.activity-details{margin:0}.activity-details dt{font-weight:600}.activity-details dd{margin:0 0 4px 0;overflow-wrap:anywhere}pre{white-space:pre-wrap;background:#f6f8fa;padding:8px;border:1px solid #d9e1e8}");
     html.push_str(".kdft-band{display:flex;justify-content:space-between;align-items:center;background:#0f3d3e;color:#eaf4f4;padding:10px 14px;border-radius:6px;font-size:0.9em}.kdft-band .kdft-logo{font-weight:800;letter-spacing:2px;font-size:1.2em}.dirtree{font-family:Consolas,monospace;font-size:0.85em;line-height:1.5;overflow-x:auto}.kdft-integrity{margin-top:32px;border-top:2px solid #0f3d3e;padding-top:8px;color:#5b6773;font-size:0.8em;overflow-wrap:anywhere}body::after{content:'KDFT';position:fixed;top:40%;left:20%;font-size:18vw;font-weight:900;color:rgba(15,61,62,0.05);transform:rotate(-28deg);pointer-events:none;z-index:0}");
-    html.push_str(".processing-warning{border:2px solid #9f1239;background:#fff1f2;color:#881337;padding:12px 14px;margin:16px 0;font-weight:650;position:relative;z-index:1}.processing-partial{color:#9f1239;font-weight:700}");
+    html.push_str(".processing-warning{border:2px solid #9f1239;background:#fff1f2;color:#881337;padding:12px 14px;margin:16px 0;font-weight:650;position:relative;z-index:1}.processing-note{border:1px solid #9a6700;background:#fff8c5;color:#5d4414;padding:12px 14px;margin:16px 0;position:relative;z-index:1}.processing-partial{color:#9f1239;font-weight:700}.processing-diagnostic{color:#6b4f00;font-weight:600}");
     html.push_str(".kdft-toc{background:#f3f6f8;border:1px solid #d9e1e8;border-radius:6px;padding:10px 14px;margin-top:16px;display:flex;flex-wrap:wrap;gap:6px 14px;align-items:baseline;position:relative;z-index:1}.kdft-toc a{color:#0f3d3e;text-decoration:none;font-weight:600}.kdft-toc a:hover{text-decoration:underline}.kdft-back-to-top{display:inline-block;margin-top:6px;font-size:0.85em}");
     html.push_str(".bookmark-items{table-layout:fixed}.bookmark-items td{overflow-wrap:anywhere}.bookmark-items th:nth-child(1),.bookmark-items td:nth-child(1){width:4%}.bookmark-items th:nth-child(2),.bookmark-items td:nth-child(2){width:10%}.bookmark-items th:nth-child(3),.bookmark-items td:nth-child(3){width:13%}.bookmark-items th:nth-child(4),.bookmark-items td:nth-child(4){width:8%}.bookmark-items th:nth-child(5),.bookmark-items td:nth-child(5){width:39%}.bookmark-items th:nth-child(6),.bookmark-items td:nth-child(6){width:26%}");
     html.push_str("</style></head><body>");
@@ -11087,9 +16432,35 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
     if !incomplete_finding_evidence.is_empty() {
         let mut names = incomplete_finding_evidence.into_iter().collect::<Vec<_>>();
         names.sort_unstable();
-        html.push_str("<div class=\"processing-warning\">WARNING: This report contains findings derived from truncated, failed, or still-running indexing for: ");
+        html.push_str("<div class=\"processing-warning\">Coverage warning: processing did not reach its normal terminal completion for: ");
         html.push_str(&escape_html(&names.join(", ")));
-        html.push_str(". Those findings represent partial/uncertain coverage and must not be interpreted as a complete examination of the source.</div>");
+        html.push_str(". Findings remain valid at their cited source locations, but absence of additional findings must not be treated as exhaustive. See Technical Details for the recorded job state.</div>");
+    }
+
+    let diagnostic_finding_evidence = report
+        .folders
+        .iter()
+        .flat_map(|folder| &folder.bookmarks)
+        .flat_map(|bookmark| &bookmark.items)
+        .filter_map(|item| {
+            item.evidence_id
+                .and_then(|evidence_id| evidence_by_id.get(&evidence_id).copied())
+        })
+        .filter(|evidence| {
+            processing_status_has_diagnostics(
+                evidence.latest_process_job_status.as_deref(),
+                evidence.requested_entry_limit,
+                evidence.processing_truncation_reason.as_deref(),
+            )
+        })
+        .map(|evidence| evidence.display_name.as_str())
+        .collect::<HashSet<_>>();
+    if !diagnostic_finding_evidence.is_empty() {
+        let mut names = diagnostic_finding_evidence.into_iter().collect::<Vec<_>>();
+        names.sort_unstable();
+        html.push_str("<div class=\"processing-note\"><strong>Processing note:</strong> Processing reached finalization for ");
+        html.push_str(&escape_html(&names.join(", ")));
+        html.push_str(". Some optional artifact classes recorded bounded diagnostics or limited coverage. This does not invalidate the evidence or the validated findings presented in this report; detailed scope is retained in Technical Details and the case audit log.</div>");
     }
 
     html.push_str("<nav class=\"kdft-toc\"><strong>Jump to:</strong> <a href=\"#technical-details\">Technical Details</a>");
@@ -11141,7 +16512,7 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
     html.push_str("</tbody></table>");
 
     if !report.evidence.is_empty() {
-        html.push_str("<h2>Evidence Sources</h2><table class=\"items\"><thead><tr><th>ID</th><th>Name</th><th>Kind</th><th>Extension</th><th>Size</th><th>SHA-256 (decoded media for images; evidence file for files)</th><th>Acquisition/container file manifest</th><th>Latest processing status</th><th>Requested limit</th><th>Latest job indexed entries</th><th>Coverage / truncation reason</th><th>Location</th><th>Attached</th><th>Current indexed entries</th></tr></thead><tbody>");
+        html.push_str("<h2>Evidence Sources</h2><table class=\"items\"><thead><tr><th>ID</th><th>Name</th><th>Kind</th><th>Extension</th><th>Size</th><th>SHA-256 (decoded media for images; evidence file for files)</th><th>Acquisition/container file manifest</th><th>Latest processing status</th><th>Requested limit</th><th>Latest job indexed entries</th><th>Processing coverage</th><th>Location</th><th>Attached</th><th>Current indexed entries</th></tr></thead><tbody>");
         for evidence in &report.evidence {
             html.push_str("<tr><td>");
             html.push_str(&evidence.id.to_string());
@@ -11186,8 +16557,18 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
                 None => html.push_str("<span class=\"meta\">not recorded</span>"),
             }
             html.push_str("</td><td");
-            if processing_status_is_incomplete(evidence.latest_process_job_status.as_deref()) {
+            if processing_status_stopped_early(
+                evidence.latest_process_job_status.as_deref(),
+                evidence.requested_entry_limit,
+                evidence.processing_truncation_reason.as_deref(),
+            ) {
                 html.push_str(" class=\"processing-partial\"");
+            } else if processing_status_has_diagnostics(
+                evidence.latest_process_job_status.as_deref(),
+                evidence.requested_entry_limit,
+                evidence.processing_truncation_reason.as_deref(),
+            ) {
+                html.push_str(" class=\"processing-diagnostic\"");
             }
             html.push('>');
             html.push_str(&escape_html(&evidence.processing_coverage));
@@ -11937,6 +17318,8 @@ impl BrowserRecordCounts {
 struct BrowserImportDiagnostics {
     samples: Vec<String>,
     total: u64,
+    examiner_limit_samples: Vec<String>,
+    examiner_limit_kinds: Vec<String>,
 }
 
 impl BrowserImportDiagnostics {
@@ -11951,12 +17334,193 @@ impl BrowserImportDiagnostics {
         }
     }
 
+    fn record_examiner_limit(&mut self, artifact_kind: &str, message: String) {
+        progress::progress_truncated(message.clone());
+        if !self
+            .examiner_limit_kinds
+            .iter()
+            .any(|kind| kind == artifact_kind)
+        {
+            self.examiner_limit_kinds.push(artifact_kind.to_string());
+        }
+        if self.examiner_limit_samples.len() < BROWSER_IMPORT_ERROR_SAMPLE_LIMIT {
+            self.examiner_limit_samples.push(message);
+        }
+    }
+
     fn merge(&mut self, other: Self) {
         self.total = self.total.saturating_add(other.total);
         let remaining = BROWSER_IMPORT_ERROR_SAMPLE_LIMIT.saturating_sub(self.samples.len());
         self.samples
             .extend(other.samples.into_iter().take(remaining));
+        let limit_remaining =
+            BROWSER_IMPORT_ERROR_SAMPLE_LIMIT.saturating_sub(self.examiner_limit_samples.len());
+        self.examiner_limit_samples.extend(
+            other
+                .examiner_limit_samples
+                .into_iter()
+                .take(limit_remaining),
+        );
+        for kind in other.examiner_limit_kinds {
+            if !self
+                .examiner_limit_kinds
+                .iter()
+                .any(|existing| existing == &kind)
+            {
+                self.examiner_limit_kinds.push(kind);
+            }
+        }
     }
+}
+
+#[derive(Debug)]
+struct BrowserExaminerLimitReached {
+    artifact_kind: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for BrowserExaminerLimitReached {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for BrowserExaminerLimitReached {}
+
+#[derive(Debug, Clone)]
+struct BrowserImportDisposition {
+    status: &'static str,
+    truncated: bool,
+    reason: Option<String>,
+    examiner_limit_reached: bool,
+    completed_with_diagnostics: bool,
+}
+
+impl BrowserImportDisposition {
+    fn classify(
+        visit_limit_reached: bool,
+        artifact_limit_reached: bool,
+        parse_error_count: u64,
+    ) -> Self {
+        let examiner_limit_reached = visit_limit_reached || artifact_limit_reached;
+        let completed_with_diagnostics = !examiner_limit_reached && parse_error_count > 0;
+        let status = if examiner_limit_reached {
+            "truncated"
+        } else if completed_with_diagnostics {
+            "completed_with_diagnostics"
+        } else {
+            "completed"
+        };
+        let mut reasons = Vec::with_capacity(3);
+        if visit_limit_reached {
+            reasons.push("examiner visit limit reached".to_string());
+        }
+        if artifact_limit_reached {
+            reasons.push("examiner per-artifact row limit reached".to_string());
+        }
+        if parse_error_count > 0 {
+            reasons.push(format!(
+                "{parse_error_count} browser parser diagnostic(s) recorded"
+            ));
+        }
+        Self {
+            status,
+            truncated: examiner_limit_reached,
+            reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
+            examiner_limit_reached,
+            completed_with_diagnostics,
+        }
+    }
+
+    fn complete_generation(&self) -> bool {
+        self.status == "completed"
+    }
+}
+
+fn browser_dataset_generation_counts(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+    derivation_key: Option<&str>,
+) -> Result<(usize, usize)> {
+    let (visible, from_complete_jobs): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN EXISTS(
+                    SELECT 1 FROM evidence_jobs j
+                    WHERE j.id = f.discovered_by_job_id AND j.status = 'completed'
+                ) THEN 1 ELSE 0 END), 0)
+         FROM filesystem_entries f
+         WHERE f.case_id = ?1 AND f.evidence_id = ?2
+           AND (?3 IS NULL OR json_extract(f.metadata_json, '$.browser_derivation_key') = ?3)",
+        params![case_id, evidence_id, derivation_key],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((
+        usize::try_from(visible.max(0)).unwrap_or(usize::MAX),
+        usize::try_from(from_complete_jobs.max(0)).unwrap_or(usize::MAX),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn annotate_browser_import_attempt(
+    parameters_json: &str,
+    disposition: &BrowserImportDisposition,
+    attempt_entries_parsed: usize,
+    retained_entries: usize,
+    prior_complete_entries: usize,
+    canonical_generation_preserved: bool,
+    replacement_committed: bool,
+) -> Result<String> {
+    let mut parameters: serde_json::Value = serde_json::from_str(parameters_json)
+        .context("parsing browser import attempt parameters")?;
+    let object = parameters
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("browser import parameters are not a JSON object"))?;
+    object.insert(
+        "attempt_status".to_string(),
+        serde_json::json!(disposition.status),
+    );
+    object.insert(
+        "attempt_entries_parsed".to_string(),
+        serde_json::json!(attempt_entries_parsed),
+    );
+    object.insert(
+        "entries_indexed".to_string(),
+        serde_json::json!(retained_entries),
+    );
+    object.insert(
+        "prior_complete_entries".to_string(),
+        serde_json::json!(prior_complete_entries),
+    );
+    object.insert(
+        "canonical_generation_preserved".to_string(),
+        serde_json::json!(canonical_generation_preserved),
+    );
+    object.insert(
+        "replacement_committed".to_string(),
+        serde_json::json!(replacement_committed),
+    );
+    object.insert(
+        "examiner_limit_reached".to_string(),
+        serde_json::json!(disposition.examiner_limit_reached),
+    );
+    object.insert(
+        "completed_with_diagnostics".to_string(),
+        serde_json::json!(disposition.completed_with_diagnostics),
+    );
+    object.insert(
+        "processing_coverage".to_string(),
+        serde_json::json!(if canonical_generation_preserved {
+            "A prior complete browser generation remains canonical; this attempt was retained only as diagnostic provenance."
+        } else if disposition.truncated {
+            "Partial browser coverage because an examiner-configured row limit was reached."
+        } else if disposition.completed_with_diagnostics {
+            "Completed browser import with parser diagnostics; successfully decoded records remain usable and diagnostics identify unsupported or unreadable artifacts."
+        } else {
+            "Complete supported browser-artifact coverage for the selected source and parser scope."
+        }),
+    );
+    Ok(parameters.to_string())
 }
 
 /// Disk-backed record sink used by all browser collectors. Producers emit one
@@ -12106,13 +17670,42 @@ struct BrowserHistoryImportData {
 
 impl BrowserHistoryImportData {
     fn add_diagnostics(&mut self, diagnostics: BrowserImportDiagnostics) -> Result<()> {
-        self.parse_error_count = self.parse_error_count.saturating_add(diagnostics.total);
+        let BrowserImportDiagnostics {
+            samples,
+            total,
+            examiner_limit_samples,
+            examiner_limit_kinds,
+        } = diagnostics;
+        self.parse_error_count = self.parse_error_count.saturating_add(total);
         let remaining = BROWSER_IMPORT_ERROR_SAMPLE_LIMIT.saturating_sub(self.parse_errors.len());
         self.parse_errors
-            .extend(diagnostics.samples.into_iter().take(remaining));
+            .extend(samples.into_iter().take(remaining));
+        for kind in examiner_limit_kinds {
+            if !self
+                .limited_artifact_kinds
+                .iter()
+                .any(|existing| existing == &kind)
+            {
+                self.limited_artifact_kinds.push(kind);
+            }
+        }
+        self.examiner_artifact_limit_reached = !self.limited_artifact_kinds.is_empty();
         let mut parameters: serde_json::Value = serde_json::from_str(&self.parameters_json)
             .context("parsing browser import parameters for diagnostics")?;
         if let Some(object) = parameters.as_object_mut() {
+            let mut examiner_limit_messages = object
+                .get("examiner_limit_messages")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let limit_remaining =
+                BROWSER_IMPORT_ERROR_SAMPLE_LIMIT.saturating_sub(examiner_limit_messages.len());
+            examiner_limit_messages.extend(
+                examiner_limit_samples
+                    .into_iter()
+                    .take(limit_remaining)
+                    .map(serde_json::Value::String),
+            );
             object.insert(
                 "parse_errors".to_string(),
                 serde_json::json!(self.parse_errors),
@@ -12127,6 +17720,18 @@ impl BrowserHistoryImportData {
                     .parse_error_count
                     .saturating_sub(self.parse_errors.len() as u64)),
             );
+            object.insert(
+                "artifact_limit_reached".to_string(),
+                serde_json::json!(self.examiner_artifact_limit_reached),
+            );
+            object.insert(
+                "limited_artifact_kinds".to_string(),
+                serde_json::json!(self.limited_artifact_kinds),
+            );
+            object.insert(
+                "examiner_limit_messages".to_string(),
+                serde_json::Value::Array(examiner_limit_messages),
+            );
         }
         self.parameters_json = parameters.to_string();
         Ok(())
@@ -12138,6 +17743,58 @@ struct BrowserActivityRecord {
     display_name: String,
     metadata_json: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SensitiveValueSummary {
+    bytes: usize,
+    sha256_hex: Option<String>,
+}
+
+impl SensitiveValueSummary {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.len(),
+            sha256_hex: (!bytes.is_empty()).then(|| sha256_hex(bytes)),
+        }
+    }
+
+    fn present(&self) -> bool {
+        self.bytes > 0
+    }
+}
+
+fn sensitive_sqlite_value_summary(value: ValueRef<'_>) -> SensitiveValueSummary {
+    match value {
+        ValueRef::Null => SensitiveValueSummary::from_bytes(&[]),
+        ValueRef::Blob(bytes) | ValueRef::Text(bytes) => SensitiveValueSummary::from_bytes(bytes),
+        // Callers select CAST(... AS BLOB), but retain a deterministic and
+        // non-secret summary if a non-conforming SQLite implementation still
+        // returns a numeric storage class.
+        ValueRef::Integer(value) => SensitiveValueSummary::from_bytes(&value.to_le_bytes()),
+        ValueRef::Real(value) => SensitiveValueSummary::from_bytes(&value.to_le_bytes()),
+    }
+}
+
+fn chromium_protected_value_format(value: ValueRef<'_>) -> &'static str {
+    let bytes = match value {
+        ValueRef::Blob(bytes) | ValueRef::Text(bytes) => bytes,
+        _ => return "absent_or_non_blob",
+    };
+    if bytes.starts_with(b"v10") {
+        "chromium_os_crypt_v10"
+    } else if bytes.starts_with(b"v11") {
+        "chromium_os_crypt_v11"
+    } else if bytes.starts_with(b"v20") {
+        "chromium_app_bound_v20"
+    } else if bytes.is_empty() {
+        "absent"
+    } else {
+        "platform_protected_or_legacy_blob"
+    }
+}
+
+const BROWSER_SENSITIVE_VALUE_POLICY: &str =
+    "value withheld from case metadata and reports; use the cited source artifact through an explicit audited examiner workflow";
 
 /// Adapter that lets the existing row-to-record builders retain their simple
 /// `push` shape while forwarding each record immediately to a bounded sink.
@@ -12390,6 +18047,7 @@ pub(crate) struct EvidenceReadSession {
     conn: Connection,
     case_id: i64,
     cached_image: Option<CachedEvidenceImage>,
+    bypass_shared_ewf_cache: bool,
 }
 
 struct CachedEvidenceImage {
@@ -12405,6 +18063,7 @@ impl EvidenceReadSession {
             conn,
             case_id,
             cached_image: None,
+            bypass_shared_ewf_cache: false,
         })
     }
 
@@ -12430,7 +18089,18 @@ impl EvidenceReadSession {
             conn,
             case_id,
             cached_image: None,
+            bypass_shared_ewf_cache: false,
         })
+    }
+
+    /// Hash workers bind their checkpoints to a source-generation snapshot.
+    /// They must therefore open a fresh EWF handle/decoder instead of reusing
+    /// the process-wide weak cache, which may still reference a replaced path.
+    /// Query-only SQLite semantics are identical to `open_worker_read_only`.
+    fn open_worker_read_only_fresh(case_path: &Path) -> Result<Self> {
+        let mut session = Self::open_worker_read_only(case_path)?;
+        session.bypass_shared_ewf_cache = true;
+        Ok(session)
     }
 
     fn cached_disk_image(&mut self, source_path: &str) -> Result<&mut OpenedDiskImage> {
@@ -12439,9 +18109,24 @@ impl EvidenceReadSession {
             .as_ref()
             .is_none_or(|cached| cached.source_path != source_path);
         if replace {
+            let path = Path::new(source_path);
+            let opened = if self.bypass_shared_ewf_cache && has_ewf_signature(path)? {
+                let segment_set = acquisition_segment_set(path)?;
+                let reader = ewf::EwfReader::open_segments(&segment_set.paths)
+                    .with_context(|| format!("decoding fresh EWF segment set {source_path}"))?;
+                let decoded_size = reader.total_size();
+                OpenedDiskImage {
+                    format: "Ewf".to_string(),
+                    decoded_size,
+                    reader: Box::new(reader),
+                    container_finding_count: 0,
+                }
+            } else {
+                open_disk_image(path)?
+            };
             self.cached_image = Some(CachedEvidenceImage {
                 source_path: source_path.to_string(),
-                opened: open_disk_image(Path::new(source_path))?,
+                opened,
             });
         }
         self.cached_image
@@ -12784,17 +18469,147 @@ pub fn detect_browser_database(path: &Path) -> Result<Option<BrowserFamily>> {
 }
 
 fn copy_sqlite_database_to_temp(path: &Path) -> Result<TempFileGuard> {
+    const SQLITE_SNAPSHOT_ATTEMPTS: usize = 4;
+    let mut last_mismatch = None;
+    for attempt in 1..=SQLITE_SNAPSHOT_ATTEMPTS {
+        let before = fingerprint_sqlite_database_group(path)?;
+        let guard = copy_sqlite_database_to_temp_once(path)?;
+        let copied = fingerprint_sqlite_database_group(&guard.path)?;
+        let after = fingerprint_sqlite_database_group(path)?;
+        if sqlite_snapshot_generation_matches(&before, &copied, &after) {
+            return Ok(guard);
+        }
+        last_mismatch = Some(format!(
+            "attempt {attempt} observed source generation change or a non-matching copy (source members before: {}; after: {}; copied: {})",
+            sqlite_snapshot_member_names(&before),
+            sqlite_snapshot_member_names(&after),
+            sqlite_snapshot_member_names(&copied),
+        ));
+        drop(guard);
+    }
+    bail!(
+        "browser SQLite source {} did not remain stable while copying; no mixed main/WAL/journal generation was accepted after {SQLITE_SNAPSHOT_ATTEMPTS} attempts ({})",
+        path.display(),
+        last_mismatch.unwrap_or_else(|| "generation mismatch".to_string()),
+    )
+}
+
+fn sqlite_snapshot_generation_matches(
+    before: &[SqliteSnapshotMemberFingerprint],
+    copied: &[SqliteSnapshotMemberFingerprint],
+    after: &[SqliteSnapshotMemberFingerprint],
+) -> bool {
+    before == after && before == copied
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqliteSnapshotMemberFingerprint {
+    suffix: &'static str,
+    bytes: u64,
+    sha256_hex: String,
+}
+
+fn fingerprint_sqlite_database_group(
+    database_path: &Path,
+) -> Result<Vec<SqliteSnapshotMemberFingerprint>> {
+    let mut fingerprints = Vec::with_capacity(4);
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let member_path = if suffix.is_empty() {
+            database_path.to_path_buf()
+        } else {
+            sqlite_sidecar_path(database_path, suffix)
+        };
+        let metadata = match fs::metadata(&member_path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) if suffix.is_empty() => {
+                bail!(
+                    "browser SQLite source {} is not a file",
+                    member_path.display()
+                )
+            }
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !suffix.is_empty() => {
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "reading browser SQLite snapshot member {}",
+                        member_path.display()
+                    )
+                })
+            }
+        };
+        let mut input = fs::File::open(&member_path).with_context(|| {
+            format!(
+                "opening browser SQLite snapshot member {}",
+                member_path.display()
+            )
+        })?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 256 * 1024];
+        let mut bytes = 0_u64;
+        loop {
+            let read = input.read(&mut buffer).with_context(|| {
+                format!(
+                    "hashing browser SQLite snapshot member {}",
+                    member_path.display()
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            bytes = bytes
+                .checked_add(read as u64)
+                .context("browser SQLite snapshot byte count exceeds u64")?;
+        }
+        if bytes != metadata.len() {
+            bail!(
+                "browser SQLite snapshot member {} changed size while hashing (metadata {} bytes, read {} bytes)",
+                member_path.display(),
+                metadata.len(),
+                bytes,
+            );
+        }
+        fingerprints.push(SqliteSnapshotMemberFingerprint {
+            suffix,
+            bytes,
+            sha256_hex: format!("{:x}", hasher.finalize()),
+        });
+    }
+    Ok(fingerprints)
+}
+
+fn sqlite_snapshot_member_names(fingerprints: &[SqliteSnapshotMemberFingerprint]) -> String {
+    fingerprints
+        .iter()
+        .map(|fingerprint| {
+            if fingerprint.suffix.is_empty() {
+                "main"
+            } else {
+                fingerprint.suffix.trim_start_matches('-')
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn copy_sqlite_database_to_temp_once(path: &Path) -> Result<TempFileGuard> {
     static NEXT_HISTORY_COPY_NONCE: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(1);
     let (copy_path, mut output) = (0..128)
         .find_map(|_| {
             let nonce = NEXT_HISTORY_COPY_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let candidate = temp_history_copy_path(path, nonce);
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&candidate)
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&candidate) {
                 Ok(file) => Some(Ok((candidate, file))),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
                 Err(error) => Some(Err(error).with_context(|| {
@@ -12856,11 +18671,14 @@ fn copy_sqlite_sidecar_if_present(
                 .with_context(|| format!("opening SQLite sidecar {}", source_sidecar.display()))
         }
     };
-    let mut destination = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&dest_sidecar)
+    let mut destination_options = fs::OpenOptions::new();
+    destination_options.write(true).create_new(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        destination_options.mode(0o600);
+    }
+    let mut destination = match destination_options.open(&dest_sidecar) {
         Ok(destination) => destination,
         Err(error) => {
             return Err(error).with_context(|| {
@@ -12999,7 +18817,12 @@ fn collect_browser_record_stream(
     match produce(&mut emit) {
         Ok(produced) => produced.max(observed) > output_limit,
         Err(error) => {
-            diagnostics.record(format!("{label}: {error:#}"));
+            let message = format!("{label}: {error:#}");
+            if let Some(limit) = error.downcast_ref::<BrowserExaminerLimitReached>() {
+                diagnostics.record_examiner_limit(limit.artifact_kind, message);
+            } else {
+                diagnostics.record(message);
+            }
             false
         }
     }
@@ -13187,7 +19010,16 @@ fn collect_chromium_history_import_with_protections(
         limited_artifact_kinds.push("downloads".to_string());
     }
     diagnostics.merge(download_diagnostics);
+    for kind in &diagnostics.examiner_limit_kinds {
+        if !limited_artifact_kinds
+            .iter()
+            .any(|existing| existing == kind)
+        {
+            limited_artifact_kinds.push(kind.clone());
+        }
+    }
     records.seal()?;
+    let examiner_limit_messages = diagnostics.examiner_limit_samples;
     let parse_errors = diagnostics.samples;
     let parse_error_count = diagnostics.total;
     let source_path = stable_path_string(&profile_paths.profile_dir);
@@ -13208,6 +19040,7 @@ fn collect_chromium_history_import_with_protections(
         "max_visits_scope": "visits and each row-oriented browser artifact class; bookmarks and selected preference fields are not row-capped",
         "artifact_limit_reached": !limited_artifact_kinds.is_empty(),
         "limited_artifact_kinds": &limited_artifact_kinds,
+        "examiner_limit_messages": examiner_limit_messages,
         "parse_errors": parse_errors,
         "parse_error_count": parse_error_count,
         "parse_error_samples_omitted": parse_error_count.saturating_sub(parse_errors.len() as u64)
@@ -13764,8 +19597,11 @@ fn stream_chromium_omnibox_shortcut_records(
     records.finish()
 }
 
-/// Plain-text form entries from Chromium's `Web Data` database. Credit-card
-/// and encrypted tables are deliberately outside this reader.
+/// Form-entry metadata from Chromium's `Web Data` database. Credit-card and
+/// encrypted tables are deliberately outside this reader. Autofill values can
+/// contain addresses, phone numbers, tokens, and other sensitive examiner
+/// data, so ordinary case rows retain only presence, exact byte length, and a
+/// complete SHA-256 fingerprint. The source SQLite row remains the evidence.
 fn stream_chromium_autofill_records(
     web_data_path: &Path,
     max_rows: usize,
@@ -13820,7 +19656,7 @@ fn stream_chromium_autofill_records(
         "NULL"
     };
     let sql = format!(
-        "SELECT a.rowid, {name}, {value}, {count}, {date_created}, {date_last_used}
+        "SELECT a.rowid, {name}, CAST({value} AS BLOB), {count}, {date_created}, {date_last_used}
          FROM autofill a
          {legacy_join}
          ORDER BY {date_last_used} DESC, a.rowid DESC
@@ -13831,7 +19667,7 @@ fn stream_chromium_autofill_records(
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
+            sensitive_sqlite_value_summary(row.get_ref(2)?),
             row.get::<_, Option<i64>>(3)?,
             row.get::<_, Option<i64>>(4)?,
             row.get::<_, Option<i64>>(5)?,
@@ -13839,7 +19675,7 @@ fn stream_chromium_autofill_records(
     })?;
     let mut records = BrowserRecordEmitter::new(emit);
     for row in rows {
-        let (rowid, name, value, count, date_created, date_last_used) = row?;
+        let (rowid, name, value_summary, count, date_created, date_last_used) = row?;
         let date_created_utc = nonzero_optional_i64(date_created).and_then(unix_seconds_to_rfc3339);
         let date_last_used_utc =
             nonzero_optional_i64(date_last_used).and_then(unix_seconds_to_rfc3339);
@@ -13853,7 +19689,12 @@ fn stream_chromium_autofill_records(
             "browser_family": "chromium",
             "rowid": rowid,
             "name": name,
-            "value": value,
+            "autofill_value_present": value_summary.present(),
+            "autofill_value_bytes": value_summary.bytes,
+            "autofill_value_sha256": value_summary.sha256_hex,
+            "autofill_value_disclosure": "withheld",
+            "sensitive_value_policy": BROWSER_SENSITIVE_VALUE_POLICY,
+            "sensitive_value_access_path": "source_artifact_path + source_sqlite_table=autofill + source_sqlite_rowid; explicit audited examiner access only",
             "count": count,
             "date_created": date_created,
             "date_created_unix_seconds": date_created,
@@ -13861,7 +19702,7 @@ fn stream_chromium_autofill_records(
             "date_last_used": date_last_used,
             "date_last_used_unix_seconds": date_last_used,
             "date_last_used_utc": date_last_used_utc,
-            "search_text": format!("{} {}", path_name, value.as_deref().unwrap_or("")),
+            "search_text": path_name,
         });
         merge_json_object(&mut metadata, &source_metadata);
         let logical_path = format!(
@@ -14026,7 +19867,7 @@ fn stream_chromium_download_records(
         }
         let url_chain_omitted = url_chain_total.saturating_sub(url_chain.len());
         if url_chain_omitted > 0 {
-            diagnostics.record(format!(
+            diagnostics.record_examiner_limit("download URL chains", format!(
                 "downloads URL chain {id}: retained {} of {url_chain_total} URLs; omitted {url_chain_omitted} at the configured protective bound {CHROMIUM_DOWNLOAD_URL_CHAIN_MAX_URLS_ENV}={max_url_chain_urls}",
                 url_chain.len(),
             ));
@@ -14127,6 +19968,7 @@ fn stream_chromium_download_records(
             "original_mime_type": row.original_mime_type,
             "guid": row.guid,
             "opened": row.opened.map(|value| value != 0),
+            "opened_interpretation": "Chromium downloads.opened flag only; false does not prove the downloaded file was never accessed by another application or method",
             "hash": row.hash_hex,
             "hash_hex": row.hash_hex,
             "url_chain": url_chain,
@@ -14155,10 +19997,11 @@ fn stream_chromium_download_records(
     records.finish()
 }
 
-/// Saved website credentials from `Login Data`. Encrypted password bytes are
-/// retained as labelled ciphertext so the examiner can export the complete
-/// record or use an authorized external decryptor without KDFT pretending that
-/// DPAPI/application encryption was decoded.
+/// Saved website-credential metadata from `Login Data`. Usernames and protected
+/// password bytes are never duplicated into ordinary case metadata or reports.
+/// Exact byte lengths, SHA-256 values, and the recognizable Chromium password
+/// envelope generation are retained so an examiner can correlate the source
+/// row without exposing credential material.
 fn stream_chromium_login_records(
     profile_dir: &Path,
     max_rows: usize,
@@ -14172,75 +20015,82 @@ fn stream_chromium_login_records(
     let source_metadata = source_artifact_metadata(&login_path, "Login Data");
     let password_value = sql_column_or_null(&conn, "logins", "", "password_value")?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT origin_url, action_url, username_value, date_created, date_last_used, times_used,
-                hex({password_value})
+        "SELECT rowid, origin_url, action_url, CAST(username_value AS BLOB), date_created, date_last_used,
+                times_used, CAST({password_value} AS BLOB)
          FROM logins ORDER BY date_created DESC LIMIT ?1",
     ))?;
     let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
-        let origin_url: Option<String> = row.get(0)?;
-        let action_url: Option<String> = row.get(1)?;
-        let username: Option<String> = row.get(2)?;
-        let date_created: Option<i64> = row.get(3)?;
-        let date_last_used: Option<i64> = row.get(4)?;
-        let times_used: Option<i64> = row.get(5)?;
-        let password_ciphertext_hex: Option<String> = row.get(6)?;
+        let source_rowid: i64 = row.get(0)?;
+        let origin_url: Option<String> = row.get(1)?;
+        let action_url: Option<String> = row.get(2)?;
+        let username_summary = sensitive_sqlite_value_summary(row.get_ref(3)?);
+        let date_created: Option<i64> = row.get(4)?;
+        let date_last_used: Option<i64> = row.get(5)?;
+        let times_used: Option<i64> = row.get(6)?;
+        let password_value = row.get_ref(7)?;
+        let password_blob_format = chromium_protected_value_format(password_value);
+        let password_summary = sensitive_sqlite_value_summary(password_value);
         Ok((
+            source_rowid,
             origin_url,
             action_url,
-            username,
+            username_summary,
             date_created,
             date_last_used,
             times_used,
-            password_ciphertext_hex,
+            password_summary,
+            password_blob_format,
         ))
     })?;
     let mut records = BrowserRecordEmitter::new(emit);
-    for (index, row) in rows.enumerate() {
+    for row in rows {
         let (
+            source_rowid,
             origin_url,
             action_url,
-            username,
+            username_summary,
             date_created,
             date_last_used,
             times_used,
-            password_ciphertext_hex,
+            password_summary,
+            password_blob_format,
         ) = row?;
-        let password_ciphertext_hex = password_ciphertext_hex.filter(|value| !value.is_empty());
-        let password_ciphertext_bytes = password_ciphertext_hex
-            .as_ref()
-            .map(|value| value.len().saturating_div(2));
         let origin = origin_url.clone().unwrap_or_default();
         let host = host_from_url(&origin);
-        let user_label = username
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("(no username)");
+        let sensitive_value_present = username_summary.present() || password_summary.present();
         let mut metadata = serde_json::json!({
             "artifact_kind": "browser_login",
             "browser_family": "chromium",
+            "source_sqlite_table": "logins",
+            "source_sqlite_rowid": source_rowid,
             "origin_url": origin_url,
             "action_url": action_url,
-            "username": username,
+            "username_value_present": username_summary.present(),
+            "username_value_bytes": username_summary.bytes,
+            "username_value_sha256": username_summary.sha256_hex,
+            "username_value_disclosure": "withheld",
             "host": host,
             "date_created_chrome": date_created,
             "date_created_utc": optional_chrome_time_to_rfc3339(date_created),
             "date_last_used_chrome": date_last_used,
             "date_last_used_utc": optional_chrome_time_to_rfc3339(date_last_used),
             "times_used": times_used,
-            "password_ciphertext_hex": password_ciphertext_hex,
-            "password_ciphertext_bytes": password_ciphertext_bytes,
-            "sensitive_value_present": password_ciphertext_bytes.unwrap_or_default() > 0,
-            "password_note": "encrypted password retained as ciphertext; not decrypted",
+            "password_protected_blob_bytes": password_summary.bytes,
+            "password_protected_blob_sha256": password_summary.sha256_hex,
+            "password_protected_blob_format": password_blob_format,
+            "password_value_disclosure": "withheld",
+            "sensitive_value_present": sensitive_value_present,
+            "sensitive_value_policy": BROWSER_SENSITIVE_VALUE_POLICY,
+            "sensitive_value_access_path": "source_artifact_path + source_sqlite_table=logins + source_sqlite_rowid; explicit audited examiner access only",
+            "credential_note": "username and protected password remain only in the cited Login Data row; KDFT did not decrypt or copy either value into case metadata",
         });
         merge_json_object(&mut metadata, &source_metadata);
         let logical_path = format!(
-            "/Browser Activities/Logins/{}/{}-{}.record",
+            "/Browser Activities/Logins/{}/saved-login-{}.record",
             sanitize_logical_segment(&host),
-            sanitize_logical_segment(user_label),
-            index
+            source_rowid
         );
-        let display_name: String = format!("{user_label} @ {host}").chars().take(180).collect();
+        let display_name: String = format!("Saved login @ {host}").chars().take(180).collect();
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
         records.push(BrowserActivityRecord {
             logical_path,
@@ -14251,9 +20101,9 @@ fn stream_chromium_login_records(
     records.finish()
 }
 
-/// Cookie records from the Chromium cookie store (`Network\Cookies` or legacy `Cookies`).
-/// Plaintext values already present in the database are retained as sensitive evidence;
-/// encrypted values are counted but are never mislabeled as decoded plaintext.
+/// Cookie metadata from the Chromium cookie store (`Network\Cookies` or
+/// legacy `Cookies`). Plaintext and encrypted session values are fingerprinted
+/// but never duplicated into ordinary case metadata or reports.
 fn stream_chromium_cookie_records(
     profile_dir: &Path,
     max_rows: usize,
@@ -14271,28 +20121,32 @@ fn stream_chromium_cookie_records(
     let (conn, _guard) = open_sqlite_copy_read_only(&cookie_path)?;
     let source_metadata = source_artifact_metadata(&cookie_path, "Cookies");
     let plaintext_value = sql_column_or_null(&conn, "cookies", "", "value")?;
-    let encrypted_length = if sqlite_column_exists(&conn, "cookies", "encrypted_value")? {
-        "length(encrypted_value)".to_string()
+    let encrypted_value = if sqlite_column_exists(&conn, "cookies", "encrypted_value")? {
+        "encrypted_value".to_string()
     } else {
         "NULL".to_string()
     };
     let mut stmt = conn.prepare(&format!(
-        "SELECT host_key, name, path, creation_utc, expires_utc, last_access_utc,
-                is_secure, is_httponly, {plaintext_value}, {encrypted_length}
+        "SELECT rowid, host_key, name, path, creation_utc, expires_utc, last_access_utc,
+                is_secure, is_httponly, CAST({plaintext_value} AS BLOB),
+                CAST({encrypted_value} AS BLOB)
          FROM cookies ORDER BY creation_utc DESC LIMIT ?1"
     ))?;
     let rows = stmt.query_map(params![sqlite_limit_param(max_rows)], |row| {
-        let host_key: String = row.get(0)?;
-        let name: String = row.get(1)?;
-        let path: Option<String> = row.get(2)?;
-        let creation: Option<i64> = row.get(3)?;
-        let expires: Option<i64> = row.get(4)?;
-        let last_access: Option<i64> = row.get(5)?;
-        let is_secure: Option<i64> = row.get(6)?;
-        let is_httponly: Option<i64> = row.get(7)?;
-        let plaintext_value: Option<String> = row.get(8)?;
-        let encrypted_value_bytes: Option<i64> = row.get(9)?;
+        let source_rowid: i64 = row.get(0)?;
+        let host_key: String = row.get(1)?;
+        let name: String = row.get(2)?;
+        let path: Option<String> = row.get(3)?;
+        let creation: Option<i64> = row.get(4)?;
+        let expires: Option<i64> = row.get(5)?;
+        let last_access: Option<i64> = row.get(6)?;
+        let is_secure: Option<i64> = row.get(7)?;
+        let is_httponly: Option<i64> = row.get(8)?;
+        let plaintext_summary = sensitive_sqlite_value_summary(row.get_ref(9)?);
+        let encrypted_format = chromium_protected_value_format(row.get_ref(10)?);
+        let encrypted_summary = sensitive_sqlite_value_summary(row.get_ref(10)?);
         Ok((
+            source_rowid,
             host_key,
             name,
             path,
@@ -14301,13 +20155,15 @@ fn stream_chromium_cookie_records(
             last_access,
             is_secure,
             is_httponly,
-            plaintext_value,
-            encrypted_value_bytes,
+            plaintext_summary,
+            encrypted_summary,
+            encrypted_format,
         ))
     })?;
     let mut records = BrowserRecordEmitter::new(emit);
     for row in rows {
         let (
+            source_rowid,
             host_key,
             name,
             path,
@@ -14316,13 +20172,15 @@ fn stream_chromium_cookie_records(
             last_access,
             is_secure,
             is_httponly,
-            plaintext_value,
-            encrypted_value_bytes,
+            plaintext_summary,
+            encrypted_summary,
+            encrypted_format,
         ) = row?;
-        let plaintext_value = plaintext_value.filter(|value| !value.is_empty());
         let mut metadata = serde_json::json!({
             "artifact_kind": "browser_cookie",
             "browser_family": "chromium",
+            "source_sqlite_table": "cookies",
+            "source_sqlite_rowid": source_rowid,
             "host": host_key,
             "cookie_name": name,
             "cookie_path": path,
@@ -14334,17 +20192,25 @@ fn stream_chromium_cookie_records(
             "last_access_utc": optional_chrome_time_to_rfc3339(last_access),
             "is_secure": is_secure.map(|value| value != 0),
             "is_httponly": is_httponly.map(|value| value != 0),
-            "cookie_value_plaintext": plaintext_value,
-            "cookie_value_encrypted_bytes": encrypted_value_bytes,
-            "sensitive_value_present": plaintext_value.is_some() || encrypted_value_bytes.unwrap_or(0) > 0,
-            "value_note": if plaintext_value.is_some() { "plaintext cookie/session value retained as sensitive evidence" } else { "encrypted cookie value not decoded" },
+            "cookie_plaintext_value_present": plaintext_summary.present(),
+            "cookie_plaintext_value_bytes": plaintext_summary.bytes,
+            "cookie_plaintext_value_sha256": plaintext_summary.sha256_hex,
+            "cookie_encrypted_value_present": encrypted_summary.present(),
+            "cookie_encrypted_value_bytes": encrypted_summary.bytes,
+            "cookie_encrypted_value_sha256": encrypted_summary.sha256_hex,
+            "cookie_encrypted_value_format": encrypted_format,
+            "cookie_value_disclosure": "withheld",
+            "sensitive_value_present": plaintext_summary.present() || encrypted_summary.present(),
+            "sensitive_value_policy": BROWSER_SENSITIVE_VALUE_POLICY,
+            "sensitive_value_access_path": "source_artifact_path + source_sqlite_table=cookies + source_sqlite_rowid; explicit audited examiner access only",
+            "value_note": "cookie/session value retained only in cited source row; KDFT did not decrypt or copy it into case metadata",
         });
         merge_json_object(&mut metadata, &source_metadata);
         let logical_path = format!(
             "/Browser Activities/Cookies/{}/{}-{}.record",
             sanitize_logical_segment(&host_key),
             sanitize_logical_segment(&name),
-            creation.unwrap_or_default()
+            source_rowid
         );
         let display_name: String = format!("{name} ({host_key})").chars().take(180).collect();
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
@@ -14925,8 +20791,10 @@ fn stream_chromium_preference_records(
         serde_json::json!({
             "artifact_kind": "browser_preference",
             "category": "search",
-            "default_search_provider": json_path(&value, &["default_search_provider"]).cloned(),
-            "default_search_provider_data": json_path(&value, &["default_search_provider_data", "template_url_data"]).cloned(),
+            "default_search_provider_enabled": json_path(&value, &["default_search_provider", "enabled"]).cloned(),
+            "default_search_provider_short_name": json_path(&value, &["default_search_provider_data", "template_url_data", "short_name"]).cloned(),
+            "default_search_provider_keyword": json_path(&value, &["default_search_provider_data", "template_url_data", "keyword"]).cloned(),
+            "default_search_provider_url_template": json_path(&value, &["default_search_provider_data", "template_url_data", "url"]).cloned(),
         }),
         &source_metadata,
     );
@@ -14947,10 +20815,13 @@ fn stream_chromium_preference_records(
         serde_json::json!({
             "artifact_kind": "browser_preference",
             "category": "privacy_safety",
-            "safe_browsing": json_path(&value, &["safebrowsing"]).cloned(),
+            "safe_browsing_enabled": json_path(&value, &["safebrowsing", "enabled"]).cloned(),
+            "safe_browsing_enhanced": json_path(&value, &["safebrowsing", "enhanced"]).cloned(),
             "credentials_enable_service": json_path(&value, &["credentials_enable_service"]).cloned(),
             "profile_password_manager_enabled": json_path(&value, &["profile", "password_manager_enabled"]).cloned(),
-            "autofill": json_path(&value, &["autofill"]).cloned(),
+            "autofill_enabled": json_path(&value, &["autofill", "enabled"]).cloned(),
+            "autofill_profile_enabled": json_path(&value, &["autofill", "profile_enabled"]).cloned(),
+            "autofill_credit_card_enabled": json_path(&value, &["autofill", "credit_card_enabled"]).cloned(),
         }),
         &source_metadata,
     );
@@ -14965,18 +20836,40 @@ fn stream_chromium_preference_records(
             "artifact_kind": "browser_preference",
             "category": "extensions",
             "extension_count": extensions_count,
-            "extensions_settings": json_path(&value, &["extensions", "settings"]).cloned(),
+            "extension_inventory": chromium_extension_inventory(&value),
+            "extension_settings_policy": "arbitrary extension preference values are not copied into ordinary case metadata; only stable identifiers and selected manifest/install-state fields are retained",
         }),
         &source_metadata,
     );
     records.finish()
 }
 
-/// Some preference records intentionally retain selected JSON subtrees in a
-/// single case row. Until those subtrees are normalized into their own record
-/// family, parsing the whole source is bounded explicitly. Crossing the bound
-/// is a disclosed parser error (and therefore a truncated import), never a
-/// false successful parse with silently omitted fields.
+fn chromium_extension_inventory(preferences: &serde_json::Value) -> Vec<serde_json::Value> {
+    let Some(settings) =
+        json_path(preferences, &["extensions", "settings"]).and_then(serde_json::Value::as_object)
+    else {
+        return Vec::new();
+    };
+    settings
+        .iter()
+        .map(|(extension_id, extension)| {
+            serde_json::json!({
+                "extension_id": extension_id,
+                "state": json_path(extension, &["state"]).cloned(),
+                "from_webstore": json_path(extension, &["from_webstore"]).cloned(),
+                "was_installed_by_default": json_path(extension, &["was_installed_by_default"]).cloned(),
+                "install_time": json_path(extension, &["install_time"]).cloned(),
+                "manifest_name": json_path(extension, &["manifest", "name"]).cloned(),
+                "manifest_version": json_path(extension, &["manifest", "version"]).cloned(),
+            })
+        })
+        .collect()
+}
+
+/// Chromium Preferences is parsed from a bounded source snapshot. Crossing
+/// the configured bound is an examiner-limit outcome rather than a parser
+/// defect: no partial JSON is decoded and the resulting import is explicitly
+/// marked truncated.
 fn read_json_value_with_byte_bound(
     path: &Path,
     artifact_label: &str,
@@ -14997,13 +20890,17 @@ fn read_json_value_with_byte_bound(
         let omitted_text = omitted
             .map(|value| format!("{value} bytes"))
             .unwrap_or_else(|| "an unknown number of bytes".to_string());
-        bail!(
-            "{artifact_label} file {} exceeds configured protective bound {configuration_name}={max_bytes} bytes; metadata reports {} total bytes and {omitted_text} were not parsed",
-            path.display(),
-            metadata_bytes
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "an unknown".to_string()),
-        );
+        return Err(BrowserExaminerLimitReached {
+            artifact_kind: "preferences",
+            message: format!(
+                "{artifact_label} file {} exceeds configured protective bound {configuration_name}={max_bytes} bytes; metadata reports {} total bytes and {omitted_text} were not parsed",
+                path.display(),
+                metadata_bytes
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "an unknown".to_string()),
+            ),
+        }
+        .into());
     }
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing {artifact_label} file {}", path.display()))
@@ -15677,6 +21574,10 @@ fn stream_firefox_downloads_sqlite_records(
 /// document nor the whole login list in memory.
 #[derive(Deserialize)]
 struct FirefoxLoginInput {
+    #[serde(default)]
+    id: Option<JsonChromeTime>,
+    #[serde(default, deserialize_with = "deserialize_optional_json_string")]
+    guid: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_json_string")]
     hostname: Option<String>,
     #[serde(
@@ -15708,14 +21609,19 @@ struct FirefoxLoginInput {
 }
 
 struct FirefoxLoginSpoolRecord {
+    sequence: i64,
+    login_id: Option<i64>,
+    guid: Option<String>,
     hostname: Option<String>,
     http_realm: Option<String>,
     time_created: Option<i64>,
     time_last_used: Option<i64>,
     time_password_changed: Option<i64>,
     times_used: Option<i64>,
-    encrypted_username: Option<String>,
-    encrypted_password: Option<String>,
+    encrypted_username_bytes: usize,
+    encrypted_username_sha256: Option<String>,
+    encrypted_password_bytes: usize,
+    encrypted_password_sha256: Option<String>,
 }
 
 struct FirefoxLoginJsonSpool {
@@ -15736,14 +21642,18 @@ impl FirefoxLoginJsonSpool {
              CREATE TABLE firefox_logins(
                  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                  sort_time INTEGER NOT NULL,
+                 login_id INTEGER,
+                 guid TEXT,
                  hostname TEXT,
                  http_realm TEXT,
                  time_created INTEGER,
                  time_last_used INTEGER,
                  time_password_changed INTEGER,
                  times_used INTEGER,
-                 encrypted_username TEXT,
-                 encrypted_password TEXT
+                 encrypted_username_bytes INTEGER NOT NULL,
+                 encrypted_username_sha256 TEXT,
+                 encrypted_password_bytes INTEGER NOT NULL,
+                 encrypted_password_sha256 TEXT
              );
              BEGIN IMMEDIATE;",
         )?;
@@ -15759,24 +21669,45 @@ impl FirefoxLoginJsonSpool {
         let time_last_used = login.time_last_used.and_then(|value| value.0);
         let time_password_changed = login.time_password_changed.and_then(|value| value.0);
         let times_used = login.times_used.and_then(|value| value.0);
+        let login_id = login.id.and_then(|value| value.0);
+        let encrypted_username = SensitiveValueSummary::from_bytes(
+            login
+                .encrypted_username
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        let encrypted_password = SensitiveValueSummary::from_bytes(
+            login
+                .encrypted_password
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         let sort_time = time_last_used.or(time_created).unwrap_or_default();
         self.conn
             .prepare_cached(
                 "INSERT INTO firefox_logins(
-                sort_time, hostname, http_realm, time_created, time_last_used,
-                time_password_changed, times_used, encrypted_username, encrypted_password
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                sort_time, login_id, guid, hostname, http_realm, time_created, time_last_used,
+                time_password_changed, times_used,
+                encrypted_username_bytes, encrypted_username_sha256,
+                encrypted_password_bytes, encrypted_password_sha256
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?
             .execute(params![
                 sort_time,
+                login_id,
+                login.guid,
                 login.hostname,
                 login.http_realm,
                 time_created,
                 time_last_used,
                 time_password_changed,
                 times_used,
-                login.encrypted_username,
-                login.encrypted_password,
+                i64::try_from(encrypted_username.bytes).unwrap_or(i64::MAX),
+                encrypted_username.sha256_hex,
+                i64::try_from(encrypted_password.bytes).unwrap_or(i64::MAX),
+                encrypted_password.sha256_hex,
             ])?;
         Ok(())
     }
@@ -15795,8 +21726,10 @@ impl FirefoxLoginJsonSpool {
         mut consume: impl FnMut(usize, FirefoxLoginSpoolRecord) -> Result<()>,
     ) -> Result<usize> {
         let mut stmt = self.conn.prepare(
-            "SELECT hostname, http_realm, time_created, time_last_used,
-                    time_password_changed, times_used, encrypted_username, encrypted_password
+            "SELECT sequence, login_id, guid, hostname, http_realm, time_created, time_last_used,
+                    time_password_changed, times_used,
+                    encrypted_username_bytes, encrypted_username_sha256,
+                    encrypted_password_bytes, encrypted_password_sha256
              FROM firefox_logins
              ORDER BY sort_time DESC, sequence ASC LIMIT ?1",
         )?;
@@ -15806,14 +21739,21 @@ impl FirefoxLoginJsonSpool {
             consume(
                 index,
                 FirefoxLoginSpoolRecord {
-                    hostname: row.get(0)?,
-                    http_realm: row.get(1)?,
-                    time_created: row.get(2)?,
-                    time_last_used: row.get(3)?,
-                    time_password_changed: row.get(4)?,
-                    times_used: row.get(5)?,
-                    encrypted_username: row.get(6)?,
-                    encrypted_password: row.get(7)?,
+                    sequence: row.get(0)?,
+                    login_id: row.get(1)?,
+                    guid: row.get(2)?,
+                    hostname: row.get(3)?,
+                    http_realm: row.get(4)?,
+                    time_created: row.get(5)?,
+                    time_last_used: row.get(6)?,
+                    time_password_changed: row.get(7)?,
+                    times_used: row.get(8)?,
+                    encrypted_username_bytes: usize::try_from(row.get::<_, i64>(9)?)
+                        .unwrap_or(usize::MAX),
+                    encrypted_username_sha256: row.get(10)?,
+                    encrypted_password_bytes: usize::try_from(row.get::<_, i64>(11)?)
+                        .unwrap_or(usize::MAX),
+                    encrypted_password_sha256: row.get(12)?,
                 },
             )?;
             index = index.saturating_add(1);
@@ -15932,18 +21872,24 @@ fn stream_firefox_login_records(
     login_spool.seal()?;
     let source_metadata = source_artifact_metadata(logins_path, "logins.json");
     let mut records = BrowserRecordEmitter::new(emit);
-    login_spool.for_each(max_rows, |index, login| {
+    login_spool.for_each(max_rows, |_index, login| {
         let FirefoxLoginSpoolRecord {
+            sequence,
+            login_id,
+            guid,
             hostname,
             http_realm,
             time_created,
             time_last_used,
             time_password_changed,
             times_used,
-            encrypted_username,
-            encrypted_password,
+            encrypted_username_bytes,
+            encrypted_username_sha256,
+            encrypted_password_bytes,
+            encrypted_password_sha256,
         } = login;
-        let sensitive_value_present = encrypted_username.is_some() || encrypted_password.is_some();
+        let sensitive_value_present =
+            encrypted_username_bytes > 0 || encrypted_password_bytes > 0;
         let host_label = hostname.as_deref().unwrap_or("unknown-host");
         let host = host_from_url(host_label);
         let realm_label = http_realm
@@ -15951,9 +21897,20 @@ fn stream_firefox_login_records(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("saved-login");
+        let source_json_sequence = sequence.saturating_sub(1);
+        let stable_locator = guid
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| login_id.map(|value| format!("id-{value}")))
+            .unwrap_or_else(|| format!("sequence-{source_json_sequence}"));
         let mut metadata = serde_json::json!({
             "artifact_kind": "browser_login",
             "browser_family": "firefox",
+            "source_json_array": "logins",
+            "source_json_sequence": source_json_sequence,
+            "source_login_id": login_id,
+            "source_login_guid": guid,
             "hostname": hostname,
             "http_realm": http_realm,
             "host": host,
@@ -15964,17 +21921,23 @@ fn stream_firefox_login_records(
             "time_password_changed_ms": time_password_changed,
             "time_password_changed_utc": time_password_changed.and_then(unix_millis_to_rfc3339),
             "times_used": times_used,
-            "username_ciphertext": encrypted_username,
-            "password_ciphertext": encrypted_password,
+            "username_protected_value_bytes": encrypted_username_bytes,
+            "username_protected_value_sha256": encrypted_username_sha256,
+            "password_protected_value_bytes": encrypted_password_bytes,
+            "password_protected_value_sha256": encrypted_password_sha256,
+            "protected_value_format": "firefox_nss_sdr_base64",
+            "credential_value_disclosure": "withheld",
             "sensitive_value_present": sensitive_value_present,
-            "password_note": "encrypted username/password retained as ciphertext; not decrypted",
+            "sensitive_value_policy": BROWSER_SENSITIVE_VALUE_POLICY,
+            "sensitive_value_access_path": "source_artifact_path + source_json_array=logins + source_login_guid/source_login_id/source_json_sequence; explicit audited examiner access only",
+            "password_note": "NSS-protected username/password strings remain only in the cited logins.json object; KDFT did not decrypt or copy them into case metadata",
         });
         merge_json_object(&mut metadata, &source_metadata);
         let logical_path = format!(
             "/Browser Activities/Logins/{}/{}-{}.record",
             sanitize_logical_segment(&host),
             sanitize_logical_segment(realm_label),
-            index
+            sanitize_logical_segment(&stable_locator)
         );
         let display_name = format!("{realm_label} @ {host}")
             .chars()
@@ -16008,7 +21971,8 @@ fn stream_firefox_cookie_records(
     let last_accessed = sql_column_or_null(&conn, "moz_cookies", "", "lastAccessed")?;
     let cookie_value = sql_column_or_null(&conn, "moz_cookies", "", "value")?;
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, host, name, path, {creation_time}, {last_accessed}, expiry, isSecure, isHttpOnly, {cookie_value}
+        "SELECT id, host, name, path, {creation_time}, {last_accessed}, expiry, isSecure, isHttpOnly,
+                CAST({cookie_value} AS BLOB)
          FROM moz_cookies
          ORDER BY COALESCE({creation_time}, 0) DESC, id DESC
          LIMIT ?1",
@@ -16024,7 +21988,7 @@ fn stream_firefox_cookie_records(
             row.get::<_, Option<i64>>(6)?,
             row.get::<_, Option<i64>>(7)?,
             row.get::<_, Option<i64>>(8)?,
-            row.get::<_, Option<String>>(9)?,
+            sensitive_sqlite_value_summary(row.get_ref(9)?),
         ))
     })?;
     let mut records = BrowserRecordEmitter::new(emit);
@@ -16039,12 +22003,16 @@ fn stream_firefox_cookie_records(
             expiry,
             is_secure,
             is_httponly,
-            cookie_value,
+            cookie_value_summary,
         ) = row?;
-        let cookie_value = cookie_value.filter(|value| !value.is_empty());
+        let cookie_value_present = cookie_value_summary.present();
+        let cookie_value_bytes = cookie_value_summary.bytes;
+        let cookie_value_sha256 = cookie_value_summary.sha256_hex;
         let mut metadata = serde_json::json!({
             "artifact_kind": "browser_cookie",
             "browser_family": "firefox",
+            "source_sqlite_table": "moz_cookies",
+            "source_sqlite_primary_key": id,
             "cookie_id": id,
             "host": host,
             "cookie_name": name,
@@ -16057,9 +22025,15 @@ fn stream_firefox_cookie_records(
             "expiry_utc": expiry.and_then(unix_seconds_to_rfc3339),
             "is_secure": is_secure.map(|value| value != 0),
             "is_httponly": is_httponly.map(|value| value != 0),
-            "cookie_value_plaintext": cookie_value,
-            "sensitive_value_present": cookie_value.is_some(),
-            "value_note": if cookie_value.is_some() { "plaintext cookie/session value retained as sensitive evidence" } else { "cookie value empty" },
+            "cookie_plaintext_value_present": cookie_value_present,
+            "cookie_plaintext_value_bytes": cookie_value_bytes,
+            "cookie_plaintext_value_sha256": cookie_value_sha256,
+            "cookie_value_source_state": "plaintext_source_value_withheld",
+            "cookie_value_disclosure": "withheld",
+            "sensitive_value_present": cookie_value_present,
+            "sensitive_value_policy": BROWSER_SENSITIVE_VALUE_POLICY,
+            "sensitive_value_access_path": "source_artifact_path + source_sqlite_table=moz_cookies + source_sqlite_primary_key; explicit audited examiner access only",
+            "value_note": if cookie_value_present { "plaintext cookie/session value remains only in the cited moz_cookies row; KDFT did not copy it into case metadata" } else { "cookie value empty" },
         });
         merge_json_object(&mut metadata, &source_metadata);
         let logical_path = format!(
@@ -16284,7 +22258,7 @@ struct EntryCategory {
 /// Version stamp written into every entry's `category_source`. Public so the
 /// UI can detect entries categorized by an older classifier and offer the
 /// DB-only category refresh only when it would actually change something.
-pub const ENTRY_CATEGORY_CLASSIFIER_VERSION: &str = "evidence_path_rules_v5";
+pub const ENTRY_CATEGORY_CLASSIFIER_VERSION: &str = "evidence_path_rules_v6";
 const RECATEGORIZE_BATCH_SIZE: i64 = 1_000;
 const NON_ARTIFACT_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "ico", "bmp", "svg", "webp", "tif", "tiff", "dll", "exe", "sys",
@@ -16570,7 +22544,7 @@ fn classify_entry(
             return category(
                 "Web Activity",
                 "Autofill",
-                "Plain-text form value retained by Chromium autofill",
+                "Chromium autofill field use; the form value is withheld and represented only by byte length and SHA-256",
                 "high",
                 &["browser", "autofill", "typing", "web"],
             );
@@ -16597,7 +22571,7 @@ fn classify_entry(
             return category(
                 "Accounts and Identity",
                 "Saved logins",
-                "Saved website credential; encrypted password material is retained as labelled ciphertext",
+                "Saved website credential metadata; protected values are withheld and represented only by byte length and SHA-256",
                 "high",
                 &["browser", "login", "credential", "accounts"],
             );
@@ -16606,7 +22580,7 @@ fn classify_entry(
             return category(
                 "Accounts and Identity",
                 "Cookies",
-                "Browser cookie and session record; plaintext values are retained and encrypted values remain labelled",
+                "Browser cookie/session metadata; values are withheld and represented only by byte length and SHA-256",
                 "medium",
                 &["browser", "cookie", "session", "token"],
             );
@@ -16636,6 +22610,24 @@ fn classify_entry(
                 "Parsed email message",
                 "high",
                 &["email", "communications", "message"],
+            );
+        }
+        "outlook_msg_container" => {
+            return category(
+                "Email and Communications",
+                "Outlook MSG containers",
+                "Structurally validated Outlook MSG compound file; MAPI properties are not yet decoded",
+                "medium",
+                &["email", "communications", "outlook", "msg", "container"],
+            );
+        }
+        "email_candidate" => {
+            return category(
+                "Email and Communications",
+                "Unvalidated email candidates",
+                "Filename indicates a possible email container, but structural validation is pending or inconclusive",
+                "low",
+                &["email", "communications", "candidate", "unvalidated"],
             );
         }
         "pst_folder" => {
@@ -16728,13 +22720,20 @@ fn classify_entry(
                 &["accounts", "credentials", "secrets", "lead"],
             );
         }
-        "plaintext_secret" => {
+        "structured_secret" | "plaintext_secret" => {
             return category(
                 "Accounts and Identity",
-                "Recovered plaintext secrets",
-                "Plaintext password, token, key, or secret recovered from an exact structured configuration field",
+                "Structured secret indicators",
+                "Sensitive value observed in an exact structured source field; ordinary metadata retains its locator, state, byte length, and SHA-256 but not the value",
                 "high",
-                &["accounts", "credentials", "secrets", "sensitive", "parsed"],
+                &[
+                    "accounts",
+                    "credentials",
+                    "secrets",
+                    "sensitive",
+                    "source-located",
+                    "value-withheld",
+                ],
             );
         }
         "windows_amcache_record" | "windows_userassist_record" | "windows_shimcache_record" => {
@@ -16849,9 +22848,9 @@ fn classify_entry(
             return category(
                 "Recovery",
                 "Recovered partitions",
-                "Orphaned volume found by scanning unpartitioned space for boot sectors",
+                "Parser-validated filesystem or volume candidate found within a scanned gap; discovery alone does not establish deletion, orphanhood, or historical ownership",
                 "high",
-                &["recovery", "partition", "boot-sector"],
+                &["recovery", "partition", "gap-scan", "validated"],
             );
         }
         "carved_file" => {
@@ -16965,6 +22964,27 @@ fn classify_entry(
             "low",
             &["os", "system-file", "informational"],
         );
+    }
+
+    let is_not_outlook_msg = artifact_kind == "not_outlook_msg"
+        || metadata
+            .get("email_candidate_parser_status")
+            .and_then(serde_json::Value::as_str)
+            == Some("not_outlook_msg");
+    if is_not_outlook_msg {
+        return verified_signature_mismatch_category(metadata).unwrap_or_else(|| {
+            category(
+                "Uncategorized",
+                "Extension/content mismatch",
+                "File uses the .msg extension but does not validate as an Outlook MSG compound file",
+                "high",
+                &["extension-mismatch", "not-outlook-msg", "signature"],
+            )
+        });
+    }
+
+    if let Some(category) = verified_signature_mismatch_category(metadata) {
+        return category;
     }
 
     let filesystem_parser = metadata
@@ -17629,6 +23649,122 @@ fn precise_forensic_artifact_category(
     None
 }
 
+fn verified_signature_mismatch_category(metadata: &serde_json::Value) -> Option<EntryCategory> {
+    if metadata
+        .get("signature_status")
+        .and_then(serde_json::Value::as_str)
+        != Some("mismatch")
+    {
+        return None;
+    }
+    let label = metadata
+        .get("detected_signature")
+        .and_then(serde_json::Value::as_str)?;
+    let category = match label {
+        "Tencent QQ DIMG" => category(
+            "Pictures and Media",
+            "Graphics and design",
+            "Content signature identifies a Tencent QQ DIMG graphic/resource container despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "graphics"],
+        ),
+        "JPEG" | "PNG" | "GIF" | "BMP" | "TIFF (little-endian)"
+        | "TIFF (big-endian)" => category(
+            "Pictures and Media",
+            "Pictures",
+            "Content signature identifies an image despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "pictures"],
+        ),
+        "MP3 (ID3)" => category(
+            "Pictures and Media",
+            "Audio",
+            "Content signature identifies audio despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "audio"],
+        ),
+        "ISO Base Media (MP4/MOV)" => category(
+            "Pictures and Media",
+            "Video and ISO base media",
+            "Content signature identifies an ISO base media container despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "media"],
+        ),
+        "RIFF (AVI/WAV)" => category(
+            "Pictures and Media",
+            "RIFF media containers",
+            "Content signature identifies a RIFF media container despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "media"],
+        ),
+        "PDF" => category(
+            "Documents and Office",
+            "PDF",
+            "Content signature identifies a PDF document despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "documents", "pdf"],
+        ),
+        "RTF" => category(
+            "Documents and Office",
+            "Word processing",
+            "Content signature identifies an RTF document despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "documents", "rtf"],
+        ),
+        "XML" => category(
+            "Documents and Office",
+            "XML",
+            "Content signature identifies XML despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "documents", "xml"],
+        ),
+        "CSV" => category(
+            "Documents and Office",
+            "Spreadsheets",
+            "A consistent UTF-8 comma-delimited row structure indicates CSV data despite the filename extension; this is a content heuristic, not a magic-signature proof",
+            "medium",
+            &["signature", "extension-mismatch", "documents", "spreadsheet"],
+        ),
+        "OLE Compound File" => category(
+            "Documents and Office",
+            "OLE compound containers",
+            "Content signature identifies an OLE compound container; the contained application format is not inferred from the misleading extension",
+            "high",
+            &["signature", "extension-mismatch", "ole", "container"],
+        ),
+        "ZIP / Office Open XML / OpenDocument" => category(
+            "Archives and Containers",
+            "ZIP and package containers",
+            "Content signature identifies a ZIP-family package despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "archive", "container"],
+        ),
+        "RAR" | "7-Zip" | "GZIP" => category(
+            "Archives and Containers",
+            "Archives",
+            "Content signature identifies an archive despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "archive", "container"],
+        ),
+        "Windows PE" | "ELF" => category(
+            "Program Execution",
+            "Executables and binaries",
+            "Content signature identifies executable or binary content despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "execution", "binary"],
+        ),
+        "SQLite 3" => category(
+            "Databases",
+            "SQLite databases",
+            "Content signature identifies a SQLite database despite the filename extension",
+            "high",
+            &["signature", "extension-mismatch", "database", "sqlite"],
+        ),
+        _ => return None,
+    };
+    Some(category)
+}
+
 fn normalize_category_path(value: &str) -> String {
     let replaced = value.replace('\\', "/").to_ascii_lowercase();
     let mut normalized = String::with_capacity(replaced.len().saturating_add(1));
@@ -17898,7 +24034,7 @@ fn annotate_email_metadata_for_path(
     path: &Path,
     logical_path: &str,
     name: &str,
-    _size_bytes: u64,
+    size_bytes: u64,
 ) -> bool {
     let Some(ext) = extension_lower(name).or_else(|| extension_lower(logical_path)) else {
         return false;
@@ -17955,6 +24091,19 @@ fn annotate_email_metadata_for_path(
                 }
             }
         }
+    } else if ext == "msg" {
+        match fs::File::open(path).and_then(|file| {
+            annotate_msg_candidate_from_reader(metadata, file, size_bytes).map_err(io::Error::other)
+        }) {
+            Ok(incomplete) => return incomplete,
+            Err(error) => {
+                mark_msg_candidate_read_error(
+                    metadata,
+                    &format!("could not read MSG candidate: {error}"),
+                );
+                return true;
+            }
+        }
     } else if is_email_store_extension(&ext) {
         mark_email_store(metadata, &ext);
     }
@@ -17966,11 +24115,15 @@ fn annotate_email_metadata_for_path(
 /// than ambiguous.
 const EMAIL_PARSE_DISABLED_NOTE: &str =
     "email parsing was disabled for this processing run; re-process with email parsing enabled";
+const RFC822_PARSER_NAME: &str = "kdft-rfc822-mime-2";
+const PENDING_RFC822_TEXT_SEGMENTS_KEY: &str = "_kdft_pending_rfc822_text_segments";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EmailAnnotationStatus {
     Parsed,
     Partial,
+    Unsupported,
+    LimitReached,
     Skipped,
     Failed,
     NotRecognized,
@@ -17981,6 +24134,8 @@ impl EmailAnnotationStatus {
         match self {
             Self::Parsed => "parsed",
             Self::Partial => "partial",
+            Self::Unsupported => "unsupported",
+            Self::LimitReached => "limit_reached",
             Self::Skipped => "skipped",
             Self::Failed => "failed",
             Self::NotRecognized => "not_recognized",
@@ -18083,13 +24238,13 @@ fn annotate_email_metadata_from_reader<R: Read>(
             if let Some(object) = metadata.as_object_mut() {
                 object.insert(
                     "email_parser".to_string(),
-                    serde_json::Value::String("kdft-rfc822-stream-1".to_string()),
+                    serde_json::Value::String(RFC822_PARSER_NAME.to_string()),
                 );
             }
             apply_rfc822_parser_statistics(metadata, &parsed, false);
             let result = EmailAnnotationResult::incomplete(
                 EmailAnnotationStatus::Skipped,
-                1,
+                usize::from(parsed.error_count > 0),
                 1,
                 parsed.error_count,
                 parsed.diagnostics_omitted_count,
@@ -18112,9 +24267,14 @@ fn annotate_email_metadata_from_reader<R: Read>(
         return result;
     }
 
-    let parser_partial =
-        parsed.header_truncated || !parsed.header_complete || parsed.error_count > 0;
-    let incomplete = parser_partial;
+    let parser_status = match parsed.parser_status {
+        rfc822::Rfc822ParseStatus::Complete => EmailAnnotationStatus::Parsed,
+        rfc822::Rfc822ParseStatus::Partial => EmailAnnotationStatus::Partial,
+        rfc822::Rfc822ParseStatus::Unsupported => EmailAnnotationStatus::Unsupported,
+        rfc822::Rfc822ParseStatus::LimitReached => EmailAnnotationStatus::LimitReached,
+        rfc822::Rfc822ParseStatus::NotRecognized => EmailAnnotationStatus::NotRecognized,
+    };
+    let incomplete = !matches!(parser_status, EmailAnnotationStatus::Parsed);
     let email = ParsedEmail {
         from: parsed.from.clone(),
         to: parsed.to.clone(),
@@ -18131,18 +24291,16 @@ fn annotate_email_metadata_from_reader<R: Read>(
     if let Some(object) = metadata.as_object_mut() {
         object.insert(
             "email_parser".to_string(),
-            serde_json::Value::String("kdft-rfc822-stream-1".to_string()),
+            serde_json::Value::String(RFC822_PARSER_NAME.to_string()),
         );
         object.insert(
             "email_parser_status".to_string(),
-            serde_json::Value::String(
-                if parser_partial { "partial" } else { "parsed" }.to_string(),
-            ),
+            serde_json::Value::String(parsed.parser_status.as_str().to_string()),
         );
         object.insert(
             "email_parser_scope".to_string(),
             serde_json::Value::String(
-                "RFC 822 target headers and bounded raw body preview; RFC 2047, MIME parts, and transfer encodings are not decoded"
+                "RFC 5322 headers, RFC 2047 encoded words, bounded nested MIME structure, transfer decoding, charset decoding, exact raw-message/part offsets, complete decoded-content hashes, searchable text bodies, and metadata-only attachments"
                     .to_string(),
             ),
         );
@@ -18150,14 +24308,21 @@ fn annotate_email_metadata_from_reader<R: Read>(
     apply_rfc822_parser_statistics(metadata, &parsed, true);
     let result = if incomplete {
         EmailAnnotationResult::incomplete(
-            EmailAnnotationStatus::Partial,
-            1,
-            0,
+            parser_status,
+            usize::from(parsed.error_count > 0),
+            usize::from(matches!(parser_status, EmailAnnotationStatus::Unsupported)),
             parsed.error_count,
             parsed.diagnostics_omitted_count,
         )
     } else {
-        EmailAnnotationResult::complete(EmailAnnotationStatus::Parsed)
+        EmailAnnotationResult {
+            status: parser_status,
+            incomplete: false,
+            progress_error_count: parsed.error_count,
+            progress_skip_count: 0,
+            parser_error_count: parsed.error_count,
+            diagnostics_omitted: parsed.diagnostics_omitted_count,
+        }
     };
     apply_email_annotation_outcome(metadata, result, true);
     result
@@ -18238,6 +24403,82 @@ fn apply_rfc822_parser_statistics(
         "email_parser_recognized".to_string(),
         serde_json::json!(recognized),
     );
+    object.insert(
+        "email_parser_coverage_status".to_string(),
+        serde_json::json!(parsed.parser_status.as_str()),
+    );
+    object.insert(
+        "email_raw_message_sha256".to_string(),
+        serde_json::json!(parsed.raw_message_sha256),
+    );
+    object.insert(
+        "email_message_capture_truncated".to_string(),
+        serde_json::json!(parsed.message_capture_truncated),
+    );
+    object.insert(
+        "email_from_addresses".to_string(),
+        serde_json::json!(parsed.from_addresses),
+    );
+    object.insert(
+        "email_to_addresses".to_string(),
+        serde_json::json!(parsed.to_addresses),
+    );
+    object.insert(
+        "email_cc_addresses".to_string(),
+        serde_json::json!(parsed.cc_addresses),
+    );
+    object.insert(
+        "email_bcc_addresses".to_string(),
+        serde_json::json!(parsed.bcc_addresses),
+    );
+    object.insert(
+        "email_reply_to_addresses".to_string(),
+        serde_json::json!(parsed.reply_to_addresses),
+    );
+    object.insert(
+        "email_message_ids".to_string(),
+        serde_json::json!(parsed.message_ids),
+    );
+    object.insert(
+        "email_date_utc".to_string(),
+        serde_json::json!(parsed.date_utc),
+    );
+    object.insert(
+        "email_body_preview_part_index".to_string(),
+        serde_json::json!(parsed.body_preview_part_index),
+    );
+    object.insert(
+        "email_mime_part_count".to_string(),
+        serde_json::json!(parsed.mime_parts.len()),
+    );
+    object.insert(
+        "email_attachment_count".to_string(),
+        serde_json::json!(parsed.attachment_count),
+    );
+    object.insert(
+        "email_unsupported_part_count".to_string(),
+        serde_json::json!(parsed.unsupported_part_count),
+    );
+    object.insert(
+        "email_partial_part_count".to_string(),
+        serde_json::json!(parsed.partial_part_count),
+    );
+    object.insert(
+        "email_limit_hit_count".to_string(),
+        serde_json::json!(parsed.limit_hit_count),
+    );
+    object.insert(
+        "email_parser_warning_count".to_string(),
+        serde_json::json!(parsed.warning_count),
+    );
+    object.insert(
+        "email_mime_parts".to_string(),
+        serde_json::json!(parsed.mime_parts),
+    );
+    object.insert(
+        PENDING_RFC822_TEXT_SEGMENTS_KEY.to_string(),
+        serde_json::json!(parsed.searchable_text_segments),
+    );
 }
 
 fn apply_rfc822_candidate_statistics(
@@ -18283,9 +24524,21 @@ fn apply_rfc822_candidate_statistics(
         "email_candidate_parser_recognized".to_string(),
         serde_json::json!(false),
     );
+    object.insert(
+        "email_candidate_raw_message_sha256".to_string(),
+        serde_json::json!(parsed.raw_message_sha256),
+    );
+    object.insert(
+        "email_candidate_parser_coverage_status".to_string(),
+        serde_json::json!(parsed.parser_status.as_str()),
+    );
 }
 
 fn mark_email_store(metadata: &mut serde_json::Value, email_format: &str) {
+    if email_format.eq_ignore_ascii_case("msg") {
+        mark_msg_extension_candidate(metadata);
+        return;
+    }
     if let Some(object) = metadata.as_object_mut() {
         object.insert(
             "artifact_kind".to_string(),
@@ -18315,6 +24568,195 @@ fn mark_email_store(metadata: &mut serde_json::Value, email_format: &str) {
     }
 }
 
+const OUTLOOK_MSG_CFB_MAGIC: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+const OUTLOOK_MSG_PROBE_BYTES: usize = 8 * 1024 * 1024;
+
+fn mark_msg_extension_candidate(metadata: &mut serde_json::Value) {
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "artifact_kind".to_string(),
+        serde_json::json!("email_candidate"),
+    );
+    object.insert(
+        "email_candidate_format".to_string(),
+        serde_json::json!("msg"),
+    );
+    object.insert(
+        "email_candidate_parser".to_string(),
+        serde_json::json!("kdft-msg-cfb-signature-1"),
+    );
+    object.insert(
+        "email_candidate_parser_status".to_string(),
+        serde_json::json!("signature_required"),
+    );
+    object.insert(
+        "email_candidate_parser_recognized".to_string(),
+        serde_json::json!(false),
+    );
+    object.insert(
+        "email_candidate_parser_error".to_string(),
+        serde_json::json!(
+            "the .msg extension alone is not evidence of an Outlook MSG compound file"
+        ),
+    );
+}
+
+fn mark_msg_candidate_read_error(metadata: &mut serde_json::Value, reason: &str) {
+    mark_msg_extension_candidate(metadata);
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "email_candidate_parser_status".to_string(),
+            serde_json::json!("read_failed"),
+        );
+        object.insert(
+            "email_candidate_parser_error".to_string(),
+            serde_json::json!(reason),
+        );
+    }
+}
+
+fn utf16le_ascii_marker_present(bytes: &[u8], marker: &str) -> bool {
+    let mut encoded = Vec::with_capacity(marker.len().saturating_mul(2));
+    for byte in marker.bytes() {
+        encoded.push(byte);
+        encoded.push(0);
+    }
+    bytes
+        .windows(encoded.len())
+        .any(|candidate| candidate == encoded.as_slice())
+}
+
+/// Validate a `.msg` candidate by its CFB header and mandatory Outlook MSG
+/// storage naming conventions.  The extension is deliberately never enough.
+/// A validated container is retained as recognized-but-unsupported until a
+/// bounded native property decoder is available.
+fn annotate_msg_candidate_from_bytes(
+    metadata: &mut serde_json::Value,
+    bytes: &[u8],
+    complete: bool,
+) -> bool {
+    mark_msg_extension_candidate(metadata);
+    let has_cfb_magic = bytes.starts_with(&OUTLOOK_MSG_CFB_MAGIC);
+    let has_properties = utf16le_ascii_marker_present(bytes, "__properties_version1.0");
+    let has_substitution = utf16le_ascii_marker_present(bytes, "__substg1.0_");
+    let Some(object) = metadata.as_object_mut() else {
+        return !complete;
+    };
+    object.insert(
+        "email_candidate_probe_bytes".to_string(),
+        serde_json::json!(bytes.len()),
+    );
+    object.insert(
+        "email_candidate_probe_complete".to_string(),
+        serde_json::json!(complete),
+    );
+    object.insert(
+        "email_candidate_cfb_signature".to_string(),
+        serde_json::json!(has_cfb_magic),
+    );
+    object.insert(
+        "email_candidate_msg_properties_stream_marker".to_string(),
+        serde_json::json!(has_properties),
+    );
+    object.insert(
+        "email_candidate_msg_substitution_stream_marker".to_string(),
+        serde_json::json!(has_substitution),
+    );
+
+    if !has_cfb_magic {
+        object.insert(
+            "artifact_kind".to_string(),
+            serde_json::json!("not_outlook_msg"),
+        );
+        object.insert(
+            "email_candidate_parser_status".to_string(),
+            serde_json::json!("not_outlook_msg"),
+        );
+        object.insert(
+            "email_candidate_parser_error".to_string(),
+            serde_json::json!("content does not begin with the CFB/OLE compound-file signature required by Outlook MSG"),
+        );
+        return false;
+    }
+    if has_properties && has_substitution {
+        object.insert(
+            "artifact_kind".to_string(),
+            serde_json::json!("outlook_msg_container"),
+        );
+        object.insert("email_format".to_string(), serde_json::json!("msg"));
+        object.insert(
+            "email_parser".to_string(),
+            serde_json::json!("kdft-msg-cfb-signature-1"),
+        );
+        object.insert(
+            "email_parser_status".to_string(),
+            serde_json::json!("recognized_unsupported"),
+        );
+        object.insert(
+            "email_parser_error".to_string(),
+            serde_json::json!("validated Outlook MSG compound-file structure; native bounded MAPI property decoding is not implemented"),
+        );
+        object.insert(
+            "email_candidate_parser_status".to_string(),
+            serde_json::json!("recognized_outlook_msg"),
+        );
+        object.insert(
+            "email_candidate_parser_recognized".to_string(),
+            serde_json::json!(true),
+        );
+        return false;
+    }
+
+    object.insert(
+        "email_candidate_parser_status".to_string(),
+        serde_json::json!(if complete {
+            "not_outlook_msg"
+        } else {
+            "signature_inconclusive"
+        }),
+    );
+    if complete {
+        object.insert(
+            "artifact_kind".to_string(),
+            serde_json::json!("not_outlook_msg"),
+        );
+    }
+    object.insert(
+        "email_candidate_parser_error".to_string(),
+        serde_json::json!(if complete {
+            "CFB compound file does not expose the Outlook MSG property and substitution stream markers"
+        } else {
+            "CFB signature is present but the bounded prefix does not contain enough Outlook MSG stream markers to classify the file"
+        }),
+    );
+    !complete
+}
+
+fn annotate_msg_candidate_from_reader<R: Read>(
+    metadata: &mut serde_json::Value,
+    reader: R,
+    logical_size: u64,
+) -> Result<bool> {
+    let read_len = usize::try_from(logical_size)
+        .unwrap_or(usize::MAX)
+        .min(OUTLOOK_MSG_PROBE_BYTES);
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(read_len).map_err(|error| {
+        anyhow!("allocating {read_len} bytes for bounded MSG signature validation: {error}")
+    })?;
+    reader
+        .take(read_len as u64)
+        .read_to_end(&mut bytes)
+        .context("reading bounded MSG signature probe")?;
+    let complete =
+        logical_size <= OUTLOOK_MSG_PROBE_BYTES as u64 && bytes.len() as u64 == logical_size;
+    Ok(annotate_msg_candidate_from_bytes(
+        metadata, &bytes, complete,
+    ))
+}
+
 fn mark_email_parse_skipped(metadata: &mut serde_json::Value, email_format: &str, reason: &str) {
     if let Some(object) = metadata.as_object_mut() {
         object.insert(
@@ -18326,7 +24768,15 @@ fn mark_email_parse_skipped(metadata: &mut serde_json::Value, email_format: &str
             serde_json::Value::String(email_format.to_string()),
         );
         object.insert(
+            "email_parser".to_string(),
+            serde_json::Value::String(RFC822_PARSER_NAME.to_string()),
+        );
+        object.insert(
             "email_parser_status".to_string(),
+            serde_json::Value::String("skipped".to_string()),
+        );
+        object.insert(
+            "email_parser_coverage_status".to_string(),
             serde_json::Value::String("skipped".to_string()),
         );
         object.insert(
@@ -18360,10 +24810,14 @@ fn mark_email_parse_failed(metadata: &mut serde_json::Value, email_format: &str,
         );
         object.insert(
             "email_parser".to_string(),
-            serde_json::Value::String("kdft-rfc822-stream-1".to_string()),
+            serde_json::Value::String(RFC822_PARSER_NAME.to_string()),
         );
         object.insert(
             "email_parser_status".to_string(),
+            serde_json::Value::String("failed".to_string()),
+        );
+        object.insert(
+            "email_parser_coverage_status".to_string(),
             serde_json::Value::String("failed".to_string()),
         );
         object.insert(
@@ -18402,7 +24856,7 @@ fn mark_email_candidate_failed(metadata: &mut serde_json::Value, email_format: &
         );
         object.insert(
             "email_candidate_parser".to_string(),
-            serde_json::Value::String("kdft-rfc822-stream-1".to_string()),
+            serde_json::Value::String(RFC822_PARSER_NAME.to_string()),
         );
         object.insert(
             "email_candidate_parser_status".to_string(),
@@ -18455,7 +24909,7 @@ fn apply_parsed_email_metadata(
         );
         object.insert(
             "email_parser".to_string(),
-            serde_json::Value::String("rfc822_header_v1".to_string()),
+            serde_json::Value::String(RFC822_PARSER_NAME.to_string()),
         );
         object.insert(
             "email_parser_status".to_string(),
@@ -22290,9 +28744,12 @@ fn process_image_evidence(
         "decoded_size_bytes": opened.decoded_size,
         "source_size_bytes": source_metadata.len(),
         "source_path": evidence.source_path,
+        "offset_coordinate_system": "decoded_media_byte_stream",
+        "decoded_media_to_source_container_offsets": decoded_media_container_offset_relationship(&opened.format),
+        "decoded_media_offset_note": decoded_media_offset_note(&opened.format),
         "parser": "disk-forensic",
         "supported_formats": ["e01", "vmdk", "vhdx", "vhd", "vdi", "raw", "dd", "img"],
-        "filesystem_browsing_status": "partition discovery only; filesystem parsers are pending",
+        "filesystem_browsing_status": "partition discovery with bounded NTFS, FAT, and ext filesystem parsing where signatures are recognized",
     });
     merge_json_object(&mut container_metadata, &source_info);
     insert_image_record(
@@ -22313,17 +28770,40 @@ fn process_image_evidence(
     match disk_forensic::analyse_disk(&mut opened.reader, opened.decoded_size) {
         Ok(report) => {
             let scheme = format!("{:?}", report.scheme());
-            let layout = disk_forensic::layout::from_report(
-                &report,
-                &evidence.display_name,
+            let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                disk_forensic::layout::from_report(
+                    &report,
+                    &evidence.display_name,
+                    opened.decoded_size,
+                )
+            }))
+            .map_err(|_| anyhow!("partition layout conversion panicked on malformed geometry"))?;
+            let partition_geometry = layout
+                .partitions
+                .iter()
+                .map(|partition| {
+                    partition_geometry_from_layout(
+                        &scheme,
+                        partition.start_offset,
+                        partition.size_bytes,
+                        partition.partition_type.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            validate_partition_layout_geometry(
                 opened.decoded_size,
-            );
+                layout.logical_sector_size,
+                layout.physical_sector_size,
+                &partition_geometry,
+            )?;
             let text_report = disk_forensic::report::text_report(&report);
             let report_metadata = serde_json::json!({
                 "artifact_kind": "disk_partition_report",
                 "container_format": opened.format,
                 "partition_scheme": scheme,
                 "decoded_size_bytes": opened.decoded_size,
+                "offset_coordinate_system": "decoded_media_byte_stream",
+                "decoded_media_to_source_container_offsets": decoded_media_container_offset_relationship(&opened.format),
                 "logical_sector_size": layout.logical_sector_size,
                 "physical_sector_size": layout.physical_sector_size,
                 "partition_count": layout.partitions.len(),
@@ -22368,8 +28848,11 @@ fn process_image_evidence(
                 );
                 progress::progress_set_volume(Some(format!("Partition {}: {}", index + 1, name)));
                 progress::progress_current(logical_path.clone());
-                let detected_filesystem =
-                    detect_volume_filesystem_at(&mut *opened.reader, partition.start_offset)?;
+                let detected_filesystem = detect_volume_filesystem_in_range(
+                    &mut *opened.reader,
+                    partition.start_offset,
+                    partition.size_bytes,
+                )?;
                 let bitlocker_locked = detected_filesystem == Some(BITLOCKER_LOCKED_FILESYSTEM);
                 let bitlocker_inspection = if bitlocker_locked {
                     bitlocker_inspection_at(
@@ -22425,6 +28908,10 @@ fn process_image_evidence(
                 } else {
                     None
                 };
+                let partition_end = partition
+                    .start_offset
+                    .checked_add(partition.size_bytes)
+                    .context("validated partition end offset overflow")?;
                 let mut metadata = serde_json::json!({
                     "artifact_kind": "disk_partition",
                     "container_format": opened.format,
@@ -22438,7 +28925,9 @@ fn process_image_evidence(
                     "detected_filesystem": detected_filesystem,
                     "start_offset": partition.start_offset,
                     "size_bytes": partition.size_bytes,
-                    "end_offset_exclusive": partition.start_offset.saturating_add(partition.size_bytes),
+                    "end_offset_exclusive": partition_end,
+                    "offset_coordinate_system": "decoded_media_byte_stream",
+                    "decoded_media_to_source_container_offsets": decoded_media_container_offset_relationship(&opened.format),
                     "logical_sector_size": layout.logical_sector_size,
                     "physical_sector_size": layout.physical_sector_size,
                     "filesystem_parser": filesystem_parser,
@@ -22629,9 +29118,11 @@ fn process_image_evidence(
                 {
                     // btrfs is not yet browsable; if its superblock is present,
                     // record the volume with parsed metadata (pending walk).
-                    if let Some(info) =
-                        read_btrfs_superblock(&mut *opened.reader, partition.start_offset)?
-                    {
+                    if let Some(info) = read_btrfs_superblock_in_range(
+                        &mut *opened.reader,
+                        partition.start_offset,
+                        partition.size_bytes,
+                    )? {
                         record_btrfs_volume(
                             conn,
                             case_id,
@@ -22703,6 +29194,8 @@ fn process_image_evidence(
                 "artifact_kind": "disk_partition_report",
                 "container_format": opened.format,
                 "decoded_size_bytes": opened.decoded_size,
+                "offset_coordinate_system": "decoded_media_byte_stream",
+                "decoded_media_to_source_container_offsets": decoded_media_container_offset_relationship(&opened.format),
                 "status": "partition scheme not recognized",
                 "error": err.to_string(),
             });
@@ -22773,6 +29266,26 @@ struct OpenedDiskImage {
     decoded_size: u64,
     reader: Box<dyn disk_forensic::container::ReadSeek>,
     container_finding_count: usize,
+}
+
+fn decoded_media_container_offset_relationship(container_format: &str) -> &'static str {
+    if container_format == "Raw" {
+        "equal_to_single_raw_source_file_offsets"
+    } else if container_format.starts_with("SplitRaw(") {
+        "concatenated_segment_stream_not_per_segment_file_offsets"
+    } else {
+        "decoder_logical_media_offsets_not_source_container_file_offsets"
+    }
+}
+
+fn decoded_media_offset_note(container_format: &str) -> &'static str {
+    if container_format == "Raw" {
+        "Offsets are zero-based bytes in the raw source file and decoded logical media."
+    } else if container_format.starts_with("SplitRaw(") {
+        "Offsets are zero-based bytes in the ordered, concatenated raw-segment stream; resolve through the segment table before using a per-segment file offset."
+    } else {
+        "Offsets are zero-based bytes in the decoder-produced logical disk, suitable for a forensic tool's evidence/media view; they are not byte offsets inside the compressed or sparse source container file."
+    }
 }
 
 /// A cursor over one immutable EWF decoder shared by concurrent evidence
@@ -22964,10 +29477,11 @@ impl Read for SplitRawReader {
             return Ok(0);
         }
         let position = self.position;
-        let segment = self
-            .segments
-            .iter_mut()
-            .find(|(_, start, len)| position >= *start && position < *start + *len);
+        let segment = self.segments.iter_mut().find(|(_, start, len)| {
+            position
+                .checked_sub(*start)
+                .is_some_and(|within| within < *len)
+        });
         let Some((file, start, len)) = segment else {
             return Ok(0);
         };
@@ -22975,7 +29489,10 @@ impl Read for SplitRawReader {
         let remaining = (*len - within).min(buf.len() as u64) as usize;
         file.seek(SeekFrom::Start(within))?;
         let read = file.read(&mut buf[..remaining])?;
-        self.position += read as u64;
+        self.position = self
+            .position
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "split raw read overflow"))?;
         Ok(read)
     }
 }
@@ -23016,6 +29533,123 @@ pub struct LiveVolume {
     pub browsable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitlocker: Option<LiveBitLockerInfo>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PartitionGeometry {
+    start: u64,
+    size: u64,
+    overlap_exempt_container: bool,
+}
+
+fn validate_partition_range(decoded_size: u64, start: u64, size: u64, label: &str) -> Result<u64> {
+    if size == 0 {
+        bail!("{label} has a zero-byte extent");
+    }
+    let end = start
+        .checked_add(size)
+        .with_context(|| format!("{label} extent overflows u64"))?;
+    if start >= decoded_size || end > decoded_size {
+        bail!("{label} extent {start}..{end} is outside decoded media size {decoded_size}");
+    }
+    Ok(end)
+}
+
+fn validate_partition_layout_geometry(
+    decoded_size: u64,
+    logical_sector_size: u32,
+    physical_sector_size: u32,
+    partitions: &[PartitionGeometry],
+) -> Result<()> {
+    let logical = u64::from(logical_sector_size);
+    let physical = u64::from(physical_sector_size);
+    if !(512..=65_536).contains(&logical) || !logical.is_power_of_two() {
+        bail!("partition table reports invalid logical sector size {logical_sector_size}");
+    }
+    if !(logical..=65_536).contains(&physical)
+        || !physical.is_power_of_two()
+        || !physical.is_multiple_of(logical)
+    {
+        bail!(
+            "partition table reports invalid physical sector size {physical_sector_size} for logical sector size {logical_sector_size}"
+        );
+    }
+
+    let mut data_extents = Vec::with_capacity(partitions.len());
+    let mut container_extents = Vec::new();
+    for (index, partition) in partitions.iter().enumerate() {
+        let end = validate_partition_range(
+            decoded_size,
+            partition.start,
+            partition.size,
+            &format!("partition {}", index + 1),
+        )?;
+        if !partition.start.is_multiple_of(logical) || !partition.size.is_multiple_of(logical) {
+            bail!(
+                "partition {} extent {}..{} is not aligned to the reported {logical}-byte logical sector",
+                index + 1,
+                partition.start,
+                end
+            );
+        }
+        if partition.overlap_exempt_container {
+            container_extents.push((partition.start, end, index + 1));
+        } else {
+            data_extents.push((partition.start, end, index + 1));
+        }
+    }
+
+    data_extents.sort_unstable_by_key(|(start, end, index)| (*start, *end, *index));
+    for pair in data_extents.windows(2) {
+        let (left_start, left_end, left_index) = pair[0];
+        let (right_start, right_end, right_index) = pair[1];
+        if right_start < left_end {
+            bail!(
+                "partition {left_index} extent {left_start}..{left_end} overlaps partition {right_index} extent {right_start}..{right_end}"
+            );
+        }
+    }
+
+    // MBR extended partitions are containers, so overlap with a logical
+    // partition fully contained inside one is expected. They are not a blanket
+    // overlap exemption: two extended containers, or a primary/data extent
+    // merely crossing an extended-container boundary, is malformed geometry.
+    container_extents.sort_unstable_by_key(|(start, end, index)| (*start, *end, *index));
+    for pair in container_extents.windows(2) {
+        let (left_start, left_end, left_index) = pair[0];
+        let (right_start, right_end, right_index) = pair[1];
+        if right_start < left_end {
+            bail!(
+                "extended partition {left_index} extent {left_start}..{left_end} overlaps extended partition {right_index} extent {right_start}..{right_end}"
+            );
+        }
+    }
+    for (container_start, container_end, container_index) in &container_extents {
+        for (data_start, data_end, data_index) in &data_extents {
+            let overlaps = *data_start < *container_end && *container_start < *data_end;
+            if overlaps && (*data_start < *container_start || *data_end > *container_end) {
+                bail!(
+                    "partition {data_index} extent {data_start}..{data_end} crosses extended partition {container_index} boundary {container_start}..{container_end}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn partition_geometry_from_layout(
+    partition_scheme: &str,
+    start: u64,
+    size: u64,
+    partition_type: Option<&str>,
+) -> PartitionGeometry {
+    let overlap_exempt_container = partition_scheme == "Mbr"
+        && partition_type.is_some_and(|value| value.to_ascii_lowercase().contains("extended"));
+    PartitionGeometry {
+        start,
+        size,
+        overlap_exempt_container,
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -23077,6 +29711,23 @@ pub struct LiveEntry {
     pub file_data_logical_offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_data_physical_offset: Option<u64>,
+    /// File-relative byte represented by `file_data_physical_offset`. This can
+    /// be non-zero when a stream begins with a sparse run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data_file_offset: Option<u64>,
+    /// Number of direct logical bytes proven contiguous from the reported
+    /// decoded-media offset. Bytes beyond this range must not be inferred to
+    /// belong to the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data_contiguous_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub physical_offset_basis: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data_direct_logical_mapping: Option<bool>,
+    /// Present only when `file_data_physical_offset` is in the decoded image
+    /// byte stream. A decrypted BitLocker view deliberately has no such claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_coordinate_system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ntfs_mft_record_modification_time_utc: Option<String>,
     #[serde(skip_serializing_if = "is_false")]
@@ -23095,9 +29746,35 @@ pub fn list_image_volumes(image_path: &Path) -> Result<Vec<LiveVolume>> {
     let mut opened = open_disk_image(image_path)?;
     let mut volumes = Vec::new();
     if let Ok(report) = disk_forensic::analyse_disk(&mut opened.reader, opened.decoded_size) {
-        let layout = disk_forensic::layout::from_report(&report, "image", opened.decoded_size);
+        let scheme = format!("{:?}", report.scheme());
+        let layout = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            disk_forensic::layout::from_report(&report, "image", opened.decoded_size)
+        }))
+        .map_err(|_| anyhow!("partition layout conversion panicked on malformed geometry"))?;
+        let partition_geometry = layout
+            .partitions
+            .iter()
+            .map(|partition| {
+                partition_geometry_from_layout(
+                    &scheme,
+                    partition.start_offset,
+                    partition.size_bytes,
+                    partition.partition_type.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        validate_partition_layout_geometry(
+            opened.decoded_size,
+            layout.logical_sector_size,
+            layout.physical_sector_size,
+            &partition_geometry,
+        )?;
         for partition in &layout.partitions {
-            let filesystem = live_volume_filesystem(&mut *opened.reader, partition.start_offset)?;
+            let filesystem = live_volume_filesystem(
+                &mut *opened.reader,
+                partition.start_offset,
+                partition.size_bytes,
+            )?;
             let browsable = matches!(filesystem.as_str(), "NTFS" | "FAT" | "EXT");
             let bitlocker = if filesystem == BITLOCKER_LOCKED_FILESYSTEM {
                 bitlocker_inspection_at(
@@ -23133,7 +29810,7 @@ pub fn list_image_volumes(image_path: &Path) -> Result<Vec<LiveVolume>> {
         }
     }
     if volumes.is_empty() {
-        let filesystem = live_volume_filesystem(&mut *opened.reader, 0)?;
+        let filesystem = live_volume_filesystem(&mut *opened.reader, 0, opened.decoded_size)?;
         if filesystem != "unknown" {
             let browsable = matches!(filesystem.as_str(), "NTFS" | "FAT" | "EXT");
             let bitlocker = if filesystem == BITLOCKER_LOCKED_FILESYSTEM {
@@ -23162,14 +29839,33 @@ pub fn list_image_volumes(image_path: &Path) -> Result<Vec<LiveVolume>> {
 fn live_volume_filesystem(
     reader: &mut dyn disk_forensic::container::ReadSeek,
     start_offset: u64,
+    size_bytes: u64,
 ) -> Result<String> {
-    if let Some(filesystem) = detect_volume_filesystem_at(reader, start_offset)? {
+    if let Some(filesystem) = detect_volume_filesystem_in_range(reader, start_offset, size_bytes)? {
         return Ok(filesystem.to_string());
     }
-    if read_btrfs_superblock(reader, start_offset)?.is_some() {
+    if read_btrfs_superblock_in_range(reader, start_offset, size_bytes)?.is_some() {
         return Ok("BTRFS".to_string());
     }
     Ok("unknown".to_string())
+}
+
+fn detect_volume_filesystem_in_range(
+    reader: &mut dyn disk_forensic::container::ReadSeek,
+    start_offset: u64,
+    size_bytes: u64,
+) -> Result<Option<&'static str>> {
+    let mut slice = PartitionSlice::new(reader, start_offset, size_bytes);
+    detect_volume_filesystem_at(&mut slice, 0)
+}
+
+fn read_btrfs_superblock_in_range(
+    reader: &mut dyn disk_forensic::container::ReadSeek,
+    start_offset: u64,
+    size_bytes: u64,
+) -> Result<Option<BtrfsInfo>> {
+    let mut slice = PartitionSlice::new(reader, start_offset, size_bytes);
+    read_btrfs_superblock(&mut slice, 0)
 }
 
 fn bitlocker_inspection_at(
@@ -23279,7 +29975,7 @@ pub fn list_image_directory(
             list_ntfs_directory(image_path, volume.start_offset, volume.size_bytes, relative)?
         }
         "FAT" => list_fat_directory(image_path, volume.start_offset, volume.size_bytes, relative)?,
-        "EXT" => list_ext_directory(image_path, volume.start_offset, relative)?,
+        "EXT" => list_ext_directory(image_path, volume.start_offset, volume.size_bytes, relative)?,
         other => bail!("live browsing is not supported for {other} volumes"),
     };
     sort_live_entries(&mut entries);
@@ -23400,36 +30096,46 @@ fn list_ntfs_directory_from_reader<T: Read + Seek>(
     let children = collect_ntfs_dir_children(&ntfs, fs, record)?.children;
     Ok(children
         .into_iter()
-        .map(|child| LiveEntry {
-            ntfs_file_record_number: Some(child.file_record_number),
-            mft_record_logical_offset: child.mft_record_logical_offset,
-            mft_record_physical_offset: physical_base.and_then(|base| {
-                child
-                    .mft_record_logical_offset
-                    .and_then(|offset| base.checked_add(offset))
-            }),
-            file_data_logical_offset: child.file_data_logical_offset,
-            file_data_physical_offset: physical_base.and_then(|base| {
-                child
-                    .file_data_logical_offset
-                    .and_then(|offset| base.checked_add(offset))
-            }),
-            ntfs_mft_record_modification_time_utc: child
-                .standard_mft_record_modification_time_utc
-                .or(child.mft_record_modification_time_utc),
-            size_bytes: if child.is_directory {
-                None
-            } else {
-                Some(i64::try_from(child.size_bytes).unwrap_or(i64::MAX))
-            },
-            created_utc: child.standard_creation_time_utc.or(child.creation_time_utc),
-            modified_utc: child
-                .standard_modification_time_utc
-                .or(child.modification_time_utc),
-            accessed_utc: child.standard_access_time_utc.or(child.access_time_utc),
-            name: child.name,
-            is_dir: child.is_directory,
-            symlink: false,
+        .map(|child| {
+            let data_location = child.data_location;
+            let file_data_physical_offset = physical_base.and_then(|base| {
+                data_location.and_then(|location| base.checked_add(location.filesystem_offset))
+            });
+            LiveEntry {
+                ntfs_file_record_number: Some(child.file_record_number),
+                mft_record_logical_offset: child.mft_record_logical_offset,
+                mft_record_physical_offset: physical_base.and_then(|base| {
+                    child
+                        .mft_record_logical_offset
+                        .and_then(|offset| base.checked_add(offset))
+                }),
+                file_data_logical_offset: data_location.map(|location| location.filesystem_offset),
+                file_data_physical_offset,
+                file_data_file_offset: data_location.map(|location| location.file_offset),
+                file_data_contiguous_bytes: data_location
+                    .and_then(|location| location.contiguous_bytes),
+                physical_offset_basis: data_location.map(|location| location.basis.to_string()),
+                file_data_direct_logical_mapping: data_location
+                    .map(|location| location.direct_logical_mapping),
+                offset_coordinate_system: file_data_physical_offset
+                    .map(|_| "decoded_media_byte_stream".to_string()),
+                ntfs_mft_record_modification_time_utc: child
+                    .standard_mft_record_modification_time_utc
+                    .or(child.mft_record_modification_time_utc),
+                size_bytes: if child.is_directory {
+                    None
+                } else {
+                    Some(i64::try_from(child.size_bytes).unwrap_or(i64::MAX))
+                },
+                created_utc: child.standard_creation_time_utc.or(child.creation_time_utc),
+                modified_utc: child
+                    .standard_modification_time_utc
+                    .or(child.modification_time_utc),
+                accessed_utc: child.standard_access_time_utc.or(child.access_time_utc),
+                name: child.name,
+                is_dir: child.is_directory,
+                symlink: false,
+            }
         })
         .collect())
 }
@@ -23526,6 +30232,11 @@ fn list_fat_directory(
             mft_record_physical_offset: None,
             file_data_logical_offset: None,
             file_data_physical_offset: None,
+            file_data_file_offset: None,
+            file_data_contiguous_bytes: None,
+            physical_offset_basis: None,
+            file_data_direct_logical_mapping: None,
+            offset_coordinate_system: None,
             ntfs_mft_record_modification_time_utc: None,
             name,
             symlink: false,
@@ -23569,9 +30280,10 @@ fn fat_date_iso(value: fatfs::Date) -> Option<String> {
 fn list_ext_directory(
     image_path: &Path,
     start_offset: u64,
+    size_bytes: u64,
     relative: &str,
 ) -> Result<Vec<LiveEntry>> {
-    let fs = open_ext4_superblock(image_path, start_offset)?;
+    let fs = open_ext4_superblock_bounded(image_path, start_offset, size_bytes)?;
     let path = if relative.is_empty() {
         "/".to_string()
     } else {
@@ -23580,6 +30292,7 @@ fn list_ext_directory(
     let children = ext4_list_dir(&fs, &path)?;
     let mut entries = Vec::with_capacity(children.len());
     for child in children {
+        let data_location = bounded_ext_data_location(child.data_location, size_bytes);
         let size_bytes = i64::try_from(child.size).unwrap_or(i64::MAX);
         entries.push(LiveEntry {
             name: child.name,
@@ -23591,8 +30304,21 @@ fn list_ext_directory(
             ntfs_file_record_number: None,
             mft_record_logical_offset: None,
             mft_record_physical_offset: None,
-            file_data_logical_offset: None,
-            file_data_physical_offset: None,
+            file_data_logical_offset: data_location.map(|location| location.filesystem_offset),
+            file_data_physical_offset: data_location
+                .and_then(|location| start_offset.checked_add(location.filesystem_offset)),
+            file_data_file_offset: data_location.map(|location| location.file_offset),
+            file_data_contiguous_bytes: data_location.map(|location| location.contiguous_bytes),
+            physical_offset_basis: data_location.map(|location| match location.storage {
+                ext4::DataLocationStorage::Extent => "ext first allocated extent".to_string(),
+                ext4::DataLocationStorage::InlineSymlink => {
+                    "ext inline symlink target in inode record".to_string()
+                }
+            }),
+            file_data_direct_logical_mapping: data_location.map(|_| true),
+            offset_coordinate_system: data_location
+                .and_then(|location| start_offset.checked_add(location.filesystem_offset))
+                .map(|_| "decoded_media_byte_stream".to_string()),
             ntfs_mft_record_modification_time_utc: None,
             symlink: child.is_symlink,
         });
@@ -23840,6 +30566,11 @@ fn local_live_entry(name: String, metadata: fs::Metadata) -> Result<LiveEntry> {
         mft_record_physical_offset: None,
         file_data_logical_offset: None,
         file_data_physical_offset: None,
+        file_data_file_offset: None,
+        file_data_contiguous_bytes: None,
+        physical_offset_basis: None,
+        file_data_direct_logical_mapping: None,
+        offset_coordinate_system: None,
         ntfs_mft_record_modification_time_utc: None,
         symlink,
     })
@@ -23986,7 +30717,8 @@ pub fn read_image_directory_bytes(
     let relative = file_path.trim_matches('/');
     match volume.filesystem.as_str() {
         "EXT" => {
-            let fs = open_ext4_superblock(image_path, volume.start_offset)?;
+            let fs =
+                open_ext4_superblock_bounded(image_path, volume.start_offset, volume.size_bytes)?;
             let data = ext4_read_file_bytes(&fs, &format!("/{relative}"))?;
             let total = data.len() as u64;
             let start = (offset as usize).min(data.len());
@@ -24408,7 +31140,8 @@ pub fn export_image_file(
 
     let bytes: Vec<u8> = match volume.filesystem.as_str() {
         "EXT" => {
-            let fs = open_ext4_superblock(image_path, volume.start_offset)?;
+            let fs =
+                open_ext4_superblock_bounded(image_path, volume.start_offset, volume.size_bytes)?;
             ext4_read_file_bytes(&fs, &format!("/{relative}"))?
         }
         "FAT" => {
@@ -24836,7 +31569,8 @@ pub fn export_image_tree(
 
     match volume.filesystem.as_str() {
         "EXT" => {
-            let fs = open_ext4_superblock(image_path, volume.start_offset)?;
+            let fs =
+                open_ext4_superblock_bounded(image_path, volume.start_offset, volume.size_bytes)?;
             let start = if relative.is_empty() {
                 "/".to_string()
             } else {
@@ -25335,7 +32069,8 @@ pub fn list_image_tree_files(
 
     match volume.filesystem.as_str() {
         "EXT" => {
-            let fs = open_ext4_superblock(image_path, volume.start_offset)?;
+            let fs =
+                open_ext4_superblock_bounded(image_path, volume.start_offset, volume.size_bytes)?;
             let start = if relative.is_empty() {
                 "/".to_string()
             } else {
@@ -26528,6 +33263,8 @@ fn process_whole_volume_fallback(
         "start_offset": 0,
         "size_bytes": decoded_size,
         "end_offset_exclusive": decoded_size,
+        "offset_coordinate_system": "decoded_media_byte_stream",
+        "decoded_media_to_source_container_offsets": decoded_media_container_offset_relationship(container_format),
         "filesystem_parser": filesystem_parser,
         "filesystem_browsing_status": filesystem_browsing_status,
     });
@@ -26640,6 +33377,7 @@ fn record_btrfs_volume(
             "partition_index": partition_index,
             "partition_start_offset": start_offset,
             "partition_size_bytes": size_bytes,
+            "offset_coordinate_system": "decoded_media_byte_stream",
             "btrfs_fsid": info.fsid,
             "btrfs_label": info.label,
             "btrfs_total_bytes": info.total_bytes,
@@ -26664,24 +33402,56 @@ fn record_btrfs_volume(
 struct Ext4ImageReader {
     reader: RefCell<Box<dyn disk_forensic::container::ReadSeek>>,
     partition_start: u64,
+    /// Exclusive length of the validated decoded-media slice.
+    partition_size: u64,
 }
 
 impl positioned_io::ReadAt for Ext4ImageReader {
     fn read_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if pos >= self.partition_size {
+            return Ok(0);
+        }
+        let read_len =
+            usize::try_from((self.partition_size - pos).min(buf.len() as u64)).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bounded EXT read length exceeds this platform's address space",
+                )
+            })?;
+        let absolute_offset = self.partition_start.checked_add(pos).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "EXT decoded-media offset overflow",
+            )
+        })?;
         let mut reader = self.reader.borrow_mut();
-        reader.seek(SeekFrom::Start(self.partition_start.saturating_add(pos)))?;
-        reader.read(buf)
+        reader.seek(SeekFrom::Start(absolute_offset))?;
+        reader.read(&mut buf[..read_len])
     }
 }
 
-fn open_ext4_superblock(
+fn open_ext4_superblock_bounded(
     source_path: &Path,
     partition_start: u64,
+    partition_size: u64,
 ) -> Result<ext4::SuperBlock<Ext4ImageReader>> {
+    if partition_size < 2_048 {
+        bail!("bounded EXT candidate is too short for its primary superblock");
+    }
     let opened = open_disk_image(source_path)?;
+    let end = partition_start
+        .checked_add(partition_size)
+        .context("bounded EXT candidate end offset overflow")?;
+    if end > opened.decoded_size {
+        bail!(
+            "bounded EXT candidate range {partition_start}..{end} exceeds decoded-media size {}",
+            opened.decoded_size
+        );
+    }
     let reader = Ext4ImageReader {
         reader: RefCell::new(opened.reader),
         partition_start,
+        partition_size,
     };
     // `Checksums::Required` (the crate default) refuses to open any
     // filesystem without the metadata_csum feature, which is common on
@@ -26715,6 +33485,20 @@ struct ExtChild {
     mtime_utc: Option<String>,
     ctime_utc: Option<String>,
     btime_utc: Option<String>,
+}
+
+fn bounded_ext_data_location(
+    location: Option<ext4::DataLocation>,
+    partition_size: u64,
+) -> Option<ext4::DataLocation> {
+    location.filter(|location| {
+        location.contiguous_bytes > 0
+            && location.filesystem_offset < partition_size
+            && location
+                .filesystem_offset
+                .checked_add(location.contiguous_bytes)
+                .is_some_and(|end| end <= partition_size)
+    })
 }
 
 /// Converts an ext4 on-disk timestamp (32-bit Unix seconds, optional
@@ -27528,32 +34312,47 @@ fn persist_auto_browser_profile_import_inner(
         source_profile_path,
         volume_index_zero_based,
     )?;
+    let visit_limit_reached = import_data.total_visits > import_data.records.counts.visits;
+    let disposition = BrowserImportDisposition::classify(
+        visit_limit_reached,
+        import_data.examiner_artifact_limit_reached,
+        import_data.parse_error_count,
+    );
+    let attempt_entries_parsed = import_data.records.counts.total();
+    let (visible_entries_before, prior_complete_entries) =
+        browser_dataset_generation_counts(conn, case_id, evidence_id, Some(&derivation_key))?;
+    let canonical_generation_preserved =
+        !disposition.complete_generation() && prior_complete_entries > 0;
 
     // A profile is a replaceable derived dataset even during the EXT walk.
     // The source filesystem entries do not carry this key and are untouched.
-    conn.execute(
-        "DELETE FROM filesystem_entries
-         WHERE case_id = ?1 AND evidence_id = ?2
-           AND json_extract(metadata_json, '$.browser_derivation_key') = ?3",
-        params![case_id, evidence_id, derivation_key],
-    )?;
-    let context = BrowserDerivedImportContext {
-        evidence_id,
-        derivation_key: &derivation_key,
-        logical_prefix: &logical_prefix,
-        source_profile_path,
-        volume_index_zero_based,
-        staging_path,
-        source_files: &source_files,
+    let inserted = if canonical_generation_preserved {
+        visible_entries_before
+    } else {
+        conn.execute(
+            "DELETE FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_extract(metadata_json, '$.browser_derivation_key') = ?3",
+            params![case_id, evidence_id, derivation_key],
+        )?;
+        let context = BrowserDerivedImportContext {
+            evidence_id,
+            derivation_key: &derivation_key,
+            logical_prefix: &logical_prefix,
+            source_profile_path,
+            volume_index_zero_based,
+            staging_path,
+            source_files: &source_files,
+        };
+        insert_browser_history_records_into_evidence(
+            conn,
+            case_id,
+            evidence_id,
+            job_id,
+            import_data,
+            Some(&context),
+        )?
     };
-    let inserted = insert_browser_history_records_into_evidence(
-        conn,
-        case_id,
-        evidence_id,
-        job_id,
-        import_data,
-        Some(&context),
-    )?;
     append_auto_browser_import_job_disclosure(
         conn,
         job_id,
@@ -27564,16 +34363,29 @@ fn persist_auto_browser_profile_import_inner(
             "volume_index_zero_based": volume_index_zero_based,
             "staging_path": staging_path,
             "entries_indexed": inserted,
+            "attempt_entries_parsed": attempt_entries_parsed,
+            "prior_complete_entries": prior_complete_entries,
+            "canonical_generation_preserved": canonical_generation_preserved,
+            "replacement_committed": !canonical_generation_preserved,
             "visits_indexed": import_data.records.counts.visits,
             "bookmarks_indexed": import_data.records.counts.bookmarks,
             "preferences_indexed": import_data.records.counts.preferences,
             "parse_errors": &import_data.parse_errors,
             "parse_error_count": import_data.parse_error_count,
             "parse_error_samples_omitted": import_data.parse_error_count.saturating_sub(import_data.parse_errors.len() as u64),
-            "status": if import_data.parse_error_count == 0 {
-                "completed"
+            "examiner_limit_reached": disposition.examiner_limit_reached,
+            "completed_with_diagnostics": disposition.completed_with_diagnostics,
+            "truncated": disposition.truncated,
+            "status": disposition.status,
+            "status_reason": disposition.reason,
+            "processing_coverage": if canonical_generation_preserved {
+                "A prior complete browser generation remains canonical; this attempt was retained only as diagnostic provenance."
+            } else if disposition.truncated {
+                "Partial browser coverage because an examiner-configured row limit was reached."
+            } else if disposition.completed_with_diagnostics {
+                "Completed browser import with parser diagnostics; successfully decoded records remain usable."
             } else {
-                "completed_with_errors"
+                "Complete supported browser-artifact coverage for this profile."
             },
         }),
     )?;
@@ -27619,6 +34431,56 @@ fn ensure_directory_is_not_reparse(path: &Path, description: &str) -> Result<()>
         bail!("{description} is not a directory: {}", path.display());
     }
     Ok(())
+}
+
+/// Creates a browser-owned staging directory without a permissive-umask
+/// window. On Unix, browser DB copies can contain credentials/session data, so
+/// every owned directory is mode 0700 from creation. Windows inherits the
+/// current user's ACL from the case/output parent. Existing directories are
+/// accepted only for the single stable imports root; per-job directories must
+/// be new so a collision can never mix two profile generations.
+fn create_private_browser_staging_directory(
+    path: &Path,
+    description: &str,
+    allow_existing: bool,
+) -> Result<()> {
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
+    match builder.create(path) {
+        Ok(()) => {}
+        Err(error) if allow_existing && error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("creating {description} {}", path.display()))
+        }
+    }
+    ensure_directory_is_not_reparse(path, description)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {description} permissions {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn create_private_browser_staging_file(path: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("creating staged browser file {}", path.display()))
 }
 
 const EXT_BROWSER_TOP_LEVEL_ARTIFACTS: &[&str] = &[
@@ -27691,14 +34553,9 @@ fn stage_ext_browser_file(
         .open(&inode)
         .map_err(|error| anyhow!("opening {source_path}: {error}"))?;
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating browser staging folder {}", parent.display()))?;
+        create_private_browser_staging_directory(parent, "browser staging folder", true)?;
     }
-    let mut output = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .with_context(|| format!("creating staged browser file {}", destination.display()))?;
+    let mut output = create_private_browser_staging_file(destination)?;
     let copied = match io::copy(&mut reader, &mut output) {
         Ok(copied) => copied,
         Err(error) => {
@@ -27773,8 +34630,8 @@ fn detect_staged_browser_family(staging_root: &Path) -> Result<Option<BrowserFam
 /// modern `Network/Cookies`) to the persistent staging folder, then parses and
 /// inserts records under the enclosing evidence id. Unrelated cache/profile
 /// files are never staged. Optional staging and parser failures are retained
-/// as bounded samples with exact counts and make the enclosing filesystem job
-/// explicitly partial/truncated.
+/// as bounded samples with exact counts and complete-with-diagnostics coverage;
+/// only an examiner-configured processing bound produces truncation.
 #[allow(clippy::too_many_arguments)]
 fn maybe_auto_import_browser_profile(
     conn: &Connection,
@@ -27822,11 +34679,12 @@ fn maybe_auto_import_browser_profile(
     );
     let mut staging_diagnostics = BrowserImportDiagnostics::default();
     let staging_created = (|| -> Result<()> {
-        fs::create_dir_all(&imports_root)
-            .with_context(|| format!("creating browser imports root {}", imports_root.display()))?;
-        ensure_directory_is_not_reparse(&imports_root, "browser imports root")?;
-        fs::create_dir(&staging_root)
-            .with_context(|| format!("creating staging folder {}", staging_root.display()))?;
+        create_private_browser_staging_directory(&imports_root, "browser imports root", true)?;
+        create_private_browser_staging_directory(
+            &staging_root,
+            "browser profile staging folder",
+            false,
+        )?;
         Ok(())
     })();
     if let Err(error) = staging_created {
@@ -28019,6 +34877,7 @@ fn maybe_auto_import_browser_profile(
             let mut persistence_diagnostics = BrowserImportDiagnostics {
                 samples: import_data.parse_errors.clone(),
                 total: import_data.parse_error_count,
+                ..BrowserImportDiagnostics::default()
             };
             persistence_diagnostics.record(format!(
                 "persisting staged browser profile {ext_dir_path}: {error:#}"
@@ -28082,7 +34941,7 @@ fn process_ext_partition_entries(
     indexed: &mut usize,
     max_entries: usize,
 ) -> Result<bool> {
-    let fs = open_ext4_superblock(Path::new(source_path), start_offset)?;
+    let fs = open_ext4_superblock_bounded(Path::new(source_path), start_offset, size_bytes)?;
 
     upsert_filesystem_entry(
         conn,
@@ -28100,6 +34959,7 @@ fn process_ext_partition_entries(
                 "partition_index": partition_index,
                 "partition_start_offset": start_offset,
                 "partition_size_bytes": size_bytes,
+                "offset_coordinate_system": "decoded_media_byte_stream",
             }),
             volume_prefix,
             volume_name,
@@ -28182,6 +35042,20 @@ fn process_ext_partition_entries(
             } else {
                 format!("{ext_path}/{name}")
             };
+            let inode_physical_offset = child
+                .inode_filesystem_offset
+                .and_then(|offset| start_offset.checked_add(offset));
+            let data_location = bounded_ext_data_location(child.data_location, size_bytes);
+            let data_location_rejected = child.data_location.is_some() && data_location.is_none();
+            if data_location_rejected {
+                traversal.record_partial_error();
+                progress::progress_truncated(format!(
+                    "ext inode {} ({child_ext_path}) reports a first data range outside the authoritative {size_bytes}-byte partition slice; no decoded-media location was claimed",
+                    child.inode_number
+                ));
+            }
+            let file_data_physical_offset = data_location
+                .and_then(|location| start_offset.checked_add(location.filesystem_offset));
 
             let mut entry_metadata = serde_json::json!({
                 "artifact_kind": "filesystem_entry",
@@ -28194,15 +35068,18 @@ fn process_ext_partition_entries(
                 "ext_path": child_ext_path,
                 "ext_inode_number": child.inode_number,
                 "ext_inode_logical_offset": child.inode_filesystem_offset,
-                "ext_inode_physical_offset": child.inode_filesystem_offset.map(|offset| start_offset.saturating_add(offset)),
-                "file_data_logical_offset": child.data_location.map(|location| location.filesystem_offset),
-                "file_data_physical_offset": child.data_location.map(|location| start_offset.saturating_add(location.filesystem_offset)),
-                "file_data_file_offset": child.data_location.map(|location| location.file_offset),
-                "file_data_contiguous_bytes": child.data_location.map(|location| location.contiguous_bytes),
-                "physical_offset_basis": child.data_location.map(|location| match location.storage {
+                "ext_inode_physical_offset": inode_physical_offset,
+                "file_data_logical_offset": data_location.map(|location| location.filesystem_offset),
+                "file_data_physical_offset": file_data_physical_offset,
+                "file_data_file_offset": data_location.map(|location| location.file_offset),
+                "file_data_contiguous_bytes": data_location.map(|location| location.contiguous_bytes),
+                "physical_offset_basis": data_location.map(|location| match location.storage {
                     ext4::DataLocationStorage::Extent => "ext first allocated extent",
                     ext4::DataLocationStorage::InlineSymlink => "ext inline symlink target in inode record",
                 }),
+                "file_data_direct_logical_mapping": data_location.map(|_| true),
+                "file_data_location_rejected_out_of_partition": data_location_rejected,
+                "offset_coordinate_system": "decoded_media_byte_stream",
                 "ext_is_symlink": child.is_symlink,
                 "ext_mode_octal": format!("{:o}", child.mode),
                 "ext_uid": child.uid,
@@ -28281,6 +35158,37 @@ fn process_ext_partition_entries(
                                     &logical_path,
                                     "ext email candidate",
                                 );
+                            }
+                        }
+                    } else if ext == "msg" {
+                        let reader = fs
+                            .load_inode(child.inode_number)
+                            .map_err(|error| anyhow!("loading ext MSG inode: {error}"))
+                            .and_then(|inode| {
+                                fs.open(&inode)
+                                    .map_err(|error| anyhow!("opening ext MSG inode: {error}"))
+                            });
+                        match reader.and_then(|reader| {
+                            annotate_msg_candidate_from_reader(
+                                &mut entry_metadata,
+                                reader,
+                                child.size,
+                            )
+                        }) {
+                            Ok(true) => {
+                                traversal.record_partial_error();
+                                progress::progress_truncated(format!(
+                                    "MSG candidate {logical_path} has an inconclusive bounded CFB signature probe"
+                                ));
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                mark_msg_candidate_read_error(
+                                    &mut entry_metadata,
+                                    &format!("could not read ext MSG candidate: {error}"),
+                                );
+                                traversal.record_partial_error();
+                                progress::progress_error(Some(logical_path.clone()));
                             }
                         }
                     } else if is_email_store_extension(&ext) {
@@ -28374,12 +35282,140 @@ fn process_ext_partition_entries(
     Ok(traversal.is_truncated())
 }
 
-/// Scan every 512-byte sector boundary in unpartitioned gaps for orphaned
-/// NTFS/FAT/ext/BitLocker headers.
-/// Candidate headers are validated by the real filesystem detector and
-/// consumed immediately, so there is no probe cap, recovered-volume cap, or
-/// unbounded candidate list. max_entries remains the examiner-controlled
-/// output bound.
+#[derive(Debug)]
+struct ValidatedLostCandidate {
+    filesystem: &'static str,
+    size_bytes: Option<u64>,
+    validation_method: &'static str,
+    is_validated_volume: bool,
+    bitlocker_inspection: Option<bitlocker_decrypt::BitLockerInspection>,
+}
+
+/// A discovery hint is never enough to create a recovered-volume record.
+/// Validate it with the same downstream parser that would browse the volume,
+/// using the exact decoded-media range available inside the partition-map
+/// gap. Parser rejection is an ordinary false-positive outcome, not a failed
+/// evidence job.
+fn validate_lost_partition_candidate(
+    reader: &mut dyn disk_forensic::container::ReadSeek,
+    source_path: &str,
+    candidate: lost_scan::Candidate,
+    available_bytes: u64,
+) -> Result<Option<ValidatedLostCandidate>> {
+    if available_bytes < 512 {
+        return Ok(None);
+    }
+    match candidate.hint {
+        lost_scan::FsHint::Fat => {
+            let Some(size_bytes) = recovered_volume_size(reader, candidate.offset, "FAT")? else {
+                return Ok(None);
+            };
+            if size_bytes == 0 || size_bytes > available_bytes {
+                return Ok(None);
+            }
+            let accepted = {
+                let slice = PartitionSlice::new(reader, candidate.offset, size_bytes);
+                match fatfs::FileSystem::new(slice, fatfs::FsOptions::new()) {
+                    Ok(fs) => fs.root_dir().iter().next().transpose().is_ok(),
+                    Err(_) => false,
+                }
+            };
+            Ok(accepted.then_some(ValidatedLostCandidate {
+                filesystem: "FAT",
+                size_bytes: Some(size_bytes),
+                validation_method: "fatfs boot-sector and root-directory parse",
+                is_validated_volume: true,
+                bitlocker_inspection: None,
+            }))
+        }
+        lost_scan::FsHint::Ntfs => {
+            let Some(size_bytes) = recovered_volume_size(reader, candidate.offset, "NTFS")? else {
+                return Ok(None);
+            };
+            if size_bytes == 0 || size_bytes > available_bytes {
+                return Ok(None);
+            }
+            let accepted = {
+                let mut slice = PartitionSlice::new(reader, candidate.offset, size_bytes);
+                match ntfs::Ntfs::new(&mut slice) {
+                    Ok(ntfs) => ntfs.root_directory(&mut slice).is_ok(),
+                    Err(_) => false,
+                }
+            };
+            Ok(accepted.then_some(ValidatedLostCandidate {
+                filesystem: "NTFS",
+                size_bytes: Some(size_bytes),
+                validation_method: "ntfs boot-sector, MFT, and root-record parse",
+                is_validated_volume: true,
+                bitlocker_inspection: None,
+            }))
+        }
+        lost_scan::FsHint::Ext => {
+            let Some(size_bytes) = recovered_ext_volume_size(reader, candidate.offset)? else {
+                return Ok(None);
+            };
+            if size_bytes == 0 || size_bytes > available_bytes {
+                return Ok(None);
+            }
+            if open_ext4_superblock_bounded(Path::new(source_path), candidate.offset, size_bytes)
+                .is_err()
+            {
+                return Ok(None);
+            }
+            Ok(Some(ValidatedLostCandidate {
+                filesystem: "EXT",
+                size_bytes: Some(size_bytes),
+                validation_method: "ext4-view primary-superblock parse",
+                is_validated_volume: true,
+                bitlocker_inspection: None,
+            }))
+        }
+        lost_scan::FsHint::BitLocker => {
+            let Some(inspection) =
+                bitlocker_inspection_at(reader, candidate.offset, Some(available_bytes))?
+            else {
+                return Ok(None);
+            };
+            let is_validated_volume =
+                inspection.metadata_state == bitlocker_decrypt::BitLockerMetadataState::Parsed;
+            let size_bytes = inspection
+                .encrypted_volume_size
+                .filter(|size| *size > 0 && *size <= available_bytes);
+            if is_validated_volume && size_bytes.is_none() {
+                return Ok(None);
+            }
+            Ok(Some(ValidatedLostCandidate {
+                filesystem: BITLOCKER_LOCKED_FILESYSTEM,
+                size_bytes,
+                validation_method: if is_validated_volume {
+                    "bitlocker-decrypt FVE header and metadata parse"
+                } else {
+                    "bitlocker-decrypt coherent FVE header parse; metadata unavailable"
+                },
+                is_validated_volume,
+                bitlocker_inspection: Some(inspection),
+            }))
+        }
+    }
+}
+
+/// Candidate-scoped parser/read failures are evidence diagnostics: the
+/// candidate savepoint is rolled back and scanning continues. Database errors
+/// and explicit integration invariants remain fatal so KDFT never presents a
+/// partially committed case as a successful examination.
+fn lost_partition_indexing_error_is_fatal(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some())
+        || format!("{error:#}").contains("internal lost-partition invariant:")
+}
+
+/// Scan every 512-byte sector boundary in current partition-map gaps for
+/// NTFS/FAT/ext/BitLocker discovery candidates. A candidate location proves
+/// neither that a partition once existed nor that a current table entry was
+/// deleted. Only candidates accepted by the real downstream parser can be
+/// persisted as validated volumes. `max_entries` remains the explicit
+/// examiner-controlled output bound.
 #[allow(clippy::too_many_arguments)]
 fn scan_lost_partitions(
     conn: &Connection,
@@ -28416,17 +35452,34 @@ fn scan_lost_partitions(
     if disk_size > cursor {
         gaps.push((cursor, disk_size));
     }
+    let planned_gap_count = gaps.len();
+    let planned_bytes_total = gaps.iter().try_fold(0_u64, |total, (start, end)| {
+        total
+            .checked_add(end.saturating_sub(*start))
+            .context("lost-partition planned byte coverage overflow")
+    })?;
 
+    let ignored_offsets: HashSet<u64> = skip_offsets.iter().copied().collect();
+    let mut seen_candidate_offsets = HashSet::<u64>::new();
+    let mut duplicate_candidates_ignored = 0_u64;
+    let mut rejected_candidates = 0_u64;
+    let mut validated_volume_candidates = 0_u64;
+    let mut validated_volume_findings_persisted = 0_u64;
+    let mut header_only_candidates = 0_u64;
+    let mut candidate_indexing_failures = 0_u64;
+    let mut candidate_partial_indexing = 0_u64;
+    let mut scanned_bytes = 0_u64;
+    let mut prefilter_candidates_reported = 0_u64;
     let mut truncated = false;
-    let mut recovered = 0_usize;
+    let mut accepted_candidates = 0_usize;
     let mut output_limit_hit = false;
     let config = lost_scan::LostScanConfig::default();
 
-    for (gap_start, gap_end) in gaps {
+    for &(gap_start, gap_end) in &gaps {
         if output_limit_hit {
             break;
         }
-        progress::progress_set_volume(Some(format!("Unpartitioned gap {gap_start}..{gap_end}")));
+        progress::progress_set_volume(Some(format!("Partition-map gap {gap_start}..{gap_end}")));
         let mut resume_after = 0_u64;
         let mut callback_error: Option<anyhow::Error> = None;
         let scan_result = lost_scan::scan_gaps_with_reader(
@@ -28435,199 +35488,357 @@ fn scan_lost_partitions(
             |reader, candidate| {
                 let result: Result<bool> = (|| {
                     let candidate_offset = candidate.offset;
-                    if candidate_offset < resume_after || skip_offsets.contains(&candidate_offset) {
+                    if candidate_offset < resume_after
+                        || ignored_offsets.contains(&candidate_offset)
+                    {
+                        return Ok(true);
+                    }
+                    if !seen_candidate_offsets.insert(candidate_offset) {
+                        duplicate_candidates_ignored = duplicate_candidates_ignored
+                            .checked_add(1)
+                            .context("lost-partition duplicate-candidate count overflow")?;
                         return Ok(true);
                     }
                     progress::progress_current(format!(
                         "Validating {:?} candidate at byte {candidate_offset}",
                         candidate.hint
                     ));
-                    let Some(filesystem) = detect_volume_filesystem_at(reader, candidate_offset)?
+                    let remaining_in_gap = gap_end.saturating_sub(candidate_offset);
+                    let Some(validation) = validate_lost_partition_candidate(
+                        reader,
+                        source_path,
+                        candidate,
+                        remaining_in_gap,
+                    )?
                     else {
+                        rejected_candidates = rejected_candidates
+                            .checked_add(1)
+                            .context("lost-partition rejected-candidate count overflow")?;
                         return Ok(true);
                     };
+                    let filesystem = validation.filesystem;
                     let bitlocker_locked = filesystem == BITLOCKER_LOCKED_FILESYSTEM;
-                    let remaining_in_gap = gap_end.saturating_sub(candidate_offset);
-                    let known_volume_size = if bitlocker_locked {
-                        None
-                    } else if filesystem == "EXT" {
-                        let Some(size) = recovered_ext_volume_size(reader, candidate_offset)?
-                        else {
-                            // The two-byte ext magic is intentionally only a
-                            // cheap prefilter. Random file content can contain
-                            // it, so malformed/overflowing superblock geometry
-                            // rejects the candidate without aborting the real
-                            // filesystem index that has already completed.
-                            return Ok(true);
-                        };
-                        if size == 0 || size > remaining_in_gap {
-                            return Ok(true);
-                        }
-                        // Match the scanner's documented contract: an EXT
-                        // candidate is recovered only after the real parser
-                        // accepts its superblock, not from magic bytes alone.
-                        if open_ext4_superblock(Path::new(source_path), candidate_offset).is_err() {
-                            return Ok(true);
-                        }
-                        Some(size)
-                    } else {
-                        recovered_volume_size(reader, candidate_offset, filesystem)?
-                            .filter(|size| *size > 0 && *size <= remaining_in_gap)
-                    };
-                    let parser_bound = known_volume_size.unwrap_or(gap_end - candidate_offset);
-                    recovered += 1;
+                    let known_volume_size = validation.size_bytes;
+                    let known_volume_end = known_volume_size
+                        .map(|size| {
+                            candidate_offset.checked_add(size).context(
+                                "internal lost-partition invariant: validated candidate end overflow",
+                            )
+                        })
+                        .transpose()?;
+                    let parser_bound = known_volume_size.unwrap_or(remaining_in_gap);
+                    let rows_available = max_entries.saturating_sub(*indexed);
+                    if rows_available == 0 {
+                        output_limit_hit = true;
+                        truncated = true;
+                        return Ok(false);
+                    }
+                    // A browsable filesystem needs one finding row plus its
+                    // volume-root row. If only the final examiner-authorized
+                    // row remains, retain a truthful validated-candidate
+                    // disclosure but do not claim/index a browsable volume.
+                    let deferred_by_examiner_limit =
+                        validation.is_validated_volume && !bitlocker_locked && rows_available == 1;
+                    let persist_as_validated_volume =
+                        validation.is_validated_volume && !deferred_by_examiner_limit;
+                    let candidate_number = accepted_candidates
+                        .checked_add(1)
+                        .context("lost-partition candidate count overflow")?;
                     let fs_slug = if bitlocker_locked {
                         "bitlocker-locked".to_string()
                     } else {
                         filesystem.to_ascii_lowercase()
                     };
-                    let name = format!("recovered-{recovered:02}-{fs_slug}");
-                    let volume_prefix = format!("/Image Analysis/Volumes/{name}");
-                    if *indexed >= max_entries {
-                        output_limit_hit = true;
-                        truncated = true;
-                        return Ok(false);
-                    }
-                    let bitlocker_inspection = if bitlocker_locked {
-                        bitlocker_inspection_at(reader, candidate_offset, Some(parser_bound))?
+                    let name = if persist_as_validated_volume {
+                        format!("recovered-{candidate_number:02}-{fs_slug}")
                     } else {
-                        None
+                        format!("candidate-{candidate_number:02}-{fs_slug}")
+                    };
+                    let volume_prefix = format!("/Image Analysis/Volumes/{name}");
+                    let artifact_kind = if persist_as_validated_volume {
+                        "recovered_partition"
+                    } else {
+                        "lost_partition_candidate"
+                    };
+                    let candidate_validation_status = if deferred_by_examiner_limit {
+                        "validated_but_volume_indexing_deferred_at_examiner_limit"
+                    } else if validation.is_validated_volume {
+                        "validated"
+                    } else {
+                        "recognized_header_only"
+                    };
+                    let filesystem_parser = match candidate.hint {
+                        lost_scan::FsHint::Fat => "fatfs",
+                        lost_scan::FsHint::Ntfs => "ntfs",
+                        lost_scan::FsHint::Ext => "ext4-view",
+                        lost_scan::FsHint::BitLocker => "bitlocker-decrypt",
                     };
                     let mut metadata = serde_json::json!({
-                        "artifact_kind": "recovered_partition",
+                        "artifact_kind": artifact_kind,
+                        "discovery_source": "partition_map_gap_header_scan",
                         "recovery_source": "boot_sector_scan",
                         "scan_strategy": "exhaustive_512_byte_sector_scan",
-                        "recovery_status": "orphaned boot sector found in unpartitioned gap",
+                        "recovery_status": if persist_as_validated_volume {
+                            "filesystem/encrypted-volume structure validated in a current partition-map gap; partition deletion or orphaning is not inferred"
+                        } else if deferred_by_examiner_limit {
+                            "filesystem structure validated, but volume indexing was deferred at the examiner output limit"
+                        } else {
+                            "encrypted-volume header recognized; metadata unavailable, so this remains a discovery candidate"
+                        },
+                        "candidate_claim_scope": if validation.is_validated_volume {
+                            "filesystem/encrypted-volume structure validated at a decoded-media offset outside current declared partition extents; prior partition ownership, deletion, and orphaning are not inferred"
+                        } else {
+                            "coherent encrypted-volume header recognized at a decoded-media offset outside current declared partition extents; volume metadata and prior partition ownership are not established"
+                        },
+                        "candidate_validation_status": candidate_validation_status,
+                        "candidate_validation_method": validation.validation_method,
                         "filesystem": filesystem,
                         "detected_filesystem": filesystem,
                         "prefilter_hint": format!("{:?}", candidate.hint),
+                        "prefilter_is_discovery_only": true,
+                        "offset_coordinate_system": "decoded evidence media byte stream",
+                        "decoded_media_start_offset_bytes": candidate_offset,
                         "start_offset": candidate_offset,
                         "size_bytes": known_volume_size,
-                        "end_offset_exclusive": known_volume_size.map(|size| candidate_offset.saturating_add(size)),
-                        "scan_extent_upper_bound_bytes": parser_bound,
+                        "decoded_media_end_offset_exclusive": known_volume_end,
+                        "end_offset_exclusive": known_volume_end,
+                        "scan_extent_upper_bound_bytes": remaining_in_gap,
                         "size_basis": if known_volume_size.is_some() {
-                            "validated filesystem metadata"
+                            "validated downstream parser metadata"
                         } else {
-                            "unknown; parser bounded by the containing unpartitioned gap"
+                            "unknown; no size is inferred from the containing partition-map gap"
                         },
+                        "gap_start_decoded_media_bytes": gap_start,
+                        "gap_end_exclusive_decoded_media_bytes": gap_end,
                         "gap_start": gap_start,
                         "gap_end": gap_end,
                         "scan_sector_size": 512,
-                        "filesystem_parser": if bitlocker_locked { "locked" } else { "pending" },
+                        "filesystem_parser": filesystem_parser,
                         "filesystem_browsing_status": if bitlocker_locked {
-                            bitlocker_status_message(bitlocker_inspection.as_ref())
+                            bitlocker_status_message(validation.bitlocker_inspection.as_ref())
+                        } else if deferred_by_examiner_limit {
+                            "filesystem structure validated; volume/content rows not indexed because only one examiner-authorized output row remained"
                         } else {
-                            "filesystem parser pending"
-                        },
-                        "volume_entry_prefix": volume_prefix,
+                        "filesystem structure validated; volume/content indexing is transactional and may be examiner-limited; see job coverage"
+                    },
+                        "volume_entry_prefix": (persist_as_validated_volume && !bitlocker_locked).then_some(volume_prefix.as_str()),
+                        "container_file_physical_offset": serde_json::Value::Null,
+                        "container_file_physical_offset_status": "not available; decoded-media offsets must not be treated as EWF/container-file byte offsets",
                     });
                     if bitlocker_locked {
                         merge_json_object(
                             &mut metadata,
-                            &bitlocker_metadata_value(bitlocker_inspection.as_ref()),
+                            &bitlocker_metadata_value(validation.bitlocker_inspection.as_ref()),
                         );
                     }
-                    insert_image_record(
-                        conn,
-                        case_id,
-                        evidence_id,
-                        &format!("/Image Analysis/Partitions/{name}.record"),
-                        &name,
-                        known_volume_size.map(|size| i64::try_from(size).unwrap_or(i64::MAX)),
-                        &metadata,
-                        job_id,
+                    const SAVEPOINT: &str = "kdft_lost_partition_candidate";
+                    conn.execute_batch(&format!("SAVEPOINT {SAVEPOINT}"))?;
+                    let indexed_before_candidate = *indexed;
+                    let indexed_after_candidate = indexed_before_candidate.checked_add(1).context(
+                        "internal lost-partition invariant: indexed-entry count overflow",
                     )?;
-                    *indexed += 1;
-                    if *indexed >= max_entries {
-                        output_limit_hit = true;
-                        truncated = true;
-                        return Ok(false);
-                    }
-                    if bitlocker_locked {
-                        return Ok(true);
-                    }
-                    let parse_result = match filesystem {
-                        "FAT" => process_fat_partition_entries(
+                    let persist_result: Result<bool> = (|| {
+                        insert_image_record(
                             conn,
                             case_id,
                             evidence_id,
-                            job_id,
-                            reader,
-                            candidate_offset,
-                            parser_bound,
-                            &volume_prefix,
+                            &format!("/Image Analysis/Partitions/{name}.record"),
                             &name,
-                            declared_count + recovered,
-                            indexed,
-                            max_entries,
-                        ),
-                        "NTFS" => process_ntfs_partition_entries(
-                            conn,
-                            case_id,
-                            evidence_id,
+                            known_volume_size.map(|size| i64::try_from(size).unwrap_or(i64::MAX)),
+                            &metadata,
                             job_id,
-                            reader,
-                            candidate_offset,
-                            parser_bound,
-                            &volume_prefix,
-                            &name,
-                            declared_count + recovered,
-                            indexed,
-                            max_entries,
-                        ),
-                        "EXT" => process_ext_partition_entries(
-                            conn,
-                            case_id,
-                            evidence_id,
-                            job_id,
-                            source_path,
-                            candidate_offset,
-                            parser_bound,
-                            &volume_prefix,
-                            &name,
-                            declared_count + recovered,
-                            indexed,
-                            max_entries,
-                        ),
-                        _ => Ok(false),
-                    };
-                    let fs_lower = filesystem.to_ascii_lowercase();
-                    match parse_result {
-                        Ok(parse_truncated) => {
-                            truncated |= parse_truncated;
-                            if let Some(volume_size) = known_volume_size {
-                                resume_after = candidate_offset.saturating_add(volume_size);
-                            }
+                        )?;
+                        *indexed = indexed_after_candidate;
+                        if bitlocker_locked || deferred_by_examiner_limit {
+                            return Ok(false);
                         }
-                        Err(err) => {
-                            if *indexed >= max_entries {
-                                output_limit_hit = true;
-                                truncated = true;
-                                return Ok(false);
+                        match filesystem {
+                            "FAT" => process_fat_partition_entries(
+                                conn,
+                                case_id,
+                                evidence_id,
+                                job_id,
+                                reader,
+                                candidate_offset,
+                                parser_bound,
+                                &volume_prefix,
+                                &name,
+                                declared_count + candidate_number,
+                                indexed,
+                                max_entries,
+                            ),
+                            "NTFS" => process_ntfs_partition_entries(
+                                conn,
+                                case_id,
+                                evidence_id,
+                                job_id,
+                                reader,
+                                candidate_offset,
+                                parser_bound,
+                                &volume_prefix,
+                                &name,
+                                declared_count + candidate_number,
+                                indexed,
+                                max_entries,
+                            ),
+                            "EXT" => process_ext_partition_entries(
+                                conn,
+                                case_id,
+                                evidence_id,
+                                job_id,
+                                source_path,
+                                candidate_offset,
+                                parser_bound,
+                                &volume_prefix,
+                                &name,
+                                declared_count + candidate_number,
+                                indexed,
+                                max_entries,
+                            ),
+                            _ => bail!("validated lost-partition candidate has unsupported parser"),
+                        }
+                    })();
+                    let parse_truncated = match persist_result {
+                        Ok(parse_truncated) => {
+                            if let Err(error) =
+                                conn.execute_batch(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))
+                            {
+                                let _ = conn.execute_batch(&format!(
+                                    "ROLLBACK TO SAVEPOINT {SAVEPOINT}; RELEASE SAVEPOINT {SAVEPOINT};"
+                                ));
+                                *indexed = indexed_before_candidate;
+                                return Err(error).context(
+                                    "committing validated lost-partition candidate atomically",
+                                );
                             }
+                            parse_truncated
+                        }
+                        Err(error) => {
+                            conn.execute_batch(&format!(
+                                "ROLLBACK TO SAVEPOINT {SAVEPOINT}; RELEASE SAVEPOINT {SAVEPOINT};"
+                            ))
+                            .context("rolling back failed lost-partition candidate indexing")?;
+                            *indexed = indexed_before_candidate;
+                            if lost_partition_indexing_error_is_fatal(&error) {
+                                return Err(error).with_context(|| {
+                                    format!(
+                                        "indexing validated {filesystem} candidate at decoded-media offset {candidate_offset}"
+                                    )
+                                });
+                            }
+
+                            // The format parser accepted the volume header but
+                            // failed during the bounded content walk. Preserve
+                            // only an explicit diagnostic candidate; do not
+                            // leave the earlier validated-volume row or any
+                            // partially indexed children behind.
+                            let error_message =
+                                format!("{error:#}").chars().take(2_000).collect::<String>();
+                            let failed_name = format!("candidate-{candidate_number:02}-{fs_slug}");
+                            if let Some(object) = metadata.as_object_mut() {
+                                object.insert(
+                                    "artifact_kind".to_string(),
+                                    serde_json::json!("lost_partition_candidate"),
+                                );
+                                object.insert(
+                                    "candidate_validation_status".to_string(),
+                                    serde_json::json!(
+                                        "filesystem_structure_validated_but_content_indexing_failed"
+                                    ),
+                                );
+                                object.insert(
+                                    "recovery_status".to_string(),
+                                    serde_json::json!(
+                                        "filesystem structure was recognized, but bounded content indexing failed; this is not a browsable recovered volume"
+                                    ),
+                                );
+                                object.insert(
+                                    "filesystem_browsing_status".to_string(),
+                                    serde_json::json!("failed; see candidate_parser_error"),
+                                );
+                                object.insert(
+                                    "volume_entry_prefix".to_string(),
+                                    serde_json::Value::Null,
+                                );
+                                object.insert(
+                                    "candidate_parser_error".to_string(),
+                                    serde_json::json!(error_message),
+                                );
+                                object.insert(
+                                    "candidate_parser_error_scope".to_string(),
+                                    serde_json::json!(
+                                        "candidate-scoped downstream filesystem/content walk"
+                                    ),
+                                );
+                            } else {
+                                bail!(
+                                    "internal lost-partition invariant: candidate metadata is not an object"
+                                );
+                            }
+                            let failed_logical_path =
+                                format!("/Image Analysis/Partitions/{failed_name}.record");
                             insert_image_record(
                                 conn,
                                 case_id,
                                 evidence_id,
-                                &format!("{volume_prefix}/Parser Error.record"),
-                                "Parser Error",
-                                None,
-                                &serde_json::json!({
-                                    "artifact_kind": "filesystem_parser_error",
-                                    "filesystem_parser": fs_lower,
-                                    "recovered_partition": true,
-                                    "error": err.to_string(),
-                                }),
+                                &failed_logical_path,
+                                &failed_name,
+                                known_volume_size
+                                    .map(|size| i64::try_from(size).unwrap_or(i64::MAX)),
+                                &metadata,
                                 job_id,
                             )?;
-                            *indexed += 1;
-                            truncated = true;
-                            progress::progress_error(Some(volume_prefix.clone()));
-                            progress::progress_skip(Some(volume_prefix.clone()));
+                            *indexed = indexed_after_candidate;
+                            accepted_candidates = candidate_number;
+                            validated_volume_candidates = validated_volume_candidates
+                                .checked_add(1)
+                                .context("lost-partition validated-volume count overflow")?;
+                            candidate_indexing_failures =
+                                candidate_indexing_failures.checked_add(1).context(
+                                    "lost-partition candidate-indexing failure count overflow",
+                                )?;
+                            progress::progress_error(Some(failed_logical_path));
                             progress::progress_truncated(format!(
-                                "recovered {filesystem} volume at byte offset {candidate_offset} could not be parsed: {err}"
+                                "validated {filesystem} candidate at decoded-media offset {candidate_offset} could not be indexed: {error_message}"
                             ));
+                            truncated = true;
+                            if let Some(volume_end) = known_volume_end {
+                                resume_after = volume_end;
+                            }
+                            if *indexed >= max_entries {
+                                output_limit_hit = true;
+                            }
+                            return Ok(!output_limit_hit);
                         }
+                    };
+                    accepted_candidates = candidate_number;
+                    if validation.is_validated_volume {
+                        validated_volume_candidates = validated_volume_candidates
+                            .checked_add(1)
+                            .context("lost-partition validated-volume count overflow")?;
+                        if persist_as_validated_volume {
+                            validated_volume_findings_persisted =
+                                validated_volume_findings_persisted.checked_add(1).context(
+                                    "lost-partition persisted validated-volume count overflow",
+                                )?;
+                        }
+                    } else {
+                        header_only_candidates = header_only_candidates
+                            .checked_add(1)
+                            .context("lost-partition header-only count overflow")?;
+                    }
+                    if parse_truncated {
+                        candidate_partial_indexing = candidate_partial_indexing
+                            .checked_add(1)
+                            .context("lost-partition partial-candidate count overflow")?;
+                    }
+                    truncated |= parse_truncated;
+                    if let Some(volume_end) = known_volume_end {
+                        resume_after = volume_end;
+                    }
+                    if *indexed >= max_entries {
+                        output_limit_hit = true;
+                        truncated = true;
                     }
                     Ok(!output_limit_hit)
                 })();
@@ -28654,8 +35865,80 @@ fn scan_lost_partitions(
                 format!("processing lost-partition candidate in gap {gap_start}..{gap_end}")
             });
         }
-        scan_result
-            .with_context(|| format!("scanning unpartitioned gap {gap_start}..{gap_end}"))?;
+        let outcome = scan_result
+            .with_context(|| format!("scanning partition-map gap {gap_start}..{gap_end}"))?;
+        scanned_bytes = scanned_bytes
+            .checked_add(outcome.bytes_scanned)
+            .context("lost-partition scanned byte count overflow")?;
+        prefilter_candidates_reported = prefilter_candidates_reported
+            .checked_add(outcome.candidates_reported)
+            .context("lost-partition prefilter candidate count overflow")?;
+        match outcome.status {
+            lost_scan::ScanTerminalStatus::Complete => {
+                if outcome.bytes_scanned != outcome.bytes_total {
+                    bail!(
+                        "lost-partition scanner reported complete with only {} of {} bytes covered",
+                        outcome.bytes_scanned,
+                        outcome.bytes_total
+                    );
+                }
+            }
+            lost_scan::ScanTerminalStatus::StoppedByCallback => {
+                if !output_limit_hit {
+                    bail!(
+                        "lost-partition scanner stopped without an examiner output limit after {} of {} bytes",
+                        outcome.bytes_scanned,
+                        outcome.bytes_total
+                    );
+                }
+                progress::progress_truncated(format!(
+                    "lost-partition discovery stopped at the examiner entry limit after {} of {} bytes in decoded-media gap {gap_start}..{gap_end}",
+                    outcome.bytes_scanned,
+                    outcome.bytes_total
+                ));
+            }
+        }
+    }
+    let scan_status = if output_limit_hit {
+        "stopped_at_examiner_entry_limit"
+    } else if candidate_indexing_failures > 0 || candidate_partial_indexing > 0 {
+        "complete_with_candidate_diagnostics"
+    } else {
+        "complete"
+    };
+    let scan_audit = serde_json::json!({
+        "status": scan_status,
+        "coverage_complete": !output_limit_hit,
+        "candidate_content_indexing_complete": !output_limit_hit
+            && candidate_indexing_failures == 0
+            && candidate_partial_indexing == 0,
+        "coordinate_system": "decoded evidence media byte stream",
+        "planned_gap_count": planned_gap_count,
+        "planned_bytes_total": planned_bytes_total,
+        "bytes_scanned": scanned_bytes,
+        "prefilter_candidates_reported": prefilter_candidates_reported,
+        "unique_candidate_offsets_examined": seen_candidate_offsets.len(),
+        "duplicate_candidates_ignored": duplicate_candidates_ignored,
+        "downstream_parser_rejections": rejected_candidates,
+        "validated_volume_candidates": validated_volume_candidates,
+        "validated_volume_findings_persisted": validated_volume_findings_persisted,
+        "header_only_candidates": header_only_candidates,
+        "candidate_indexing_failures": candidate_indexing_failures,
+        "candidate_partial_indexing": candidate_partial_indexing,
+        "candidate_findings_persisted": accepted_candidates,
+        "skip_offsets_count": ignored_offsets.len(),
+        "sector_alignment_bytes": 512,
+        "candidate_policy": "prefilter hints are discovery only; validated-volume findings require the real downstream parser",
+        "partition_history_claim": "none; presence in a current partition-map gap does not prove deletion or orphaning",
+    });
+    let updated = conn.execute(
+        "UPDATE evidence_jobs
+         SET parameters_json = json_set(parameters_json, '$.lost_partition_scan', json(?1))
+         WHERE id = ?2 AND case_id = ?3 AND evidence_id = ?4",
+        params![scan_audit.to_string(), job_id, case_id, evidence_id],
+    )?;
+    if updated != 1 {
+        bail!("recording lost-partition scan audit metadata affected {updated} jobs");
     }
     Ok(truncated)
 }
@@ -28668,11 +35951,18 @@ fn recovered_volume_size(
 ) -> Result<Option<u64>> {
     let mut sector = [0_u8; 512];
     reader.seek(SeekFrom::Start(start_offset))?;
-    if reader.read(&mut sector)? < sector.len() {
-        return Ok(None);
+    match reader.read_exact(&mut sector) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error).context("reading recovered-volume boot sector"),
     }
     let bytes_per_sector = u64::from(u16::from_le_bytes([sector[11], sector[12]]));
-    if !(256..=8192).contains(&bytes_per_sector) {
+    let valid_sector_size = if filesystem == "NTFS" {
+        matches!(bytes_per_sector, 256 | 512 | 1024 | 2048 | 4096)
+    } else {
+        matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096)
+    };
+    if !valid_sector_size {
         return Ok(None);
     }
     let total_sectors = if filesystem == "NTFS" {
@@ -29149,7 +36439,11 @@ fn scan_fat_deleted_entries(
             anyhow!("allocating {read_len} bytes for a complete FAT directory region: {error}")
         })?;
         region.resize(read_len, 0);
-        reader.seek(SeekFrom::Start(start_offset + region_offset))?;
+        reader.seek(SeekFrom::Start(
+            start_offset
+                .checked_add(region_offset)
+                .context("FAT directory-region offset overflow")?,
+        ))?;
         let read = reader.read(&mut region)?;
         region.truncate(read);
 
@@ -29182,7 +36476,14 @@ fn scan_fat_deleted_entries(
                     entry[28], entry[29], entry[30], entry[31],
                 ]));
                 let data_logical_offset = layout.cluster_data_offset(first_cluster);
-                let data_physical_offset = data_logical_offset.map(|offset| start_offset + offset);
+                let data_physical_offset =
+                    data_logical_offset.and_then(|offset| start_offset.checked_add(offset));
+                let cluster_bytes = layout
+                    .sectors_per_cluster
+                    .checked_mul(layout.bytes_per_sector)
+                    .context("FAT cluster byte length overflow")?;
+                let authoritative_contiguous_bytes =
+                    (!is_directory).then_some(file_size.min(cluster_bytes));
                 let logical_path = format!(
                     "{recovery_prefix}/{}{}-cluster{first_cluster}",
                     if parent_rel.is_empty() {
@@ -29205,11 +36506,17 @@ fn scan_fat_deleted_entries(
                     "storage_area": "deleted_filesystem_record",
                     "partition_index": partition_index,
                     "partition_start_offset": start_offset,
+                    "partition_size_bytes": size_bytes,
                     "fat_parent_path": parent_rel,
                     "fat_first_cluster": first_cluster,
                     "fat_attributes": attr,
                     "file_data_logical_offset": data_logical_offset,
                     "file_data_physical_offset": data_physical_offset,
+                    "file_data_file_offset": data_logical_offset.map(|_| 0_u64),
+                    "file_data_contiguous_bytes": authoritative_contiguous_bytes,
+                    "physical_offset_basis": data_logical_offset.map(|_| "FAT deleted directory entry first cluster; only the first cluster is authoritative"),
+                    "file_data_direct_logical_mapping": data_logical_offset.map(|_| true),
+                    "offset_coordinate_system": "decoded_media_byte_stream",
                     "created_utc": dos_datetime_to_utc(
                         u16::from_le_bytes([entry[16], entry[17]]),
                         u16::from_le_bytes([entry[14], entry[15]]),
@@ -29223,7 +36530,11 @@ fn scan_fat_deleted_entries(
                 add_entry_category(&mut metadata, &logical_path, &name, entry_kind);
                 let content_head = if !is_directory && processing_profile().capture_content {
                     data_physical_offset.and_then(|offset| {
-                        let mut head = vec![0_u8; CONTENT_INDEX_BYTES.min(file_size as usize)];
+                        let head_len =
+                            usize::try_from(authoritative_contiguous_bytes.unwrap_or_default())
+                                .unwrap_or(usize::MAX)
+                                .min(CONTENT_INDEX_BYTES);
+                        let mut head = vec![0_u8; head_len];
                         if head.is_empty() {
                             return None;
                         }
@@ -29552,7 +36863,7 @@ struct NtfsDirChild {
     standard_access_time_utc: Option<String>,
     standard_mft_record_modification_time_raw: Option<u64>,
     standard_mft_record_modification_time_utc: Option<String>,
-    file_data_logical_offset: Option<u64>,
+    data_location: Option<NtfsDataLocation>,
 }
 
 struct NtfsDataStreamInfo {
@@ -29560,12 +36871,28 @@ struct NtfsDataStreamInfo {
     size_bytes: u64,
     allocated_size_bytes: Option<u64>,
     valid_data_size_bytes: Option<u64>,
-    file_data_logical_offset: Option<u64>,
+    data_location: Option<NtfsDataLocation>,
     is_resident: bool,
     attribute_flags: u16,
     is_compressed: bool,
     is_encrypted: bool,
     is_sparse: bool,
+}
+
+/// First authoritative raw-media location for an NTFS data stream. Offsets
+/// are relative to the mounted NTFS volume; callers add the partition start
+/// to express a decoded-media offset. `file_offset` matters when one or more
+/// leading sparse runs precede the first allocated run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NtfsDataLocation {
+    filesystem_offset: u64,
+    file_offset: u64,
+    /// Direct logical bytes available from `filesystem_offset`. This is absent
+    /// for compressed/encrypted/attribute-list mappings and stops before an
+    /// NTFS FILE update-sequence trailer for resident values.
+    contiguous_bytes: Option<u64>,
+    basis: &'static str,
+    direct_logical_mapping: bool,
 }
 
 fn ntfs_stream_read_support(is_compressed: bool, is_encrypted: bool) -> &'static str {
@@ -29738,9 +37065,11 @@ fn walk_ntfs_volume<T: Read + Seek>(
             let mft_record_logical_offset = child.mft_record_logical_offset;
             let mft_record_physical_offset = mft_record_logical_offset
                 .and_then(|offset| partition_start_offset.checked_add(offset));
-            let file_data_physical_offset = child
-                .file_data_logical_offset
-                .and_then(|offset| partition_start_offset.checked_add(offset));
+            let data_location = child.data_location;
+            let file_data_logical_offset = data_location.map(|location| location.filesystem_offset);
+            let file_data_physical_offset = data_location.and_then(|location| {
+                partition_start_offset.checked_add(location.filesystem_offset)
+            });
             let mut metadata = serde_json::json!({
                 "artifact_kind": "filesystem_entry",
                 "filesystem_parser": "ntfs",
@@ -29761,8 +37090,13 @@ fn walk_ntfs_volume<T: Read + Seek>(
                 "ntfs_file_name_attribute_flags": child.file_attribute_flags,
                 "mft_record_logical_offset": mft_record_logical_offset,
                 "mft_record_physical_offset": mft_record_physical_offset,
-                "file_data_logical_offset": child.file_data_logical_offset,
+                "file_data_logical_offset": file_data_logical_offset,
                 "file_data_physical_offset": file_data_physical_offset,
+                "file_data_file_offset": data_location.map(|location| location.file_offset),
+                "file_data_contiguous_bytes": data_location.and_then(|location| location.contiguous_bytes),
+                "physical_offset_basis": data_location.map(|location| location.basis),
+                "file_data_direct_logical_mapping": data_location.map(|location| location.direct_logical_mapping),
+                "offset_coordinate_system": "decoded_media_byte_stream",
                 "ntfs_namespace": child.namespace,
                 "ntfs_allocated_size": child.allocated_size,
                 "ntfs_creation_time_raw": child.creation_time_raw,
@@ -29782,6 +37116,17 @@ fn walk_ntfs_volume<T: Read + Seek>(
                 "ntfs_standard_mft_record_modification_time_raw": child.standard_mft_record_modification_time_raw,
                 "ntfs_standard_mft_record_modification_time_utc": child.standard_mft_record_modification_time_utc,
             });
+            if !child.is_directory
+                && child.file_attribute_flags
+                    & (NTFS_FILE_ATTRIBUTE_SPARSE_FILE | NTFS_FILE_ATTRIBUTE_REPARSE_POINT)
+                    != 0
+            {
+                if let Ok(file) = ntfs.file(fs, child.file_record_number) {
+                    if let Err(error) = annotate_ntfs_wof_metadata(&mut metadata, &file, fs) {
+                        annotate_ntfs_wof_error(&mut metadata, &error);
+                    }
+                }
+            }
             if !child.is_directory {
                 if let Some(ext) =
                     extension_lower(&child.name).or_else(|| extension_lower(&logical_path))
@@ -29873,6 +37218,30 @@ fn walk_ntfs_volume<T: Read + Seek>(
                                 }
                             }
                         }
+                    } else if ext == "msg" {
+                        match annotate_ntfs_file_record_msg_candidate(
+                            &mut metadata,
+                            ntfs,
+                            fs,
+                            child.file_record_number,
+                            child.size_bytes,
+                        ) {
+                            Ok(true) => {
+                                truncated = true;
+                                progress::progress_truncated(format!(
+                                    "NTFS MSG candidate {logical_path} has an inconclusive bounded CFB signature probe"
+                                ));
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                mark_msg_candidate_read_error(
+                                    &mut metadata,
+                                    &format!("could not read NTFS MSG candidate: {error}"),
+                                );
+                                truncated = true;
+                                progress::progress_error(Some(logical_path.clone()));
+                            }
+                        }
                     } else if is_email_store_extension(&ext) {
                         mark_email_store(&mut metadata, &ext);
                     }
@@ -29915,9 +37284,12 @@ fn walk_ntfs_volume<T: Read + Seek>(
                             internal_source_segment(&format!("ads:{}", stream.name))
                         );
                         let stream_ntfs_path = format!("{ntfs_path}:{}", stream.name);
-                        let stream_physical_offset = stream
-                            .file_data_logical_offset
-                            .and_then(|offset| partition_start_offset.checked_add(offset));
+                        let stream_data_location = stream.data_location;
+                        let stream_logical_offset =
+                            stream_data_location.map(|location| location.filesystem_offset);
+                        let stream_physical_offset = stream_data_location.and_then(|location| {
+                            partition_start_offset.checked_add(location.filesystem_offset)
+                        });
                         let mut stream_metadata = serde_json::json!({
                             "artifact_kind": "filesystem_entry",
                             "filesystem_parser": "ntfs",
@@ -29944,8 +37316,13 @@ fn walk_ntfs_volume<T: Read + Seek>(
                             "ntfs_stream_read_support": ntfs_stream_read_support(stream.is_compressed, stream.is_encrypted),
                             "mft_record_logical_offset": mft_record_logical_offset,
                             "mft_record_physical_offset": mft_record_physical_offset,
-                            "file_data_logical_offset": stream.file_data_logical_offset,
+                            "file_data_logical_offset": stream_logical_offset,
                             "file_data_physical_offset": stream_physical_offset,
+                            "file_data_file_offset": stream_data_location.map(|location| location.file_offset),
+                            "file_data_contiguous_bytes": stream_data_location.and_then(|location| location.contiguous_bytes),
+                            "physical_offset_basis": stream_data_location.map(|location| location.basis),
+                            "file_data_direct_logical_mapping": stream_data_location.map(|location| location.direct_logical_mapping),
+                            "offset_coordinate_system": "decoded_media_byte_stream",
                             "ntfs_namespace": child.namespace,
                             "ntfs_data_size": stream.size_bytes,
                             "ntfs_allocated_size": stream.allocated_size_bytes,
@@ -30285,19 +37662,20 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
                 None
             }
         };
-        let file_data_logical_offset = if is_directory {
+        let data_location = if is_directory {
             None
         } else {
-            match ntfs_data_stream_logical_offset_checked(&file, fs, "") {
-                Ok(offset) => offset,
+            match ntfs_data_stream_location_checked(&file, fs, "") {
+                Ok(location) => location,
                 Err(error) => {
                     diagnostics.record_error(record_number, "data_stream", error, false);
                     None
                 }
             }
         };
-        let file_data_physical_offset =
-            file_data_logical_offset.and_then(|offset| partition_start_offset.checked_add(offset));
+        let file_data_logical_offset = data_location.map(|location| location.filesystem_offset);
+        let file_data_physical_offset = data_location
+            .and_then(|location| partition_start_offset.checked_add(location.filesystem_offset));
         let mft_record_logical_offset = file.position().value().map(|position| position.get());
         let mft_record_physical_offset =
             mft_record_logical_offset.and_then(|offset| partition_start_offset.checked_add(offset));
@@ -30323,10 +37701,16 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
             "ntfs_parent_record_number": name.parent_record_number,
             "ntfs_file_record_number": record_number,
             "ntfs_sequence_number": file.sequence_number(),
+            "ntfs_file_name_attribute_flags": name.file_attribute_flags,
             "mft_record_logical_offset": mft_record_logical_offset,
             "mft_record_physical_offset": mft_record_physical_offset,
             "file_data_logical_offset": file_data_logical_offset,
             "file_data_physical_offset": file_data_physical_offset,
+            "file_data_file_offset": data_location.map(|location| location.file_offset),
+            "file_data_contiguous_bytes": data_location.and_then(|location| location.contiguous_bytes),
+            "physical_offset_basis": data_location.map(|location| location.basis),
+            "file_data_direct_logical_mapping": data_location.map(|location| location.direct_logical_mapping),
+            "offset_coordinate_system": "decoded_media_byte_stream",
             "ntfs_namespace": name.namespace,
             "ntfs_allocated_size": name.allocated_size,
             "ntfs_creation_time_raw": name.creation_time_raw,
@@ -30348,6 +37732,15 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
         });
         let native_attribute_summary = ntfs_native_attribute_summary(&file, fs);
         merge_native_ntfs_attribute_summary(&mut metadata, &native_attribute_summary);
+        if entry_kind == "file"
+            && name.file_attribute_flags
+                & (NTFS_FILE_ATTRIBUTE_SPARSE_FILE | NTFS_FILE_ATTRIBUTE_REPARSE_POINT)
+                != 0
+        {
+            if let Err(error) = annotate_ntfs_wof_metadata(&mut metadata, &file, fs) {
+                annotate_ntfs_wof_error(&mut metadata, &error);
+            }
+        }
         if entry_kind == "file" {
             if let Some(ext) =
                 extension_lower(&name.name).or_else(|| extension_lower(&logical_path))
@@ -30435,6 +37828,30 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
                                     "deleted NTFS RFC 822 candidate",
                                 );
                             }
+                        }
+                    }
+                } else if ext == "msg" {
+                    match annotate_ntfs_file_record_msg_candidate(
+                        &mut metadata,
+                        ntfs,
+                        fs,
+                        record_number,
+                        name.data_size,
+                    ) {
+                        Ok(true) => {
+                            truncated = true;
+                            progress::progress_truncated(format!(
+                                "deleted NTFS MSG candidate {logical_path} has an inconclusive bounded CFB signature probe"
+                            ));
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            mark_msg_candidate_read_error(
+                                &mut metadata,
+                                &format!("could not read deleted NTFS MSG candidate: {error}"),
+                            );
+                            truncated = true;
+                            progress::progress_error(Some(logical_path.clone()));
                         }
                     }
                 } else if is_email_store_extension(&ext) {
@@ -30571,7 +37988,10 @@ fn preserve_deleted_recovery_artifact_kind(metadata: &mut serde_json::Value) {
     else {
         return;
     };
-    if kind == "email_message" || kind == "email_store" {
+    if matches!(
+        kind.as_str(),
+        "email_message" | "email_store" | "outlook_msg_container"
+    ) {
         object.insert(
             "email_artifact_kind".to_string(),
             serde_json::Value::String(kind),
@@ -30586,6 +38006,7 @@ fn preserve_deleted_recovery_artifact_kind(metadata: &mut serde_json::Value) {
 struct NtfsRecordName {
     name: String,
     namespace: String,
+    file_attribute_flags: u32,
     parent_record_number: u64,
     allocated_size: u64,
     data_size: u64,
@@ -30626,6 +38047,7 @@ fn ntfs_primary_file_name<T: Read + Seek>(
         return Ok(Some(NtfsRecordName {
             name: file_name.name().to_string_lossy(),
             namespace: format!("{:?}", file_name.namespace()),
+            file_attribute_flags: file_name.file_attributes().bits(),
             parent_record_number: file_name.parent_directory_reference().file_record_number(),
             allocated_size: file_name.allocated_size(),
             data_size: file_name.data_size(),
@@ -30749,10 +38171,10 @@ fn collect_ntfs_dir_children<T: Read + Seek>(
         } else {
             ntfs_default_data_size(&file, fs).unwrap_or_else(|| file_name.data_size())
         };
-        let file_data_logical_offset = if is_directory {
+        let data_location = if is_directory {
             None
         } else {
-            ntfs_default_data_logical_offset(&file, fs)
+            ntfs_default_data_location(&file, fs)
         };
         candidates.push(NtfsDirChild {
             name,
@@ -30806,7 +38228,7 @@ fn collect_ntfs_dir_children<T: Read + Seek>(
             standard_mft_record_modification_time_utc: standard_info
                 .as_ref()
                 .and_then(|info| ntfs_time_to_rfc3339(info.mft_record_modification_time())),
-            file_data_logical_offset,
+            data_location,
         });
     }
 
@@ -30886,17 +38308,23 @@ fn ntfs_named_data_streams<T: Read + Seek>(
             continue;
         };
         let size_bytes = data_value.len();
+        drop(data_value);
         let is_resident = attribute.is_resident();
         let flags = attribute.flags();
+        let data_location = ntfs_attribute_data_location(
+            file,
+            fs,
+            &attribute,
+            &format!("NTFS file record {}:${name}", file.file_record_number()),
+        )
+        .ok()
+        .flatten();
         streams.push(NtfsDataStreamInfo {
             name,
             size_bytes,
             allocated_size_bytes: is_resident.then_some(size_bytes),
             valid_data_size_bytes: is_resident.then_some(size_bytes),
-            file_data_logical_offset: data_value
-                .data_position()
-                .value()
-                .map(|position| position.get()),
+            data_location,
             is_resident,
             attribute_flags: flags.bits(),
             is_compressed: flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED),
@@ -30934,9 +38362,12 @@ fn ntfs_unallocated_summary<T: Read + Seek>(
         summary.total_size_bytes = summary.total_size_bytes.saturating_add(length_bytes);
         summary.run_count = summary.run_count.saturating_add(1);
         if summary.sample_extents.len() < NTFS_UNALLOCATED_METADATA_EXTENTS_LIMIT {
+            let physical_offset = partition_start_offset
+                .checked_add(logical_offset)
+                .context("NTFS unallocated physical-offset overflow")?;
             summary.sample_extents.push(NtfsUnallocatedExtent {
                 logical_offset,
-                physical_offset: partition_start_offset.saturating_add(logical_offset),
+                physical_offset,
                 length_bytes,
             });
         }
@@ -32042,20 +39473,22 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
             let allocated_size = mft_stream_summary(&summary, stream_name)
                 .and_then(|stream| stream["allocated_size"].as_u64())
                 .unwrap_or(best_name.physical_size);
-            let file_data_logical_offset = if is_directory {
+            let data_location = if is_directory {
                 None
             } else {
                 native_file
                     .as_ref()
-                    .and_then(|file| ntfs_default_data_logical_offset(file, fs))
+                    .and_then(|file| ntfs_default_data_location(file, fs))
             };
+            let file_data_logical_offset = data_location.map(|location| location.filesystem_offset);
             let mft_record_logical_offset = native_file
                 .as_ref()
                 .and_then(|file| file.position().value().map(|position| position.get()));
             let mft_record_physical_offset = mft_record_logical_offset
                 .and_then(|offset| partition_start_offset.checked_add(offset));
-            let file_data_physical_offset = file_data_logical_offset
-                .and_then(|offset| partition_start_offset.checked_add(offset));
+            let file_data_physical_offset = data_location.and_then(|location| {
+                partition_start_offset.checked_add(location.filesystem_offset)
+            });
             let base_logical_path = ntfs_internal_logical_path(volume_prefix, &ntfs_path);
             let logical_path = unique_reconciled_ntfs_logical_path(
                 base_logical_path,
@@ -32086,6 +39519,11 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
                 "mft_record_physical_offset": mft_record_physical_offset,
                 "file_data_logical_offset": file_data_logical_offset,
                 "file_data_physical_offset": file_data_physical_offset,
+                "file_data_file_offset": data_location.map(|location| location.file_offset),
+                "file_data_contiguous_bytes": data_location.and_then(|location| location.contiguous_bytes),
+                "physical_offset_basis": data_location.map(|location| location.basis),
+                "file_data_direct_logical_mapping": data_location.map(|location| location.direct_logical_mapping),
+                "offset_coordinate_system": "decoded_media_byte_stream",
                 "ntfs_namespace": format!("{:?}", best_name.namespace),
                 "ntfs_file_name_attribute_flags": best_name.flags.bits(),
                 "ntfs_creation_time_utc": best_name.created.to_string(),
@@ -32100,6 +39538,52 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
             merge_mft_summary_into_ntfs_metadata(&mut metadata, &summary);
             if let Some(native_summary) = native_attribute_summary.as_ref() {
                 merge_native_ntfs_attribute_summary(&mut metadata, native_summary);
+            }
+            if !is_directory
+                && best_name.flags.bits()
+                    & (NTFS_FILE_ATTRIBUTE_SPARSE_FILE | NTFS_FILE_ATTRIBUTE_REPARSE_POINT)
+                    != 0
+            {
+                if let Some(file) = native_file.as_ref() {
+                    if let Err(error) = annotate_ntfs_wof_metadata(&mut metadata, file, fs) {
+                        annotate_ntfs_wof_error(&mut metadata, &error);
+                    }
+                }
+            }
+            if !is_directory {
+                if let Some(ext) =
+                    extension_lower(&best_name.name).or_else(|| extension_lower(&logical_path))
+                {
+                    if ext == "msg" {
+                        match annotate_ntfs_file_record_msg_candidate(
+                            &mut metadata,
+                            ntfs,
+                            fs,
+                            record_number,
+                            data_size,
+                        ) {
+                            Ok(true) => {
+                                truncated = true;
+                                progress::progress_truncated(format!(
+                                    "reconciled NTFS MSG candidate {logical_path} has an inconclusive bounded CFB signature probe"
+                                ));
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                mark_msg_candidate_read_error(
+                                    &mut metadata,
+                                    &format!(
+                                        "could not read reconciled NTFS MSG candidate: {error}"
+                                    ),
+                                );
+                                truncated = true;
+                                progress::progress_error(Some(logical_path.clone()));
+                            }
+                        }
+                    } else if is_email_store_extension(&ext) {
+                        mark_email_store(&mut metadata, &ext);
+                    }
+                }
             }
             add_entry_category(&mut metadata, &logical_path, &best_name.name, entry_kind);
             let content_head = native_file.as_ref().and_then(|_| {
@@ -32157,9 +39641,12 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
                 .map(|position| position.get());
             let mft_record_physical_offset = mft_record_logical_offset
                 .and_then(|offset| partition_start_offset.checked_add(offset));
-            let stream_physical_offset = stream
-                .file_data_logical_offset
-                .and_then(|offset| partition_start_offset.checked_add(offset));
+            let stream_data_location = stream.data_location;
+            let stream_logical_offset =
+                stream_data_location.map(|location| location.filesystem_offset);
+            let stream_physical_offset = stream_data_location.and_then(|location| {
+                partition_start_offset.checked_add(location.filesystem_offset)
+            });
             let mut stream_metadata = serde_json::json!({
                 "artifact_kind": "filesystem_entry",
                 "filesystem_parser": "ntfs",
@@ -32191,8 +39678,13 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
                 "ntfs_stream_read_support": ntfs_stream_read_support(stream.is_compressed, stream.is_encrypted),
                 "mft_record_logical_offset": mft_record_logical_offset,
                 "mft_record_physical_offset": mft_record_physical_offset,
-                "file_data_logical_offset": stream.file_data_logical_offset,
+                "file_data_logical_offset": stream_logical_offset,
                 "file_data_physical_offset": stream_physical_offset,
+                "file_data_file_offset": stream_data_location.map(|location| location.file_offset),
+                "file_data_contiguous_bytes": stream_data_location.and_then(|location| location.contiguous_bytes),
+                "physical_offset_basis": stream_data_location.map(|location| location.basis),
+                "file_data_direct_logical_mapping": stream_data_location.map(|location| location.direct_logical_mapping),
+                "offset_coordinate_system": "decoded_media_byte_stream",
                 "ntfs_namespace": format!("{:?}", best_name.namespace),
                 "ntfs_file_name_attribute_flags": best_name.flags.bits(),
                 "ntfs_creation_time_utc": best_name.created.to_string(),
@@ -32281,18 +39773,18 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
     Ok(truncated)
 }
 
-fn ntfs_default_data_logical_offset<T: Read + Seek>(
+fn ntfs_default_data_location<T: Read + Seek>(
     file: &ntfs::NtfsFile<'_>,
     fs: &mut T,
-) -> Option<u64> {
-    ntfs_data_stream_logical_offset(file, fs, "")
+) -> Option<NtfsDataLocation> {
+    ntfs_data_stream_location(file, fs, "")
 }
 
-fn ntfs_data_stream_logical_offset_checked<T: Read + Seek>(
+fn ntfs_data_stream_location_checked<T: Read + Seek>(
     file: &ntfs::NtfsFile<'_>,
     fs: &mut T,
     data_stream_name: &str,
-) -> Result<Option<u64>> {
+) -> Result<Option<NtfsDataLocation>> {
     let mut iter = file.attributes();
     while let Some(item_result) = iter.next(fs) {
         let item = item_result.context("reading NTFS file attribute")?;
@@ -32308,37 +39800,262 @@ fn ntfs_data_stream_logical_offset_checked<T: Read + Seek>(
         {
             continue;
         }
-        let value = attribute
-            .value(fs)
-            .context("opening NTFS data stream value")?;
-        return Ok(value.data_position().value().map(|position| position.get()));
+        let logical_path = if data_stream_name.is_empty() {
+            format!("NTFS file record {}:$DATA", file.file_record_number())
+        } else {
+            format!(
+                "NTFS file record {}:${data_stream_name}",
+                file.file_record_number()
+            )
+        };
+        return ntfs_attribute_data_location(file, fs, &attribute, &logical_path);
     }
     Ok(None)
 }
 
-fn ntfs_data_stream_logical_offset<T: Read + Seek>(
+fn ntfs_data_stream_location<T: Read + Seek>(
     file: &ntfs::NtfsFile<'_>,
     fs: &mut T,
     data_stream_name: &str,
-) -> Option<u64> {
-    let mut iter = file.attributes();
-    while let Some(item_result) = iter.next(fs) {
-        let item = item_result.ok()?;
-        let attribute = item.to_attribute().ok()?;
-        if attribute.ty().ok()? != ntfs::NtfsAttributeType::Data {
-            continue;
-        }
-        if attribute.name().ok()?.to_string_lossy() != data_stream_name {
-            continue;
-        }
-        return attribute
-            .value(fs)
-            .ok()?
-            .data_position()
-            .value()
-            .map(|position| position.get());
+) -> Option<NtfsDataLocation> {
+    ntfs_data_stream_location_checked(file, fs, data_stream_name)
+        .ok()
+        .flatten()
+}
+
+fn ntfs_attribute_data_location<T: Read + Seek>(
+    file: &ntfs::NtfsFile<'_>,
+    fs: &mut T,
+    attribute: &ntfs::NtfsAttribute<'_, '_>,
+    logical_path: &str,
+) -> Result<Option<NtfsDataLocation>> {
+    let flags = attribute.flags();
+    let compressed = flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED);
+    let encrypted = flags.contains(ntfs::NtfsAttributeFlags::ENCRYPTED);
+    let value = attribute
+        .value(fs)
+        .with_context(|| format!("opening NTFS data value for {logical_path}"))?;
+    let data_size = value.len();
+    if data_size == 0 {
+        return Ok(None);
     }
-    None
+
+    match value {
+        ntfs::attribute_value::NtfsAttributeValue::Resident(resident) => {
+            fixed_ntfs_resident_data_location(
+                file.ntfs(),
+                fs,
+                file,
+                attribute,
+                resident.len(),
+                logical_path,
+            )
+            .map(Some)
+        }
+        ntfs::attribute_value::NtfsAttributeValue::NonResident(nonresident) => {
+            let mut file_offset = 0_u64;
+            for run_result in nonresident.data_runs() {
+                let run = run_result.with_context(|| {
+                    format!("decoding NTFS data run while locating {logical_path}")
+                })?;
+                let run_length = run.allocated_size();
+                if let Some(position) = run.data_position().value() {
+                    let remaining = data_size.saturating_sub(file_offset);
+                    if remaining == 0 {
+                        return Ok(None);
+                    }
+                    let direct_logical_mapping = !compressed && !encrypted;
+                    let basis = if compressed {
+                        "NTFS first allocated compressed $DATA run (raw allocation; logical bytes require LZNT1 decoding)"
+                    } else if encrypted {
+                        "NTFS first allocated encrypted $DATA run (raw ciphertext allocation; logical plaintext requires EFS decryption)"
+                    } else if file_offset > 0 {
+                        "NTFS first allocated $DATA run after leading sparse range"
+                    } else {
+                        "NTFS first allocated $DATA run"
+                    };
+                    return Ok(Some(NtfsDataLocation {
+                        filesystem_offset: position.get(),
+                        file_offset,
+                        contiguous_bytes: direct_logical_mapping
+                            .then_some(run_length.min(remaining)),
+                        basis,
+                        direct_logical_mapping,
+                    }));
+                }
+                file_offset = file_offset
+                    .checked_add(run_length)
+                    .with_context(|| format!("NTFS sparse-prefix length overflow: {logical_path}"))?;
+            }
+            Ok(None)
+        }
+        ntfs::attribute_value::NtfsAttributeValue::AttributeListNonResident(value) => {
+            Ok(value.data_position().value().map(|position| NtfsDataLocation {
+                filesystem_offset: position.get(),
+                file_offset: 0,
+                contiguous_bytes: None,
+                basis: "NTFS attribute-list-resolved $DATA allocation (contiguous mapping unavailable)",
+                direct_logical_mapping: false,
+            }))
+        }
+    }
+}
+
+/// The `ntfs` crate correctly slices resident bytes from its fixed-up in-memory
+/// FILE record, but version 0.4.0 reports `data_position()` at the attribute
+/// header rather than at the resident `value_offset`. Re-read and USA-fix the
+/// containing FILE record, validate the attribute identity, and derive the
+/// actual raw byte location. A normal resident value begins 24 bytes after the
+/// attribute header; named attributes can begin later.
+fn fixed_ntfs_resident_data_location<T: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+    file: &ntfs::NtfsFile<'_>,
+    attribute: &ntfs::NtfsAttribute<'_, '_>,
+    expected_value_length: u64,
+    logical_path: &str,
+) -> Result<NtfsDataLocation> {
+    let record_start = file
+        .position()
+        .value()
+        .with_context(|| format!("NTFS FILE record has no disk position: {logical_path}"))?
+        .get();
+    let attribute_position = attribute
+        .position()
+        .value()
+        .with_context(|| format!("resident NTFS attribute has no disk position: {logical_path}"))?
+        .get();
+    let attribute_offset = usize::try_from(
+        attribute_position
+            .checked_sub(record_start)
+            .with_context(|| format!("NTFS attribute precedes its FILE record: {logical_path}"))?,
+    )
+    .context("NTFS resident attribute offset exceeds memory address space")?;
+    let record_size = usize::try_from(ntfs.file_record_size())
+        .context("NTFS FILE record size does not fit in memory address space")?;
+    let sector_size = usize::from(ntfs.sector_size());
+    let attribute_length = usize::try_from(attribute.attribute_length())
+        .context("NTFS resident attribute length does not fit in memory address space")?;
+    if attribute_length < 24 {
+        bail!(
+            "resident NTFS attribute is shorter than its 24-byte header ({attribute_length} bytes): {logical_path}"
+        );
+    }
+    if attribute_offset
+        .checked_add(attribute_length)
+        .is_none_or(|end| end > record_size)
+    {
+        bail!("resident NTFS attribute exceeds its FILE record: {logical_path}");
+    }
+
+    let saved_position = fs
+        .stream_position()
+        .with_context(|| format!("saving NTFS reader position for {logical_path}"))?;
+    let result = (|| -> Result<NtfsDataLocation> {
+        fs.seek(SeekFrom::Start(record_start))
+            .with_context(|| format!("seeking NTFS FILE record for {logical_path}"))?;
+        let mut record = vec![0_u8; record_size];
+        fs.read_exact(&mut record)
+            .with_context(|| format!("reading NTFS FILE record for {logical_path}"))?;
+        let update_sequence_offset =
+            usize::from(little_endian_u16(&record, 4, "update-sequence offset")?);
+        let update_sequence_count =
+            usize::from(little_endian_u16(&record, 6, "update-sequence count")?);
+        apply_ntfs_file_record_fixups(&mut record, sector_size, logical_path)?;
+
+        if little_endian_u32(&record, attribute_offset, "attribute type")?
+            != NTFS_DATA_ATTRIBUTE_TYPE
+            || usize::try_from(little_endian_u32(
+                &record,
+                attribute_offset + 4,
+                "attribute length",
+            )?)
+            .ok()
+                != Some(attribute_length)
+            || record[attribute_offset + 8] != 0
+            || little_endian_u16(&record, attribute_offset + 12, "attribute flags")?
+                != attribute.flags().bits()
+        {
+            bail!("resident NTFS $DATA header did not match the parsed attribute: {logical_path}");
+        }
+        let value_length = u64::from(little_endian_u32(
+            &record,
+            attribute_offset + 16,
+            "resident value length",
+        )?);
+        let value_offset = usize::from(little_endian_u16(
+            &record,
+            attribute_offset + 20,
+            "resident value offset",
+        )?);
+        if value_length != expected_value_length {
+            bail!(
+                "resident NTFS $DATA length {value_length} disagrees with parsed length {expected_value_length}: {logical_path}"
+            );
+        }
+        if value_offset < 24
+            || value_offset
+                .checked_add(usize::try_from(value_length).unwrap_or(usize::MAX))
+                .is_none_or(|end| end > attribute_length)
+        {
+            bail!(
+                "resident NTFS $DATA value range {value_offset}+{value_length} exceeds its {attribute_length}-byte attribute: {logical_path}"
+            );
+        }
+        let value_record_offset = attribute_offset
+            .checked_add(value_offset)
+            .context("resident NTFS value offset overflow")?;
+        let logical_filesystem_offset = record_start
+            .checked_add(u64::try_from(value_record_offset).unwrap_or(u64::MAX))
+            .context("resident NTFS value position overflow")?;
+
+        // USA protection replaces the last two raw bytes of every sector with
+        // the update-sequence number. If a value starts there, the actual first
+        // byte lives in the USA replacement array; otherwise direct raw bytes
+        // remain valid only until that trailer.
+        let within_sector = value_record_offset % sector_size;
+        let trailer_start = sector_size - 2;
+        if within_sector >= trailer_start {
+            let sector_index = value_record_offset / sector_size;
+            if sector_index + 1 >= update_sequence_count {
+                bail!("resident NTFS value maps beyond the FILE update-sequence array: {logical_path}");
+            }
+            let trailer_delta = within_sector - trailer_start;
+            let replacement_offset = update_sequence_offset
+                .checked_add(2 * (sector_index + 1))
+                .and_then(|offset| offset.checked_add(trailer_delta))
+                .context("resident NTFS update-sequence replacement offset overflow")?;
+            if replacement_offset >= record_size {
+                bail!("resident NTFS update-sequence replacement exceeds the FILE record: {logical_path}");
+            }
+            return Ok(NtfsDataLocation {
+                filesystem_offset: record_start
+                    .checked_add(u64::try_from(replacement_offset).unwrap_or(u64::MAX))
+                    .context("resident NTFS replacement position overflow")?,
+                file_offset: 0,
+                contiguous_bytes: Some(value_length.min((2 - trailer_delta) as u64)),
+                basis:
+                    "NTFS resident $DATA bytes stored in the FILE update-sequence replacement array",
+                direct_logical_mapping: true,
+            });
+        }
+        Ok(NtfsDataLocation {
+            filesystem_offset: logical_filesystem_offset,
+            file_offset: 0,
+            contiguous_bytes: Some(value_length.min((trailer_start - within_sector) as u64)),
+            basis:
+                "NTFS resident $DATA value (FILE record value_offset, update-sequence validated)",
+            direct_logical_mapping: true,
+        })
+    })();
+    let restore_result = fs.seek(SeekFrom::Start(saved_position));
+    match (result, restore_result) {
+        (Ok(location), Ok(_)) => Ok(location),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => {
+            Err(error).with_context(|| format!("restoring NTFS reader position for {logical_path}"))
+        }
+    }
 }
 
 fn read_ntfs_file_record_bytes<T: Read + Seek>(
@@ -32348,6 +40065,310 @@ fn read_ntfs_file_record_bytes<T: Read + Seek>(
     max_bytes: usize,
 ) -> Result<Vec<u8>> {
     read_ntfs_file_record_stream_bytes(ntfs, fs, file_record_number, "", max_bytes)
+}
+
+const NTFS_FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+const NTFS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+const MAX_WOF_REPARSE_BUFFER_BYTES: usize = 24;
+
+#[derive(Clone, Copy, Debug)]
+struct NtfsWofDescriptor {
+    info: wof::WofFileInfo,
+    logical_length: u64,
+    backing_length: u64,
+    backing_first_data_logical_offset: Option<u64>,
+    unnamed_stream_sparse: bool,
+}
+
+struct NtfsWofDecodedRange {
+    decoded: wof::WofDecodedRange,
+    total_size: u64,
+}
+
+/// Inspect an NTFS file for a complete, internally consistent WOF tuple:
+/// exact WOF reparse metadata, a sparse unnamed stream, and the named backing
+/// stream.  A backing stream without trustworthy reparse metadata is an error,
+/// never an invitation to guess the algorithm.
+fn inspect_ntfs_wof_file<T: Read + Seek>(
+    file: &ntfs::NtfsFile<'_>,
+    fs: &mut T,
+) -> Result<Option<NtfsWofDescriptor>> {
+    let mut info = None;
+    let mut logical_length = None;
+    let mut unnamed_stream_sparse = false;
+    let mut backing_length = None;
+    let mut backing_first_data_logical_offset = None;
+    let mut backing_flags = None;
+    let mut iter = file.attributes();
+
+    while let Some(item_result) = iter.next(fs) {
+        let item = item_result.context("opening NTFS attribute while inspecting WOF metadata")?;
+        let attribute = item
+            .to_attribute()
+            .context("opening NTFS attribute while inspecting WOF metadata")?;
+        let attribute_type = attribute
+            .ty()
+            .context("reading NTFS attribute type while inspecting WOF metadata")?;
+        if attribute_type == ntfs::NtfsAttributeType::ReparsePoint {
+            let value = attribute
+                .value(fs)
+                .context("opening NTFS reparse-point value for WOF inspection")?;
+            let value_length = value.len();
+            let probe_length = usize::try_from(value_length)
+                .unwrap_or(usize::MAX)
+                .min(MAX_WOF_REPARSE_BUFFER_BYTES);
+            let mut probe = Vec::new();
+            probe.try_reserve_exact(probe_length).map_err(|error| {
+                anyhow!("allocating {probe_length} bytes for WOF reparse metadata: {error}")
+            })?;
+            value
+                .attach(fs)
+                .take(probe_length as u64)
+                .read_to_end(&mut probe)
+                .context("reading NTFS reparse-point value for WOF inspection")?;
+            let tag = probe
+                .get(..4)
+                .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+            if tag == Some(wof::IO_REPARSE_TAG_WOF) {
+                if value_length != MAX_WOF_REPARSE_BUFFER_BYTES as u64
+                    || probe.len() != MAX_WOF_REPARSE_BUFFER_BYTES
+                {
+                    bail!(
+                        "WOF reparse point has {value_length} bytes; expected exactly {MAX_WOF_REPARSE_BUFFER_BYTES}"
+                    );
+                }
+                if info.is_some() {
+                    bail!("NTFS file has more than one WOF reparse-point attribute");
+                }
+                info = Some(
+                    wof::parse_reparse_buffer(&probe)
+                        .context("validating NTFS WOF file-provider metadata")?,
+                );
+            }
+            continue;
+        }
+        if attribute_type != ntfs::NtfsAttributeType::Data {
+            continue;
+        }
+        let name = attribute
+            .name()
+            .context("reading NTFS stream name while inspecting WOF metadata")?
+            .to_string_lossy();
+        if name.is_empty() {
+            let value = attribute
+                .value(fs)
+                .context("opening unnamed NTFS stream while inspecting WOF metadata")?;
+            logical_length = Some(value.len());
+            unnamed_stream_sparse = attribute.flags().contains(ntfs::NtfsAttributeFlags::SPARSE);
+        } else if name.eq_ignore_ascii_case("WofCompressedData") {
+            if backing_length.is_some() {
+                bail!("NTFS file has more than one WofCompressedData stream");
+            }
+            let value = attribute
+                .value(fs)
+                .context("opening WofCompressedData stream metadata")?;
+            backing_first_data_logical_offset =
+                value.data_position().value().map(|position| position.get());
+            backing_length = Some(value.len());
+            backing_flags = Some(attribute.flags());
+        }
+    }
+
+    match (info, backing_length) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => {
+            bail!("WofCompressedData exists without a validated WOF reparse point; compression algorithm was not guessed")
+        }
+        (Some(_), None) => bail!("validated WOF reparse metadata has no WofCompressedData stream"),
+        (Some(info), Some(backing_length)) => {
+            let logical_length =
+                logical_length.context("validated WOF file has no unnamed logical data stream")?;
+            let flags = backing_flags.context("WOF backing stream flags are unavailable")?;
+            if flags.contains(ntfs::NtfsAttributeFlags::ENCRYPTED) {
+                bail!("WofCompressedData is EFS-encrypted and cannot be decoded safely");
+            }
+            if flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED) {
+                bail!("WofCompressedData is additionally NTFS-compressed; stacked compression is unsupported")
+            }
+            if !unnamed_stream_sparse {
+                bail!("validated WOF file's unnamed logical stream is not marked sparse")
+            }
+            Ok(Some(NtfsWofDescriptor {
+                info,
+                logical_length,
+                backing_length,
+                backing_first_data_logical_offset,
+                unnamed_stream_sparse,
+            }))
+        }
+    }
+}
+
+fn read_ntfs_wof_file_range<T: Read + Seek>(
+    file: &ntfs::NtfsFile<'_>,
+    fs: &mut T,
+    offset: u64,
+    length: usize,
+) -> Result<Option<NtfsWofDecodedRange>> {
+    if let Ok(info) = file.info() {
+        let flags = info.file_attributes().bits();
+        if flags & (NTFS_FILE_ATTRIBUTE_SPARSE_FILE | NTFS_FILE_ATTRIBUTE_REPARSE_POINT) == 0 {
+            return Ok(None);
+        }
+    }
+    let Some(descriptor) = inspect_ntfs_wof_file(file, fs)? else {
+        return Ok(None);
+    };
+    let mut iter = file.attributes();
+    while let Some(item_result) = iter.next(fs) {
+        let item = item_result.context("opening NTFS WOF backing-stream attribute")?;
+        let attribute = item
+            .to_attribute()
+            .context("opening NTFS WOF backing-stream attribute")?;
+        if attribute.ty().ok() != Some(ntfs::NtfsAttributeType::Data) {
+            continue;
+        }
+        let name = attribute
+            .name()
+            .context("reading NTFS WOF backing-stream name")?
+            .to_string_lossy();
+        if !name.eq_ignore_ascii_case("WofCompressedData") {
+            continue;
+        }
+        let value = attribute
+            .value(fs)
+            .context("opening WofCompressedData value")?;
+        if value.len() != descriptor.backing_length {
+            bail!(
+                "WofCompressedData length changed from {} to {} during the bounded read",
+                descriptor.backing_length,
+                value.len()
+            );
+        }
+        let mut reader = value.attach(fs);
+        let decoded = wof::decode_range(
+            &mut reader,
+            descriptor.backing_length,
+            descriptor.logical_length,
+            descriptor.info,
+            offset,
+            length,
+            wof::WofDecodeLimits::for_output(length),
+        )
+        .context("decoding bounded WOF logical file range")?;
+        return Ok(Some(NtfsWofDecodedRange {
+            decoded,
+            total_size: descriptor.logical_length,
+        }));
+    }
+    bail!("validated WOF descriptor lost its WofCompressedData stream during the bounded read")
+}
+
+fn annotate_ntfs_wof_metadata<T: Read + Seek>(
+    metadata: &mut serde_json::Value,
+    file: &ntfs::NtfsFile<'_>,
+    fs: &mut T,
+) -> Result<bool> {
+    let Some(descriptor) = inspect_ntfs_wof_file(file, fs)? else {
+        return Ok(false);
+    };
+    let backing_physical_offset =
+        metadata["partition_start_offset"]
+            .as_u64()
+            .and_then(|partition_start| {
+                descriptor
+                    .backing_first_data_logical_offset
+                    .and_then(|offset| partition_start.checked_add(offset))
+            });
+    let Some(object) = metadata.as_object_mut() else {
+        return Ok(false);
+    };
+    object.insert("wof_reparse_validated".to_string(), serde_json::json!(true));
+    object.insert(
+        "wof_algorithm".to_string(),
+        serde_json::json!(descriptor.info.algorithm.name()),
+    );
+    object.insert(
+        "wof_algorithm_id".to_string(),
+        serde_json::json!(descriptor.info.algorithm.raw()),
+    );
+    object.insert(
+        "wof_chunk_size_bytes".to_string(),
+        serde_json::json!(descriptor.info.algorithm.chunk_size()),
+    );
+    object.insert(
+        "wof_logical_size_bytes".to_string(),
+        serde_json::json!(descriptor.logical_length),
+    );
+    object.insert(
+        "wof_backing_stream_size_bytes".to_string(),
+        serde_json::json!(descriptor.backing_length),
+    );
+    object.insert(
+        "wof_backing_first_data_logical_offset".to_string(),
+        serde_json::json!(descriptor.backing_first_data_logical_offset),
+    );
+    object.insert(
+        "wof_backing_first_data_physical_offset".to_string(),
+        serde_json::json!(backing_physical_offset),
+    );
+    object.insert(
+        "wof_unnamed_stream_sparse".to_string(),
+        serde_json::json!(descriptor.unnamed_stream_sparse),
+    );
+    object.insert(
+        "wof_logical_coordinate_system".to_string(),
+        serde_json::json!(wof::WofRangeProvenance::LOGICAL_COORDINATE_SYSTEM),
+    );
+    object.insert(
+        "wof_backing_coordinate_system".to_string(),
+        serde_json::json!(wof::WofRangeProvenance::BACKING_COORDINATE_SYSTEM),
+    );
+    object.insert(
+        "wof_physical_mapping_note".to_string(),
+        serde_json::json!(wof::WofRangeProvenance::PHYSICAL_MAPPING_NOTE),
+    );
+    object.insert(
+        "wof_content_reader_status".to_string(),
+        serde_json::json!(if descriptor.info.algorithm == wof::WofAlgorithm::Lzx {
+            "recognized_unsupported_lzx"
+        } else {
+            "supported_bounded_random_access"
+        }),
+    );
+    Ok(true)
+}
+
+fn annotate_ntfs_wof_error(metadata: &mut serde_json::Value, error: &anyhow::Error) {
+    if let Some(object) = metadata.as_object_mut() {
+        object.insert(
+            "wof_content_reader_status".to_string(),
+            serde_json::json!("invalid_or_incomplete_metadata"),
+        );
+        object.insert(
+            "wof_content_reader_error".to_string(),
+            serde_json::json!(format!("{error:#}")),
+        );
+        object.insert(
+            "wof_algorithm_guessed".to_string(),
+            serde_json::json!(false),
+        );
+    }
+}
+
+fn annotate_ntfs_file_record_msg_candidate<T: Read + Seek>(
+    metadata: &mut serde_json::Value,
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+    file_record_number: u64,
+    logical_size: u64,
+) -> Result<bool> {
+    let bytes = read_ntfs_file_record_bytes(ntfs, fs, file_record_number, OUTLOOK_MSG_PROBE_BYTES)?;
+    let complete =
+        logical_size <= OUTLOOK_MSG_PROBE_BYTES as u64 && bytes.len() as u64 == logical_size;
+    Ok(annotate_msg_candidate_from_bytes(
+        metadata, &bytes, complete,
+    ))
 }
 
 fn annotate_ntfs_file_record_email<T: Read + Seek>(
@@ -32363,6 +40384,24 @@ fn annotate_ntfs_file_record_email<T: Read + Seek>(
         .with_context(|| format!("opening NTFS email file record {file_record_number}"))?;
     if file.is_directory() {
         bail!("NTFS email file record {file_record_number} is a directory");
+    }
+    if let Some(descriptor) = inspect_ntfs_wof_file(&file, fs)? {
+        const MAX_WOF_EMAIL_BYTES: usize = 512 * 1024 * 1024;
+        let read_length = usize::try_from(descriptor.logical_length)
+            .with_context(|| format!("WOF email file record {file_record_number} is too large"))?;
+        if read_length > MAX_WOF_EMAIL_BYTES {
+            bail!(
+                "WOF email file record {file_record_number} exceeds the safe {MAX_WOF_EMAIL_BYTES}-byte parser limit"
+            );
+        }
+        let decoded = read_ntfs_wof_file_range(&file, fs, 0, read_length)?
+            .context("validated WOF email file did not produce a logical byte stream")?;
+        return Ok(annotate_email_metadata_from_reader(
+            metadata,
+            email_format,
+            io::Cursor::new(decoded.decoded.bytes),
+            required_message,
+        ));
     }
     let mut iter = file.attributes();
     while let Some(item_result) = iter.next(fs) {
@@ -32387,7 +40426,10 @@ fn annotate_ntfs_file_record_email<T: Read + Seek>(
         if flags.contains(ntfs::NtfsAttributeFlags::ENCRYPTED) {
             bail!("NTFS email file record {file_record_number} is encrypted");
         }
-        if flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED) {
+        // NTFS may retain the COMPRESSED attribute flag while a sufficiently
+        // small value is resident.  Resident values are stored directly in
+        // the FILE record and must not be passed through LZNT1.
+        if flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED) && !data_attribute.is_resident() {
             const MAX_COMPRESSED_EMAIL_BYTES: usize = 512 * 1024 * 1024;
             let total_size = data_attribute
                 .value(fs)
@@ -32449,6 +40491,11 @@ fn read_ntfs_file_record_stream_bytes<T: Read + Seek>(
     if file.is_directory() {
         bail!("NTFS file record {file_record_number} is a directory");
     }
+    if data_stream_name.is_empty() {
+        if let Some(decoded) = read_ntfs_wof_file_range(&file, fs, 0, max_bytes)? {
+            return Ok(decoded.decoded.bytes);
+        }
+    }
     let mut iter = file.attributes();
     while let Some(item_result) = iter.next(fs) {
         let item = item_result
@@ -32472,7 +40519,7 @@ fn read_ntfs_file_record_stream_bytes<T: Read + Seek>(
         if flags.contains(ntfs::NtfsAttributeFlags::ENCRYPTED) {
             bail!("NTFS file record {file_record_number} data stream is encrypted");
         }
-        if flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED) {
+        if flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED) && !data_attribute.is_resident() {
             let logical_path = if data_stream_name.is_empty() {
                 format!("NTFS file record {file_record_number}")
             } else {
@@ -32568,22 +40615,42 @@ fn image_partition_size_bytes(entry: &EntryForBytes) -> Option<u64> {
     metadata_u64_or_i64(&entry.metadata_json, "partition_size_bytes")
 }
 
-/// Serves deleted-record bytes recovered by direct physical-extent reads
-/// (e.g. FAT 0xE5 entries, whose data is assumed contiguous from the recorded
-/// first cluster).
+fn require_image_partition_size_bytes(entry: &EntryForBytes, filesystem_name: &str) -> Result<u64> {
+    image_partition_size_bytes(entry).with_context(|| {
+        format!(
+            "{filesystem_name} entry is missing partition_size_bytes: {}",
+            entry.logical_path
+        )
+    })
+}
+
+/// Serves bytes recovered from an explicitly bounded contiguous decoded-media
+/// extent. Legacy `physical_extent` rows are partition-bounded; carve-v2
+/// `decoded_media_extent` rows are bounded against the full decoded evidence
+/// stream. Neither coordinate is an E01 segment/container-file offset.
 fn read_image_physical_extent_bytes(
     entry: &EntryForBytes,
     offset: u64,
     length: usize,
 ) -> Result<Option<EntryBytes>> {
+    let recovery_read = entry.metadata_json["recovery_read"].as_str();
     if entry.source_kind != "image"
-        || entry.metadata_json["recovery_read"].as_str() != Some("physical_extent")
+        || !matches!(
+            recovery_read,
+            Some("physical_extent" | "decoded_media_extent")
+        )
     {
         return Ok(None);
     }
-    let Some(physical) = entry.metadata_json["file_data_physical_offset"].as_u64() else {
+    let decoded_extent = recovery_read == Some("decoded_media_extent");
+    let extent_start = if decoded_extent {
+        metadata_u64_or_i64(&entry.metadata_json, "file_data_decoded_media_offset")
+    } else {
+        metadata_u64_or_i64(&entry.metadata_json, "file_data_physical_offset")
+    };
+    let Some(extent_start) = extent_start else {
         bail!(
-            "deleted entry has no recoverable data offset: {}",
+            "recovered entry has no decoded-media data offset: {}",
             entry.logical_path
         );
     };
@@ -32597,9 +40664,49 @@ fn read_image_physical_extent_bytes(
     let mut bytes_read = 0_usize;
     if want > 0 {
         let mut opened = open_disk_image(Path::new(&entry.source_path))?;
+        let extent_end = extent_start
+            .checked_add(total_size)
+            .context("recovered extent end overflow")?;
+        if decoded_extent {
+            if extent_end > opened.decoded_size {
+                bail!(
+                    "decoded-media extent {}..{} is outside the {}-byte decoded evidence stream: {}",
+                    extent_start,
+                    extent_end,
+                    opened.decoded_size,
+                    entry.logical_path
+                );
+            }
+        } else {
+            let partition_start = image_partition_start_offset(entry, "recovered extent")?;
+            let partition_size = require_image_partition_size_bytes(entry, "recovered extent")?;
+            validate_partition_range(
+                opened.decoded_size,
+                partition_start,
+                partition_size,
+                "recovered extent partition",
+            )?;
+            let partition_end = partition_start
+                .checked_add(partition_size)
+                .context("recovered extent partition end overflow")?;
+            if extent_start < partition_start || extent_end > partition_end {
+                bail!(
+                    "recovered extent {}..{} is outside partition {}..{}: {}",
+                    extent_start,
+                    extent_end,
+                    partition_start,
+                    partition_end,
+                    entry.logical_path
+                );
+            }
+        }
         opened
             .reader
-            .seek(SeekFrom::Start(physical.saturating_add(offset)))
+            .seek(SeekFrom::Start(
+                extent_start
+                    .checked_add(offset)
+                    .context("recovered extent read offset overflow")?,
+            ))
             .with_context(|| format!("seeking recovered data for {}", entry.logical_path))?;
         bytes_read = opened
             .reader
@@ -32634,7 +40741,14 @@ fn read_image_ext_entry_bytes(
         return Ok(None);
     };
     let start_offset = image_partition_start_offset(entry, "EXT")?;
-    let fs = open_ext4_superblock(Path::new(&entry.source_path), start_offset)?;
+    let partition_size = image_partition_size_bytes(entry).with_context(|| {
+        format!(
+            "EXT entry is missing partition_size_bytes: {}",
+            entry.logical_path
+        )
+    })?;
+    let fs =
+        open_ext4_superblock_bounded(Path::new(&entry.source_path), start_offset, partition_size)?;
     let data = ext4_read_file_bytes(&fs, ext_path)
         .map_err(|err| anyhow!("reading ext entry {}: {err}", entry.logical_path))?;
     let total_size = data.len() as u64;
@@ -32666,10 +40780,14 @@ fn read_image_fat_entry_bytes(
         return Ok(None);
     }
     let start_offset = image_partition_start_offset(entry, "FAT")?;
-    let size_bytes = image_partition_size_bytes(entry);
+    let partition_size = require_image_partition_size_bytes(entry, "FAT")?;
     let mut opened = open_disk_image(Path::new(&entry.source_path))?;
-    let partition_size =
-        size_bytes.unwrap_or_else(|| opened.decoded_size.saturating_sub(start_offset));
+    validate_partition_range(
+        opened.decoded_size,
+        start_offset,
+        partition_size,
+        "indexed FAT partition",
+    )?;
     let slice = PartitionSlice::new(&mut *opened.reader, start_offset, partition_size);
     let fs = fatfs::FileSystem::new(slice, fatfs::FsOptions::new())
         .with_context(|| format!("opening FAT filesystem for {}", entry.logical_path))?;
@@ -32750,9 +40868,13 @@ fn read_image_ntfs_entry_bytes_from_opened(
         return read_image_ntfs_unallocated_entry_bytes(entry, offset, length);
     }
     let start_offset = image_partition_start_offset(entry, "NTFS")?;
-    let size_bytes = image_partition_size_bytes(entry);
-    let partition_size =
-        size_bytes.unwrap_or_else(|| opened.decoded_size.saturating_sub(start_offset));
+    let partition_size = require_image_partition_size_bytes(entry, "NTFS")?;
+    validate_partition_range(
+        opened.decoded_size,
+        start_offset,
+        partition_size,
+        "indexed NTFS partition",
+    )?;
     let mut slice = PartitionSlice::new(&mut *opened.reader, start_offset, partition_size);
     let ntfs = ntfs::Ntfs::new(&mut slice)
         .with_context(|| format!("opening NTFS filesystem for {}", entry.logical_path))?;
@@ -32766,6 +40888,9 @@ fn is_ntfs_unallocated_entry(entry: &EntryForBytes) -> bool {
 }
 
 const MAX_NTFS_COMPRESSION_UNIT_BYTES: u64 = 16 * 1024 * 1024;
+const NTFS_FILE_RECORD_SIGNATURE: &[u8; 4] = b"FILE";
+const NTFS_DATA_ATTRIBUTE_TYPE: u32 = 0x80;
+const NTFS_NONRESIDENT_HEADER_SIZE: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NtfsCompressionHeader {
@@ -32817,7 +40942,160 @@ fn little_endian_u16(bytes: &[u8], offset: usize, field: &str) -> Result<u16> {
     Ok(u16::from_le_bytes(raw))
 }
 
+fn apply_ntfs_file_record_fixups(
+    record: &mut [u8],
+    sector_size: usize,
+    logical_path: &str,
+) -> Result<()> {
+    if record.get(..NTFS_FILE_RECORD_SIGNATURE.len()) != Some(NTFS_FILE_RECORD_SIGNATURE) {
+        bail!("NTFS FILE record signature is missing: {logical_path}");
+    }
+    if sector_size < 2 || record.is_empty() || !record.len().is_multiple_of(sector_size) {
+        bail!(
+            "NTFS FILE record/sector geometry is invalid (record {}, sector {}): {}",
+            record.len(),
+            sector_size,
+            logical_path
+        );
+    }
+
+    let update_sequence_offset =
+        usize::from(little_endian_u16(record, 4, "update-sequence offset")?);
+    let update_sequence_count = usize::from(little_endian_u16(record, 6, "update-sequence count")?);
+    let expected_count = record.len() / sector_size + 1;
+    if update_sequence_count != expected_count {
+        bail!(
+            "NTFS FILE record has update-sequence count {update_sequence_count}, expected {expected_count}: {logical_path}"
+        );
+    }
+    let update_sequence_bytes = update_sequence_count
+        .checked_mul(2)
+        .and_then(|length| update_sequence_offset.checked_add(length))
+        .with_context(|| format!("NTFS update-sequence range overflow: {logical_path}"))?;
+    if update_sequence_bytes > record.len() {
+        bail!("NTFS FILE record update-sequence array exceeds the record: {logical_path}");
+    }
+
+    let update_sequence_number = [
+        record[update_sequence_offset],
+        record[update_sequence_offset + 1],
+    ];
+    for sector_index in 0..(update_sequence_count - 1) {
+        let trailer = (sector_index + 1)
+            .checked_mul(sector_size)
+            .and_then(|offset| offset.checked_sub(2))
+            .with_context(|| format!("NTFS sector-trailer offset overflow: {logical_path}"))?;
+        if record.get(trailer..trailer + 2) != Some(update_sequence_number.as_slice()) {
+            bail!(
+                "NTFS FILE record update-sequence mismatch in sector {sector_index}: {logical_path}"
+            );
+        }
+        let replacement = update_sequence_offset + 2 * (sector_index + 1);
+        let replacement_bytes = [record[replacement], record[replacement + 1]];
+        record[trailer..trailer + 2].copy_from_slice(&replacement_bytes);
+    }
+    Ok(())
+}
+
+fn fixed_ntfs_attribute_header<T: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+    data_attribute: &ntfs::NtfsAttribute<'_, '_>,
+    logical_path: &str,
+) -> Result<[u8; NTFS_NONRESIDENT_HEADER_SIZE]> {
+    let attribute_position = data_attribute
+        .position()
+        .value()
+        .with_context(|| format!("compressed NTFS attribute has no disk position: {logical_path}"))?
+        .get();
+    let file_record_size = usize::try_from(ntfs.file_record_size())
+        .context("NTFS FILE record size does not fit in memory address space")?;
+    let sector_size = usize::from(ntfs.sector_size());
+    if file_record_size < NTFS_NONRESIDENT_HEADER_SIZE {
+        bail!(
+            "NTFS FILE record size {file_record_size} is too small for a nonresident attribute header: {logical_path}"
+        );
+    }
+
+    let saved_position = fs
+        .stream_position()
+        .with_context(|| format!("saving NTFS reader position for {logical_path}"))?;
+    let result = (|| {
+        let search_start = attribute_position
+            .saturating_sub(u64::try_from(file_record_size - 1).unwrap_or(u64::MAX));
+        let search_length = usize::try_from(attribute_position - search_start)
+            .context("NTFS FILE-record search range is too large")?
+            .checked_add(NTFS_FILE_RECORD_SIGNATURE.len())
+            .context("NTFS FILE-record search range overflow")?;
+        fs.seek(SeekFrom::Start(search_start)).with_context(|| {
+            format!("seeking NTFS FILE-record search window for {logical_path}")
+        })?;
+        let mut search = vec![0_u8; search_length];
+        fs.read_exact(&mut search).with_context(|| {
+            format!("reading NTFS FILE-record search window for {logical_path}")
+        })?;
+
+        let expected_attribute_length = data_attribute.attribute_length();
+        let expected_flags = data_attribute.flags().bits();
+        for relative_start in (0..=search.len() - NTFS_FILE_RECORD_SIGNATURE.len()).rev() {
+            if search.get(relative_start..relative_start + 4)
+                != Some(NTFS_FILE_RECORD_SIGNATURE.as_slice())
+            {
+                continue;
+            }
+            let record_start = search_start
+                .checked_add(relative_start as u64)
+                .with_context(|| format!("NTFS FILE-record position overflow: {logical_path}"))?;
+            let attribute_offset_u64 = attribute_position.saturating_sub(record_start);
+            let Ok(attribute_offset) = usize::try_from(attribute_offset_u64) else {
+                continue;
+            };
+            if attribute_offset
+                .checked_add(NTFS_NONRESIDENT_HEADER_SIZE)
+                .is_none_or(|end| end > file_record_size)
+            {
+                continue;
+            }
+
+            fs.seek(SeekFrom::Start(record_start))
+                .with_context(|| format!("seeking NTFS FILE record for {logical_path}"))?;
+            let mut record = vec![0_u8; file_record_size];
+            if fs.read_exact(&mut record).is_err()
+                || apply_ntfs_file_record_fixups(&mut record, sector_size, logical_path).is_err()
+            {
+                continue;
+            }
+            if little_endian_u32(&record, attribute_offset, "attribute type")?
+                != NTFS_DATA_ATTRIBUTE_TYPE
+                || little_endian_u32(&record, attribute_offset + 4, "attribute length")?
+                    != expected_attribute_length
+                || record[attribute_offset + 8] != 1
+                || little_endian_u16(&record, attribute_offset + 12, "attribute flags")?
+                    != expected_flags
+            {
+                continue;
+            }
+
+            return record[attribute_offset..attribute_offset + NTFS_NONRESIDENT_HEADER_SIZE]
+                .try_into()
+                .map_err(|_| anyhow!("NTFS nonresident header has an invalid length"));
+        }
+        bail!(
+            "could not locate and validate the containing NTFS FILE record for compressed attribute: {logical_path}"
+        )
+    })();
+    let restore_result = fs.seek(SeekFrom::Start(saved_position));
+    match (result, restore_result) {
+        (Ok(header), Ok(_)) => Ok(header),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => {
+            Err(error).with_context(|| format!("restoring NTFS reader position for {logical_path}"))
+        }
+    }
+}
+
 fn read_ntfs_compression_header<T: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
     fs: &mut T,
     data_attribute: &ntfs::NtfsAttribute<'_, '_>,
     logical_path: &str,
@@ -32825,22 +41103,11 @@ fn read_ntfs_compression_header<T: Read + Seek>(
     if data_attribute.is_resident() {
         bail!("compressed NTFS stream is unexpectedly resident: {logical_path}");
     }
-    let attribute_position = data_attribute
-        .position()
-        .value()
-        .with_context(|| format!("compressed NTFS attribute has no disk position: {logical_path}"))?
-        .get();
-    let saved_position = fs
-        .stream_position()
-        .with_context(|| format!("saving NTFS reader position for {logical_path}"))?;
-    fs.seek(SeekFrom::Start(attribute_position))
-        .with_context(|| format!("seeking compressed NTFS attribute header for {logical_path}"))?;
-    let mut header = [0_u8; 64];
-    let read_result = fs.read_exact(&mut header);
-    let restore_result = fs.seek(SeekFrom::Start(saved_position));
-    read_result
-        .with_context(|| format!("reading compressed NTFS attribute header for {logical_path}"))?;
-    restore_result.with_context(|| format!("restoring NTFS reader position for {logical_path}"))?;
+    // `NtfsAttribute::position` names the raw MFT byte offset.  Reading those
+    // bytes directly without applying the FILE record update sequence corrupts
+    // any field crossing a sector trailer.  Recover and validate the containing
+    // FILE record before interpreting the header.
+    let header = fixed_ntfs_attribute_header(ntfs, fs, data_attribute, logical_path)?;
 
     let attribute_length = little_endian_u32(&header, 4, "attribute length")?;
     if attribute_length < header.len() as u32 {
@@ -32909,7 +41176,69 @@ fn classify_ntfs_compression_unit(
 
 #[cfg(test)]
 mod ntfs_compressed_unit_tests {
-    use super::{classify_ntfs_compression_unit, NtfsCompressionUnitStorage};
+    use super::{
+        apply_ntfs_file_record_fixups, classify_ntfs_compression_unit, NtfsCompressionUnitStorage,
+    };
+
+    fn protected_file_record() -> Vec<u8> {
+        const RECORD_SIZE: usize = 1024;
+        const SECTOR_SIZE: usize = 512;
+        const UPDATE_SEQUENCE_OFFSET: usize = 0x30;
+        const CROSS_SECTOR_FIELD_OFFSET: usize = SECTOR_SIZE - 8;
+
+        let mut record = vec![0_u8; RECORD_SIZE];
+        record[..4].copy_from_slice(b"FILE");
+        record[4..6].copy_from_slice(&(UPDATE_SEQUENCE_OFFSET as u16).to_le_bytes());
+        record[6..8].copy_from_slice(&3_u16.to_le_bytes());
+
+        // Model a nonresident-header u64 whose high two bytes occupy the first
+        // sector trailer.  The on-disk update-sequence number temporarily
+        // replaces those bytes and makes the raw value look enormous.
+        record[CROSS_SECTOR_FIELD_OFFSET..CROSS_SECTOR_FIELD_OFFSET + 8]
+            .copy_from_slice(&0x0010_1000_u64.to_le_bytes());
+        record[RECORD_SIZE - 2..].copy_from_slice(&[0x21, 0x43]);
+
+        let update_sequence_number = [0xaa, 0xbb];
+        let first_replacement = [record[SECTOR_SIZE - 2], record[SECTOR_SIZE - 1]];
+        let second_replacement = [record[RECORD_SIZE - 2], record[RECORD_SIZE - 1]];
+        record[UPDATE_SEQUENCE_OFFSET..UPDATE_SEQUENCE_OFFSET + 2]
+            .copy_from_slice(&update_sequence_number);
+        record[UPDATE_SEQUENCE_OFFSET + 2..UPDATE_SEQUENCE_OFFSET + 4]
+            .copy_from_slice(&first_replacement);
+        record[UPDATE_SEQUENCE_OFFSET + 4..UPDATE_SEQUENCE_OFFSET + 6]
+            .copy_from_slice(&second_replacement);
+        record[SECTOR_SIZE - 2..SECTOR_SIZE].copy_from_slice(&update_sequence_number);
+        record[RECORD_SIZE - 2..].copy_from_slice(&update_sequence_number);
+        record
+    }
+
+    #[test]
+    fn restores_ntfs_file_record_sector_trailers_before_header_parsing() {
+        const FIELD_OFFSET: usize = 512 - 8;
+        let mut record = protected_file_record();
+        let raw_value =
+            u64::from_le_bytes(record[FIELD_OFFSET..FIELD_OFFSET + 8].try_into().unwrap());
+        assert_ne!(raw_value, 0x0010_1000);
+
+        apply_ntfs_file_record_fixups(&mut record, 512, "/fixture").unwrap();
+
+        let fixed_value =
+            u64::from_le_bytes(record[FIELD_OFFSET..FIELD_OFFSET + 8].try_into().unwrap());
+        assert_eq!(fixed_value, 0x0010_1000);
+        assert_eq!(&record[1022..1024], &[0x21, 0x43]);
+    }
+
+    #[test]
+    fn rejects_ntfs_file_record_with_a_mismatched_sector_trailer() {
+        let mut record = protected_file_record();
+        record[1023] ^= 1;
+
+        let error = apply_ntfs_file_record_fixups(&mut record, 512, "/fixture")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("update-sequence mismatch"));
+    }
 
     #[test]
     fn classifies_sparse_compressed_and_uncompressed_units() {
@@ -33055,7 +41384,7 @@ fn read_ntfs_compressed_attribute_range<T: Read + Seek>(
     offset: u64,
     length: usize,
 ) -> Result<(Vec<u8>, u64)> {
-    let header = read_ntfs_compression_header(fs, data_attribute, logical_path)?;
+    let header = read_ntfs_compression_header(ntfs, fs, data_attribute, logical_path)?;
     let mut data_value = data_attribute
         .value(fs)
         .with_context(|| format!("opening compressed NTFS data value {logical_path}"))?;
@@ -33098,13 +41427,21 @@ fn read_ntfs_compressed_attribute_range<T: Read + Seek>(
     if offset < total_size && offset < requested_end {
         let mut unit_start = (offset / unit_bytes) * unit_bytes;
         while unit_start < requested_end {
-            let logical_length_u64 = unit_bytes.min(total_size - unit_start);
-            let logical_length = usize::try_from(logical_length_u64)
+            let complete_unit_logical_length = unit_bytes.min(total_size - unit_start);
+            // LZNT1 chunks are independently encoded.  Decode only through the
+            // end of the requested range, so a bounded prefix read does not
+            // inspect unrelated later allocation slack or later corrupt
+            // chunks.  A read that reaches those chunks remains strict and
+            // reports the structural error.
+            let required_logical_length_u64 = requested_end
+                .min(unit_start + complete_unit_logical_length)
+                .saturating_sub(unit_start);
+            let required_logical_length = usize::try_from(required_logical_length_u64)
                 .context("NTFS compression-unit logical length is too large")?;
             let initialized_length_u64 = header
                 .initialized_size
                 .saturating_sub(unit_start)
-                .min(logical_length_u64);
+                .min(required_logical_length_u64);
             let initialized_length = usize::try_from(initialized_length_u64)
                 .context("NTFS compression-unit initialized length is too large")?;
             let unit = decode_ntfs_compression_unit(
@@ -33113,14 +41450,14 @@ fn read_ntfs_compressed_attribute_range<T: Read + Seek>(
                 &mut data_value,
                 total_size,
                 unit_start,
-                logical_length,
+                required_logical_length,
                 initialized_length,
                 cluster_size,
                 clusters_per_unit,
                 logical_path,
             )?;
             let copy_start = offset.max(unit_start) - unit_start;
-            let copy_end = requested_end.min(unit_start + logical_length_u64) - unit_start;
+            let copy_end = requested_end.min(unit_start + required_logical_length_u64) - unit_start;
             let copy_start =
                 usize::try_from(copy_start).context("NTFS compressed copy start is too large")?;
             let copy_end =
@@ -33194,6 +41531,22 @@ fn read_mounted_ntfs_entry_bytes<T: Read + Seek>(
             entry.logical_path
         );
     }
+    if data_stream_name.is_empty() {
+        if let Some(decoded) = read_ntfs_wof_file_range(&file, fs, offset, length)? {
+            let bytes_read = decoded.decoded.bytes.len();
+            return Ok(EntryBytes {
+                entry_id: entry.entry_id,
+                evidence_id: entry.evidence_id,
+                logical_path: entry.logical_path.clone(),
+                offset,
+                requested_length: length,
+                bytes_read,
+                total_size: decoded.total_size,
+                eof: offset.saturating_add(bytes_read as u64) >= decoded.total_size,
+                bytes: decoded.decoded.bytes,
+            });
+        }
+    }
     let mut iter = file.attributes();
     while let Some(item_result) = iter.next(fs) {
         let item = item_result
@@ -33218,7 +41571,9 @@ fn read_mounted_ntfs_entry_bytes<T: Read + Seek>(
                 entry.logical_path
             );
         }
-        if data_flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED) {
+        if data_flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED)
+            && !data_attribute.is_resident()
+        {
             return read_mounted_ntfs_compressed_attribute_bytes(
                 ntfs,
                 fs,
@@ -33272,11 +41627,15 @@ fn read_image_ntfs_unallocated_entry_bytes(
     length: usize,
 ) -> Result<Option<EntryBytes>> {
     let start_offset = image_partition_start_offset(entry, "NTFS unallocated")?;
-    let size_bytes = image_partition_size_bytes(entry);
+    let partition_size = require_image_partition_size_bytes(entry, "NTFS unallocated")?;
 
     let mut opened = open_disk_image(Path::new(&entry.source_path))?;
-    let partition_size =
-        size_bytes.unwrap_or_else(|| opened.decoded_size.saturating_sub(start_offset));
+    validate_partition_range(
+        opened.decoded_size,
+        start_offset,
+        partition_size,
+        "indexed NTFS unallocated partition",
+    )?;
     let mut slice = PartitionSlice::new(&mut *opened.reader, start_offset, partition_size);
     let ntfs = ntfs::Ntfs::new(&mut slice)
         .with_context(|| format!("opening NTFS filesystem for {}", entry.logical_path))?;
@@ -33526,6 +41885,28 @@ fn walk_fat_dir<T: fatfs::ReadWriteSeek>(
                             );
                         }
                     }
+                } else if ext == "msg" {
+                    match annotate_msg_candidate_from_reader(
+                        &mut metadata,
+                        entry.to_file(),
+                        entry.len(),
+                    ) {
+                        Ok(true) => {
+                            *truncated = true;
+                            progress::progress_truncated(format!(
+                                "FAT MSG candidate {logical_path} has an inconclusive bounded CFB signature probe"
+                            ));
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            mark_msg_candidate_read_error(
+                                &mut metadata,
+                                &format!("could not read FAT MSG candidate: {error}"),
+                            );
+                            *truncated = true;
+                            progress::progress_error(Some(logical_path.clone()));
+                        }
+                    }
                 } else if is_email_store_extension(&ext) {
                     mark_email_store(&mut metadata, &ext);
                 }
@@ -33758,9 +42139,71 @@ fn upsert_filesystem_entry_with_deleted(
     job_id: i64,
     content_head: Option<&[u8]>,
 ) -> Result<()> {
-    let metadata_json = metadata_json_with_path_identity(logical_path, metadata_json)?;
-    conn.execute(
-        "INSERT INTO filesystem_entries(
+    let mut metadata_value = serde_json::from_str::<serde_json::Value>(metadata_json)
+        .with_context(|| format!("parsing metadata while indexing {logical_path}"))?;
+    let pending_email_segments = metadata_value
+        .as_object_mut()
+        .and_then(|object| object.remove(PENDING_RFC822_TEXT_SEGMENTS_KEY))
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let email_mime_parts = metadata_value
+        .get("email_mime_parts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let has_rfc822_generation = metadata_value
+        .get("email_parser")
+        .and_then(serde_json::Value::as_str)
+        == Some(RFC822_PARSER_NAME);
+    let incoming_rfc822_complete = has_rfc822_generation
+        && metadata_value
+            .get("email_parser_coverage_status")
+            .and_then(serde_json::Value::as_str)
+            == Some(rfc822::Rfc822ParseStatus::Complete.as_str());
+    let prior_complete_rfc822_metadata = if has_rfc822_generation {
+        existing_complete_rfc822_metadata(conn, evidence_id, logical_path)?
+    } else {
+        None
+    };
+    let preserve_prior_rfc822_generation =
+        prior_complete_rfc822_metadata.is_some() && !incoming_rfc822_complete;
+    if has_rfc822_generation {
+        let attempt_metadata = metadata_value.clone();
+        if let Some(mut prior_metadata) = prior_complete_rfc822_metadata {
+            if preserve_prior_rfc822_generation {
+                apply_rfc822_attempt_metadata(&mut prior_metadata, &attempt_metadata, false, true);
+                metadata_value = prior_metadata;
+            } else {
+                apply_rfc822_attempt_metadata(&mut metadata_value, &attempt_metadata, true, false);
+            }
+        } else {
+            apply_rfc822_attempt_metadata(&mut metadata_value, &attempt_metadata, true, false);
+        }
+    }
+    let metadata_json =
+        metadata_json_with_path_identity(logical_path, &metadata_value.to_string())?;
+
+    if has_rfc822_generation {
+        conn.execute_batch("SAVEPOINT kdft_rfc822_entry_generation")
+            .with_context(|| format!("starting RFC 822 entry generation for {logical_path}"))?;
+    }
+    let generation_result = (|| -> Result<()> {
+        if preserve_prior_rfc822_generation {
+            let updated = conn.execute(
+                "UPDATE filesystem_entries
+                 SET metadata_json = ?1
+                 WHERE evidence_id = ?2 AND logical_path = ?3",
+                params![metadata_json, evidence_id, logical_path],
+            )?;
+            if updated != 1 {
+                bail!(
+                    "prior complete RFC 822 generation disappeared while preserving {logical_path}"
+                );
+            }
+            return Ok(());
+        }
+        conn.execute(
+            "INSERT INTO filesystem_entries(
              case_id, evidence_id, logical_path, name, entry_kind, size_bytes, is_deleted,
              metadata_json, discovered_by_job_id, content_head
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -33772,21 +42215,291 @@ fn upsert_filesystem_entry_with_deleted(
              metadata_json = excluded.metadata_json,
              discovered_by_job_id = excluded.discovered_by_job_id,
              content_head = excluded.content_head",
-        params![
-            case_id,
-            evidence_id,
-            logical_path,
-            name,
-            entry_kind,
-            size_bytes,
-            if is_deleted { 1 } else { 0 },
-            metadata_json,
-            job_id,
-            content_head,
-        ],
-    )
-    .with_context(|| format!("indexing filesystem entry {logical_path}"))?;
+            params![
+                case_id,
+                evidence_id,
+                logical_path,
+                name,
+                entry_kind,
+                size_bytes,
+                if is_deleted { 1 } else { 0 },
+                metadata_json,
+                job_id,
+                content_head,
+            ],
+        )
+        .with_context(|| format!("indexing filesystem entry {logical_path}"))?;
+
+        if has_rfc822_generation {
+            persist_rfc822_generation(
+                conn,
+                case_id,
+                evidence_id,
+                logical_path,
+                job_id,
+                &pending_email_segments,
+                &email_mime_parts,
+            )?;
+        }
+        Ok(())
+    })();
+    if has_rfc822_generation {
+        match generation_result {
+            Ok(()) => conn
+                .execute_batch("RELEASE SAVEPOINT kdft_rfc822_entry_generation")
+                .with_context(|| {
+                    format!("committing RFC 822 entry generation for {logical_path}")
+                })?,
+            Err(error) => {
+                let rollback = conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT kdft_rfc822_entry_generation;
+                     RELEASE SAVEPOINT kdft_rfc822_entry_generation;",
+                );
+                if let Err(rollback_error) = rollback {
+                    return Err(error).context(format!(
+                        "RFC 822 generation rollback also failed: {rollback_error}"
+                    ));
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        generation_result?;
+    }
     progress::progress_database_entry(logical_path.to_string());
+    Ok(())
+}
+
+fn existing_complete_rfc822_metadata(
+    conn: &Connection,
+    evidence_id: i64,
+    logical_path: &str,
+) -> Result<Option<serde_json::Value>> {
+    let existing = conn
+        .query_row(
+            "SELECT metadata_json
+             FROM filesystem_entries
+             WHERE evidence_id = ?1 AND logical_path = ?2",
+            params![evidence_id, logical_path],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    let metadata = serde_json::from_str::<serde_json::Value>(&existing)
+        .with_context(|| format!("parsing prior RFC 822 metadata for {logical_path}"))?;
+    let is_complete = metadata
+        .get("email_parser")
+        .and_then(serde_json::Value::as_str)
+        == Some(RFC822_PARSER_NAME)
+        && metadata
+            .get("email_parser_coverage_status")
+            .and_then(serde_json::Value::as_str)
+            == Some(rfc822::Rfc822ParseStatus::Complete.as_str());
+    Ok(is_complete.then_some(metadata))
+}
+
+fn apply_rfc822_attempt_metadata(
+    target: &mut serde_json::Value,
+    attempt: &serde_json::Value,
+    replacement_committed: bool,
+    prior_complete_preserved: bool,
+) {
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    let coverage_status = attempt
+        .get("email_parser_coverage_status")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            attempt
+                .get("email_parser_status")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("unknown");
+    let first_diagnostic = attempt
+        .get("email_parser_diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|diagnostics| diagnostics.first())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let last_attempt = serde_json::json!({
+        "parser": RFC822_PARSER_NAME,
+        "coverage_status": coverage_status,
+        "parser_status": attempt.get("email_parser_status"),
+        "processing_status": attempt.get("email_processing_status"),
+        "raw_message_sha256": attempt.get("email_raw_message_sha256"),
+        "bytes_consumed": attempt.get("email_parser_bytes_consumed"),
+        "message_capture_truncated": attempt.get("email_message_capture_truncated"),
+        "mime_part_count": attempt.get("email_mime_part_count"),
+        "attachment_count": attempt.get("email_attachment_count"),
+        "parser_error_count": attempt.get("email_parser_error_count"),
+        "parser_warning_count": attempt.get("email_parser_warning_count"),
+        "limit_hit_count": attempt.get("email_limit_hit_count"),
+        "diagnostics": attempt.get("email_parser_diagnostics"),
+        "diagnostics_omitted": attempt.get("email_parser_diagnostics_omitted"),
+        "replacement_committed": replacement_committed,
+        "prior_complete_generation_preserved": prior_complete_preserved,
+    });
+    target.insert("email_rfc822_last_attempt".to_string(), last_attempt);
+    target.insert(
+        "email_parser_last_attempt_status".to_string(),
+        serde_json::json!(coverage_status),
+    );
+    target.insert(
+        "email_parser_last_attempt_error".to_string(),
+        first_diagnostic,
+    );
+    target.insert(
+        "email_parser_replacement_committed".to_string(),
+        serde_json::json!(replacement_committed),
+    );
+    target.insert(
+        "email_parser_replacement_rolled_back".to_string(),
+        serde_json::json!(!replacement_committed && prior_complete_preserved),
+    );
+    target.insert(
+        "email_parser_previous_records_preserved".to_string(),
+        serde_json::json!(prior_complete_preserved),
+    );
+}
+
+fn persist_rfc822_generation(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+    logical_path: &str,
+    job_id: i64,
+    text_segments: &[serde_json::Value],
+    mime_parts: &[serde_json::Value],
+) -> Result<()> {
+    let entry_id = conn.query_row(
+        "SELECT id FROM filesystem_entries WHERE evidence_id = ?1 AND logical_path = ?2",
+        params![evidence_id, logical_path],
+        |row| row.get::<_, i64>(0),
+    )?;
+    conn.execute(
+        "DELETE FROM filesystem_entry_text_segments
+         WHERE entry_id = ?1 AND parser_name = ?2",
+        params![entry_id, RFC822_PARSER_NAME],
+    )?;
+
+    for (segment_index, segment) in text_segments.iter().enumerate() {
+        let part_index = segment
+            .get("part_index")
+            .and_then(serde_json::Value::as_u64)
+            .context("RFC 822 text segment omitted its part index")?;
+        let content = segment
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .context("RFC 822 text segment omitted decoded content")?;
+        let provenance = serde_json::json!({
+            "parser": RFC822_PARSER_NAME,
+            "mime_part_index": part_index,
+            "content_type": segment.get("content_type"),
+            "charset": segment.get("charset"),
+            "content_transfer_encoding": segment.get("transfer_encoding"),
+            "raw_message_header_start": segment.get("raw_header_start"),
+            "raw_message_header_end_exclusive": segment.get("raw_header_end"),
+            "raw_message_body_start": segment.get("raw_body_start"),
+            "raw_message_body_end_exclusive": segment.get("raw_body_end"),
+            "decoded_size": segment.get("decoded_size"),
+            "decoded_sha256": segment.get("decoded_sha256"),
+            "content_complete": segment.get("content_complete"),
+            "raw_offset_basis": "absolute byte offsets within the raw RFC 5322 message stream",
+            "decoded_text_semantics": "exact decoded MIME text retained without whitespace or markup normalization",
+        });
+        conn.execute(
+            "INSERT INTO filesystem_entry_text_segments(
+                 entry_id, parser_name, segment_index, part_name, content, content_encoding,
+                 segment_kind, provenance_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'utf-8', 'email_body', ?6)",
+            params![
+                entry_id,
+                RFC822_PARSER_NAME,
+                i64::try_from(segment_index).context("RFC 822 segment index exceeds SQLite i64")?,
+                format!("mime-part-{part_index:04}"),
+                content.as_bytes(),
+                provenance.to_string(),
+            ],
+        )?;
+    }
+
+    conn.execute(
+        "DELETE FROM filesystem_entries
+         WHERE parent_id = ?1
+           AND json_extract(metadata_json, '$.email_attachment_parser') = ?2",
+        params![entry_id, RFC822_PARSER_NAME],
+    )?;
+    for part in mime_parts.iter().filter(|part| {
+        part.get("is_attachment")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }) {
+        let part_index = part
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .context("RFC 822 attachment omitted its part index")?;
+        let child_logical_path = format!("{logical_path}/::mime/attachment-{part_index:04}");
+        let display_name = part
+            .get("filename")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("MIME attachment {part_index}"));
+        let mut attachment_metadata = serde_json::json!({
+            "artifact_kind": "email_attachment",
+            "email_attachment_parser": RFC822_PARSER_NAME,
+            "email_source_entry_id": entry_id,
+            "email_source_logical_path": logical_path,
+            "mime_part": part,
+            "content_bytes_persisted": false,
+            "content_bytes_scope": "metadata-only attachment record; decoded bytes are deliberately not mixed into searchable email body text",
+        });
+        add_entry_category(
+            &mut attachment_metadata,
+            &child_logical_path,
+            &display_name,
+            "record",
+        );
+        let attachment_metadata = metadata_json_with_path_identity(
+            &child_logical_path,
+            &attachment_metadata.to_string(),
+        )?;
+        let size_bytes = part
+            .get("decoded_content_complete")
+            .and_then(serde_json::Value::as_bool)
+            .filter(|complete| *complete)
+            .and_then(|_| part.get("decoded_size"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|size| i64::try_from(size).ok());
+        conn.execute(
+            "INSERT INTO filesystem_entries(
+                 case_id, evidence_id, parent_id, logical_path, name, entry_kind, size_bytes,
+                 is_deleted, metadata_json, discovered_by_job_id, content_head)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'record', ?6, 0, ?7, ?8, NULL)
+             ON CONFLICT(evidence_id, logical_path) DO UPDATE SET
+                 parent_id = excluded.parent_id,
+                 name = excluded.name,
+                 entry_kind = excluded.entry_kind,
+                 size_bytes = excluded.size_bytes,
+                 is_deleted = excluded.is_deleted,
+                 metadata_json = excluded.metadata_json,
+                 discovered_by_job_id = excluded.discovered_by_job_id,
+                 content_head = NULL",
+            params![
+                case_id,
+                evidence_id,
+                entry_id,
+                child_logical_path,
+                display_name,
+                size_bytes,
+                attachment_metadata,
+                job_id,
+            ],
+        )?;
+    }
     Ok(())
 }
 
@@ -33854,6 +42567,8 @@ fn path_search_results(
                         selection_offset: None,
                         selection_length: None,
                         data_preview: source_path_exact.or(Some(logical_path)),
+                        parsed_segment_kind: None,
+                        parsed_segment_provenance: None,
                     };
                 }
                 if let Some(offset) = metadata_json.to_ascii_lowercase().find(query_lower) {
@@ -33869,6 +42584,8 @@ fn path_search_results(
                         selection_offset: None,
                         selection_length: None,
                         data_preview: Some(content_preview(&metadata_json, offset, query.len())),
+                        parsed_segment_kind: None,
+                        parsed_segment_provenance: None,
                     };
                 }
                 // The SQL WHERE clause guarantees one of the three fields matched; fall back to a
@@ -33886,6 +42603,8 @@ fn path_search_results(
                     selection_offset: None,
                     selection_length: None,
                     data_preview: source_path_exact.or(Some(logical_path)),
+                    parsed_segment_kind: None,
+                    parsed_segment_provenance: None,
                 }
             },
         )
@@ -34045,6 +42764,8 @@ fn content_hex_search_results(
                 selection_offset: Some(offset as i64),
                 selection_length: Some(needle.len() as i64),
                 data_preview: Some(hex_match_preview(bytes, offset, needle.len())),
+                parsed_segment_kind: None,
+                parsed_segment_provenance: None,
             });
         }
     }
@@ -34082,6 +42803,8 @@ fn push_content_search_result(
         selection_offset: Some(hit.offset as i64),
         selection_length: Some(hit.length as i64),
         data_preview: Some(hit.data_preview),
+        parsed_segment_kind: None,
+        parsed_segment_provenance: None,
     });
 }
 
@@ -34287,6 +43010,7 @@ fn printable_ascii_preview(bytes: &[u8]) -> String {
 /// content search, this reads files of ANY size (it never rejects a file for being larger than the
 /// window), because we only need the header to identify the file type. Read failures retain their
 /// complete error chain so the signature-analysis job can disclose the affected canonical entry.
+#[derive(Debug, Clone)]
 struct SignatureHeaderSample {
     bytes: Vec<u8>,
     window_complete: bool,
@@ -34424,6 +43148,26 @@ const FILE_SIGNATURES: &[FileSignature] = &[
         category: "Archives and Containers",
     },
     FileSignature {
+        label: "ZIP / Office Open XML / OpenDocument",
+        description: "Empty ZIP container (end-of-central-directory record)",
+        offset: 0,
+        magic: &[0x50, 0x4B, 0x05, 0x06],
+        extensions: &[
+            "zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "jar", "apk", "epub", "kmz", "vsdx",
+        ],
+        category: "Archives and Containers",
+    },
+    FileSignature {
+        label: "ZIP / Office Open XML / OpenDocument",
+        description: "Spanned ZIP container",
+        offset: 0,
+        magic: &[0x50, 0x4B, 0x07, 0x08],
+        extensions: &[
+            "zip", "docx", "xlsx", "pptx", "odt", "ods", "odp", "jar", "apk", "epub", "kmz", "vsdx",
+        ],
+        category: "Archives and Containers",
+    },
+    FileSignature {
         label: "RAR",
         description: "RAR archive",
         offset: 0,
@@ -34443,7 +43187,7 @@ const FILE_SIGNATURES: &[FileSignature] = &[
         label: "GZIP",
         description: "gzip compressed data",
         offset: 0,
-        magic: &[0x1F, 0x8B],
+        magic: &[0x1F, 0x8B, 0x08],
         extensions: &["gz", "gzip", "tgz"],
         category: "Archives and Containers",
     },
@@ -34570,6 +43314,12 @@ fn evaluate_signature_with_completeness(
                 )
                 .any(|window| window == signature.magic);
         }
+        if signature.label == "Windows PE" {
+            return is_valid_windows_pe_header(header);
+        }
+        if signature.label == "RIFF (AVI/WAV)" {
+            return is_valid_riff_media_header(header);
+        }
         let end = signature.offset.saturating_add(signature.magic.len());
         header.len() >= end && &header[signature.offset..end] == signature.magic
     });
@@ -34647,6 +43397,30 @@ fn evaluate_signature_with_completeness(
         mismatch_basis,
         reason,
     }
+}
+
+fn is_valid_windows_pe_header(header: &[u8]) -> bool {
+    if header.get(..2) != Some(b"MZ") || header.len() < 0x40 {
+        return false;
+    }
+    let Some(offset_bytes) = header.get(0x3c..0x40) else {
+        return false;
+    };
+    let pe_offset = u32::from_le_bytes([
+        offset_bytes[0],
+        offset_bytes[1],
+        offset_bytes[2],
+        offset_bytes[3],
+    ]);
+    let Ok(pe_offset) = usize::try_from(pe_offset) else {
+        return false;
+    };
+    header.get(pe_offset..pe_offset.saturating_add(4)) == Some(b"PE\0\0")
+}
+
+fn is_valid_riff_media_header(header: &[u8]) -> bool {
+    header.get(..4) == Some(b"RIFF")
+        && matches!(header.get(8..12), Some(b"AVI " | b"WAVE" | b"WEBP"))
 }
 
 fn is_high_confidence_csv(bytes: &[u8], sample_complete: bool) -> bool {
@@ -34970,6 +43744,21 @@ fn enrich_live_bookmark_item(conn: &Connection, case_id: i64, item: &mut Bookmar
             .entry("file_data_physical_offset".to_string())
             .or_insert_with(|| serde_json::json!(entry.file_data_physical_offset));
         object
+            .entry("file_data_file_offset".to_string())
+            .or_insert_with(|| serde_json::json!(entry.file_data_file_offset));
+        object
+            .entry("file_data_contiguous_bytes".to_string())
+            .or_insert_with(|| serde_json::json!(entry.file_data_contiguous_bytes));
+        object
+            .entry("physical_offset_basis".to_string())
+            .or_insert_with(|| serde_json::json!(entry.physical_offset_basis));
+        object
+            .entry("file_data_direct_logical_mapping".to_string())
+            .or_insert_with(|| serde_json::json!(entry.file_data_direct_logical_mapping));
+        object
+            .entry("offset_coordinate_system".to_string())
+            .or_insert_with(|| serde_json::json!(entry.offset_coordinate_system));
+        object
             .entry("ntfs_mft_record_modification_time_utc".to_string())
             .or_insert_with(|| serde_json::json!(entry.ntfs_mft_record_modification_time_utc));
         if item
@@ -35273,6 +44062,26 @@ fn report_entry_item_ref_json(entry: &FilesystemEntry) -> serde_json::Value {
         .get("artifact_kind")
         .and_then(|value| value.as_str())
         .map(str::to_string);
+    if artifact_kind
+        .as_deref()
+        .is_some_and(is_browser_activity_artifact_kind)
+    {
+        redact_browser_sensitive_report_fields(&mut metadata_for_report);
+        object = metadata_for_report
+            .as_object()
+            .cloned()
+            .unwrap_or_else(serde_json::Map::new);
+    }
+    if artifact_kind
+        .as_deref()
+        .is_some_and(is_identity_sensitive_artifact_kind)
+    {
+        redact_identity_sensitive_report_fields(&mut metadata_for_report);
+        object = metadata_for_report
+            .as_object()
+            .cloned()
+            .unwrap_or_else(serde_json::Map::new);
+    }
     object.insert(
         "evidence_id".to_string(),
         serde_json::json!(entry.evidence_id),
@@ -35469,7 +44278,170 @@ fn is_browser_activity_artifact_kind(kind: &str) -> bool {
     )
 }
 
+fn redact_browser_sensitive_report_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.retain(|key, _| !is_browser_sensitive_report_field(key));
+            for child in object.values_mut() {
+                redact_browser_sensitive_report_fields(child);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                redact_browser_sensitive_report_fields(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_identity_sensitive_artifact_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "wifi_profile"
+            | "credential_store"
+            | "structured_secret"
+            | "plaintext_secret"
+            | "secret_store"
+            | "secret_lead"
+            | "credential_lead"
+    )
+}
+
+fn identity_report_artifact_kind(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("artifact_kind")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("metadata")
+                .and_then(|metadata| metadata.get("artifact_kind"))
+                .and_then(serde_json::Value::as_str)
+        })
+}
+
+fn redact_identity_sensitive_report_fields_if_applicable(value: &mut serde_json::Value) {
+    if identity_report_artifact_kind(value).is_some_and(is_identity_sensitive_artifact_kind) {
+        redact_identity_sensitive_report_fields(value);
+    }
+}
+
+/// Legacy cases may already contain raw Wi-Fi key or structured-secret fields
+/// in entry/bookmark JSON. Report generation is a separate defensive boundary:
+/// it withholds those known legacy keys without mutating the case and retains
+/// source locators, byte lengths, hashes, and protection-state fields.
+fn redact_identity_sensitive_report_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.retain(|key, _| {
+                let compact = key
+                    .bytes()
+                    .filter(|byte| byte.is_ascii_alphanumeric())
+                    .map(|byte| byte.to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                !matches!(
+                    compact.as_slice(),
+                    b"secretvalue"
+                        | b"wifikeyplaintext"
+                        | b"wifikeyencrypted"
+                        | b"wifikeymaterial"
+                        | b"keymaterial"
+                        | b"plaintextkeymaterial"
+                        | b"encryptedkeymaterial"
+                )
+            });
+            for child in object.values_mut() {
+                redact_identity_sensitive_report_fields(child);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                redact_identity_sensitive_report_fields(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_browser_sensitive_report_field(key: &str) -> bool {
+    let normalized = key.to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "value"
+            | "autofill_value"
+            | "autofill_field_value"
+            | "cookie_value"
+            | "cookie_plaintext"
+            | "cookie_plaintext_value"
+            | "encrypted_value"
+            | "encrypted_blob"
+            | "encrypted_blob_base64"
+            | "username"
+            | "user_name"
+            | "login_username"
+            | "login_username_value"
+            | "username_value"
+            | "username_ciphertext"
+            | "password"
+            | "login_password"
+            | "password_value"
+            | "password_blob"
+            | "password_blob_base64"
+            | "password_ciphertext"
+            | "encryptedusername"
+            | "encryptedpassword"
+            | "encrypted_username"
+            | "encrypted_password"
+            | "token"
+            | "tokens"
+            | "token_value"
+            | "secret"
+            | "secrets"
+            | "secret_value"
+            | "credential_value"
+    ) {
+        return true;
+    }
+
+    if normalized.ends_with("_ciphertext")
+        || normalized.ends_with("_plaintext")
+        || normalized.ends_with("_plaintext_value")
+        || normalized.ends_with("_protected_blob_hex")
+        || normalized.ends_with("_protected_blob_base64")
+    {
+        return true;
+    }
+
+    let carries_encoded_payload = normalized.ends_with("_base64")
+        || normalized.ends_with("_blob")
+        || normalized.ends_with("_raw_bytes")
+        || normalized.ends_with("_hex");
+    carries_encoded_payload
+        && [
+            "autofill",
+            "cookie",
+            "credential",
+            "encrypted",
+            "password",
+            "protected",
+            "secret",
+            "token",
+            "username",
+        ]
+        .iter()
+        .any(|sensitive_kind| normalized.contains(sensitive_kind))
+}
+
 fn report_entry_display_name(entry: &FilesystemEntry) -> String {
+    if entry.metadata_json["artifact_kind"].as_str() == Some("browser_login") {
+        let host = entry.metadata_json["host"]
+            .as_str()
+            .or_else(|| entry.metadata_json["hostname"].as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown host");
+        return format!("Saved login @ {host}");
+    }
     if entry.name.trim().is_empty() {
         {
             entry
@@ -35495,11 +44467,9 @@ fn report_entry_preview(item_ref: &serde_json::Value) -> Option<String> {
         "url",
         "search_term",
         "text",
-        "value",
         "outcome_summary",
         "target_path",
         "current_path",
-        "username",
         "cookie_name",
         "category_detail",
         "category_sub",
@@ -35539,12 +44509,37 @@ fn ensure_filesystem_entry_text_segments_table(conn: &Connection) -> Result<()> 
              part_name TEXT NOT NULL,
              content BLOB NOT NULL,
              content_encoding TEXT NOT NULL,
+             segment_kind TEXT NOT NULL DEFAULT 'visible_text',
+             provenance_json TEXT NOT NULL DEFAULT '{}',
              PRIMARY KEY(entry_id, parser_name, segment_index)
          );
          CREATE INDEX IF NOT EXISTS ix_filesystem_entry_text_segments_entry
          ON filesystem_entry_text_segments(entry_id);",
     )
-    .context("ensuring parser-derived filesystem text segment storage")
+    .context("ensuring parser-derived filesystem text segment storage")?;
+
+    // Existing cases predate semantic-role and parser-coordinate provenance.
+    // Defaults preserve every prior row verbatim and let parsers that do not
+    // yet provide richer metadata keep using their existing INSERT statements.
+    for (column, declaration) in [
+        (
+            "segment_kind",
+            "segment_kind TEXT NOT NULL DEFAULT 'visible_text'",
+        ),
+        (
+            "provenance_json",
+            "provenance_json TEXT NOT NULL DEFAULT '{}'",
+        ),
+    ] {
+        if !sqlite_column_exists(conn, "filesystem_entry_text_segments", column)? {
+            conn.execute(
+                &format!("ALTER TABLE filesystem_entry_text_segments ADD COLUMN {declaration}"),
+                [],
+            )
+            .with_context(|| format!("adding filesystem_entry_text_segments.{column} column"))?;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_filesystem_entry_binary_blobs_table(conn: &Connection) -> Result<()> {
@@ -36303,7 +45298,8 @@ fn read_bookmark_item(conn: &Connection, case_id: i64, item_id: i64) -> Result<B
 }
 
 fn bookmark_item_from_raw(raw: RawBookmarkItem) -> Result<BookmarkItem> {
-    let item_ref_json = parse_stored_item_json(&raw.item_ref_json, "item_ref_json", raw.id)?;
+    let mut item_ref_json = parse_stored_item_json(&raw.item_ref_json, "item_ref_json", raw.id)?;
+    redact_identity_sensitive_report_fields_if_applicable(&mut item_ref_json);
     let source_path_exact = bookmark_item_exact_source_path(&item_ref_json);
     let internal_path_key = item_ref_json
         .get("internal_path_key")
@@ -37023,7 +46019,20 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
         }
         "browser_autofill" => {
             push_activity_detail(html, item_ref, "Form Field", &["name"]);
-            push_activity_detail(html, item_ref, "Typed Value", &["value"]);
+            push_activity_detail(html, item_ref, "Value Present", &["autofill_value_present"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Withheld Value Bytes",
+                &["autofill_value_bytes"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Withheld Value SHA-256",
+                &["autofill_value_sha256"],
+            );
+            push_activity_detail(html, item_ref, "Disclosure", &["autofill_value_disclosure"]);
             push_activity_detail(html, item_ref, "Use Count", &["count"]);
             push_activity_detail(html, item_ref, "Created", &["date_created_utc"]);
             push_activity_detail(html, item_ref, "Last Used", &["date_last_used_utc"]);
@@ -37074,7 +46083,13 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 &["original_mime_type"],
             );
             push_activity_detail(html, item_ref, "GUID", &["guid"]);
-            push_activity_detail(html, item_ref, "Opened", &["opened"]);
+            push_activity_detail(html, item_ref, "Chromium Opened Flag", &["opened"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Opened Flag Interpretation",
+                &["opened_interpretation"],
+            );
             push_activity_detail(html, item_ref, "Last Access", &["last_access_time_utc"]);
             push_activity_detail(html, item_ref, "Download Hash", &["hash_hex"]);
             push_activity_detail(html, item_ref, "Download ID", &["download_id"]);
@@ -37110,7 +46125,24 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(html, item_ref, "Action URL", &["action_url"]);
             push_activity_detail(html, item_ref, "Hostname", &["hostname"]);
             push_activity_detail(html, item_ref, "Realm", &["http_realm"]);
-            push_activity_detail(html, item_ref, "Username", &["username"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Username Value Present",
+                &["username_value_present", "sensitive_value_present"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Withheld Username Bytes",
+                &["username_value_bytes", "username_protected_value_bytes"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Username SHA-256",
+                &["username_value_sha256", "username_protected_value_sha256"],
+            );
             push_activity_detail(
                 html,
                 item_ref,
@@ -37133,16 +46165,57 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(
                 html,
                 item_ref,
-                "Password Ciphertext",
-                &["password_ciphertext", "password_ciphertext_hex"],
+                "Protected Username Bytes",
+                &["username_protected_value_bytes"],
             );
             push_activity_detail(
                 html,
                 item_ref,
-                "Username Ciphertext",
-                &["username_ciphertext"],
+                "Protected Username SHA-256",
+                &["username_protected_value_sha256"],
             );
-            push_activity_detail(html, item_ref, "Password Note", &["password_note"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Protected Password Bytes",
+                &[
+                    "password_protected_blob_bytes",
+                    "password_protected_value_bytes",
+                ],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Protected Password SHA-256",
+                &[
+                    "password_protected_blob_sha256",
+                    "password_protected_value_sha256",
+                ],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Protected Value Format",
+                &["password_protected_blob_format", "protected_value_format"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Disclosure",
+                &["password_value_disclosure", "credential_value_disclosure"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Sensitive Value Policy",
+                &["sensitive_value_policy"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Credential Note",
+                &["credential_note", "password_note"],
+            );
             push_browser_source_details(html, item_ref);
         }
         "browser_cookie" => {
@@ -37162,14 +46235,51 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(
                 html,
                 item_ref,
-                "Cookie / Session Value",
-                &["cookie_value_plaintext"],
+                "Plaintext Source Value Present",
+                &["cookie_plaintext_value_present"],
             );
             push_activity_detail(
                 html,
                 item_ref,
-                "Encrypted Value Bytes",
-                &["cookie_value_encrypted_bytes"],
+                "Plaintext Source Value Bytes",
+                &["cookie_plaintext_value_bytes"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Plaintext Source Value SHA-256",
+                &["cookie_plaintext_value_sha256"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Protected Source Value Present",
+                &["cookie_encrypted_value_present"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Protected Source Value Bytes",
+                &["cookie_encrypted_value_bytes"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Protected Source Value SHA-256",
+                &["cookie_encrypted_value_sha256"],
+            );
+            push_activity_detail(
+                html,
+                item_ref,
+                "Protected Value Format",
+                &["cookie_encrypted_value_format"],
+            );
+            push_activity_detail(html, item_ref, "Disclosure", &["cookie_value_disclosure"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Sensitive Value Policy",
+                &["sensitive_value_policy"],
             );
             push_activity_detail(html, item_ref, "Value Note", &["value_note"]);
             push_browser_source_details(html, item_ref);
@@ -37232,6 +46342,31 @@ fn push_browser_source_details(html: &mut String, item_ref: &serde_json::Value) 
         item_ref,
         "Source Path",
         &["source_artifact_path_exact", "source_artifact_path"],
+    );
+    push_activity_detail(html, item_ref, "Source Table", &["source_sqlite_table"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "Source Row",
+        &[
+            "source_sqlite_rowid",
+            "source_sqlite_primary_key",
+            "source_login_guid",
+            "source_login_id",
+            "source_json_sequence",
+        ],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Record Locator Basis",
+        &["source_record_locator_basis"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Offset Qualification",
+        &["source_record_offset_note"],
     );
     let basis = activity_value_string(item_ref, &["source_file_time_basis"])
         .unwrap_or_else(|| "basis_not_recorded".to_string());
@@ -37960,6 +47095,11 @@ fn source_artifact_metadata(path: &Path, artifact: &str) -> serde_json::Value {
         "source_artifact": artifact,
         "source_artifact_path": path.to_string_lossy(),
         "source_file_time_basis": "local_source_filesystem",
+        "source_record_locator_basis": "logical row or structured-document identifier within the cited browser artifact",
+        "source_record_offset_available": false,
+        "physical_evidence_offset_claimed": false,
+        "source_record_offset_note": "SQLite row identifiers and JSON node identifiers are logical source locators, not physical evidence byte offsets",
+        "source_snapshot_semantics": "parser reads a private source snapshot; the original browser artifact is never opened for write",
     });
     if let Ok(file_metadata) = fs::metadata(path) {
         if let Some(object) = metadata.as_object_mut() {
@@ -38410,7 +47550,7 @@ mod tests {
             standard_access_time_utc: None,
             standard_mft_record_modification_time_raw: None,
             standard_mft_record_modification_time_utc: None,
-            file_data_logical_offset: None,
+            data_location: None,
         }
     }
 
@@ -38600,9 +47740,17 @@ mod tests {
         writer.write_all(
             br#"<?xml version="1.0" encoding="UTF-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
 </Types>"#,
+        )?;
+        writer.start_file("_rels/.rels", options)?;
+        writer.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rIdOfficeDocument" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>"#,
         )?;
         writer.start_file("word/document.xml", options)?;
         writer.write_all(document_xml.as_bytes())?;
@@ -38611,6 +47759,40 @@ mod tests {
             writer.write_all(format!("<p>unsupported text {index}</p>").as_bytes())?;
         }
         writer.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn text_segment_schema_migration_preserves_legacy_content_and_adds_safe_defaults() -> Result<()>
+    {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE filesystem_entry_text_segments (
+                 entry_id INTEGER NOT NULL,
+                 parser_name TEXT NOT NULL,
+                 segment_index INTEGER NOT NULL,
+                 part_name TEXT NOT NULL,
+                 content BLOB NOT NULL,
+                 content_encoding TEXT NOT NULL,
+                 PRIMARY KEY(entry_id, parser_name, segment_index)
+             );
+             INSERT INTO filesystem_entry_text_segments(
+                 entry_id, parser_name, segment_index, part_name, content, content_encoding)
+             VALUES (7, 'legacy-parser', 3, 'legacy-part', X'6c6567616379207261772074657874', 'utf-8');",
+        )?;
+
+        ensure_filesystem_entry_text_segments_table(&conn)?;
+
+        let row: (Vec<u8>, String, String) = conn.query_row(
+            "SELECT content, segment_kind, provenance_json
+             FROM filesystem_entry_text_segments
+             WHERE entry_id = 7 AND parser_name = 'legacy-parser' AND segment_index = 3",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(row.0, b"legacy raw text");
+        assert_eq!(row.1, "visible_text");
+        assert_eq!(row.2, "{}");
         Ok(())
     }
 
@@ -38789,6 +47971,146 @@ mod tests {
                 && hit.match_kind == "parsed_content"
                 && hit.source_path_exact.as_deref() == Some("Finance/wire_transfer_pending.txt")
         }));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn document_segments_persist_raw_semantic_roles_and_nonphysical_provenance() -> Result<()> {
+        let case_path = unique_case_path("document-semantic-segments");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("document-semantic-segments-source");
+        let source_path = evidence_dir.join("Semantic Evidence.docx");
+        let document_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p>
+    <w:r><w:t>VisibleSemanticMarker</w:t></w:r>
+    <w:r><w:rPr><w:vanish/></w:rPr><w:t>HiddenSemanticMarker</w:t></w:r>
+    <w:del><w:r><w:delText>DeletedSemanticMarker</w:delText></w:r></w:del>
+    <w:r><w:instrText>FIELD SemanticInstruction</w:instrText></w:r>
+    <w:r><w:txbxContent><w:p><w:r><w:t>TextboxSemanticMarker</w:t></w:r></w:p></w:txbxContent></w:r>
+  </w:p></w:body>
+</w:document>"#;
+        write_test_docx_package(&source_path, document_xml, 0)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        let source_entry = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .find(|entry| entry.name == "Semantic Evidence.docx")
+            .context("semantic DOCX source was not indexed")?;
+        let parsed = parse_document_artifacts(&case_path, evidence_id)?;
+        assert_eq!(parsed.status, "completed");
+
+        let conn = open_existing_case(&case_path)?;
+        let mut stmt = conn.prepare(
+            "SELECT content, segment_kind, provenance_json
+             FROM filesystem_entry_text_segments
+             WHERE entry_id = ?1 AND parser_name = ?2
+             ORDER BY segment_index",
+        )?;
+        let rows = stmt.query_map(params![source_entry.id, OOXML_PARSER_NAME], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let segments = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        assert!(!segments.is_empty());
+        let persisted_text = segments
+            .iter()
+            .map(|(content, _, _)| String::from_utf8(content.clone()).expect("OOXML UTF-8"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            persisted_text,
+            vec![
+                "VisibleSemanticMarker",
+                "HiddenSemanticMarker",
+                "DeletedSemanticMarker",
+                "FIELD SemanticInstruction",
+                "TextboxSemanticMarker",
+            ]
+        );
+        let find = |needle: &str| {
+            segments
+                .iter()
+                .find(|(content, _, _)| String::from_utf8_lossy(content).contains(needle))
+                .unwrap_or_else(|| panic!("missing persisted semantic segment {needle:?}"))
+        };
+        assert_eq!(find("VisibleSemanticMarker").1, "visible_text");
+        assert_eq!(find("DeletedSemanticMarker").1, "deleted_text");
+        assert_eq!(find("FIELD SemanticInstruction").1, "field_instruction");
+        let hidden_provenance: serde_json::Value =
+            serde_json::from_str(&find("HiddenSemanticMarker").2)?;
+        assert_eq!(hidden_provenance["hidden"], true);
+        assert_eq!(hidden_provenance["source_fields"]["xml_element"], "w:t");
+        let textbox_provenance: serde_json::Value =
+            serde_json::from_str(&find("TextboxSemanticMarker").2)?;
+        assert_eq!(textbox_provenance["in_text_box"], true);
+        let instruction_provenance: serde_json::Value =
+            serde_json::from_str(&find("FIELD SemanticInstruction").2)?;
+        assert_eq!(
+            instruction_provenance["source_fields"]["xml_element"],
+            "w:instrText"
+        );
+        for (_, _, provenance) in &segments {
+            let provenance: serde_json::Value = serde_json::from_str(provenance)?;
+            assert_eq!(
+                provenance["coordinate_system"]["offset_basis"],
+                "docx_zip_package_relative"
+            );
+            assert_eq!(
+                provenance["coordinate_system"]["evidence_physical_offset_available"],
+                false
+            );
+            assert_eq!(
+                provenance["coordinate_system"]["one_to_one_physical_mapping"],
+                false
+            );
+        }
+        drop(stmt);
+        drop(conn);
+
+        let hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                query: "DeletedSemanticMarker".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: true,
+                max_results: 10,
+                max_file_bytes: CONTENT_INDEX_BYTES as u64,
+                category: None,
+                file_types: None,
+            },
+        )?;
+        let hit = hits
+            .iter()
+            .find(|hit| hit.entry_id == source_entry.id && hit.match_kind == "parsed_content")
+            .context("deleted DOCX semantic text was not query-visible")?;
+        assert_eq!(hit.parsed_segment_kind.as_deref(), Some("deleted_text"));
+        assert_eq!(
+            hit.parsed_segment_provenance
+                .as_ref()
+                .and_then(|value| value["coordinate_system"]["offset_basis"].as_str()),
+            Some("docx_zip_package_relative")
+        );
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
@@ -39003,7 +48325,7 @@ mod tests {
         let first = parse_document_artifacts(&case_path, evidence_id)?;
         assert_eq!(first.status, "completed");
 
-        let prior_segments = {
+        let (prior_segments, prior_parser) = {
             let conn = open_existing_case(&case_path)?;
             let mut stmt = conn.prepare(
                 "SELECT segment_index, part_name, content
@@ -39018,9 +48340,17 @@ mod tests {
                     row.get::<_, Vec<u8>>(2)?,
                 ))
             })?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()?
+            let segments = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            let metadata_json: String = conn.query_row(
+                "SELECT metadata_json FROM filesystem_entries WHERE id = ?1",
+                params![source_entry.id],
+                |row| row.get(0),
+            )?;
+            let metadata: serde_json::Value = serde_json::from_str(&metadata_json)?;
+            (segments, metadata["document_parser"].clone())
         };
         assert!(!prior_segments.is_empty());
+        assert_eq!(prior_parser["status"], "parsed");
 
         let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         let mut state = 0x31c4_8a7d_u32;
@@ -39029,15 +48359,18 @@ mod tests {
             state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
             replacement.push(alphabet[(state as usize) % alphabet.len()] as char);
         }
-        // The parser has already emitted one full segment when it reaches this
-        // deliberate unexpected EOF, so the test exercises transaction rollback
-        // after a replacement insert rather than an error before streaming.
+        // The replacement package is deliberately malformed. Whether package
+        // preflight rejects it before emission or the streaming transaction
+        // rejects it later, a completed canonical generation must remain exact.
         let malformed_document = format!(
             r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{replacement}</w:t></w:r></w:p>"#
         );
         write_test_docx_package(&source_path, &malformed_document, 0)?;
         let second = parse_document_artifacts(&case_path, evidence_id)?;
-        assert_eq!(second.status, "truncated");
+        assert_eq!(second.status, "completed_with_diagnostics");
+        assert!(!second.truncated);
+        assert!(second.completed_with_diagnostics);
+        assert!(second.partial_artifact_coverage);
         assert_eq!(second.documents_parsed, 0);
         assert_eq!(second.parse_error_count, 1);
 
@@ -39064,14 +48397,114 @@ mod tests {
         )?;
         let metadata: serde_json::Value = serde_json::from_str(&metadata_json)?;
         let parser = &metadata["document_parser"];
-        assert_eq!(parser["status"], "error");
-        assert_eq!(parser["replacement_committed"], false);
-        assert_eq!(parser["replacement_rolled_back"], true);
-        assert_eq!(parser["previous_segments_preserved"], true);
+        assert_eq!(parser, &prior_parser);
+        let attempt = &metadata["document_parser_last_attempt"];
+        assert_eq!(attempt["status"], "error");
+        assert_eq!(attempt["replacement_committed"], false);
+        assert_eq!(attempt["replacement_rolled_back"], true);
+        assert_eq!(attempt["previous_segments_preserved"], true);
+        assert_eq!(attempt["canonical_generation_preserved"], true);
         assert_eq!(
-            parser["previous_segments_retained"].as_i64(),
+            attempt["previous_segments_retained"].as_i64(),
             Some(prior_segments.len() as i64)
         );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn document_partial_reprocess_preserves_complete_canonical_generation() -> Result<()> {
+        let case_path = unique_case_path("document-partial-reprocess-preserves-complete");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("document-partial-reprocess-source");
+        let source_path = evidence_dir.join("Canonical Evidence.docx");
+        write_test_docx(&source_path, "CANONICAL-COMPLETE-DOCX-TEXT")?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        let source_entry = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .find(|entry| entry.name == "Canonical Evidence.docx")
+            .context("canonical DOCX source was not indexed")?;
+        let first = parse_document_artifacts(&case_path, evidence_id)?;
+        assert_eq!(first.status, "completed");
+
+        type PersistedDocxSegment = (i64, String, Vec<u8>, String, String);
+        type PersistedDocxGeneration = (Vec<PersistedDocxSegment>, serde_json::Value);
+        let read_generation = || -> Result<PersistedDocxGeneration> {
+            let conn = open_existing_case(&case_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT segment_index, part_name, content, segment_kind, provenance_json
+                 FROM filesystem_entry_text_segments
+                 WHERE entry_id = ?1 AND parser_name = ?2
+                 ORDER BY segment_index",
+            )?;
+            let rows = stmt.query_map(params![source_entry.id, OOXML_PARSER_NAME], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            let segments = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+            let metadata_json: String = conn.query_row(
+                "SELECT metadata_json FROM filesystem_entries WHERE id = ?1",
+                params![source_entry.id],
+                |row| row.get(0),
+            )?;
+            Ok((segments, serde_json::from_str(&metadata_json)?))
+        };
+        let (prior_segments, prior_metadata) = read_generation()?;
+        assert!(!prior_segments.is_empty());
+        assert_eq!(prior_metadata["document_parser"]["status"], "parsed");
+
+        let partial_document = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>ATTEMPTED-PARTIAL-DOCX-TEXT</w:t></w:r></w:p></w:body></w:document>"#;
+        write_test_docx_package(&source_path, partial_document, 1)?;
+        let second = parse_document_artifacts(&case_path, evidence_id)?;
+        assert_eq!(second.status, "completed_with_diagnostics");
+        assert!(!second.truncated);
+        assert!(second.completed_with_diagnostics);
+        assert!(second.partial_artifact_coverage);
+        assert_eq!(second.documents_parsed, 1);
+        assert_eq!(second.partial_documents, 1);
+        assert_eq!(second.segments_indexed, 0);
+        assert_eq!(second.text_bytes_indexed, 0);
+
+        let (retained_segments, metadata) = read_generation()?;
+        assert_eq!(retained_segments, prior_segments);
+        assert_eq!(
+            metadata["document_parser"],
+            prior_metadata["document_parser"]
+        );
+        let attempt = &metadata["document_parser_last_attempt"];
+        assert_eq!(attempt["status"], "partial");
+        assert_eq!(attempt["replacement_committed"], false);
+        assert_eq!(attempt["replacement_rolled_back"], true);
+        assert_eq!(attempt["previous_segments_preserved"], true);
+        assert_eq!(attempt["canonical_generation_preserved"], true);
+        assert_eq!(
+            attempt["retained_segment_count"].as_i64(),
+            Some(prior_segments.len() as i64)
+        );
+        assert_eq!(attempt["unsupported_parts_total"].as_u64(), Some(1));
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
@@ -39109,7 +48542,10 @@ mod tests {
             .find(|entry| entry.name == "Unsupported Parts.docx")
             .context("unsupported-parts DOCX source was not indexed")?;
         let parsed = parse_document_artifacts(&case_path, evidence_id)?;
-        assert_eq!(parsed.status, "truncated");
+        assert_eq!(parsed.status, "completed_with_diagnostics");
+        assert!(!parsed.truncated);
+        assert!(parsed.completed_with_diagnostics);
+        assert!(parsed.partial_artifact_coverage);
         assert_eq!(parsed.documents_parsed, 1);
         assert_eq!(parsed.partial_documents, 1);
         assert_eq!(parsed.parse_error_count, 0);
@@ -39123,6 +48559,8 @@ mod tests {
         let metadata: serde_json::Value = serde_json::from_str(&metadata_json)?;
         let parser = &metadata["document_parser"];
         assert_eq!(parser["status"], "partial");
+        assert_eq!(parser["replacement_committed"], true);
+        assert_eq!(metadata["document_parser_last_attempt"], *parser);
         assert_eq!(
             parser["unsupported_parts"].as_array().map(Vec::len),
             Some(DOCUMENT_UNSUPPORTED_PART_DISPLAY_LIMIT)
@@ -39300,6 +48738,21 @@ mod tests {
 
         assert!(!format!("{error:#}").is_empty());
         assert_eq!(fs::read(&case_path)?, original);
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_case_database_is_owner_private() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let case_path = unique_case_path("private-case-permissions");
+        create_test_case(&case_path)?;
+        assert_eq!(
+            fs::metadata(&case_path)?.permissions().mode() & 0o777,
+            0o600
+        );
         cleanup_case_path(&case_path);
         Ok(())
     }
@@ -40250,7 +49703,7 @@ mod tests {
             assert!(metadata.get("email_parser_error").is_none());
         }
 
-        for extension in ["msg", "mbox", "olm", "dbx", "nsf"] {
+        for extension in ["mbox", "olm", "dbx", "nsf"] {
             let mut metadata = serde_json::json!({});
             mark_email_store(&mut metadata, extension);
             assert_eq!(metadata["email_parser_status"].as_str(), Some("skipped"));
@@ -40258,6 +49711,116 @@ mod tests {
                 .as_str()
                 .is_some_and(|reason| reason.contains("available for export")));
         }
+
+        let mut msg = serde_json::json!({"artifact_kind": "filesystem_entry"});
+        mark_email_store(&mut msg, "msg");
+        assert_eq!(msg["artifact_kind"].as_str(), Some("email_candidate"));
+        assert!(msg.get("email_format").is_none());
+        assert_eq!(
+            msg["email_candidate_parser_status"].as_str(),
+            Some("signature_required")
+        );
+        assert_eq!(
+            msg["email_candidate_parser_recognized"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn msg_classification_requires_cfb_and_outlook_storage_markers() {
+        let mut non_cfb = serde_json::json!({"artifact_kind": "filesystem_entry"});
+        assert!(!annotate_msg_candidate_from_bytes(
+            &mut non_cfb,
+            b"MZ\x90\0not an Outlook compound file",
+            true,
+        ));
+        assert_eq!(non_cfb["artifact_kind"].as_str(), Some("not_outlook_msg"));
+        assert_eq!(
+            non_cfb["email_candidate_parser_status"].as_str(),
+            Some("not_outlook_msg")
+        );
+        let mut incomplete_cfb = serde_json::json!({"artifact_kind": "filesystem_entry"});
+        assert!(annotate_msg_candidate_from_bytes(
+            &mut incomplete_cfb,
+            &OUTLOOK_MSG_CFB_MAGIC,
+            false,
+        ));
+        assert_eq!(
+            incomplete_cfb["artifact_kind"].as_str(),
+            Some("email_candidate")
+        );
+        assert_eq!(
+            incomplete_cfb["email_candidate_parser_status"].as_str(),
+            Some("signature_inconclusive")
+        );
+
+        let mut non_msg_cfb = serde_json::json!({"artifact_kind": "filesystem_entry"});
+        assert!(!annotate_msg_candidate_from_bytes(
+            &mut non_msg_cfb,
+            &OUTLOOK_MSG_CFB_MAGIC,
+            true,
+        ));
+        assert_eq!(
+            non_msg_cfb["artifact_kind"].as_str(),
+            Some("not_outlook_msg")
+        );
+        assert_eq!(
+            non_msg_cfb["email_candidate_parser_status"].as_str(),
+            Some("not_outlook_msg")
+        );
+
+        let mut outlook_bytes = OUTLOOK_MSG_CFB_MAGIC.to_vec();
+        for marker in ["__properties_version1.0", "__substg1.0_0037001F"] {
+            outlook_bytes.extend(marker.encode_utf16().flat_map(u16::to_le_bytes));
+        }
+        let mut outlook = serde_json::json!({"artifact_kind": "filesystem_entry"});
+        assert!(!annotate_msg_candidate_from_bytes(
+            &mut outlook,
+            &outlook_bytes,
+            true,
+        ));
+        assert_eq!(
+            outlook["artifact_kind"].as_str(),
+            Some("outlook_msg_container")
+        );
+        assert_eq!(outlook["email_format"].as_str(), Some("msg"));
+        assert_eq!(
+            outlook["email_parser_status"].as_str(),
+            Some("recognized_unsupported")
+        );
+
+        let mismatch_category = classify_entry(
+            "/Users/Alice/Downloads/not-mail.msg",
+            "not-mail.msg",
+            "file",
+            &non_cfb,
+        );
+        assert_eq!(
+            (mismatch_category.main, mismatch_category.sub),
+            ("Uncategorized", "Extension/content mismatch")
+        );
+        let mut legacy_non_cfb = non_cfb.clone();
+        legacy_non_cfb["artifact_kind"] = serde_json::json!("filesystem_entry");
+        let legacy_mismatch_category = classify_entry(
+            "/Users/Alice/Downloads/not-mail.msg",
+            "not-mail.msg",
+            "file",
+            &legacy_non_cfb,
+        );
+        assert_eq!(
+            (legacy_mismatch_category.main, legacy_mismatch_category.sub),
+            ("Uncategorized", "Extension/content mismatch")
+        );
+        let candidate_category = classify_entry(
+            "/Users/Alice/Downloads/maybe-mail.msg",
+            "maybe-mail.msg",
+            "file",
+            &incomplete_cfb,
+        );
+        assert_eq!(
+            (candidate_category.main, candidate_category.sub),
+            ("Email and Communications", "Unvalidated email candidates")
+        );
     }
 
     #[test]
@@ -40950,8 +50513,10 @@ mod tests {
                 max_entries: 100,
             },
         )?;
-        assert_eq!(processed.status, "truncated");
-        assert!(processed.truncated);
+        assert_eq!(processed.status, "completed_with_diagnostics");
+        assert!(!processed.truncated);
+        assert!(processed.partial_artifact_coverage);
+        assert!(processed.completed_with_diagnostics);
         let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
         let entry = entries
             .into_iter()
@@ -41544,7 +51109,10 @@ mod tests {
             },
         )?;
         assert_eq!(second.entries_indexed, 0);
-        assert!(second.truncated);
+        assert!(!second.truncated);
+        assert!(second.partial_artifact_coverage);
+        assert!(second.completed_with_diagnostics);
+        assert_eq!(second.status, "completed_with_diagnostics");
         let retained = list_filesystem_entries(&case_path, Some(evidence_id))?;
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].id, entry.id);
@@ -42551,7 +52119,7 @@ mod tests {
     }
 
     #[test]
-    fn required_invalid_eml_is_disclosed_and_truncates_processing() -> Result<()> {
+    fn required_invalid_eml_is_disclosed_as_completed_with_diagnostics() -> Result<()> {
         let case_path = unique_case_path("invalid-required-eml");
         create_test_case(&case_path)?;
         let evidence_dir = unique_temp_dir("invalid-required-eml-source");
@@ -42579,8 +52147,11 @@ mod tests {
                 },
             )
         })?;
-        assert!(result.truncated);
-        assert_eq!(result.status, "truncated");
+        assert!(!result.truncated);
+        assert!(result.partial_artifact_coverage);
+        assert!(result.completed_with_diagnostics);
+        assert_eq!(result.status, "completed_with_diagnostics");
+        assert!(list_evidence(&case_path)?[0].indexed_at.is_some());
         let snapshot = tracker.snapshot();
         assert_eq!(snapshot.error_count, 1);
         assert_eq!(snapshot.skipped_count, 1);
@@ -42646,6 +52217,205 @@ mod tests {
             metadata["email_parser_diagnostics_omitted"].as_u64(),
             Some(0)
         );
+    }
+
+    #[test]
+    fn rfc822_complete_generation_survives_partial_and_limited_reprocessing() -> Result<()> {
+        let case_path = unique_case_path("rfc822-generation-preservation");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("rfc822-generation-preservation-source");
+        let message_path = evidence_dir.join("preserve.eml");
+        let complete_message = concat!(
+            "From: alice@example.test\r\n",
+            "To: bob@example.test\r\n",
+            "Subject: Stable generation\r\n",
+            "Message-ID: <stable@example.test>\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"stable-boundary\"\r\n",
+            "\r\n",
+            "--stable-boundary\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "Content-Transfer-Encoding: 7bit\r\n",
+            "\r\n",
+            "STABLE-PRIOR-RFC822-BODY\r\n",
+            "--stable-boundary\r\n",
+            "Content-Type: application/octet-stream; name=\"stable.bin\"\r\n",
+            "Content-Disposition: attachment; filename=\"stable.bin\"\r\n",
+            "Content-Transfer-Encoding: base64\r\n",
+            "\r\n",
+            "AQIDBA==\r\n",
+            "--stable-boundary--\r\n"
+        );
+        fs::write(&message_path, complete_message)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let first = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        assert!(!first.truncated);
+
+        let source_entry = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .find(|entry| entry.name == "preserve.eml")
+            .context("complete RFC 822 source was not indexed")?;
+        assert_eq!(
+            source_entry.metadata_json["email_parser_coverage_status"].as_str(),
+            Some("complete")
+        );
+        let source_entry_id = source_entry.id;
+        let committed_generation = {
+            let conn = open_existing_case(&case_path)?;
+            let text: Vec<u8> = conn.query_row(
+                "SELECT content FROM filesystem_entry_text_segments
+                 WHERE entry_id = ?1 AND parser_name = ?2
+                 ORDER BY segment_index LIMIT 1",
+                params![source_entry_id, RFC822_PARSER_NAME],
+                |row| row.get(0),
+            )?;
+            let attachments = conn
+                .prepare(
+                    "SELECT id, name, size_bytes, metadata_json
+                     FROM filesystem_entries
+                     WHERE parent_id = ?1
+                       AND json_extract(metadata_json, '$.email_attachment_parser') = ?2
+                     ORDER BY id",
+                )?
+                .query_map(params![source_entry_id, RFC822_PARSER_NAME], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            (text, attachments)
+        };
+        assert_eq!(
+            String::from_utf8(committed_generation.0.clone())?.trim(),
+            "STABLE-PRIOR-RFC822-BODY"
+        );
+        assert_eq!(committed_generation.1.len(), 1);
+        assert_eq!(committed_generation.1[0].1, "stable.bin");
+        assert_eq!(committed_generation.1[0].2, Some(4));
+
+        let partial_message = concat!(
+            "From: alice@example.test\r\n",
+            "To: bob@example.test\r\n",
+            "Subject: Incomplete replacement\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: multipart/mixed; boundary=\"missing-close\"\r\n",
+            "\r\n",
+            "--missing-close\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\n",
+            "\r\n",
+            "INCOMPLETE-REPLACEMENT-BODY\r\n"
+        );
+        fs::write(&message_path, partial_message)?;
+        let partial = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        assert!(!partial.truncated);
+        assert!(partial.partial_artifact_coverage);
+        assert!(partial.completed_with_diagnostics);
+
+        let assert_committed_generation_preserved = |expected_attempt_status: &str| -> Result<()> {
+            let source = list_filesystem_entries(&case_path, Some(evidence_id))?
+                .into_iter()
+                .find(|entry| entry.id == source_entry_id)
+                .context("RFC 822 source disappeared during reprocessing")?;
+            assert_eq!(
+                source.metadata_json["email_parser_coverage_status"].as_str(),
+                Some("complete")
+            );
+            assert_eq!(
+                source.metadata_json["email_parser_last_attempt_status"].as_str(),
+                Some(expected_attempt_status)
+            );
+            assert_eq!(
+                source.metadata_json["email_rfc822_last_attempt"]["coverage_status"].as_str(),
+                Some(expected_attempt_status)
+            );
+            assert_eq!(
+                source.metadata_json["email_parser_replacement_committed"].as_bool(),
+                Some(false)
+            );
+            assert_eq!(
+                source.metadata_json["email_parser_replacement_rolled_back"].as_bool(),
+                Some(true)
+            );
+            assert_eq!(
+                source.metadata_json["email_parser_previous_records_preserved"].as_bool(),
+                Some(true)
+            );
+            let conn = open_existing_case(&case_path)?;
+            let text: Vec<u8> = conn.query_row(
+                "SELECT content FROM filesystem_entry_text_segments
+                     WHERE entry_id = ?1 AND parser_name = ?2
+                     ORDER BY segment_index LIMIT 1",
+                params![source_entry_id, RFC822_PARSER_NAME],
+                |row| row.get(0),
+            )?;
+            assert_eq!(text, committed_generation.0);
+            let attachments = conn
+                .prepare(
+                    "SELECT id, name, size_bytes, metadata_json
+                         FROM filesystem_entries
+                         WHERE parent_id = ?1
+                           AND json_extract(metadata_json, '$.email_attachment_parser') = ?2
+                         ORDER BY id",
+                )?
+                .query_map(params![source_entry_id, RFC822_PARSER_NAME], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            assert_eq!(attachments, committed_generation.1);
+            Ok(())
+        };
+        assert_committed_generation_preserved("partial")?;
+
+        let limited_body = "x".repeat(rfc822::MAX_SEARCHABLE_TEXT_BYTES + 19);
+        fs::write(
+            &message_path,
+            format!(
+                "From: alice@example.test\r\nTo: bob@example.test\r\nSubject: Limited replacement\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{limited_body}"
+            ),
+        )?;
+        let limited = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        assert!(!limited.truncated);
+        assert!(limited.partial_artifact_coverage);
+        assert!(limited.completed_with_diagnostics);
+        assert_committed_generation_preserved("limit_reached")?;
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
     }
 
     #[test]
@@ -42761,11 +52531,11 @@ mod tests {
         assert!(message.logical_path.ends_with("/message.eml"));
         assert_eq!(
             message.metadata_json["email_parser"].as_str(),
-            Some("kdft-rfc822-stream-1")
+            Some(RFC822_PARSER_NAME)
         );
         assert_eq!(
             message.metadata_json["email_parser_status"].as_str(),
-            Some("parsed")
+            Some("complete")
         );
         assert_eq!(
             message.metadata_json["email_parser_bytes_consumed"].as_u64(),
@@ -43009,6 +52779,177 @@ mod tests {
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
         Ok(())
+    }
+
+    #[test]
+    fn partial_image_reprocess_preserves_prior_complete_generation() -> Result<()> {
+        let case_path = unique_case_path("image-generation-preservation");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("image-generation-preservation-source");
+        let image_path = evidence_dir.join("fat-disk.img");
+        create_test_fat_mbr_image(&image_path)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path,
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let complete = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        assert_eq!(complete.status, "completed");
+        assert!(complete.replacement_committed);
+        assert!(!complete.canonical_generation_preserved);
+        assert_eq!(complete.entries_indexed, complete.attempt_entries_indexed);
+        let indexed_at_before = list_evidence(&case_path)?[0].indexed_at.clone();
+        assert!(indexed_at_before.is_some());
+        let before = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.logical_path,
+                    entry.discovered_by_job_id,
+                    entry.metadata_json,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(before.len() > 1);
+
+        let limited = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 1,
+            },
+        )?;
+        assert_eq!(limited.status, "truncated");
+        assert!(limited.truncated);
+        assert!(limited.canonical_generation_preserved);
+        assert!(!limited.replacement_committed);
+        assert_eq!(limited.attempt_entries_indexed, 1);
+        assert_eq!(limited.entries_indexed, 0);
+        assert_eq!(limited.retained_entry_count, before.len());
+        assert_eq!(limited.bookmark_items_relinked, 0);
+
+        let after = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.logical_path,
+                    entry.discovered_by_job_id,
+                    entry.metadata_json,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            after, before,
+            "rejected staging must not alter canonical rows"
+        );
+        assert_eq!(list_evidence(&case_path)?[0].indexed_at, indexed_at_before);
+
+        let conn = open_existing_case(&case_path)?;
+        let parameters: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![limited.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters)?;
+        assert_eq!(parameters["entries_indexed"].as_u64(), Some(0));
+        assert_eq!(parameters["attempt_entries_indexed"].as_u64(), Some(1));
+        assert_eq!(
+            parameters["canonical_generation_preserved"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(parameters["replacement_committed"].as_bool(), Some(false));
+        drop(conn);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn partition_geometry_rejects_overflow_overlap_and_invalid_sector_units() {
+        assert!(validate_partition_range(4096, 0, 0, "fixture").is_err());
+        assert!(validate_partition_range(u64::MAX, u64::MAX - 1, 8, "fixture").is_err());
+        assert!(validate_partition_range(4096, 4096, 512, "fixture").is_err());
+
+        let adjacent = [
+            PartitionGeometry {
+                start: 512,
+                size: 1024,
+                overlap_exempt_container: false,
+            },
+            PartitionGeometry {
+                start: 1536,
+                size: 512,
+                overlap_exempt_container: false,
+            },
+        ];
+        assert!(validate_partition_layout_geometry(4096, 512, 4096, &adjacent).is_ok());
+        assert!(validate_partition_layout_geometry(4096, 1000, 4096, &adjacent).is_err());
+
+        let overlapping = [
+            PartitionGeometry {
+                start: 512,
+                size: 1536,
+                overlap_exempt_container: false,
+            },
+            PartitionGeometry {
+                start: 1024,
+                size: 1024,
+                overlap_exempt_container: false,
+            },
+        ];
+        assert!(validate_partition_layout_geometry(4096, 512, 4096, &overlapping).is_err());
+
+        // A classic MBR extended partition is a container for logical data
+        // partitions and is the one intentional overlap in this layout model.
+        let extended = [
+            partition_geometry_from_layout("Mbr", 512, 3072, Some("Extended (0x0F)")),
+            PartitionGeometry {
+                start: 1024,
+                size: 1024,
+                overlap_exempt_container: false,
+            },
+        ];
+        assert!(validate_partition_layout_geometry(4096, 512, 4096, &extended).is_ok());
+        assert!(validate_partition_layout_geometry(2048, 512, 4096, &extended).is_err());
+
+        let crossing_extended_boundary = [
+            partition_geometry_from_layout("Mbr", 1024, 2048, Some("Extended (0x0F)")),
+            PartitionGeometry {
+                start: 512,
+                size: 1024,
+                overlap_exempt_container: false,
+            },
+        ];
+        assert!(
+            validate_partition_layout_geometry(4096, 512, 4096, &crossing_extended_boundary)
+                .is_err()
+        );
+
+        let overlapping_extended_containers = [
+            partition_geometry_from_layout("Mbr", 512, 2048, Some("Extended (0x05)")),
+            partition_geometry_from_layout("Mbr", 1024, 2048, Some("Extended (0x0F)")),
+        ];
+        assert!(validate_partition_layout_geometry(
+            4096,
+            512,
+            4096,
+            &overlapping_extended_containers
+        )
+        .is_err());
     }
 
     #[test]
@@ -44836,32 +54777,174 @@ mod tests {
         Ok(())
     }
 
+    fn minimal_valid_jpeg() -> Vec<u8> {
+        vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xE0, 0x00, 0x02, // empty APP0
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11,
+            0x00, // one-component SOF0
+            0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, // SOS
+            0x00, 0x11, // bounded entropy-coded payload
+            0xFF, 0xD9, // EOI
+        ]
+    }
+
+    fn append_png_chunk(output: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
+        output.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        output.extend_from_slice(kind);
+        output.extend_from_slice(payload);
+        output.extend_from_slice(&crc32_ieee(&[kind, payload]).to_be_bytes());
+    }
+
+    fn minimal_valid_png() -> Vec<u8> {
+        let mut output = b"\x89PNG\r\n\x1a\n".to_vec();
+        append_png_chunk(
+            &mut output,
+            b"IHDR",
+            &[0, 0, 0, 1, 0, 0, 0, 1, 8, 0, 0, 0, 0],
+        );
+        append_png_chunk(
+            &mut output,
+            b"IDAT",
+            &[0x78, 0x9C, 0x63, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01],
+        );
+        append_png_chunk(&mut output, b"IEND", &[]);
+        output
+    }
+
+    fn minimal_valid_gif() -> Vec<u8> {
+        vec![
+            b'G', b'I', b'F', b'8', b'9', b'a', 1, 0, 1, 0, 0x80, 0, 0, // LSD
+            0, 0, 0, 0xFF, 0xFF, 0xFF, // global color table
+            0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, // image descriptor
+            2, 2, 0x4C, 0x01, 0,    // LZW data sub-blocks
+            0x3B, // trailer
+        ]
+    }
+
+    fn minimal_valid_pdf() -> Vec<u8> {
+        let mut output = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n".to_vec();
+        let xref = output.len();
+        output.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n0000000009 00000 n \ntrailer\n<< /Size 2 >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        output
+    }
+
+    fn minimal_valid_bmp() -> Vec<u8> {
+        let mut output = vec![0_u8; 58];
+        let declared_size = output.len() as u32;
+        output[..2].copy_from_slice(b"BM");
+        output[2..6].copy_from_slice(&declared_size.to_le_bytes());
+        output[10..14].copy_from_slice(&54_u32.to_le_bytes());
+        output[14..18].copy_from_slice(&40_u32.to_le_bytes());
+        output[18..22].copy_from_slice(&1_i32.to_le_bytes());
+        output[22..26].copy_from_slice(&1_i32.to_le_bytes());
+        output[26..28].copy_from_slice(&1_u16.to_le_bytes());
+        output[28..30].copy_from_slice(&24_u16.to_le_bytes());
+        output
+    }
+
+    fn minimal_valid_zip() -> Result<Vec<u8>> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("fixture.txt", options)?;
+        writer.write_all(b"forensic ZIP fixture")?;
+        Ok(writer.finish()?.into_inner())
+    }
+
+    fn minimal_valid_gzip() -> Result<Vec<u8>> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"forensic GZIP fixture")?;
+        Ok(encoder.finish()?)
+    }
+
     #[test]
-    fn carve_evidence_recovers_files_by_signature() -> Result<()> {
+    fn bounded_carve_validators_distinguish_extents_from_false_headers() -> Result<()> {
+        for (extension, bytes) in [
+            ("jpg", minimal_valid_jpeg()),
+            ("png", minimal_valid_png()),
+            ("gif", minimal_valid_gif()),
+            ("pdf", minimal_valid_pdf()),
+            ("bmp", minimal_valid_bmp()),
+            ("zip", minimal_valid_zip()?),
+            ("gz", minimal_valid_gzip()?),
+        ] {
+            let signature = CARVE_SIGNATURES
+                .iter()
+                .find(|signature| signature.extension == extension)
+                .expect("fixture signature");
+            let mut reader = std::io::Cursor::new(bytes.clone());
+            let outcome = carve_length_with_protective_limit(
+                &mut reader,
+                0,
+                signature,
+                bytes.len() as u64,
+                CARVE_UNKNOWN_LENGTH_MAX_BYTES,
+            )?;
+            assert_eq!(
+                outcome.status,
+                CarveValidationStatus::Validated,
+                "{extension}"
+            );
+            assert_eq!(outcome.length, bytes.len() as u64, "{extension}");
+            assert!(outcome.definitive, "{extension}");
+        }
+
+        let mut bad_png = minimal_valid_png();
+        let last = bad_png.len() - 1;
+        bad_png[last] ^= 0x01;
+        assert_eq!(
+            validate_png_candidate(&bad_png, false).status,
+            CarveValidationStatus::Partial
+        );
+
+        let mut bad_gzip = minimal_valid_gzip()?;
+        let last = bad_gzip.len() - 1;
+        bad_gzip[last] ^= 0x01;
+        assert_eq!(
+            validate_gzip_candidate(&bad_gzip, false).status,
+            CarveValidationStatus::Partial
+        );
+
+        assert_eq!(
+            validate_jpeg_candidate(&[0xFF, 0xD8, 0xFF, 0xD9], false).status,
+            CarveValidationStatus::Partial
+        );
+        assert_eq!(
+            validate_rar_candidate(b"Rar!\x1A\x07\x00").status,
+            CarveValidationStatus::RecognizedUnsupported
+        );
+        assert_eq!(
+            validate_rar_candidate(b"Rar!\x1A\x07\x7F").status,
+            CarveValidationStatus::Rejected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn carve_evidence_publishes_only_structurally_validated_files() -> Result<()> {
         let case_path = unique_case_path("carve-evidence");
         create_test_case(&case_path)?;
         let dir = unique_temp_dir("carve-evidence-source");
         let image_path = dir.join("carve.img");
 
-        // A raw image with a complete JPEG and PNG embedded at unaligned
-        // offsets in otherwise-zeroed space (no filesystem).
-        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
-        jpeg.extend_from_slice(b"JFIF payload bytes here");
-        jpeg.extend_from_slice(&[0xFF, 0xD9]);
-        let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        png.extend_from_slice(b"IHDR...pixels...");
-        png.extend_from_slice(&[0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82]);
+        let jpeg = minimal_valid_jpeg();
+        let png = minimal_valid_png();
+        let gzip = minimal_valid_gzip()?;
 
         let mut image = vec![0_u8; 512 * 1024];
         let jpeg_offset = 4096 + 17;
         let png_offset = 200_000;
-        // A GZIP header with no footer rule: its length cannot be measured,
-        // so the carve must say so instead of presenting the fallback bound
-        // as a real file size.
         let gzip_offset = 400_000;
         image[jpeg_offset..jpeg_offset + jpeg.len()].copy_from_slice(&jpeg);
         image[png_offset..png_offset + png.len()].copy_from_slice(&png);
-        image[gzip_offset..gzip_offset + 3].copy_from_slice(&[0x1F, 0x8B, 0x08]);
+        image[gzip_offset..gzip_offset + gzip.len()].copy_from_slice(&gzip);
         fs::write(&image_path, &image)?;
 
         let evidence_id = add_evidence(
@@ -44886,6 +54969,7 @@ mod tests {
         assert!(!result.truncated);
         assert_eq!(result.status, "completed");
         assert!(result.truncation_reasons.is_empty());
+        assert_eq!(result.recognized_candidates, 0);
         assert_eq!(result.protective_extent_limit_hits, 0);
 
         let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
@@ -44900,9 +54984,10 @@ mod tests {
             .find(|entry| entry.name.ends_with(".jpg"))
             .expect("carved JPEG present");
         assert_eq!(
-            jpg.metadata_json["file_data_physical_offset"].as_u64(),
+            jpg.metadata_json["file_data_decoded_media_offset"].as_u64(),
             Some(jpeg_offset as u64)
         );
+        assert!(jpg.metadata_json.get("file_data_physical_offset").is_none());
         assert_eq!(jpg.size_bytes, Some(jpeg.len() as i64));
         assert_eq!(
             jpg.metadata_json["category_main"].as_str(),
@@ -44912,10 +54997,13 @@ mod tests {
             jpg.metadata_json["category_sub"].as_str(),
             Some("Carved files")
         );
-        // Footer-measured length: the entry says so, with no caveat.
+        assert_eq!(
+            jpg.metadata_json["extent_structurally_validated"].as_bool(),
+            Some(true)
+        );
         assert_eq!(
             jpg.metadata_json["carve_length_basis"].as_str(),
-            Some("format footer signature located by streaming search")
+            Some("JPEG marker structure reached EOI after SOF and SOS")
         );
         assert_eq!(
             jpg.metadata_json["carve_length_definitive"].as_bool(),
@@ -44923,34 +55011,29 @@ mod tests {
         );
         assert_eq!(
             jpg.metadata_json["recovery_status"].as_str(),
-            Some("carved from image by file signature")
+            Some("structurally validated extent recovered from decoded evidence media")
         );
 
-        // Footerless format: the recorded size is only a bound and every
-        // examiner-facing field must say the end was never verified.
         let gz = carved
             .iter()
             .find(|entry| entry.name.ends_with(".gz"))
             .expect("carved GZIP present");
         assert_eq!(
-            gz.metadata_json["file_data_physical_offset"].as_u64(),
+            gz.metadata_json["file_data_decoded_media_offset"].as_u64(),
             Some(gzip_offset as u64)
         );
-        assert_eq!(gz.size_bytes, Some((image.len() - gzip_offset) as i64));
+        assert_eq!(gz.size_bytes, Some(gzip.len() as i64));
         assert_eq!(
             gz.metadata_json["carve_length_basis"].as_str(),
-            Some("no supported end rule before end of available scan scope; end not verified")
+            Some("GZIP member trailers validated CRC32 and ISIZE through stream EOF")
         );
         assert_eq!(
             gz.metadata_json["carve_length_definitive"].as_bool(),
-            Some(false)
+            Some(true)
         );
-        assert!(gz.metadata_json["recovery_status"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("length not verified"));
 
-        // Carved bytes are recoverable exactly via the physical-extent reader.
+        // Carved bytes remain recoverable on demand from their exact decoded
+        // logical-media extent; no E01 container-file offset is asserted.
         let bytes = read_filesystem_entry_bytes(
             &case_path,
             ReadEntryBytesOptions {
@@ -44961,6 +55044,14 @@ mod tests {
         )?;
         assert_eq!(bytes.bytes, jpeg);
         assert!(bytes.eof);
+        let location = filesystem_entry_disk_location(&case_path, jpg.id)?;
+        assert_eq!(location.decoded_media_offset, Some(jpeg_offset as u64));
+        assert_eq!(location.contiguous_bytes, Some(jpeg.len() as u64));
+        assert!(location
+            .warning
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not an E01 segment/container-file physical offset"));
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(&dir);
@@ -44968,33 +55059,27 @@ mod tests {
     }
 
     #[test]
-    fn footer_aware_carve_length_streams_beyond_unknown_format_limit() -> Result<()> {
+    fn candidate_inspection_limit_is_a_parser_diagnostic_not_a_file_extent() -> Result<()> {
         let signature = CARVE_SIGNATURES
             .iter()
             .find(|signature| signature.extension == "jpg")
             .expect("JPEG carve signature");
-        let mut bytes = vec![0_u8; CARVE_LENGTH_CHUNK_BYTES + 16];
-        bytes[..signature.header.len()].copy_from_slice(signature.header);
-        let footer_offset = CARVE_LENGTH_CHUNK_BYTES - 1;
-        bytes[footer_offset..footer_offset + 2].copy_from_slice(&[0xFF, 0xD9]);
+        let bytes = minimal_valid_jpeg();
         let available_len = bytes.len() as u64;
         let mut reader = std::io::Cursor::new(bytes);
 
         let length =
-            carve_length_with_protective_limit(&mut reader, 0, signature, available_len, 32)?;
+            carve_length_with_protective_limit(&mut reader, 0, signature, available_len, 20)?;
 
-        assert_eq!(length.length, (footer_offset + 2) as u64);
-        assert!(length.definitive);
-        assert!(!length.protective_limit_hit);
-        assert_eq!(
-            length.basis,
-            "format footer signature located by streaming search"
-        );
+        assert_eq!(length.length, 20);
+        assert_eq!(length.status, CarveValidationStatus::Partial);
+        assert!(!length.definitive);
+        assert!(length.protective_limit_hit);
         Ok(())
     }
 
     #[test]
-    fn unknown_length_carve_limit_truncates_result_job_and_entry() -> Result<()> {
+    fn candidate_extent_limit_does_not_misreport_examiner_truncation() -> Result<()> {
         let case_path = unique_case_path("carve-protective-limit");
         create_test_case(&case_path)?;
         let dir = unique_temp_dir("carve-protective-limit-source");
@@ -45003,7 +55088,7 @@ mod tests {
         let zip_offset = 37_usize;
         image[zip_offset..zip_offset + 4].copy_from_slice(&[0x50, 0x4B, 0x03, 0x04]);
         let jpeg_offset = 200_usize;
-        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, b'x', 0xFF, 0xD9];
+        let jpeg = minimal_valid_jpeg();
         image[jpeg_offset..jpeg_offset + jpeg.len()].copy_from_slice(&jpeg);
         fs::write(&image_path, &image)?;
 
@@ -45023,35 +55108,46 @@ mod tests {
                 max_scan_bytes: 0,
                 max_files: 0,
             },
-            32,
+            64,
         )?;
 
-        assert_eq!(result.carved_files, 2);
-        assert!(result.truncated);
-        assert_eq!(result.status, "truncated");
+        assert_eq!(result.carved_files, 1);
+        assert_eq!(result.recognized_candidates, 1);
+        assert!(!result.truncated);
+        assert_eq!(result.status, "completed_with_diagnostics");
         assert_eq!(result.protective_extent_limit_hits, 1);
-        assert_eq!(result.truncation_reasons.len(), 1);
-        assert!(result.truncation_reasons[0].contains("32-byte protective limit"));
+        assert!(result.truncation_reasons.is_empty());
 
         let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
         let zip = entries
             .iter()
-            .find(|entry| entry.name.ends_with(".zip"))
-            .expect("bounded ZIP carve");
-        assert_eq!(zip.size_bytes, Some(32));
+            .find(|entry| {
+                entry.metadata_json["artifact_kind"].as_str() == Some("carve_candidate")
+                    && entry.name.ends_with(".zip")
+            })
+            .expect("bounded ZIP candidate");
+        assert_eq!(zip.entry_kind, "record");
+        assert_eq!(zip.size_bytes, None);
+        assert_eq!(
+            zip.metadata_json["extent_structurally_validated"].as_bool(),
+            Some(false)
+        );
         assert_eq!(
             zip.metadata_json["carve_extent_truncated"].as_bool(),
             Some(true)
         );
         assert_eq!(
             zip.metadata_json["carve_protective_extent_limit_bytes"].as_u64(),
-            Some(32)
+            Some(64)
         );
         assert!(zip.metadata_json["carve_extent_truncation_reason"]
             .as_str()
             .unwrap_or_default()
             .contains("decoded offset 0x25"));
-        assert!(entries.iter().any(|entry| entry.name.ends_with(".jpg")));
+        assert!(entries.iter().any(|entry| {
+            entry.metadata_json["artifact_kind"].as_str() == Some("carved_file")
+                && entry.name.ends_with(".jpg")
+        }));
 
         let conn = Connection::open(&case_path)?;
         let (job_status, job_error, parameters): (String, Option<String>, String) = conn
@@ -45062,17 +55158,19 @@ mod tests {
                 [evidence_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-        assert_eq!(job_status, "truncated");
-        assert!(job_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("32-byte protective limit"));
+        assert_eq!(job_status, "completed_with_diagnostics");
+        assert_eq!(job_error, None);
         let parameters: serde_json::Value = serde_json::from_str(&parameters)?;
         assert_eq!(parameters["max_files"].as_u64(), Some(0));
         assert!(parameters["effective_max_files"].is_null());
         assert_eq!(parameters["protective_extent_limit_hits"].as_u64(), Some(1));
-        assert_eq!(parameters["truncated"].as_bool(), Some(true));
+        assert_eq!(parameters["truncated"].as_bool(), Some(false));
+        assert_eq!(
+            parameters["canonical_generation_complete"].as_bool(),
+            Some(true)
+        );
 
+        drop(conn);
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(&dir);
         Ok(())
@@ -45084,7 +55182,7 @@ mod tests {
         create_test_case(&case_path)?;
         let dir = unique_temp_dir("carve-file-limit-source");
         let image_path = dir.join("carve-file-limit.img");
-        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, b'x', 0xFF, 0xD9];
+        let jpeg = minimal_valid_jpeg();
         let mut image = vec![0_u8; 512];
         image[32..32 + jpeg.len()].copy_from_slice(&jpeg);
         image[256..256 + jpeg.len()].copy_from_slice(&jpeg);
@@ -45130,7 +55228,243 @@ mod tests {
         );
         assert_eq!(effective_limit, 1);
 
+        drop(conn);
         cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_carve_reprocess_preserves_prior_complete_generation() -> Result<()> {
+        let case_path = unique_case_path("carve-preserve-complete");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("carve-preserve-complete-source");
+        let image_path = dir.join("carve-preserve.img");
+        let jpeg = minimal_valid_jpeg();
+        let mut image = vec![0_u8; 1024];
+        image[64..64 + jpeg.len()].copy_from_slice(&jpeg);
+        image[512..512 + jpeg.len()].copy_from_slice(&jpeg);
+        fs::write(&image_path, image)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path,
+                kind: EvidenceKind::Image,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        let complete = carve_evidence(
+            &case_path,
+            evidence_id,
+            CarveOptions {
+                max_scan_bytes: 0,
+                max_files: 0,
+            },
+        )?;
+        assert_eq!(complete.status, "completed");
+        assert_eq!(complete.carved_files, 2);
+        let before = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let mut before_ids = before
+            .iter()
+            .filter(|entry| {
+                entry.metadata_json["artifact_kind"].as_str() == Some("carved_file")
+                    && entry.metadata_json["carve_generation_canonical"].as_bool() == Some(true)
+            })
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        before_ids.sort_unstable();
+        assert_eq!(before_ids.len(), 2);
+
+        let limited = carve_evidence(
+            &case_path,
+            evidence_id,
+            CarveOptions {
+                max_scan_bytes: 0,
+                max_files: 1,
+            },
+        )?;
+        assert_eq!(limited.status, "truncated");
+        assert!(limited.canonical_generation_preserved);
+        assert_eq!(limited.carved_files, 1);
+
+        let after = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let mut after_ids = after
+            .iter()
+            .filter(|entry| {
+                entry.metadata_json["artifact_kind"].as_str() == Some("carved_file")
+                    && entry.metadata_json["carve_generation_canonical"].as_bool() == Some(true)
+            })
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        after_ids.sort_unstable();
+        assert_eq!(after_ids, before_ids);
+        for entry in after.iter().filter(|entry| before_ids.contains(&entry.id)) {
+            assert_eq!(
+                entry.metadata_json["carve_last_attempt_status"].as_str(),
+                Some("truncated")
+            );
+            assert_eq!(
+                entry.metadata_json["carve_last_attempt_replacement_committed"].as_bool(),
+                Some(false)
+            );
+        }
+
+        let conn = Connection::open(&case_path)?;
+        let (status, preserved, replacement): (String, i64, i64) = conn.query_row(
+            "SELECT status,
+                    json_extract(parameters_json, '$.canonical_generation_preserved'),
+                    json_extract(parameters_json, '$.replacement_committed')
+             FROM evidence_jobs
+             WHERE evidence_id = ?1 AND job_type = 'carve'
+             ORDER BY id DESC LIMIT 1",
+            [evidence_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(status, "truncated");
+        assert_eq!(preserved, 1);
+        assert_eq!(replacement, 0);
+
+        drop(conn);
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_carve_job_finalization_preserves_canonical_rows() -> Result<()> {
+        let case_path = unique_case_path("carve-failed-finalization");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("carve-failed-finalization-source");
+        let image_path = dir.join("carve-failed.img");
+        fs::write(&image_path, minimal_valid_jpeg())?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path,
+                kind: EvidenceKind::Image,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        carve_evidence(
+            &case_path,
+            evidence_id,
+            CarveOptions {
+                max_scan_bytes: 0,
+                max_files: 0,
+            },
+        )?;
+
+        let conn = Connection::open(&case_path)?;
+        let case_id: i64 = conn.query_row("SELECT id FROM cases LIMIT 1", [], |row| row.get(0))?;
+        let (entry_id, metadata_before): (i64, String) = conn.query_row(
+            "SELECT id, metadata_json FROM filesystem_entries
+             WHERE evidence_id = ?1
+               AND json_extract(metadata_json, '$.artifact_kind') = 'carved_file'",
+            [evidence_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        conn.execute(
+            "INSERT INTO evidence_jobs(
+                 case_id, evidence_id, job_type, status, parameters_json, started_at
+             ) VALUES (?1, ?2, 'carve', 'running', '{}',
+                       strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![case_id, evidence_id],
+        )?;
+        let failed_job_id = conn.last_insert_rowid();
+        drop(conn);
+
+        finalize_failed_carve_job(
+            &case_path,
+            evidence_id,
+            failed_job_id,
+            "synthetic fatal scan failure",
+        )?;
+        let conn = Connection::open(&case_path)?;
+        let (status, error, preserved, replacement): (String, String, i64, i64) = conn.query_row(
+            "SELECT status, error,
+                    json_extract(parameters_json, '$.canonical_generation_preserved'),
+                    json_extract(parameters_json, '$.replacement_committed')
+             FROM evidence_jobs WHERE id = ?1",
+            [failed_job_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(status, "failed");
+        assert_eq!(error, "synthetic fatal scan failure");
+        assert_eq!(preserved, 1);
+        assert_eq!(replacement, 0);
+        let metadata_after: String = conn.query_row(
+            "SELECT metadata_json FROM filesystem_entries WHERE id = ?1",
+            [entry_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(metadata_after, metadata_before);
+
+        drop(conn);
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn carve_spool_is_bounded_collision_safe_and_cleaned_exactly() -> Result<()> {
+        let dir = unique_temp_dir("carve-spool-guardrails");
+        let stale = dir.join("stale.sqlite");
+        fs::write(&stale, b"preserve stale bytes")?;
+        let collision =
+            create_private_new_file(&stale).expect_err("create_new must reject stale path");
+        assert_eq!(collision.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&stale)?, b"preserve stale bytes");
+
+        let mut spool = CarveRecordSpool::new(Path::new("fixture.img"))?;
+        let spool_path = spool._guard.path.clone();
+        assert!(spool_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&spool_path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let invalid_json = CarveSpoolRecord {
+            logical_path: "/candidate/invalid".to_string(),
+            name: "invalid".to_string(),
+            entry_kind: "record".to_string(),
+            size_bytes: None,
+            metadata_json: "not-json".to_string(),
+        };
+        assert!(spool.push(&invalid_json).is_err());
+        let oversized = CarveSpoolRecord {
+            logical_path: "x".repeat(CARVE_SPOOL_PATH_MAX_BYTES + 1),
+            name: "oversized".to_string(),
+            entry_kind: "record".to_string(),
+            size_bytes: None,
+            metadata_json: "{}".to_string(),
+        };
+        assert!(spool.push(&oversized).is_err());
+        let valid = CarveSpoolRecord {
+            logical_path: "/candidate/valid".to_string(),
+            name: "valid".to_string(),
+            entry_kind: "record".to_string(),
+            size_bytes: None,
+            metadata_json: serde_json::json!({"offset": 7}).to_string(),
+        };
+        spool.push(&valid)?;
+        spool.seal()?;
+        assert!(spool.push(&valid).is_err());
+        drop(spool);
+        assert!(!spool_path.exists());
+
+        let mut failed_seal = CarveRecordSpool::new(Path::new("fixture.img"))?;
+        let failed_path = failed_seal._guard.path.clone();
+        failed_seal.conn.execute_batch("ROLLBACK")?;
+        assert!(failed_seal.seal().is_err());
+        drop(failed_seal);
+        assert!(!failed_path.exists());
+
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -45629,6 +55963,28 @@ mod tests {
             Some("boot_sector_scan")
         );
         assert_eq!(
+            record.metadata_json["discovery_source"].as_str(),
+            Some("partition_map_gap_header_scan")
+        );
+        assert_eq!(
+            record.metadata_json["candidate_validation_status"].as_str(),
+            Some("validated")
+        );
+        assert_eq!(
+            record.metadata_json["offset_coordinate_system"].as_str(),
+            Some("decoded evidence media byte stream")
+        );
+        assert_eq!(
+            record.metadata_json["decoded_media_start_offset_bytes"].as_u64(),
+            Some(volume_offset as u64)
+        );
+        assert_eq!(
+            record.metadata_json["container_file_physical_offset_status"].as_str(),
+            Some(
+                "not available; decoded-media offsets must not be treated as EWF/container-file byte offsets"
+            )
+        );
+        assert_eq!(
             record.metadata_json["category_main"].as_str(),
             Some("Recovery")
         );
@@ -45657,6 +56013,251 @@ mod tests {
             },
         )?;
         assert_eq!(bytes.bytes, b"FAT evidence artifact");
+        let conn = open_existing_case(&case_path)?;
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![processed.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert_eq!(
+            parameters["lost_partition_scan"]["status"].as_str(),
+            Some("complete")
+        );
+        assert_eq!(
+            parameters["lost_partition_scan"]["coverage_complete"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parameters["lost_partition_scan"]["candidate_content_indexing_complete"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            parameters["lost_partition_scan"]["validated_volume_candidates"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parameters["lost_partition_scan"]["validated_volume_findings_persisted"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parameters["lost_partition_scan"]["candidate_indexing_failures"].as_u64(),
+            Some(0)
+        );
+        drop(conn);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn lost_partition_bounded_ext_reader_never_reads_past_candidate_end() -> Result<()> {
+        let source = (0_u8..16).collect::<Vec<_>>();
+        let reader = Ext4ImageReader {
+            reader: RefCell::new(Box::new(std::io::Cursor::new(source))),
+            partition_start: 4,
+            partition_size: 3,
+        };
+        let mut bytes = [0xAA_u8; 8];
+        let read = positioned_io::ReadAt::read_at(&reader, 1, &mut bytes)?;
+        assert_eq!(read, 2);
+        assert_eq!(&bytes[..read], &[5, 6]);
+        assert!(bytes[read..].iter().all(|byte| *byte == 0xAA));
+
+        let mut beyond = [0xAA_u8; 2];
+        assert_eq!(positioned_io::ReadAt::read_at(&reader, 3, &mut beyond)?, 0);
+        assert_eq!(beyond, [0xAA; 2]);
+        Ok(())
+    }
+
+    #[test]
+    fn ext_location_claim_must_fit_authoritative_partition_slice() {
+        let valid = ext4::DataLocation {
+            filesystem_offset: 3_584,
+            file_offset: 0,
+            contiguous_bytes: 512,
+            storage: ext4::DataLocationStorage::Extent,
+        };
+        assert_eq!(bounded_ext_data_location(Some(valid), 4_096), Some(valid));
+
+        let crosses_end = ext4::DataLocation {
+            filesystem_offset: 3_585,
+            ..valid
+        };
+        assert_eq!(bounded_ext_data_location(Some(crosses_end), 4_096), None);
+
+        let overflow = ext4::DataLocation {
+            filesystem_offset: u64::MAX - 1,
+            contiguous_bytes: 4,
+            ..valid
+        };
+        assert_eq!(bounded_ext_data_location(Some(overflow), u64::MAX), None);
+
+        let empty = ext4::DataLocation {
+            contiguous_bytes: 0,
+            ..valid
+        };
+        assert_eq!(bounded_ext_data_location(Some(empty), 4_096), None);
+    }
+
+    #[test]
+    fn lost_partition_error_disposition_keeps_database_and_invariants_fatal() {
+        let parser_read = anyhow::Error::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "candidate directory record is malformed",
+        ));
+        assert!(!lost_partition_indexing_error_is_fatal(&parser_read));
+
+        let database = anyhow::Error::new(rusqlite::Error::InvalidQuery);
+        assert!(lost_partition_indexing_error_is_fatal(&database));
+
+        let invariant =
+            anyhow!("internal lost-partition invariant: validated filesystem has no parser");
+        assert!(lost_partition_indexing_error_is_fatal(&invariant));
+    }
+
+    #[test]
+    fn lost_partition_hint_is_not_persisted_as_a_validated_volume() -> Result<()> {
+        let case_path = unique_case_path("image-lost-partition-hint-only");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("image-lost-partition-hint-only-source");
+        let image_path = evidence_dir.join("hint-only.img");
+        let candidate_offset = 2 * 1024 * 1024;
+        let volume_bytes = 4 * 1024 * 1024;
+        let mut image = vec![0_u8; candidate_offset + volume_bytes + 512];
+        let boot = &mut image[candidate_offset..candidate_offset + 512];
+        boot[3..11].copy_from_slice(b"NTFS    ");
+        boot[11..13].copy_from_slice(&512_u16.to_le_bytes());
+        boot[13] = 8;
+        boot[14..16].copy_from_slice(&0_u16.to_le_bytes());
+        boot[21] = 0xF8;
+        boot[40..48].copy_from_slice(&8192_u64.to_le_bytes());
+        boot[48..56].copy_from_slice(&4_u64.to_le_bytes());
+        boot[56..64].copy_from_slice(&8_u64.to_le_bytes());
+        boot[64] = (-10_i8) as u8;
+        boot[68] = (-12_i8) as u8;
+        boot[510..512].copy_from_slice(&[0x55, 0xAA]);
+        // The BPB is coherent enough for discovery, but there is no FILE
+        // record at the claimed MFT location. The actual NTFS parser must
+        // reject it before any validated-volume database row is written.
+        fs::write(&image_path, image)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path,
+                kind: EvidenceKind::Image,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let processed = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 200,
+            },
+        )?;
+        assert_eq!(processed.status, "completed");
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        assert!(!entries.iter().any(|entry| {
+            matches!(
+                entry.metadata_json["artifact_kind"].as_str(),
+                Some("recovered_partition" | "filesystem_volume")
+            ) && entry
+                .metadata_json
+                .get("partition_start_offset")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| entry.metadata_json["start_offset"].as_u64())
+                == Some(candidate_offset as u64)
+        }));
+        let conn = open_existing_case(&case_path)?;
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![processed.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert_eq!(
+            parameters["lost_partition_scan"]["status"].as_str(),
+            Some("complete")
+        );
+        assert_eq!(
+            parameters["lost_partition_scan"]["downstream_parser_rejections"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            parameters["lost_partition_scan"]["candidate_findings_persisted"].as_u64(),
+            Some(0)
+        );
+        drop(conn);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn lost_partition_examiner_limit_is_truncated_not_diagnostic() -> Result<()> {
+        let case_path = unique_case_path("image-lost-partition-limit");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("image-lost-partition-limit-source");
+        let image_path = evidence_dir.join("limited.img");
+        let fat_volume = test_fat_volume_bytes()?;
+        let volume_offset = 2 * 1024 * 1024;
+        let mut image = vec![0_u8; volume_offset + fat_volume.len() + 512];
+        image[volume_offset..volume_offset + fat_volume.len()].copy_from_slice(&fat_volume);
+        fs::write(&image_path, image)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path,
+                kind: EvidenceKind::Image,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let processed = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                // Container/partitioning disclosures + validated-candidate
+                // record + volume root. The explicit examiner limit stops
+                // before child rows.
+                max_entries: 4,
+            },
+        )?;
+        assert_eq!(processed.status, "truncated");
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        assert!(entries.iter().any(|entry| {
+            entry.metadata_json["artifact_kind"].as_str() == Some("recovered_partition")
+                && entry.metadata_json["candidate_validation_status"].as_str() == Some("validated")
+        }));
+        assert!(!entries.iter().any(|entry| {
+            entry.metadata_json["artifact_kind"].as_str() == Some("filesystem_parser_error")
+        }));
+        let conn = open_existing_case(&case_path)?;
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![processed.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert_eq!(
+            parameters["lost_partition_scan"]["status"].as_str(),
+            Some("stopped_at_examiner_entry_limit")
+        );
+        assert_eq!(
+            parameters["lost_partition_scan"]["coverage_complete"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            parameters["lost_partition_scan"]["candidate_content_indexing_complete"].as_bool(),
+            Some(false)
+        );
+        drop(conn);
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
@@ -45765,7 +56366,10 @@ mod tests {
             },
         )?;
         assert!(
-            matches!(processed.status.as_str(), "completed" | "truncated"),
+            matches!(
+                processed.status.as_str(),
+                "completed" | "completed_with_diagnostics" | "truncated"
+            ),
             "unexpected NTFS processing status: {}",
             processed.status
         );
@@ -45808,6 +56412,27 @@ mod tests {
         )?;
         assert_eq!(bytes.bytes, b"12345");
         assert_eq!(bytes.total_size, 5);
+        let resident_offset = file.metadata_json["file_data_physical_offset"]
+            .as_u64()
+            .expect("resident NTFS data must have an exact decoded-media offset");
+        assert_eq!(
+            file.metadata_json["file_data_file_offset"].as_u64(),
+            Some(0)
+        );
+        assert!(file.metadata_json["file_data_contiguous_bytes"]
+            .as_u64()
+            .is_some_and(|length| length >= 5));
+        assert!(file.metadata_json["physical_offset_basis"]
+            .as_str()
+            .is_some_and(|basis| basis.contains("resident $DATA value")));
+        // Independent raw-media proof: this catches ntfs 0.4.0's resident
+        // `data_position()` defect, which reports the attribute header (24
+        // bytes before the usual value payload) rather than `value_offset`.
+        let mut raw = fs::File::open(&image_path)?;
+        raw.seek(SeekFrom::Start(resident_offset))?;
+        let mut resident_payload = [0_u8; 5];
+        raw.read_exact(&mut resident_payload)?;
+        assert_eq!(&resident_payload, b"12345");
 
         let unallocated = entries
             .iter()
@@ -45847,6 +56472,88 @@ mod tests {
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    /// Optional, strictly read-only regression proof against an examiner-owned
+    /// image. The test never creates or updates a case and never prints file
+    /// content. It independently compares the logical NTFS stream prefix with
+    /// bytes read at the location derived from the resident attribute's real
+    /// `value_offset`, catching the upstream 24-byte attribute-header defect.
+    #[test]
+    fn read_only_gold_ntfs_resident_location_matches_decoded_media_when_configured() -> Result<()> {
+        let Some(image_path) = std::env::var_os("KDFT_READ_ONLY_GOLD_IMAGE").map(PathBuf::from)
+        else {
+            eprintln!("skipping read-only gold NTFS location proof; image is not configured");
+            return Ok(());
+        };
+        let target_path = std::env::var("KDFT_READ_ONLY_GOLD_RESIDENT_PATH")
+            .unwrap_or_else(|_| "Users/Alice/Downloads/invoice (1).pdf".to_string());
+        let (parent_path, file_name) = target_path
+            .rsplit_once('/')
+            .context("configured gold resident path must include its parent directory")?;
+        let volumes = list_image_volumes(&image_path)?;
+        let mut target = None;
+        for (volume_index, volume) in volumes.iter().enumerate() {
+            if volume.filesystem != "NTFS" {
+                continue;
+            }
+            let Ok(entries) = list_image_directory(&image_path, volume_index, parent_path) else {
+                continue;
+            };
+            if let Some(entry) = entries
+                .into_iter()
+                .find(|entry| !entry.is_dir && entry.name.eq_ignore_ascii_case(file_name))
+            {
+                target = Some((volume_index, entry));
+                break;
+            }
+        }
+        let (volume_index, target) = target.with_context(|| {
+            format!("configured resident target was not found in a live NTFS view: {target_path}")
+        })?;
+        let decoded_offset = target
+            .file_data_physical_offset
+            .context("gold resident target has no decoded-media data offset")?;
+        if target.file_data_file_offset != Some(0)
+            || target.file_data_direct_logical_mapping != Some(true)
+            || target.offset_coordinate_system.as_deref() != Some("decoded_media_byte_stream")
+            || target
+                .physical_offset_basis
+                .as_deref()
+                .is_none_or(|basis| !basis.contains("resident $DATA value"))
+        {
+            bail!("gold resident target does not carry exact direct-mapping provenance");
+        }
+        let sample_len = target
+            .file_data_contiguous_bytes
+            .unwrap_or(0)
+            .min(
+                target
+                    .size_bytes
+                    .and_then(|size| u64::try_from(size).ok())
+                    .unwrap_or(0),
+            )
+            .min(64);
+        if sample_len == 0 {
+            bail!("gold resident target has no authoritative contiguous bytes");
+        }
+        let (logical_bytes, _) = read_image_directory_bytes(
+            &image_path,
+            volume_index,
+            &target_path,
+            0,
+            usize::try_from(sample_len).unwrap_or(64),
+        )?;
+        let mut opened = open_disk_image(&image_path)?;
+        opened.reader.seek(SeekFrom::Start(decoded_offset))?;
+        let mut raw_bytes = vec![0_u8; logical_bytes.len()];
+        opened.reader.read_exact(&mut raw_bytes)?;
+        if raw_bytes != logical_bytes {
+            bail!(
+                "gold resident location does not map to the logical stream prefix (content withheld)"
+            );
+        }
         Ok(())
     }
 
@@ -45981,8 +56688,43 @@ mod tests {
         // ZIP container with an Office Open XML extension -> alias, not mismatch.
         let zip = [0x50, 0x4B, 0x03, 0x04];
         assert_eq!(evaluate_signature("report.docx", &zip).status, "alias");
+        assert_eq!(
+            evaluate_signature("empty.zip", b"PK\x05\x06").status,
+            "match"
+        );
         // ZIP container renamed to .jpg -> mismatch.
         assert_eq!(evaluate_signature("hidden.jpg", &zip).status, "mismatch");
+
+        // RIFF is a generic chunk marker. Only supported media form identifiers are sufficient
+        // to classify a file, and gzip also requires the compression-method byte.
+        assert_eq!(
+            evaluate_signature("false-positive.bin", b"RIFF\0\0\0\0JUNK").status,
+            "unknown"
+        );
+        assert_eq!(
+            evaluate_signature("audio.wav", b"RIFF\x04\0\0\0WAVE").status,
+            "alias"
+        );
+        assert_eq!(
+            evaluate_signature("short.bin", b"\x1f\x8b ordinary bytes").status,
+            "unknown"
+        );
+        assert_eq!(
+            evaluate_signature("stream.gz", b"\x1f\x8b\x08\0").status,
+            "match"
+        );
+
+        // `MZ` alone is a DOS marker, not proof of a Windows PE file. Require the PE header at
+        // the bounded e_lfanew offset so ordinary text or damaged stubs do not become executables.
+        assert_eq!(
+            evaluate_signature("not-an-exe.txt", b"MZ ordinary text").status,
+            "unknown"
+        );
+        let mut pe = vec![0_u8; 128];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x40_u32.to_le_bytes());
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        assert_eq!(evaluate_signature("program.exe", &pe).status, "match");
 
         let invoice = b"Date,Vendor,Amount,Status\r\n2026-01-04,Acme,125.00,Paid\r\n2026-02-07,Globex,88.10,Pending\r\n2026-03-11,Initech,42.00,Paid\r\n";
         let disguised_invoice = evaluate_signature("invoice.pdf", invoice);
@@ -45995,12 +56737,281 @@ mod tests {
         assert_eq!(evaluate_signature("invoice.csv", invoice).status, "match");
         assert_eq!(evaluate_signature("invoice.dat", invoice).status, "unknown");
 
+        let complete_digest = "a".repeat(64);
+        let proven = serde_json::json!({
+            "file_sha256": complete_digest,
+            "file_sha256_input": "complete reconstructed file content",
+        });
+        assert!(
+            signature_content_identity(proven.as_object().expect("object"), Some(129),).is_some()
+        );
+        assert!(signature_content_identity(proven.as_object().expect("object"), None,).is_none());
+        let unproven = serde_json::json!({"file_sha256": "b".repeat(64)});
+        assert!(
+            signature_content_identity(unproven.as_object().expect("object"), Some(129),).is_none()
+        );
+
         let valid_pdf = b"leading comment\r\n%PDF-1.7\r\n";
         assert_eq!(evaluate_signature("valid.pdf", valid_pdf).status, "match");
         assert_eq!(
             evaluate_signature_with_completeness("partial.pdf", b"partial", false).status,
             "unknown"
         );
+    }
+
+    #[test]
+    fn signature_applicability_requires_complete_ntfs_stream_provenance() {
+        let ordinary = serde_json::json!({
+            "artifact_kind": "filesystem_entry",
+            "ntfs_file_record_number": 41,
+            "mft_attribute_parse_error_count": 0,
+            "mft_attribute_list_present": false,
+            "ntfs_data_streams": [{"name": "", "size": 64}],
+        });
+        assert_eq!(
+            signature_not_applicable_from_metadata(
+                ordinary.as_object().expect("object metadata"),
+                false,
+            ),
+            None
+        );
+
+        let ads_only_base = serde_json::json!({
+            "artifact_kind": "filesystem_entry",
+            "ntfs_file_record_number": 42,
+            "mft_attribute_parse_error_count": 0,
+            "mft_attribute_list_present": false,
+            "ntfs_data_streams": [{"name": "Zone.Identifier", "size": 27}],
+        });
+        assert_eq!(
+            signature_not_applicable_from_metadata(
+                ads_only_base.as_object().expect("object metadata"),
+                false,
+            ),
+            Some((
+                SignatureNotApplicableReason::NtfsNoUnnamedDataStream,
+                "complete_mft_data_stream_inventory"
+            ))
+        );
+        // Affirmative captured bytes win over an inventory mismatch so reconstructed logical files
+        // and other ordinary files retain signature coverage.
+        assert_eq!(
+            signature_not_applicable_from_metadata(
+                ads_only_base.as_object().expect("object metadata"),
+                true,
+            ),
+            None
+        );
+
+        let named_ads = serde_json::json!({
+            "artifact_kind": "filesystem_entry",
+            "ntfs_file_record_number": 42,
+            "ntfs_data_stream_name": "Zone.Identifier",
+            "mft_attribute_parse_error_count": 0,
+            "mft_attribute_list_present": false,
+            "ntfs_data_streams": [{"name": "Zone.Identifier", "size": 27}],
+        });
+        assert_eq!(
+            signature_not_applicable_from_metadata(
+                named_ads.as_object().expect("object metadata"),
+                false,
+            ),
+            None,
+            "readable non-WOF ADS remain signature candidates"
+        );
+
+        for incomplete_inventory in [
+            serde_json::json!({
+                "ntfs_file_record_number": 42,
+                "mft_attribute_parse_error_count": 1,
+                "mft_attribute_list_present": false,
+                "ntfs_data_streams": [],
+            }),
+            serde_json::json!({
+                "ntfs_file_record_number": 42,
+                "mft_attribute_parse_error_count": 0,
+                "mft_attribute_list_present": true,
+                "ntfs_data_streams": [],
+            }),
+            serde_json::json!({
+                "ntfs_file_record_number": 42,
+                "mft_attribute_parse_error_count": 0,
+                "mft_attribute_list_present": false,
+                "ntfs_data_streams": [{"size": 27}],
+            }),
+        ] {
+            assert_eq!(
+                signature_not_applicable_from_metadata(
+                    incomplete_inventory.as_object().expect("object metadata"),
+                    false,
+                ),
+                None,
+                "incomplete or malformed MFT metadata must not reduce file coverage"
+            );
+        }
+    }
+
+    #[test]
+    fn signature_applicability_recognizes_only_the_exact_no_unnamed_stream_error() {
+        let no_unnamed = anyhow!("NTFS entry has no unnamed data stream: /evidence/base-row")
+            .context("reading bytes for filesystem entry 42");
+        assert!(signature_error_is_ntfs_no_unnamed_data_stream(&no_unnamed));
+
+        for real_read_error in [
+            anyhow!("NTFS entry has no data stream named Zone.Identifier: /evidence/file"),
+            anyhow!("NTFS data stream is encrypted and cannot be decoded safely: /evidence/file"),
+            anyhow!("short read from evidence source"),
+        ] {
+            assert!(
+                !signature_error_is_ntfs_no_unnamed_data_stream(&real_read_error),
+                "real read failures must remain unreadable diagnostics"
+            );
+        }
+    }
+
+    #[test]
+    fn signature_analysis_stamps_non_applicable_rows_without_truncating() -> Result<()> {
+        let case_path = unique_case_path("signature-not-applicable");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("signature-not-applicable-source");
+        fs::create_dir_all(&evidence_dir)?;
+        fs::write(
+            evidence_dir.join("ordinary.png"),
+            [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+        )?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+
+        let case_id = active_case_id(&open_existing_case(&case_path)?)?;
+        let synthetic_rows = [
+            (
+                "/synthetic/ads-only-base.txt",
+                "ads-only-base.txt",
+                27_i64,
+                serde_json::json!({
+                    "artifact_kind": "filesystem_entry",
+                    "filesystem_parser": "ntfs",
+                    "ntfs_file_record_number": 42,
+                    "mft_attribute_parse_error_count": 0,
+                    "mft_attribute_list_present": false,
+                    "ntfs_data_streams": [{"name": "Zone.Identifier", "size": 27}],
+                }),
+            ),
+            (
+                "/synthetic/carrier.exe~ads_WofCompressedData",
+                "carrier.exe:WofCompressedData",
+                512_i64,
+                serde_json::json!({
+                    "artifact_kind": "filesystem_entry",
+                    "filesystem_parser": "ntfs",
+                    "ntfs_file_record_number": 43,
+                    "ntfs_data_stream_name": "WofCompressedData",
+                    "storage_area": "alternate_data_stream",
+                }),
+            ),
+            (
+                "/synthetic/UnallocatedSpace",
+                "UnallocatedSpace",
+                4096_i64,
+                serde_json::json!({
+                    "artifact_kind": "unallocated_space",
+                    "storage_area": "unallocated",
+                }),
+            ),
+        ];
+        {
+            let conn = open_existing_case(&case_path)?;
+            for (logical_path, name, size_bytes, metadata) in &synthetic_rows {
+                conn.execute(
+                    "INSERT INTO filesystem_entries(
+                         case_id, evidence_id, logical_path, name, entry_kind, size_bytes,
+                         metadata_json
+                     ) VALUES (?1, ?2, ?3, ?4, 'file', ?5, ?6)",
+                    params![
+                        case_id,
+                        evidence_id,
+                        logical_path,
+                        name,
+                        size_bytes,
+                        metadata.to_string()
+                    ],
+                )?;
+            }
+        }
+
+        let result = analyze_signatures(
+            &case_path,
+            AnalyzeSignaturesOptions {
+                evidence_id: Some(evidence_id),
+                max_entries: 0,
+            },
+        )?;
+        assert_eq!(result.status, "completed");
+        assert!(!result.truncated);
+        assert_eq!(result.candidates_total, 4);
+        assert_eq!(result.candidates_processed, 4);
+        assert_eq!(result.files_examined, 1);
+        assert_eq!(result.not_applicable, 3);
+        assert_eq!(result.not_applicable_ntfs_no_unnamed_stream, 1);
+        assert_eq!(result.not_applicable_wof_auxiliary_streams, 1);
+        assert_eq!(result.not_applicable_non_file_rows, 1);
+        assert_eq!(result.files_skipped, 3);
+        assert_eq!(result.unreadable, 0);
+        assert!(result.errors.is_empty());
+
+        let conn = open_existing_case(&case_path)?;
+        for (logical_path, _, _, _) in &synthetic_rows {
+            let metadata_json: String = conn.query_row(
+                "SELECT metadata_json FROM filesystem_entries
+                 WHERE case_id = ?1 AND evidence_id = ?2 AND logical_path = ?3",
+                params![case_id, evidence_id, logical_path],
+                |row| row.get(0),
+            )?;
+            let metadata: serde_json::Value = serde_json::from_str(&metadata_json)?;
+            assert_eq!(
+                metadata["signature_status"].as_str(),
+                Some("not_applicable")
+            );
+            assert_eq!(
+                metadata["signature_analysis"].as_str(),
+                Some(SIGNATURE_ANALYSIS_VERSION)
+            );
+            assert!(metadata["signature_not_applicable_reason_code"]
+                .as_str()
+                .is_some());
+            assert!(metadata["signature_applicability_basis"].as_str().is_some());
+        }
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![result.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert_eq!(parameters["not_applicable"].as_u64(), Some(3));
+        assert_eq!(
+            parameters["not_applicable_ntfs_no_unnamed_stream"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(parameters["unreadable"].as_u64(), Some(0));
+        drop(conn);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
     }
 
     #[test]
@@ -46079,6 +57090,14 @@ mod tests {
             disguised.metadata_json.get("file_extension"),
             Some(&serde_json::Value::String("txt".to_string()))
         );
+        assert_eq!(
+            disguised.metadata_json["category_main"].as_str(),
+            Some("Pictures and Media")
+        );
+        assert_eq!(
+            disguised.metadata_json["category_sub"].as_str(),
+            Some("Pictures")
+        );
 
         let real = entries
             .iter()
@@ -46088,7 +57107,6 @@ mod tests {
             real.metadata_json.get("signature_status"),
             Some(&serde_json::Value::String("unknown".to_string()))
         );
-
         let invoice = entries
             .iter()
             .find(|entry| entry.logical_path.ends_with("/invoice.pdf"))
@@ -46108,6 +57126,26 @@ mod tests {
         assert_eq!(
             invoice.metadata_json["signature_detection_basis"].as_str(),
             Some("content_heuristic")
+        );
+        assert_eq!(
+            invoice.metadata_json["category_confidence"].as_str(),
+            Some("medium")
+        );
+        assert_eq!(
+            invoice.metadata_json["signature_detection_confidence"].as_str(),
+            Some("medium")
+        );
+        assert_eq!(
+            invoice.metadata_json["signature_status_confidence"].as_str(),
+            Some("medium")
+        );
+        assert_eq!(
+            invoice.metadata_json["category_main"].as_str(),
+            Some("Documents and Office")
+        );
+        assert_eq!(
+            invoice.metadata_json["category_sub"].as_str(),
+            Some("Spreadsheets")
         );
 
         cleanup_case_path(&case_path);
@@ -46152,8 +57190,8 @@ mod tests {
         let analyzed_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM filesystem_entries
              WHERE evidence_id = ?1 AND entry_kind = 'file'
-               AND json_extract(metadata_json, '$.signature_analysis') = 'signature_magic_and_text_v2'",
-            params![evidence_id],
+               AND json_extract(metadata_json, '$.signature_analysis') = ?2",
+            params![evidence_id, SIGNATURE_ANALYSIS_VERSION],
             |row| row.get(0),
         )?;
         assert_eq!(usize::try_from(analyzed_count)?, file_count);
@@ -46181,7 +57219,11 @@ mod tests {
         let evidence_dir = unique_temp_dir("signature-captured-header-source");
         fs::create_dir_all(&evidence_dir)?;
         let source = evidence_dir.join("captured.exe");
-        fs::write(&source, b"MZ captured executable header")?;
+        let mut pe = vec![0_u8; 128];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x40_u32.to_le_bytes());
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        fs::write(&source, pe)?;
         let evidence_id = add_evidence(
             &case_path,
             AddEvidenceOptions {
@@ -46278,10 +57320,12 @@ mod tests {
             let mut stmt = conn.prepare(
                 "SELECT logical_path FROM filesystem_entries
                  WHERE evidence_id = ?1
-                   AND json_extract(metadata_json, '$.signature_analysis') = 'signature_magic_and_text_v2'
+                   AND json_extract(metadata_json, '$.signature_analysis') = ?2
                  ORDER BY evidence_id, logical_path, id",
             )?;
-            let rows = stmt.query_map(params![evidence_id], |row| row.get(0))?;
+            let rows = stmt.query_map(params![evidence_id, SIGNATURE_ANALYSIS_VERSION], |row| {
+                row.get(0)
+            })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
         assert_eq!(analyzed_paths, expected_paths);
@@ -46302,6 +57346,286 @@ mod tests {
             Some(exact_limit as u64)
         );
         drop(conn);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn signature_analysis_limited_rerun_preserves_prior_complete_generation_atomically(
+    ) -> Result<()> {
+        let (case_path, evidence_dir, evidence_id) =
+            create_signature_analysis_test_evidence("signature-preserve-limit", 7)?;
+        let complete = analyze_signatures(
+            &case_path,
+            AnalyzeSignaturesOptions {
+                evidence_id: Some(evidence_id),
+                max_entries: 0,
+            },
+        )?;
+        assert_eq!(complete.status, "completed");
+        {
+            let conn = open_existing_case(&case_path)?;
+            conn.execute(
+                "UPDATE filesystem_entries
+                 SET metadata_json = json_set(
+                     metadata_json,
+                     '$.signature_analysis', 'prior-complete-signature-generation',
+                     '$.prior_generation_sentinel', 'retain-exactly')
+                 WHERE evidence_id = ?1 AND entry_kind = 'file'",
+                params![evidence_id],
+            )?;
+        }
+        let before: Vec<(i64, String)> = {
+            let conn = open_existing_case(&case_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, metadata_json FROM filesystem_entries
+                 WHERE evidence_id = ?1 AND entry_kind = 'file' ORDER BY id",
+            )?;
+            let rows =
+                stmt.query_map(params![evidence_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let limited = analyze_signatures(
+            &case_path,
+            AnalyzeSignaturesOptions {
+                evidence_id: Some(evidence_id),
+                max_entries: 3,
+            },
+        )?;
+        assert_eq!(limited.status, "truncated");
+        assert!(limited.truncated);
+        assert!(limited.canonical_generation_preserved);
+        assert!(!limited.replacement_committed);
+        assert_eq!(limited.metadata_updates_committed, 0);
+        assert_eq!(limited.candidates_processed, 3);
+        let after: Vec<(i64, String)> = {
+            let conn = open_existing_case(&case_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, metadata_json FROM filesystem_entries
+                 WHERE evidence_id = ?1 AND entry_kind = 'file' ORDER BY id",
+            )?;
+            let rows =
+                stmt.query_map(params![evidence_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        assert_eq!(
+            after, before,
+            "limited rerun must not mix signature generations"
+        );
+        let parameters_json: String = open_existing_case(&case_path)?.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![limited.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert_eq!(
+            parameters["canonical_generation_preserved"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(parameters["metadata_updates_committed"].as_u64(), Some(0));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn signature_analysis_diagnostic_rerun_preserves_prior_complete_generation_atomically(
+    ) -> Result<()> {
+        let (case_path, evidence_dir, evidence_id) =
+            create_signature_analysis_test_evidence("signature-preserve-diagnostics", 3)?;
+        let complete = analyze_signatures(
+            &case_path,
+            AnalyzeSignaturesOptions {
+                evidence_id: Some(evidence_id),
+                max_entries: 0,
+            },
+        )?;
+        assert_eq!(complete.status, "completed");
+        let entries: Vec<(i64, String, String)> = {
+            let conn = open_existing_case(&case_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, name, logical_path FROM filesystem_entries
+                 WHERE evidence_id = ?1 AND entry_kind = 'file'
+                 ORDER BY logical_path, id",
+            )?;
+            let rows = stmt.query_map(params![evidence_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        {
+            let conn = open_existing_case(&case_path)?;
+            conn.execute(
+                "UPDATE filesystem_entries
+                 SET metadata_json = json_set(
+                     metadata_json,
+                     '$.signature_analysis', 'prior-complete-signature-generation',
+                     '$.prior_generation_sentinel', 'retain-exactly')
+                 WHERE evidence_id = ?1 AND entry_kind = 'file'",
+                params![evidence_id],
+            )?;
+            conn.execute(
+                "UPDATE filesystem_entries SET metadata_json = '[]' WHERE id = ?1",
+                params![entries[0].0],
+            )?;
+            conn.execute(
+                "UPDATE filesystem_entries SET content_head = NULL WHERE id = ?1",
+                params![entries[1].0],
+            )?;
+        }
+        fs::remove_file(evidence_dir.join(&entries[1].1))?;
+        let before: Vec<(i64, String)> = {
+            let conn = open_existing_case(&case_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, metadata_json FROM filesystem_entries
+                 WHERE evidence_id = ?1 AND entry_kind = 'file' ORDER BY id",
+            )?;
+            let rows =
+                stmt.query_map(params![evidence_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let diagnostic = analyze_signatures(
+            &case_path,
+            AnalyzeSignaturesOptions {
+                evidence_id: Some(evidence_id),
+                max_entries: 0,
+            },
+        )?;
+        assert_eq!(diagnostic.status, "completed_with_diagnostics");
+        assert!(diagnostic.completed_with_diagnostics);
+        assert!(!diagnostic.truncated);
+        assert!(diagnostic.canonical_generation_preserved);
+        assert!(!diagnostic.replacement_committed);
+        assert_eq!(diagnostic.metadata_updates_committed, 0);
+        assert_eq!(diagnostic.metadata_parse_errors, 1);
+        assert_eq!(diagnostic.unreadable, 1);
+        let after: Vec<(i64, String)> = {
+            let conn = open_existing_case(&case_path)?;
+            let mut stmt = conn.prepare(
+                "SELECT id, metadata_json FROM filesystem_entries
+                 WHERE evidence_id = ?1 AND entry_kind = 'file' ORDER BY id",
+            )?;
+            let rows =
+                stmt.query_map(params![evidence_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        assert_eq!(after, before, "diagnostic rerun must not mix generations");
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn signature_analysis_temp_staging_is_memory_private_and_secret_minimal() -> Result<()> {
+        let (case_path, evidence_dir, evidence_id) =
+            create_signature_analysis_test_evidence("signature-private-stage", 1)?;
+        let mut conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        let snapshot = prepare_signature_analysis_snapshot(&conn, case_id, Some(evidence_id))?;
+        assert_eq!(snapshot.candidates_total, 1);
+        let temp_store: i64 = conn.query_row("PRAGMA temp_store", [], |row| row.get(0))?;
+        assert_eq!(
+            temp_store, 2,
+            "signature TEMP storage must remain memory-only"
+        );
+        let temp_tables: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_temp_master
+             WHERE type = 'table' AND name LIKE 'signature_analysis_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(temp_tables, 2);
+        let entry_id: i64 = conn.query_row(
+            "SELECT entry_id FROM temp.signature_analysis_candidates",
+            [],
+            |row| row.get(0),
+        )?;
+        let before = serde_json::json!({
+            "unchanged_sensitive_value": "must-never-enter-signature-staging",
+            "nested_sensitive": {"token": "also-not-staged"},
+            "category_main": "Uncategorized",
+        });
+        let mut after = before.clone();
+        after["signature_status"] = serde_json::json!("match");
+        after["signature_analysis"] = serde_json::json!(SIGNATURE_ANALYSIS_VERSION);
+        let patch = signature_metadata_merge_patch(&before, &after)?;
+        assert!(!patch.contains("must-never-enter-signature-staging"));
+        assert!(!patch.contains("also-not-staged"));
+        let staged_bytes = stage_signature_analysis_updates(&mut conn, &[(entry_id, patch)], 0)?;
+        assert!(staged_bytes > 0);
+        drop(conn);
+
+        let reopened = open_existing_case(&case_path)?;
+        let leaked_temp_tables: i64 = reopened.query_row(
+            "SELECT COUNT(*) FROM sqlite_temp_master
+             WHERE type = 'table' AND name LIKE 'signature_analysis_%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            leaked_temp_tables, 0,
+            "connection drop must remove the private staging tables"
+        );
+        drop(reopened);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn signature_analysis_deduplicates_headers_only_with_complete_sha256_identity() -> Result<()> {
+        let file_count = SIGNATURE_ANALYSIS_PAGE_SIZE + 1;
+        let (case_path, evidence_dir, evidence_id) =
+            create_signature_analysis_test_evidence("signature-content-identity", file_count)?;
+        let png = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        ];
+        let digest = sha256_hex(&png);
+        {
+            let conn = open_existing_case(&case_path)?;
+            conn.execute(
+                "UPDATE filesystem_entries
+                 SET content_head = NULL,
+                     metadata_json = json_set(
+                         metadata_json,
+                         '$.file_sha256', ?2,
+                         '$.file_sha256_input', 'complete reconstructed file content')
+                 WHERE evidence_id = ?1 AND entry_kind = 'file'",
+                params![evidence_id, digest],
+            )?;
+        }
+        let result = analyze_signatures(
+            &case_path,
+            AnalyzeSignaturesOptions {
+                evidence_id: Some(evidence_id),
+                max_entries: 0,
+            },
+        )?;
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.files_examined, file_count);
+        assert_eq!(result.matches, file_count);
+        let parameters_json: String = open_existing_case(&case_path)?.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![result.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert_eq!(parameters["authoritative_header_reads"].as_u64(), Some(1));
+        assert_eq!(
+            parameters["content_identity_headers_reused"].as_u64(),
+            Some((file_count - 1) as u64)
+        );
+        assert_eq!(
+            parameters["worker_threads"].as_u64(),
+            Some(signature_analysis_worker_count(file_count) as u64)
+        );
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
@@ -46341,8 +57665,9 @@ mod tests {
                 max_entries: 0,
             },
         )?;
-        assert_eq!(result.status, "truncated");
-        assert!(result.truncated);
+        assert_eq!(result.status, "completed_with_diagnostics");
+        assert!(result.completed_with_diagnostics);
+        assert!(!result.truncated);
         assert_eq!(result.candidates_total, 3);
         assert_eq!(result.candidates_processed, 3);
         assert_eq!(result.files_examined, 1);
@@ -46366,7 +57691,7 @@ mod tests {
                 params![result.job_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-        assert_eq!(job_status, "truncated");
+        assert_eq!(job_status, "completed_with_diagnostics");
         let job_error = job_error.unwrap_or_default();
         assert!(job_error.contains("could not be read"));
         assert!(job_error.contains("invalid JSON objects"));
@@ -47587,6 +58912,10 @@ mod tests {
             diagnostics.samples[BROWSER_IMPORT_ERROR_SAMPLE_LIMIT - 1],
             format!("reader failure {}", BROWSER_IMPORT_ERROR_SAMPLE_LIMIT - 1)
         );
+        diagnostics.record_examiner_limit(
+            "cookies",
+            "configured cookie-row limit reached after 10 records".to_string(),
+        );
 
         let mut spool = BrowserRecordSpool::new(Path::new("diagnostic-History"))?;
         spool.seal()?;
@@ -47616,6 +58945,17 @@ mod tests {
         let parameters: serde_json::Value = serde_json::from_str(&import_data.parameters_json)?;
         assert_eq!(parameters["parse_error_count"].as_u64(), Some(50));
         assert_eq!(parameters["parse_error_samples_omitted"].as_u64(), Some(18));
+        assert!(import_data.examiner_artifact_limit_reached);
+        assert_eq!(import_data.limited_artifact_kinds, vec!["cookies"]);
+        assert_eq!(parameters["artifact_limit_reached"].as_bool(), Some(true));
+        assert_eq!(
+            parameters["limited_artifact_kinds"],
+            serde_json::json!(["cookies"])
+        );
+        assert_eq!(
+            parameters["examiner_limit_messages"],
+            serde_json::json!(["configured cookie-row limit reached after 10 records"])
+        );
         Ok(())
     }
 
@@ -47937,10 +59277,15 @@ mod tests {
         let mut seen = 0_usize;
         let emitted = stream_firefox_login_records(&logins_path, usize::MAX, &mut |record| {
             let metadata: serde_json::Value = serde_json::from_str(&record.metadata_json)?;
+            assert!(metadata["password_note"]
+                .as_str()
+                .is_some_and(|note| note.contains("remain only in the cited logins.json")));
             assert_eq!(
-                metadata["password_note"].as_str(),
-                Some("encrypted username/password retained as ciphertext; not decrypted")
+                metadata["credential_value_disclosure"].as_str(),
+                Some("withheld")
             );
+            assert!(metadata["username_ciphertext"].is_null());
+            assert!(metadata["password_ciphertext"].is_null());
             if seen == 0 {
                 let expected_hostname = format!("https://host-{}.example.test", LOGINS - 1);
                 assert_eq!(
@@ -47949,14 +59294,35 @@ mod tests {
                 );
                 let expected_username = format!("ENC-USER-{}", LOGINS - 1);
                 let expected_password = format!("ENC-PASSWORD-{}", LOGINS - 1);
+                let expected_username_sha256 = sha256_hex(expected_username.as_bytes());
+                let expected_password_sha256 = sha256_hex(expected_password.as_bytes());
                 assert_eq!(
-                    metadata["username_ciphertext"].as_str(),
-                    Some(expected_username.as_str())
+                    metadata["username_protected_value_bytes"].as_u64(),
+                    Some(expected_username.len() as u64)
                 );
                 assert_eq!(
-                    metadata["password_ciphertext"].as_str(),
-                    Some(expected_password.as_str())
+                    metadata["username_protected_value_sha256"].as_str(),
+                    Some(expected_username_sha256.as_str())
                 );
+                assert_eq!(
+                    metadata["password_protected_value_bytes"].as_u64(),
+                    Some(expected_password.len() as u64)
+                );
+                assert_eq!(
+                    metadata["password_protected_value_sha256"].as_str(),
+                    Some(expected_password_sha256.as_str())
+                );
+                assert_eq!(metadata["source_json_array"].as_str(), Some("logins"));
+                assert_eq!(
+                    metadata["source_json_sequence"].as_u64(),
+                    Some((LOGINS - 1) as u64)
+                );
+                assert!(metadata["sensitive_value_access_path"]
+                    .as_str()
+                    .is_some_and(|value| value.contains("source_json_sequence")));
+                let serialized = record.metadata_json.to_ascii_uppercase();
+                assert!(!serialized.contains(&expected_username.to_ascii_uppercase()));
+                assert!(!serialized.contains(&expected_password.to_ascii_uppercase()));
             }
             if seen == LOGINS - 1 {
                 assert_eq!(
@@ -47977,6 +59343,9 @@ mod tests {
         })?;
         assert_eq!(limited, POSITIVE_LIMIT);
         assert_eq!(limited_seen, POSITIVE_LIMIT);
+        let source_json = fs::read_to_string(&logins_path)?;
+        assert!(source_json.contains(&format!("ENC-USER-{}", LOGINS - 1)));
+        assert!(source_json.contains(&format!("ENC-PASSWORD-{}", LOGINS - 1)));
 
         let _ = fs::remove_dir_all(profile_dir);
         Ok(())
@@ -48059,7 +59428,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_required_firefox_and_safari_schemas_never_report_complete() -> Result<()> {
+    fn missing_required_firefox_and_safari_schemas_report_diagnostics_not_truncation() -> Result<()>
+    {
         for (label, file_name, family, expected) in [
             (
                 "firefox-missing-core",
@@ -48088,8 +59458,8 @@ mod tests {
                     evidence_name: None,
                 },
             )?;
-            assert!(imported.truncated, "{label}");
-            assert_eq!(imported.status, "truncated", "{label}");
+            assert!(!imported.truncated, "{label}");
+            assert_eq!(imported.status, "completed_with_diagnostics", "{label}");
             assert!(imported.parse_error_count > 0, "{label}");
             assert!(
                 imported
@@ -48131,15 +59501,24 @@ mod tests {
             1_024,
             TEST_BOUND,
         )?;
-        assert_eq!(import_data.parse_error_count, 1);
-        assert!(import_data.parse_errors.iter().any(|error| {
-            error.contains(CHROMIUM_PREFERENCES_MAX_BYTES_ENV)
-                && error.contains(&format!("{} total bytes", total_bytes))
-                && error.contains(&format!(
-                    "{} bytes were not parsed",
-                    total_bytes - TEST_BOUND
-                ))
-        }));
+        assert_eq!(import_data.parse_error_count, 0);
+        assert!(import_data.parse_errors.is_empty());
+        assert!(import_data.examiner_artifact_limit_reached);
+        assert_eq!(import_data.limited_artifact_kinds, vec!["preferences"]);
+        let parameters: serde_json::Value = serde_json::from_str(&import_data.parameters_json)?;
+        assert!(parameters["examiner_limit_messages"]
+            .as_array()
+            .is_some_and(
+                |messages| messages
+                    .iter()
+                    .any(|message| message.as_str().is_some_and(|message| message
+                        .contains(CHROMIUM_PREFERENCES_MAX_BYTES_ENV)
+                        && message.contains(&format!("{} total bytes", total_bytes))
+                        && message.contains(&format!(
+                            "{} bytes were not parsed",
+                            total_bytes - TEST_BOUND
+                        ))))
+            ));
         let imported = persist_browser_history_import(
             &case_path,
             Some("Bounded Preferences".to_string()),
@@ -48148,7 +59527,8 @@ mod tests {
         assert!(imported.truncated);
         assert!(!imported.visit_limit_reached);
         assert_eq!(imported.status, "truncated");
-        assert_eq!(imported.parse_error_count, 1);
+        assert_eq!(imported.parse_error_count, 0);
+        assert_eq!(imported.limited_artifact_kinds, vec!["preferences"]);
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(profile_dir);
@@ -48183,10 +59563,20 @@ mod tests {
             2,
             DEFAULT_CHROMIUM_PREFERENCES_MAX_BYTES,
         )?;
-        assert_eq!(import_data.parse_error_count, 1);
-        assert!(import_data.parse_errors.iter().any(|error| {
-            error.contains("retained 2 of 5 URLs") && error.contains("omitted 3")
-        }));
+        assert_eq!(import_data.parse_error_count, 0);
+        assert!(import_data.parse_errors.is_empty());
+        assert!(import_data.examiner_artifact_limit_reached);
+        assert_eq!(
+            import_data.limited_artifact_kinds,
+            vec!["download URL chains"]
+        );
+        let parameters: serde_json::Value = serde_json::from_str(&import_data.parameters_json)?;
+        assert!(parameters["examiner_limit_messages"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| message
+                .as_str()
+                .is_some_and(|message| message.contains("retained 2 of 5 URLs")
+                    && message.contains("omitted 3")))));
         let imported = persist_browser_history_import(
             &case_path,
             Some("Bounded URL Chain".to_string()),
@@ -48194,7 +59584,8 @@ mod tests {
         )?;
         assert!(imported.truncated);
         assert!(!imported.visit_limit_reached);
-        assert_eq!(imported.parse_error_count, 1);
+        assert_eq!(imported.parse_error_count, 0);
+        assert_eq!(imported.limited_artifact_kinds, vec!["download URL chains"]);
         let entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
         let download = entries
             .iter()
@@ -48288,11 +59679,36 @@ mod tests {
         )?;
         assert_eq!(limited.evidence_id, unlimited.evidence_id);
         assert_eq!(limited.visits_indexed, POSITIVE_LIMIT);
-        assert_eq!(limited.entries_indexed, POSITIVE_LIMIT * 2);
+        assert_eq!(limited.entries_indexed, (ROWS as usize) * 2);
         assert!(limited.visit_limit_reached);
         assert!(limited.truncated);
         assert_eq!(limited.status, "truncated");
         assert_eq!(limited.parse_error_count, 0);
+        assert_eq!(
+            list_filesystem_entries(&case_path, Some(unlimited.evidence_id))?.len(),
+            (ROWS as usize) * 2
+        );
+        let conn = open_existing_case(&case_path)?;
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![limited.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert_eq!(
+            parameters["attempt_entries_parsed"].as_u64(),
+            Some((POSITIVE_LIMIT * 2) as u64)
+        );
+        assert_eq!(
+            parameters["entries_indexed"].as_u64(),
+            Some((ROWS as usize * 2) as u64)
+        );
+        assert_eq!(
+            parameters["canonical_generation_preserved"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(parameters["replacement_committed"].as_bool(), Some(false));
+        drop(conn);
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(history_dir);
@@ -48458,14 +59874,30 @@ mod tests {
         assert_eq!(truncated.visits_indexed, 1);
         assert_eq!(truncated.bookmarks_indexed, 2);
         assert_eq!(truncated.preferences_indexed, 6);
-        // 1 visit + 2 bookmarks + 6 preferences + 1 URL + 1 search + 1 download (max_visits = 1)
-        assert_eq!(truncated.entries_indexed, 12);
+        // The limited attempt parsed 12 rows, but a prior complete 14-row
+        // generation remains canonical and visible.
+        assert_eq!(truncated.entries_indexed, 14);
         assert!(truncated.truncated);
         assert_eq!(truncated.status, "truncated");
         assert_eq!(
             list_filesystem_entries(&case_path, Some(imported.evidence_id))?.len(),
-            12
+            14
         );
+        let conn = open_existing_case(&case_path)?;
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![truncated.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert_eq!(parameters["attempt_entries_parsed"].as_u64(), Some(12));
+        assert_eq!(parameters["entries_indexed"].as_u64(), Some(14));
+        assert_eq!(
+            parameters["canonical_generation_preserved"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(parameters["replacement_committed"].as_bool(), Some(false));
+        drop(conn);
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(history_dir);
@@ -48802,6 +60234,52 @@ mod tests {
                 102,
             )
         );
+    }
+
+    #[test]
+    fn browser_staging_is_private_collision_safe_and_cleanup_is_explicit() -> Result<()> {
+        let base = unique_temp_dir("private-browser-staging");
+        let imports_root = base.join("history-imports");
+        create_private_browser_staging_directory(&imports_root, "test browser imports root", true)?;
+        let staging_root = imports_root.join("profile-job-1");
+        create_private_browser_staging_directory(
+            &staging_root,
+            "test browser profile staging folder",
+            false,
+        )?;
+        let staged_file = staging_root.join("History");
+        let mut output = create_private_browser_staging_file(&staged_file)?;
+        output.write_all(b"sensitive browser fixture")?;
+        output.flush()?;
+        drop(output);
+
+        assert!(create_private_browser_staging_directory(
+            &staging_root,
+            "test browser profile staging folder",
+            false,
+        )
+        .is_err());
+        assert!(create_private_browser_staging_file(&staged_file).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&imports_root)?.permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&staging_root)?.permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&staged_file)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        fs::remove_dir_all(&base)?;
+        assert!(!base.exists());
+        Ok(())
     }
 
     #[test]
@@ -49249,7 +60727,7 @@ mod tests {
     }
 
     #[test]
-    fn chromium_login_retains_encrypted_password_as_labelled_ciphertext() -> Result<()> {
+    fn chromium_login_withholds_credentials_but_preserves_source_locator() -> Result<()> {
         let profile_dir = unique_temp_dir("chromium-login-ciphertext");
         let login_path = profile_dir.join("Login Data");
         let conn = Connection::open(&login_path)?;
@@ -49280,23 +60758,61 @@ mod tests {
         })?;
         assert_eq!(count, 1);
         let metadata: serde_json::Value = serde_json::from_str(&records[0].metadata_json)?;
-        assert_eq!(metadata["username"].as_str(), Some("alice"));
+        assert!(metadata["username"].is_null());
+        assert_eq!(metadata["username_value_present"].as_bool(), Some(true));
+        assert_eq!(metadata["username_value_bytes"].as_u64(), Some(5));
+        let expected_username_sha256 = sha256_hex(b"alice");
         assert_eq!(
-            metadata["password_ciphertext_hex"].as_str(),
-            Some("0102A0FF")
+            metadata["username_value_sha256"].as_str(),
+            Some(expected_username_sha256.as_str())
         );
-        assert_eq!(metadata["password_ciphertext_bytes"].as_u64(), Some(4));
+        assert_eq!(
+            metadata["username_value_disclosure"].as_str(),
+            Some("withheld")
+        );
+        let expected_password_sha256 = sha256_hex(&[0x01, 0x02, 0xa0, 0xff]);
+        assert_eq!(
+            metadata["password_protected_blob_sha256"].as_str(),
+            Some(expected_password_sha256.as_str())
+        );
+        assert_eq!(metadata["password_protected_blob_bytes"].as_u64(), Some(4));
+        assert_eq!(
+            metadata["password_protected_blob_format"].as_str(),
+            Some("platform_protected_or_legacy_blob")
+        );
+        assert_eq!(
+            metadata["password_value_disclosure"].as_str(),
+            Some("withheld")
+        );
         assert_eq!(metadata["sensitive_value_present"].as_bool(), Some(true));
-        assert!(metadata["password_note"]
+        assert_eq!(metadata["source_sqlite_table"].as_str(), Some("logins"));
+        assert_eq!(metadata["source_sqlite_rowid"].as_i64(), Some(1));
+        assert!(metadata["sensitive_value_access_path"]
             .as_str()
-            .is_some_and(|value| value.contains("not decrypted")));
+            .is_some_and(|value| value.contains("source_sqlite_rowid")));
+        assert!(metadata["credential_note"]
+            .as_str()
+            .is_some_and(|value| value.contains("did not decrypt or copy")));
+        let serialized = records[0].metadata_json.to_ascii_uppercase();
+        assert!(!serialized.contains("ALICE"));
+        assert!(!serialized.contains("0102A0FF"));
+        assert!(!serialized.contains("\"USERNAME_CIPHERTEXT\""));
+        assert!(!serialized.contains("\"PASSWORD_CIPHERTEXT\""));
+        let source = Connection::open_with_flags(&login_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let (source_username, source_hex): (String, String) = source.query_row(
+            "SELECT username_value, hex(password_value) FROM logins WHERE rowid = ?1",
+            params![metadata["source_sqlite_rowid"].as_i64()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(source_username, "alice");
+        assert_eq!(source_hex, "0102A0FF");
 
         let _ = fs::remove_dir_all(profile_dir);
         Ok(())
     }
 
     #[test]
-    fn chromium_autofill_uses_unix_seconds_and_imports_plain_text_fields() -> Result<()> {
+    fn chromium_autofill_uses_unix_seconds_and_withholds_sensitive_values() -> Result<()> {
         let case_path = unique_case_path("chromium-autofill");
         create_test_case(&case_path)?;
         let root = unique_temp_dir("chromium-autofill-source");
@@ -49323,10 +60839,26 @@ mod tests {
             .iter()
             .find(|entry| entry.metadata_json["name"].as_str() == Some("email"))
             .expect("email autofill row");
+        assert!(email.metadata_json["value"].is_null());
         assert_eq!(
-            email.metadata_json["value"].as_str(),
-            Some("examiner@example.test")
+            email.metadata_json["autofill_value_present"].as_bool(),
+            Some(true)
         );
+        assert_eq!(
+            email.metadata_json["autofill_value_bytes"].as_u64(),
+            Some("examiner@example.test".len() as u64)
+        );
+        assert_eq!(
+            email.metadata_json["autofill_value_sha256"].as_str(),
+            Some(sha256_hex(b"examiner@example.test").as_str())
+        );
+        assert_eq!(
+            email.metadata_json["autofill_value_disclosure"].as_str(),
+            Some("withheld")
+        );
+        assert!(email.metadata_json["sensitive_value_access_path"]
+            .as_str()
+            .is_some_and(|value| value.contains("source_sqlite_rowid")));
         assert_eq!(email.metadata_json["count"].as_i64(), Some(3));
         assert_eq!(
             email.metadata_json["date_created_utc"].as_str(),
@@ -49360,9 +60892,10 @@ mod tests {
             .iter()
             .find(|entry| entry.metadata_json["name"].as_str() == Some("case-note"))
             .expect("case-note autofill row");
+        assert!(note.metadata_json["value"].is_null());
         assert_eq!(
-            note.metadata_json["value"].as_str(),
-            Some("typed evidence note")
+            note.metadata_json["autofill_value_sha256"].as_str(),
+            Some(sha256_hex(b"typed evidence note").as_str())
         );
         assert_eq!(note.metadata_json["count"].as_i64(), Some(2));
         assert_eq!(
@@ -49386,6 +60919,29 @@ mod tests {
         assert!(parameters["web_data_file"]
             .as_str()
             .is_some_and(|path| path.ends_with("Web Data")));
+        let case_serialized = entries
+            .iter()
+            .map(|entry| entry.metadata_json.to_string())
+            .collect::<String>();
+        assert!(!case_serialized.contains("examiner@example.test"));
+        assert!(!case_serialized.contains("typed evidence note"));
+        let source = Connection::open_with_flags(
+            profile_dir.join("Web Data"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        for entry in [email, note] {
+            let source_value: String = source.query_row(
+                "SELECT value FROM autofill WHERE rowid = ?1",
+                params![entry.metadata_json["rowid"].as_i64()],
+                |row| row.get(0),
+            )?;
+            assert_eq!(
+                sha256_hex(source_value.as_bytes()),
+                entry.metadata_json["autofill_value_sha256"]
+                    .as_str()
+                    .expect("autofill value hash")
+            );
+        }
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(root);
@@ -49672,7 +61228,15 @@ mod tests {
             disclosure["source_profile_path"].as_str(),
             Some(source_profile)
         );
-        assert_eq!(disclosure["status"].as_str(), Some("completed_with_errors"));
+        assert_eq!(
+            disclosure["status"].as_str(),
+            Some("completed_with_diagnostics")
+        );
+        assert_eq!(disclosure["truncated"].as_bool(), Some(false));
+        assert_eq!(
+            disclosure["completed_with_diagnostics"].as_bool(),
+            Some(true)
+        );
         assert_eq!(disclosure["parse_error_count"].as_u64(), Some(1));
         assert_eq!(disclosure["parse_error_samples_omitted"].as_u64(), Some(0));
         assert!(disclosure["parse_errors"]
@@ -50177,6 +61741,53 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn sqlite_browser_snapshot_rejects_a_mixed_sidecar_generation() -> Result<()> {
+        let root = unique_temp_dir("browser-mixed-snapshot");
+        let source_path = root.join("History");
+        let source_wal = sqlite_sidecar_path(&source_path, "-wal");
+        fs::write(&source_path, b"main-generation-one")?;
+        fs::write(&source_wal, b"wal-generation-one")?;
+
+        let before = fingerprint_sqlite_database_group(&source_path)?;
+        let copied_guard = copy_sqlite_database_to_temp_once(&source_path)?;
+        let copied = fingerprint_sqlite_database_group(&copied_guard.path)?;
+        assert!(sqlite_snapshot_generation_matches(
+            &before, &copied, &before
+        ));
+
+        fs::write(&source_wal, b"wal-generation-two")?;
+        let after = fingerprint_sqlite_database_group(&source_path)?;
+        assert_ne!(before, after);
+        assert!(!sqlite_snapshot_generation_matches(
+            &before, &copied, &after
+        ));
+        assert_eq!(fs::read(&copied_guard.path)?, b"main-generation-one");
+        assert_eq!(
+            fs::read(sqlite_sidecar_path(&copied_guard.path, "-wal"))?,
+            b"wal-generation-one"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&copied_guard.path)?.permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(sqlite_sidecar_path(&copied_guard.path, "-wal"))?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        drop(copied_guard);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     /// Firefox 3.0-era (2008) profiles: places.sqlite has no
     /// moz_places.last_visit_date, formhistory.sqlite has only
     /// id/fieldname/value, and cookies.sqlite has no creationTime. Readers
@@ -50282,16 +61893,39 @@ mod tests {
         assert_eq!(artifact_count(&entries, "browser_url"), 2);
         assert_eq!(artifact_count(&entries, "browser_search_term"), 1);
         assert_eq!(artifact_count(&entries, "browser_cookie"), 1);
-        let cookie_json = entry_with_artifact(&entries, "browser_cookie")
-            .metadata_json
-            .to_string();
-        assert!(cookie_json.contains("cookie-secret-2008"));
+        let cookie = entry_with_artifact(&entries, "browser_cookie");
+        let cookie_json = cookie.metadata_json.to_string();
+        assert!(!cookie_json.contains("cookie-secret-2008"));
         assert_eq!(
-            entry_with_artifact(&entries, "browser_cookie").metadata_json
-                ["sensitive_value_present"]
-                .as_bool(),
+            cookie.metadata_json["sensitive_value_present"].as_bool(),
             Some(true)
         );
+        assert_eq!(
+            cookie.metadata_json["cookie_plaintext_value_bytes"].as_u64(),
+            Some("cookie-secret-2008".len() as u64)
+        );
+        let expected_cookie_sha256 = sha256_hex(b"cookie-secret-2008");
+        assert_eq!(
+            cookie.metadata_json["cookie_plaintext_value_sha256"].as_str(),
+            Some(expected_cookie_sha256.as_str())
+        );
+        assert_eq!(
+            cookie.metadata_json["source_sqlite_primary_key"].as_i64(),
+            Some(1)
+        );
+        assert!(cookie.metadata_json["sensitive_value_access_path"]
+            .as_str()
+            .is_some_and(|value| value.contains("source_sqlite_primary_key")));
+        let cookie_source = Connection::open_with_flags(
+            profile_dir.join("cookies.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let source_cookie: String = cookie_source.query_row(
+            "SELECT value FROM moz_cookies WHERE id = ?1",
+            params![cookie.metadata_json["source_sqlite_primary_key"].as_i64()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(source_cookie, "cookie-secret-2008");
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(profile_dir);
@@ -50715,18 +62349,29 @@ mod tests {
             .parse_errors
             .iter()
             .any(|error| error.starts_with("history visits:")));
-        assert!(imported.truncated);
-        assert_eq!(imported.status, "truncated");
+        assert!(!imported.truncated);
+        assert_eq!(imported.status, "completed_with_diagnostics");
         let conn = open_existing_case(&case_path)?;
         let (job_status, job_error): (String, Option<String>) = conn.query_row(
             "SELECT status, error FROM evidence_jobs WHERE id = ?1",
             [imported.job_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        assert_eq!(job_status, "truncated");
+        assert_eq!(job_status, "completed_with_diagnostics");
         assert!(job_error
             .as_deref()
-            .is_some_and(|error| error.contains("could not be parsed")));
+            .is_some_and(|error| error.contains("browser parser diagnostic")));
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            [imported.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert!(parameters["parse_errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|error| error
+                .as_str()
+                .is_some_and(|error| error.starts_with("history visits:")))));
         drop(conn);
 
         cleanup_case_path(&case_path);
@@ -50785,22 +62430,49 @@ mod tests {
             Some("Accounts and Identity")
         );
         let login_json = login.metadata_json.to_string();
-        assert!(login_json.contains("encrypted-user"));
-        assert!(login_json.contains("encrypted-pass"));
+        assert!(!login_json.contains("encrypted-user"));
+        assert!(!login_json.contains("encrypted-pass"));
         assert_eq!(
             login.metadata_json["sensitive_value_present"].as_bool(),
             Some(true)
         );
-        let cookie_json = entry_with_artifact(&entries, "browser_cookie")
-            .metadata_json
-            .to_string();
-        assert!(cookie_json.contains("cookie-secret"));
         assert_eq!(
-            entry_with_artifact(&entries, "browser_cookie").metadata_json
-                ["sensitive_value_present"]
-                .as_bool(),
+            login.metadata_json["username_protected_value_bytes"].as_u64(),
+            Some("encrypted-user".len() as u64)
+        );
+        assert_eq!(
+            login.metadata_json["password_protected_value_bytes"].as_u64(),
+            Some("encrypted-pass".len() as u64)
+        );
+        assert!(login.metadata_json["sensitive_value_access_path"]
+            .as_str()
+            .is_some_and(|value| value.contains("source_login_id")));
+        let source_logins = fs::read_to_string(profile_dir.join("logins.json"))?;
+        assert!(source_logins.contains("encrypted-user"));
+        assert!(source_logins.contains("encrypted-pass"));
+
+        let cookie = entry_with_artifact(&entries, "browser_cookie");
+        let cookie_json = cookie.metadata_json.to_string();
+        assert!(!cookie_json.contains("cookie-secret"));
+        assert_eq!(
+            cookie.metadata_json["sensitive_value_present"].as_bool(),
             Some(true)
         );
+        let expected_cookie_sha256 = sha256_hex(b"cookie-secret");
+        assert_eq!(
+            cookie.metadata_json["cookie_plaintext_value_sha256"].as_str(),
+            Some(expected_cookie_sha256.as_str())
+        );
+        let cookie_source = Connection::open_with_flags(
+            profile_dir.join("cookies.sqlite"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let source_cookie: String = cookie_source.query_row(
+            "SELECT value FROM moz_cookies WHERE id = ?1",
+            params![cookie.metadata_json["source_sqlite_primary_key"].as_i64()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(source_cookie, "cookie-secret");
 
         let truncated = import_browser_history(
             &case_path,
@@ -50812,18 +62484,39 @@ mod tests {
         )?;
         assert_eq!(truncated.evidence_id, imported.evidence_id);
         assert_eq!(truncated.visits_indexed, 1);
+        assert_eq!(truncated.entries_indexed, imported.entries_indexed);
         assert!(truncated.truncated);
         assert_eq!(truncated.status, "truncated");
         let truncated_entries = list_filesystem_entries(&case_path, Some(imported.evidence_id))?;
         assert_eq!(
             artifact_count(&truncated_entries, "browser_history_visit"),
-            1
+            2
         );
-        assert_eq!(artifact_count(&truncated_entries, "browser_url"), 1);
-        assert_eq!(artifact_count(&truncated_entries, "browser_bookmark"), 1);
+        assert_eq!(artifact_count(&truncated_entries, "browser_url"), 2);
+        assert_eq!(artifact_count(&truncated_entries, "browser_bookmark"), 2);
         assert_eq!(artifact_count(&truncated_entries, "browser_search_term"), 1);
         assert_eq!(artifact_count(&truncated_entries, "browser_cookie"), 1);
         assert_eq!(artifact_count(&truncated_entries, "browser_login"), 1);
+        let conn = open_existing_case(&case_path)?;
+        let parameters_json: String = conn.query_row(
+            "SELECT parameters_json FROM evidence_jobs WHERE id = ?1",
+            params![truncated.job_id],
+            |row| row.get(0),
+        )?;
+        let parameters: serde_json::Value = serde_json::from_str(&parameters_json)?;
+        assert_eq!(
+            parameters["canonical_generation_preserved"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(parameters["replacement_committed"].as_bool(), Some(false));
+        assert_eq!(
+            parameters["prior_complete_entries"].as_u64(),
+            Some(imported.entries_indexed as u64)
+        );
+        assert_eq!(
+            parameters["entries_indexed"].as_u64(),
+            Some(imported.entries_indexed as u64)
+        );
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(profile_dir);
@@ -51034,24 +62727,126 @@ mod tests {
             .processing_truncation_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("entry limit reached")));
-        assert!(source.processing_coverage.contains("PARTIAL INDEXING ONLY"));
         assert!(source
             .processing_coverage
-            .contains("do not represent full source coverage"));
+            .contains("Examiner-bounded processing"));
+        assert!(source
+            .processing_coverage
+            .contains("Absence of additional findings must not be treated as exhaustive"));
 
         let html = render_report_html(&report);
         assert!(html.contains("Latest processing status"));
         assert!(html.contains("Requested limit"));
         assert!(html.contains("Latest job indexed entries"));
-        assert!(html.contains("PARTIAL INDEXING ONLY"));
+        assert!(html.contains("Examiner-bounded processing"));
         assert!(html.contains("Processing Coverage Warning"));
-        assert!(html.contains("contains findings derived from truncated"));
+        assert!(html
+            .contains("Coverage warning: processing did not reach its normal terminal completion"));
         assert!(html.contains("entry limit reached"));
         assert!(!html.contains("Complete indexing job"));
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
         Ok(())
+    }
+
+    #[test]
+    fn completed_with_diagnostics_job_renders_calm_scope_note() -> Result<()> {
+        let case_path = unique_case_path("legacy-diagnostic-report");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("legacy-diagnostic-report-source");
+        fs::write(evidence_dir.join("finding.txt"), b"validated finding")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let processed = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        let conn = Connection::open(&case_path)?;
+        conn.execute(
+            "UPDATE evidence_sources SET indexed_at = NULL WHERE id = ?1",
+            [evidence_id],
+        )?;
+        drop(conn);
+        let tracker =
+            progress::JobProgressTracker::new("legacy-diagnostic-report", "process", None);
+        tracker.set_job_id(processed.job_id);
+        tracker.set_evidence_id(evidence_id);
+        tracker
+            .record_truncation("optional parser retained usable records with bounded diagnostics");
+        tracker.finish(progress::JobProgressState::CompleteWithDiagnostics);
+        record_job_progress_summary(&case_path, processed.job_id, &tracker.snapshot())?;
+        assert!(list_evidence(&case_path)?[0].indexed_at.is_some());
+
+        let entry = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .find(|entry| entry.entry_kind == "file")
+            .context("indexed fixture file")?;
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        let item = add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: Some(evidence_id),
+                entry_id: Some(entry.id),
+                item_order: None,
+                display_name: None,
+                logical_path: None,
+                selection_offset: None,
+                selection_length: None,
+                data_preview: None,
+                item_ref_json: serde_json::json!({}),
+            },
+        )?;
+        assert_eq!(item.item_ref_json["index_requested_entry_limit"], 0);
+
+        let report = report_data(&case_path)?;
+        assert!(report.evidence[0]
+            .processing_coverage
+            .contains("Some optional artifact classes recorded diagnostics"));
+        let html = render_report_html(&report);
+        assert!(html.contains("<div class=\"processing-note\">"));
+        assert!(html.contains("This does not invalidate the evidence"));
+        assert!(!html.contains("<div class=\"processing-warning\">"));
+        assert!(!html.contains("Processing Coverage Warning"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_truncated_parser_diagnostic_is_not_called_an_examiner_stop() {
+        let reason = "optional parser retained usable records with bounded diagnostics";
+        let coverage = processing_coverage_text(
+            Some("filesystem_index"),
+            Some("truncated"),
+            Some(1_000),
+            Some(1_000),
+            Some(reason),
+        );
+        assert!(coverage.contains("Processing completed"));
+        assert!(!coverage.contains("Examiner-bounded processing"));
+        assert!(!processing_status_stopped_early(
+            Some("truncated"),
+            Some(1_000),
+            Some(reason),
+        ));
+        assert!(processing_status_has_diagnostics(
+            Some("truncated"),
+            Some(1_000),
+            Some(reason),
+        ));
     }
 
     #[test]
@@ -51450,8 +63245,8 @@ mod tests {
         conn.execute(
             "INSERT INTO filesystem_entries(
                  case_id, evidence_id, logical_path, name, entry_kind, metadata_json
-             ) VALUES (?1, ?2, '/Browser Activities/Logins/ebank.example.com/jdoe.record',
-                       'jdoe @ ebank.example.com', 'record', ?3)",
+             ) VALUES (?1, ?2, '/Browser Activities/Logins/ebank.example.com/saved-login-1.record',
+                       'Saved login @ ebank.example.com', 'record', ?3)",
             rusqlite::params![case_id, evidence_id, metadata.to_string()],
         )?;
         let entry_id = conn.last_insert_rowid();
@@ -51464,11 +63259,11 @@ mod tests {
         let item = add_bookmark_item(&case_path, options)?;
         assert_eq!(
             item.display_name.as_deref(),
-            Some("jdoe @ ebank.example.com")
+            Some("Saved login @ ebank.example.com")
         );
         assert_eq!(
             item.logical_path.as_deref(),
-            Some("/Browser Activities/Logins/ebank.example.com/jdoe.record")
+            Some("/Browser Activities/Logins/ebank.example.com/saved-login-1.record")
         );
         assert_eq!(
             item.item_ref_json["kind"],
@@ -51482,12 +63277,14 @@ mod tests {
             item.item_ref_json["host"],
             serde_json::json!("ebank.example.com")
         );
+        assert!(item.item_ref_json.get("username").is_none());
         assert!(item.item_ref_json.get("search_text").is_none());
 
         let report = report_data(&case_path)?;
         let html = render_report_html(&report);
-        assert!(html.contains("jdoe @ ebank.example.com"));
+        assert!(html.contains("Saved login @ ebank.example.com"));
         assert!(html.contains("ebank.example.com"));
+        assert!(!html.contains("jdoe"));
         assert!(!html.contains("must not leak"));
 
         cleanup_case_path(&case_path);
@@ -52179,7 +63976,7 @@ mod tests {
         let completed_jobs: i64 = conn.query_row(
             "SELECT COUNT(*) FROM evidence_jobs
              WHERE case_id = ?1 AND evidence_id = ?2 AND job_type = 'filesystem_index'
-               AND status IN ('completed', 'truncated')",
+               AND status IN ('completed', 'completed_with_diagnostics', 'truncated')",
             params![case_id, evidence_id],
             |row| row.get(0),
         )?;
@@ -52217,8 +64014,8 @@ mod tests {
         assert_eq!(report.evidence[0].latest_process_entries_indexed, Some(0));
         assert!(report.evidence[0]
             .processing_coverage
-            .contains("FAILED INDEXING"));
-        assert!(render_report_html(&report).contains("FAILED INDEXING"));
+            .contains("Processing did not complete"));
+        assert!(render_report_html(&report).contains("Processing did not complete"));
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
         Ok(())
@@ -52958,7 +64755,10 @@ mod tests {
             serde_json::json!({
                 "activity_kind": "browser_autofill",
                 "name": "email",
-                "value": "examiner@example.test",
+                "autofill_value_present": true,
+                "autofill_value_bytes": 21,
+                "autofill_value_sha256": sha256_hex(b"examiner@example.test"),
+                "autofill_value_disclosure": "withheld",
                 "count": 3,
                 "date_created_utc": "2026-06-28T09:50:00Z",
                 "source_artifact": "Web Data"
@@ -53050,7 +64850,9 @@ mod tests {
         assert!(html.contains("<dd>Omnibox Shortcut</dd>"));
         assert!(html.contains("<dt>Typed Text</dt><dd>typed query</dd>"));
         assert!(html.contains("<dd>Autofill</dd>"));
-        assert!(html.contains("<dt>Typed Value</dt><dd>examiner@example.test</dd>"));
+        assert!(html.contains("<dt>Value Present</dt><dd>true</dd>"));
+        assert!(html.contains("<dt>Withheld Value Bytes</dt><dd>21</dd>"));
+        assert!(!html.contains("examiner@example.test"));
         assert!(html.contains("<dd>Download</dd>"));
         assert!(html.contains("<dt>File Name</dt><dd>tool.zip</dd>"));
         assert!(html.contains("<dt>Outcome</dt><dd>complete - 2,048 bytes in 1.8s</dd>"));
@@ -53059,7 +64861,8 @@ mod tests {
         assert!(html.contains("<dd>Bookmark</dd>"));
         assert!(html.contains("<dt>Folder</dt><dd>Bookmarks Bar</dd>"));
         assert!(html.contains("<dd>Saved Login</dd>"));
-        assert!(html.contains("<dt>Username</dt><dd>user@example.com</dd>"));
+        assert!(!html.contains("user@example.com"));
+        assert!(!html.contains("<dt>Username</dt>"));
         assert!(html.contains("<dd>Cookie</dd>"));
         assert!(html.contains("<dt>Cookie Name</dt><dd>sid</dd>"));
         assert!(html.contains("<dd>Preference</dd>"));
@@ -53068,6 +64871,409 @@ mod tests {
 
         cleanup_case_path(&case_path);
         Ok(())
+    }
+
+    fn create_identity_test_evidence(case_path: &Path, source_root: &Path) -> Result<(i64, i64)> {
+        let conn = open_existing_case(case_path)?;
+        let case_id = active_case_id(&conn)?;
+        conn.execute(
+            "INSERT INTO evidence_sources(case_id, source_kind, source_path, display_name)
+             VALUES (?1, 'folder', ?2, 'identity-test-source')",
+            params![case_id, path_str(source_root)],
+        )?;
+        let evidence_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json)
+             VALUES (?1, ?2, 'filesystem_index', 'completed', '{}')",
+            params![case_id, evidence_id],
+        )?;
+        Ok((evidence_id, conn.last_insert_rowid()))
+    }
+
+    fn identity_test_entry(
+        logical_path: &str,
+        display_name: &str,
+        artifact_kind: &str,
+        semantic_value: &str,
+        source_job_id: i64,
+    ) -> DerivedIdentityEntry {
+        DerivedIdentityEntry {
+            logical_path: logical_path.to_string(),
+            display_name: display_name.to_string(),
+            metadata: serde_json::json!({
+                "artifact_kind": artifact_kind,
+                "lead_type": "test_identity",
+                "value": semantic_value,
+                "source_artifact_path": format!("/source/{semantic_value}"),
+                "derived_from_entry_id": 100,
+            }),
+            source_job_id,
+        }
+    }
+
+    #[test]
+    fn identity_generation_is_atomic_preserves_ids_and_cleans_stale_rows_safely() -> Result<()> {
+        let case_path = unique_case_path("identity-generation");
+        create_test_case(&case_path)?;
+        let source_root = unique_temp_dir("identity-generation-source");
+        let (evidence_id, source_job_id) = create_identity_test_evidence(&case_path, &source_root)?;
+
+        let first = vec![identity_test_entry(
+            "/Parsed identities/Hosts/host-a.record",
+            "host-a",
+            "host_identity",
+            "host-a",
+            source_job_id,
+        )];
+        commit_identity_generation(&case_path, evidence_id, &first, true)?;
+        let conn = open_existing_case(&case_path)?;
+        let (host_a_id, first_generation): (i64, String) = conn.query_row(
+            "SELECT id, json_extract(metadata_json, '$.identity_generation_id')
+             FROM filesystem_entries WHERE evidence_id = ?1 AND logical_path = ?2",
+            params![evidence_id, first[0].logical_path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        drop(conn);
+
+        let second = vec![
+            identity_test_entry(
+                &first[0].logical_path,
+                "host-a updated",
+                "host_identity",
+                "host-a",
+                source_job_id,
+            ),
+            identity_test_entry(
+                "/Parsed identities/Hosts/host-b.record",
+                "host-b",
+                "host_identity",
+                "host-b",
+                source_job_id,
+            ),
+        ];
+        commit_identity_generation(&case_path, evidence_id, &second, true)?;
+        let conn = open_existing_case(&case_path)?;
+        let (host_a_id_after, second_generation): (i64, String) = conn.query_row(
+            "SELECT id, json_extract(metadata_json, '$.identity_generation_id')
+             FROM filesystem_entries WHERE evidence_id = ?1 AND logical_path = ?2",
+            params![evidence_id, first[0].logical_path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            host_a_id_after, host_a_id,
+            "upsert must preserve entry identity"
+        );
+        assert_ne!(second_generation, first_generation);
+        drop(conn);
+
+        let bookmark_id = create_test_bookmark(&case_path)?;
+        add_bookmark_item(
+            &case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: Some(evidence_id),
+                entry_id: Some(host_a_id),
+                item_order: None,
+                display_name: Some("host-a".to_string()),
+                logical_path: Some(first[0].logical_path.clone()),
+                selection_offset: None,
+                selection_length: None,
+                data_preview: None,
+                item_ref_json: serde_json::json!({
+                    "artifact_kind": "host_identity",
+                    "entry_id": host_a_id,
+                }),
+            },
+        )?;
+        let third = vec![identity_test_entry(
+            &second[1].logical_path,
+            "host-b updated",
+            "host_identity",
+            "host-b",
+            source_job_id,
+        )];
+        commit_identity_generation(&case_path, evidence_id, &third, true)?;
+
+        let conn = open_existing_case(&case_path)?;
+        let stale: (i64, i64) = conn.query_row(
+            "SELECT json_extract(metadata_json, '$.identity_generation_canonical'),
+                    json_extract(metadata_json, '$.identity_generation_stale')
+             FROM filesystem_entries WHERE id = ?1",
+            params![host_a_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(stale, (0, 1));
+        assert_eq!(
+            identity_visible_counts(&case_path, evidence_id)?["host_identity"],
+            1
+        );
+        let bookmark_entry_id: Option<i64> = conn.query_row(
+            "SELECT entry_id FROM bookmark_items WHERE bookmark_id = ?1",
+            params![bookmark_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(bookmark_entry_id, Some(host_a_id));
+        drop(conn);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(source_root);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_diagnostic_attempt_preserves_prior_complete_generation() -> Result<()> {
+        let case_path = unique_case_path("identity-generation-preserve");
+        create_test_case(&case_path)?;
+        let source_root = unique_temp_dir("identity-generation-preserve-source");
+        let (evidence_id, source_job_id) = create_identity_test_evidence(&case_path, &source_root)?;
+        let canonical = vec![identity_test_entry(
+            "/Parsed identities/Hosts/canonical.record",
+            "canonical-host",
+            "host_identity",
+            "canonical-host",
+            source_job_id,
+        )];
+        commit_identity_generation(&case_path, evidence_id, &canonical, true)?;
+        let conn = open_existing_case(&case_path)?;
+        let canonical_generation: String = conn.query_row(
+            "SELECT json_extract(metadata_json, '$.identity_generation_id')
+             FROM filesystem_entries WHERE evidence_id = ?1 AND logical_path = ?2",
+            params![evidence_id, canonical[0].logical_path],
+            |row| row.get(0),
+        )?;
+        let case_id = active_case_id(&conn)?;
+        conn.execute(
+            "INSERT INTO filesystem_entries(
+                case_id, evidence_id, logical_path, name, entry_kind, size_bytes,
+                metadata_json, discovered_by_job_id
+             ) VALUES (?1, ?2, ?3, 'missing.xml', 'file', NULL, '{}', ?4)",
+            params![
+                case_id,
+                evidence_id,
+                "/ProgramData/Microsoft/Wlansvc/Profiles/Interfaces/test/missing.xml",
+                source_job_id
+            ],
+        )?;
+        drop(conn);
+
+        let result = parse_identity_artifacts(&case_path, evidence_id)?;
+        assert_eq!(result.status, "completed_with_diagnostics");
+        assert!(result.completed_with_diagnostics);
+        assert!(result.parse_error_count >= 1);
+        assert!(result.canonical_generation_preserved);
+        assert_eq!(result.host_identities_indexed, 1);
+        let conn = open_existing_case(&case_path)?;
+        let retained_generation: String = conn.query_row(
+            "SELECT json_extract(metadata_json, '$.identity_generation_id')
+             FROM filesystem_entries WHERE evidence_id = ?1 AND logical_path = ?2",
+            params![evidence_id, canonical[0].logical_path],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained_generation, canonical_generation);
+        drop(conn);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(source_root);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_legacy_values_are_removed_and_defensively_redacted_from_reports() -> Result<()> {
+        let case_path = unique_case_path("identity-redaction");
+        create_test_case(&case_path)?;
+        let source_root = unique_temp_dir("identity-redaction-source");
+        let (evidence_id, source_job_id) = create_identity_test_evidence(&case_path, &source_root)?;
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        for (logical_path, name, metadata) in [
+            (
+                "/Parsed identities/Wi-Fi/legacy.record",
+                "legacy-wifi",
+                serde_json::json!({
+                    "artifact_kind": "wifi_profile",
+                    "wifi_key_plaintext": "legacy-wifi-secret",
+                    "wifi_key_encrypted": "legacy-wifi-ciphertext",
+                    "source_artifact_path": "/ProgramData/profile.xml",
+                }),
+            ),
+            (
+                "/Parsed identities/Secrets/legacy.record",
+                "legacy-secret",
+                serde_json::json!({
+                    "artifact_kind": "plaintext_secret",
+                    "secret_value": "legacy-api-secret",
+                    "secret_source_location": "line 1 key API_TOKEN",
+                }),
+            ),
+        ] {
+            upsert_filesystem_entry(
+                &conn,
+                case_id,
+                evidence_id,
+                logical_path,
+                name,
+                "record",
+                None,
+                &metadata.to_string(),
+                source_job_id,
+            )?;
+        }
+        drop(conn);
+        assert_eq!(
+            sanitize_legacy_identity_sensitive_metadata(&case_path, evidence_id)?,
+            2
+        );
+        let conn = open_existing_case(&case_path)?;
+        let stored = conn.query_row(
+            "SELECT group_concat(metadata_json, '\n') FROM filesystem_entries
+             WHERE evidence_id = ?1 AND entry_kind = 'record'",
+            params![evidence_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        for forbidden in [
+            "legacy-wifi-secret",
+            "legacy-wifi-ciphertext",
+            "legacy-api-secret",
+            "wifi_key_plaintext",
+            "wifi_key_encrypted",
+            "secret_value\"",
+        ] {
+            assert!(!stored.contains(forbidden));
+        }
+        assert!(stored.contains(&sha256_hex(b"legacy-wifi-secret")));
+        assert!(stored.contains(&sha256_hex(b"legacy-api-secret")));
+
+        let legacy_entry = FilesystemEntry {
+            id: 77,
+            case_id,
+            evidence_id,
+            parent_id: None,
+            logical_path: "/Parsed identities/Secrets/legacy-report.record".to_string(),
+            internal_path_key: "/Parsed identities/Secrets/legacy-report.record".to_string(),
+            source_path_exact: Some("/source/.env".to_string()),
+            name: "legacy-report".to_string(),
+            entry_kind: "record".to_string(),
+            size_bytes: None,
+            is_deleted: false,
+            metadata_json: serde_json::json!({
+                "artifact_kind": "plaintext_secret",
+                "secret_value": "must-not-enter-report",
+                "secret_value_sha256": sha256_hex(b"must-not-enter-report"),
+                "secret_source_location": "line 2 key PASSWORD",
+                "nested": { "keyMaterial": "nested-wifi-secret" },
+            }),
+            discovered_by_job_id: Some(source_job_id),
+        };
+        let report_ref = report_entry_item_ref_json(&legacy_entry);
+        let rendered = report_ref.to_string();
+        assert!(!rendered.contains("must-not-enter-report"));
+        assert!(!rendered.contains("nested-wifi-secret"));
+        assert!(rendered.contains(&sha256_hex(b"must-not-enter-report")));
+        assert!(rendered.contains("line 2 key PASSWORD"));
+
+        let raw_item = RawBookmarkItem {
+            id: 1,
+            bookmark_id: 1,
+            evidence_id: Some(evidence_id),
+            entry_id: Some(77),
+            item_order: 1,
+            display_name: Some("legacy".to_string()),
+            logical_path: Some(legacy_entry.logical_path),
+            selection_offset: None,
+            selection_length: None,
+            data_preview: None,
+            item_ref_json: serde_json::json!({
+                "metadata": {
+                    "artifact_kind": "wifi_profile",
+                    "wifi_key_plaintext": "bookmark-wifi-secret",
+                    "wifi_key_value_sha256": sha256_hex(b"bookmark-wifi-secret"),
+                }
+            })
+            .to_string(),
+            created_at: "2026-08-25T00:00:00Z".to_string(),
+        };
+        let loaded = bookmark_item_from_raw(raw_item)?;
+        let rendered = loaded.item_ref_json.to_string();
+        assert!(!rendered.contains("bookmark-wifi-secret"));
+        assert!(rendered.contains(&sha256_hex(b"bookmark-wifi-secret")));
+        drop(conn);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(source_root);
+        Ok(())
+    }
+
+    #[test]
+    fn identity_staging_is_private_collision_safe_and_exactly_cleaned() -> Result<()> {
+        let first = PrivateIdentityStagingFile::create("test", "bin")?;
+        let second = PrivateIdentityStagingFile::create("test", "bin")?;
+        assert_ne!(first.directory, second.directory);
+        assert!(first.directory.is_dir());
+        assert!(!first.path().exists());
+        fs::write(first.path(), b"bounded fixture")?;
+        let first_directory = first.directory.clone();
+        let first_path = first.path().to_path_buf();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&first_directory)?.permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        first.cleanup()?;
+        assert!(!first_path.exists());
+        assert!(!first_directory.exists());
+        second.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn browser_report_redaction_removes_legacy_nested_sensitive_payloads() {
+        let retained_digest = sha256_hex(b"withheld password bytes");
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "browser_login",
+            "url": "https://safe.example/login",
+            "username": "legacy-user@example.test",
+            "user_name": "legacy-user-two@example.test",
+            "password_blob_base64": "c2VjcmV0LXBhc3N3b3Jk",
+            "password_protected_blob_sha256": retained_digest,
+            "password_protected_blob_bytes": 24,
+            "password_protected_blob_format": "chromium_v10_aes_gcm",
+            "credential_note": "protected values remain only in the cited source row",
+            "nested": {
+                "cookie_plaintext_value": "session-secret-value",
+                "autofill_field_value": "autofill-secret-value",
+                "token_value": "token-secret-value",
+                "encrypted_blob_base64": "ZW5jcnlwdGVkLWJ5dGVz",
+                "cookie_name": "sid"
+            }
+        });
+
+        redact_browser_sensitive_report_fields(&mut metadata);
+        let rendered = metadata.to_string();
+        for forbidden in [
+            "legacy-user@example.test",
+            "legacy-user-two@example.test",
+            "c2VjcmV0LXBhc3N3b3Jk",
+            "session-secret-value",
+            "autofill-secret-value",
+            "token-secret-value",
+            "ZW5jcnlwdGVkLWJ5dGVz",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+        assert_eq!(
+            metadata["password_protected_blob_sha256"].as_str(),
+            Some(retained_digest.as_str())
+        );
+        assert_eq!(metadata["password_protected_blob_bytes"].as_u64(), Some(24));
+        assert_eq!(
+            metadata["password_protected_blob_format"].as_str(),
+            Some("chromium_v10_aes_gcm")
+        );
+        assert_eq!(metadata["nested"]["cookie_name"].as_str(), Some("sid"));
+        assert!(metadata["credential_note"].as_str().is_some());
     }
 
     #[test]

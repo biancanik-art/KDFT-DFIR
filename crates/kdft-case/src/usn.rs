@@ -1,10 +1,10 @@
 //! Bounded, incremental parsing for the NTFS `$UsnJrnl:$J` stream.
 //!
 //! The production API accepts [`Read`] and never buffers the complete journal. Only one
-//! examiner-bounded record plus a fixed I/O chunk is resident at a time. USN V2 and V3 records
-//! are decoded; V4 and unknown versions are counted and disclosed as unsupported. Resynchronizing
-//! after damaged framing follows the format's 8-byte record alignment; the parser does not perform
-//! an unbounded byte-by-byte carve for misaligned record signatures.
+//! examiner-bounded record plus a fixed I/O chunk is resident at a time. USN V2, V3, and the
+//! documented V4.0 range-tracking layout are decoded. Resynchronizing after an untrusted header
+//! advances by one 8-byte aligned slot; a corrupt length or unknown major version is never trusted
+//! to skip later records, and the parser does not perform an unbounded byte-by-byte signature carve.
 
 #![allow(dead_code)]
 
@@ -19,6 +19,11 @@ const HARD_MAX_DIAGNOSTIC_SAMPLES: usize = 256;
 const DEFAULT_DIAGNOSTIC_SAMPLES: usize = 32;
 const DIAGNOSTIC_MESSAGE_BYTES: usize = 512;
 const FILETIME_UNIX_EPOCH_100NS: i64 = 116_444_736_000_000_000;
+const USN_RECORD_ALIGNMENT: u32 = 8;
+const USN_V2_MIN_RECORD_BYTES: u32 = 60;
+const USN_V3_MIN_RECORD_BYTES: u32 = 76;
+pub(crate) const USN_V4_HEADER_BYTES: u32 = 64;
+const USN_V4_EXTENT_BYTES: u16 = 16;
 
 const USN_REASON_DATA_OVERWRITE: u32 = 0x0000_0001;
 const USN_REASON_DATA_EXTEND: u32 = 0x0000_0002;
@@ -68,6 +73,37 @@ const KNOWN_REASON_MASK: u32 = USN_REASON_DATA_OVERWRITE
     | USN_REASON_INTEGRITY_CHANGE
     | USN_REASON_CLOSE;
 
+const USN_SOURCE_DATA_MANAGEMENT: u32 = 0x0000_0001;
+const USN_SOURCE_AUXILIARY_DATA: u32 = 0x0000_0002;
+const USN_SOURCE_REPLICATION_MANAGEMENT: u32 = 0x0000_0004;
+const USN_SOURCE_CLIENT_REPLICATION_MANAGEMENT: u32 = 0x0000_0008;
+const KNOWN_SOURCE_INFO_MASK: u32 = USN_SOURCE_DATA_MANAGEMENT
+    | USN_SOURCE_AUXILIARY_DATA
+    | USN_SOURCE_REPLICATION_MANAGEMENT
+    | USN_SOURCE_CLIENT_REPLICATION_MANAGEMENT;
+
+const KNOWN_FILE_ATTRIBUTE_MASK: u32 = 0x0000_0001
+    | 0x0000_0002
+    | 0x0000_0004
+    | 0x0000_0010
+    | 0x0000_0020
+    | 0x0000_0040
+    | 0x0000_0080
+    | 0x0000_0100
+    | 0x0000_0200
+    | 0x0000_0400
+    | 0x0000_0800
+    | 0x0000_1000
+    | 0x0000_2000
+    | 0x0000_4000
+    | 0x0000_8000
+    | 0x0001_0000
+    | 0x0002_0000
+    | 0x0004_0000
+    | 0x0008_0000
+    | 0x0010_0000
+    | 0x0040_0000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsnTerminalStatus {
     Recognized,
@@ -79,6 +115,7 @@ pub enum UsnTerminalStatus {
 pub enum UsnVersion {
     V2,
     V3,
+    V4,
 }
 
 /// V2 uses the traditional 48-bit MFT entry plus 16-bit sequence number. V3 stores the complete
@@ -87,6 +124,23 @@ pub enum UsnVersion {
 pub enum UsnFileReference {
     V2 { raw: u64, entry: u64, sequence: u16 },
     V3 { low: u64, high: u64 },
+    V4 { low: u64, high: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsnRenameRole {
+    None,
+    OldName,
+    NewName,
+    BothFlags,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsnExtent {
+    pub offset: i64,
+    pub length: i64,
+    /// Complete extent bytes, including any future trailing fields beyond the known 16-byte pair.
+    pub raw_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,15 +152,38 @@ pub struct UsnRecord {
     pub file_reference: UsnFileReference,
     pub parent_reference: UsnFileReference,
     pub usn: i64,
-    pub timestamp_filetime: i64,
+    /// V4 range-tracking records do not contain a timestamp.
+    pub timestamp_filetime: Option<i64>,
     pub timestamp_utc: Option<String>,
     pub reason: u32,
     pub reason_flags: Vec<&'static str>,
     pub unknown_reason_bits: u32,
+    pub rename_role: UsnRenameRole,
     pub source_info: u32,
-    pub security_id: u32,
-    pub file_attributes: u32,
-    pub file_name: String,
+    pub source_info_flags: Vec<&'static str>,
+    pub unknown_source_info_bits: u32,
+    /// V4 range-tracking records do not contain a security identifier.
+    pub security_id: Option<u32>,
+    /// V4 range-tracking records do not contain file attributes.
+    pub file_attributes: Option<u32>,
+    pub file_attribute_flags: Vec<&'static str>,
+    pub unknown_file_attribute_bits: u32,
+    /// V4 range-tracking records do not contain a file name.
+    pub file_name: Option<String>,
+    /// Byte offset of the V2/V3 filename inside this record.
+    pub file_name_offset: Option<u16>,
+    /// Exact byte length of the V2/V3 filename inside this record.
+    pub file_name_length: Option<u16>,
+    /// Exact V2/V3 filename bytes as stored in the record, before display decoding.
+    pub file_name_utf16le: Option<Vec<u8>>,
+    /// True when the display string uses U+FFFD for an unpaired UTF-16 surrogate.
+    pub file_name_decode_lossy: bool,
+    pub remaining_extents: Option<u32>,
+    pub number_of_extents: Option<u16>,
+    pub extent_size: Option<u16>,
+    pub extent_unknown_trailing_bytes: Option<u16>,
+    pub extents: Vec<UsnExtent>,
+    /// Offset in the recovered `$UsnJrnl:$J` stream, not a decoded-media or physical offset.
     pub byte_offset: u64,
 }
 
@@ -140,12 +217,15 @@ pub struct UsnDiagnostic {
 pub struct UsnStreamStats {
     pub bytes_read: u64,
     pub sparse_zero_bytes_skipped: u64,
+    pub aligned_header_candidates: u64,
+    pub resync_slots_skipped: u64,
     pub records_seen: u64,
     pub records_parsed: u64,
     pub records_emitted: u64,
     pub v2_records: u64,
     pub v3_records: u64,
-    pub unsupported_v4_records: u64,
+    pub v4_records: u64,
+    pub unsupported_minor_version_records: u64,
     pub unknown_version_records: u64,
     pub corrupt_records: u64,
     pub truncated_records: u64,
@@ -179,7 +259,7 @@ impl UsnStreamStats {
         if self.corrupt_records > 0
             || self.truncated_records > 0
             || self.oversized_records > 0
-            || self.unsupported_v4_records > 0
+            || self.unsupported_minor_version_records > 0
             || self.unknown_version_records > 0
         {
             UsnTerminalStatus::Partial
@@ -202,10 +282,11 @@ pub enum UsnErrorKind {
     Sink,
     TruncatedRecord,
     InvalidRecordLength,
+    InvalidRecordAlignment,
     InvalidVersion,
     InvalidFileNameOffset,
     InvalidFileNameLength,
-    InvalidUtf16,
+    InvalidExtentLayout,
     CheckedArithmeticOverflow,
     Allocation,
 }
@@ -302,10 +383,12 @@ pub fn parse_usn_journal<R: Read, S: UsnSink>(
 
         let record_length = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         let major_version = u16::from_le_bytes([header[4], header[5]]);
-        stats.records_seen = stats.records_seen.saturating_add(1);
+        let minor_version = u16::from_le_bytes([header[6], header[7]]);
+        stats.aligned_header_candidates = stats.aligned_header_candidates.saturating_add(1);
 
         if record_length == 0 || record_length < 8 {
             stats.corrupt_records = stats.corrupt_records.saturating_add(1);
+            stats.resync_slots_skipped = stats.resync_slots_skipped.saturating_add(1);
             stats.diagnostic(
                 options,
                 stream_offset,
@@ -316,62 +399,75 @@ pub fn parse_usn_journal<R: Read, S: UsnSink>(
             continue;
         }
 
-        let aligned_length = align_record_length(record_length).ok_or_else(|| {
-            failed_error(
-                UsnErrorKind::CheckedArithmeticOverflow,
-                stream_offset,
-                format!("aligning record length {record_length}"),
-                &stats,
-            )
-        })?;
-        let remaining_framed_bytes = aligned_length.checked_sub(8).ok_or_else(|| {
-            failed_error(
-                UsnErrorKind::CheckedArithmeticOverflow,
-                stream_offset,
-                "subtracting the record prefix from aligned length".to_string(),
-                &stats,
-            )
-        })?;
-
-        let recognized_version = major_version == 2 || major_version == 3;
-        let minimum_length = if major_version == 3 { 76_u32 } else { 60_u32 };
-        if !recognized_version {
-            if major_version == 4 {
-                stats.unsupported_v4_records = stats.unsupported_v4_records.saturating_add(1);
-            } else {
-                stats.unknown_version_records = stats.unknown_version_records.saturating_add(1);
-            }
+        if !record_length.is_multiple_of(USN_RECORD_ALIGNMENT) {
+            stats.corrupt_records = stats.corrupt_records.saturating_add(1);
+            stats.resync_slots_skipped = stats.resync_slots_skipped.saturating_add(1);
             stats.diagnostic(
                 options,
                 stream_offset,
-                UsnErrorKind::InvalidVersion,
-                format!("USN major version {major_version} is not decoded"),
+                UsnErrorKind::InvalidRecordAlignment,
+                format!(
+                    "record length {record_length} is not a multiple of the documented 8-byte alignment; the length is not trusted"
+                ),
             );
-            if !discard_exact(
-                &mut reader,
-                remaining_framed_bytes,
-                &mut stats,
-                stream_offset,
-            )? {
-                note_truncated_record(
-                    &mut stats,
-                    options,
-                    stream_offset,
-                    "unsupported record ends beyond the available stream",
-                );
-                break;
-            }
-            stream_offset = checked_offset_add(stream_offset, aligned_length, &stats)?;
+            stream_offset = checked_offset_add(stream_offset, 8, &stats)?;
             continue;
         }
 
+        let minimum_length = match major_version {
+            2 => USN_V2_MIN_RECORD_BYTES,
+            3 => USN_V3_MIN_RECORD_BYTES,
+            4 => USN_V4_HEADER_BYTES,
+            _ => {
+                stats.unknown_version_records = stats.unknown_version_records.saturating_add(1);
+                stats.resync_slots_skipped = stats.resync_slots_skipped.saturating_add(1);
+                stats.diagnostic(
+                    options,
+                    stream_offset,
+                    UsnErrorKind::InvalidVersion,
+                    format!(
+                        "USN major version {major_version} is unknown; its declared framing is not trusted"
+                    ),
+                );
+                stream_offset = checked_offset_add(stream_offset, 8, &stats)?;
+                continue;
+            }
+        };
         if record_length < minimum_length {
             stats.corrupt_records = stats.corrupt_records.saturating_add(1);
+            stats.resync_slots_skipped = stats.resync_slots_skipped.saturating_add(1);
             stats.diagnostic(
                 options,
                 stream_offset,
                 UsnErrorKind::InvalidRecordLength,
-                format!("V{major_version} record length {record_length} is below {minimum_length}"),
+                format!(
+                    "V{major_version} record length {record_length} is below {minimum_length}; the length is not trusted"
+                ),
+            );
+            stream_offset = checked_offset_add(stream_offset, 8, &stats)?;
+            continue;
+        }
+
+        stats.records_seen = stats.records_seen.saturating_add(1);
+        let remaining_framed_bytes = u64::from(record_length).checked_sub(8).ok_or_else(|| {
+            failed_error(
+                UsnErrorKind::CheckedArithmeticOverflow,
+                stream_offset,
+                "subtracting the record prefix from record length".to_string(),
+                &stats,
+            )
+        })?;
+
+        if major_version == 4 && minor_version != 0 {
+            stats.unsupported_minor_version_records =
+                stats.unsupported_minor_version_records.saturating_add(1);
+            stats.diagnostic(
+                options,
+                stream_offset,
+                UsnErrorKind::InvalidVersion,
+                format!(
+                    "USN V4 minor version {minor_version} is not the documented V4.0 extent layout; record omitted"
+                ),
             );
             if !discard_exact(
                 &mut reader,
@@ -383,11 +479,11 @@ pub fn parse_usn_journal<R: Read, S: UsnSink>(
                     &mut stats,
                     options,
                     stream_offset,
-                    "short record ends beyond the available stream",
+                    "unsupported V4 minor-version record ends beyond the available stream",
                 );
                 break;
             }
-            stream_offset = checked_offset_add(stream_offset, aligned_length, &stats)?;
+            stream_offset = checked_offset_add(stream_offset, u64::from(record_length), &stats)?;
             continue;
         }
 
@@ -424,7 +520,7 @@ pub fn parse_usn_journal<R: Read, S: UsnSink>(
                 );
                 break;
             }
-            stream_offset = checked_offset_add(stream_offset, aligned_length, &stats)?;
+            stream_offset = checked_offset_add(stream_offset, u64::from(record_length), &stats)?;
             continue;
         }
 
@@ -463,26 +559,6 @@ pub fn parse_usn_journal<R: Read, S: UsnSink>(
             break;
         }
 
-        let padding = aligned_length
-            .checked_sub(u64::from(record_length))
-            .ok_or_else(|| {
-                failed_error(
-                    UsnErrorKind::CheckedArithmeticOverflow,
-                    stream_offset,
-                    "calculating aligned record padding".to_string(),
-                    &stats,
-                )
-            })?;
-        if !discard_exact(&mut reader, padding, &mut stats, stream_offset)? {
-            note_truncated_record(
-                &mut stats,
-                options,
-                stream_offset,
-                "record alignment padding is truncated",
-            );
-            break;
-        }
-
         match parse_single_record(&record_bytes, major_version, stream_offset, options) {
             Ok(record) => {
                 stats.records_parsed = stats.records_parsed.saturating_add(1);
@@ -495,10 +571,18 @@ pub fn parse_usn_journal<R: Read, S: UsnSink>(
                     )
                 })?;
                 stats.records_emitted = stats.records_emitted.saturating_add(1);
-                if major_version == 2 {
-                    stats.v2_records = stats.v2_records.saturating_add(1);
-                } else {
-                    stats.v3_records = stats.v3_records.saturating_add(1);
+                match major_version {
+                    2 => stats.v2_records = stats.v2_records.saturating_add(1),
+                    3 => stats.v3_records = stats.v3_records.saturating_add(1),
+                    4 => stats.v4_records = stats.v4_records.saturating_add(1),
+                    other => {
+                        return Err(failed_error(
+                            UsnErrorKind::InvalidVersion,
+                            stream_offset,
+                            format!("record parser returned unsupported USN major version {other}"),
+                            &stats,
+                        ));
+                    }
                 }
             }
             Err(error) => {
@@ -507,7 +591,7 @@ pub fn parse_usn_journal<R: Read, S: UsnSink>(
             }
         }
 
-        stream_offset = checked_offset_add(stream_offset, aligned_length, &stats)?;
+        stream_offset = checked_offset_add(stream_offset, u64::from(record_length), &stats)?;
     }
 
     Ok(UsnStreamResult {
@@ -540,6 +624,44 @@ fn validate_options(options: &UsnParseOptions) -> Result<(), String> {
 }
 
 fn parse_single_record(
+    data: &[u8],
+    major_version: u16,
+    byte_offset: u64,
+    options: &UsnParseOptions,
+) -> Result<UsnRecord, RecordError> {
+    let record_length = read_u32(data, 0)?;
+    if usize::try_from(record_length).ok() != Some(data.len()) {
+        return Err(RecordError::new(
+            UsnErrorKind::InvalidRecordLength,
+            format!(
+                "declared record length {record_length} differs from framed buffer length {}",
+                data.len()
+            ),
+        ));
+    }
+    if !record_length.is_multiple_of(USN_RECORD_ALIGNMENT) {
+        return Err(RecordError::new(
+            UsnErrorKind::InvalidRecordAlignment,
+            format!("record length {record_length} is not 8-byte aligned"),
+        ));
+    }
+    if read_u16(data, 4)? != major_version {
+        return Err(RecordError::new(
+            UsnErrorKind::InvalidVersion,
+            "record major version differs from the validated framing header",
+        ));
+    }
+    match major_version {
+        2 | 3 => parse_v2_or_v3_record(data, major_version, byte_offset, options),
+        4 => parse_v4_record(data, byte_offset),
+        _ => Err(RecordError::new(
+            UsnErrorKind::InvalidVersion,
+            format!("USN major version {major_version} is not supported"),
+        )),
+    }
+}
+
+fn parse_v2_or_v3_record(
     data: &[u8],
     major_version: u16,
     byte_offset: u64,
@@ -594,8 +716,15 @@ fn parse_single_record(
         )
     };
 
-    let filename_length = usize::from(read_u16(data, filename_length_offset)?);
-    let filename_offset = usize::from(read_u16(data, filename_offset_offset)?);
+    let fixed_prefix_length = if major_version == 2 {
+        usize::try_from(USN_V2_MIN_RECORD_BYTES).unwrap_or(usize::MAX)
+    } else {
+        usize::try_from(USN_V3_MIN_RECORD_BYTES).unwrap_or(usize::MAX)
+    };
+    let filename_length_raw = read_u16(data, filename_length_offset)?;
+    let filename_offset_raw = read_u16(data, filename_offset_offset)?;
+    let filename_length = usize::from(filename_length_raw);
+    let filename_offset = usize::from(filename_offset_raw);
     if filename_length > options.max_filename_bytes {
         return Err(RecordError::new(
             UsnErrorKind::InvalidFileNameLength,
@@ -609,6 +738,14 @@ fn parse_single_record(
         return Err(RecordError::new(
             UsnErrorKind::InvalidFileNameLength,
             format!("UTF-16 filename length {filename_length} is odd"),
+        ));
+    }
+    if filename_offset < fixed_prefix_length || filename_offset % 2 != 0 {
+        return Err(RecordError::new(
+            UsnErrorKind::InvalidFileNameOffset,
+            format!(
+                "UTF-16 filename offset {filename_offset} must be even and at or after the {fixed_prefix_length}-byte fixed V{major_version} prefix"
+            ),
         ));
     }
     let filename_end = filename_offset
@@ -640,12 +777,10 @@ fn parse_single_record(
     for pair in data[filename_offset..filename_end].chunks_exact(2) {
         code_units.push(u16::from_le_bytes([pair[0], pair[1]]));
     }
-    let file_name = String::from_utf16(&code_units).map_err(|_| {
-        RecordError::new(
-            UsnErrorKind::InvalidUtf16,
-            "filename contains an unpaired UTF-16 surrogate",
-        )
-    })?;
+    let (file_name, file_name_decode_lossy) = match String::from_utf16(&code_units) {
+        Ok(file_name) => (file_name, false),
+        Err(_) => (String::from_utf16_lossy(&code_units), true),
+    };
 
     Ok(UsnRecord {
         version: if major_version == 2 {
@@ -659,15 +794,172 @@ fn parse_single_record(
         file_reference,
         parent_reference,
         usn,
-        timestamp_filetime,
+        timestamp_filetime: Some(timestamp_filetime),
         timestamp_utc: filetime_to_rfc3339(timestamp_filetime),
         reason,
         reason_flags: decode_reason_flags(reason),
         unknown_reason_bits: reason & !KNOWN_REASON_MASK,
+        rename_role: rename_role(reason),
         source_info,
-        security_id,
-        file_attributes,
-        file_name,
+        source_info_flags: decode_source_info_flags(source_info),
+        unknown_source_info_bits: source_info & !KNOWN_SOURCE_INFO_MASK,
+        security_id: Some(security_id),
+        file_attributes: Some(file_attributes),
+        file_attribute_flags: decode_file_attribute_flags(file_attributes),
+        unknown_file_attribute_bits: file_attributes & !KNOWN_FILE_ATTRIBUTE_MASK,
+        file_name: Some(file_name),
+        file_name_offset: Some(filename_offset_raw),
+        file_name_length: Some(filename_length_raw),
+        file_name_utf16le: Some(data[filename_offset..filename_end].to_vec()),
+        file_name_decode_lossy,
+        remaining_extents: None,
+        number_of_extents: None,
+        extent_size: None,
+        extent_unknown_trailing_bytes: None,
+        extents: Vec::new(),
+        byte_offset,
+    })
+}
+
+fn parse_v4_record(data: &[u8], byte_offset: u64) -> Result<UsnRecord, RecordError> {
+    let record_length = read_u32(data, 0)?;
+    let minor_version = read_u16(data, 6)?;
+    if minor_version != 0 {
+        return Err(RecordError::new(
+            UsnErrorKind::InvalidVersion,
+            format!("only the documented USN V4.0 layout is decoded, not V4.{minor_version}"),
+        ));
+    }
+
+    let file_reference = UsnFileReference::V4 {
+        low: read_u64(data, 8)?,
+        high: read_u64(data, 16)?,
+    };
+    let parent_reference = UsnFileReference::V4 {
+        low: read_u64(data, 24)?,
+        high: read_u64(data, 32)?,
+    };
+    let usn = read_i64(data, 40)?;
+    let reason = read_u32(data, 48)?;
+    let source_info = read_u32(data, 52)?;
+    let remaining_extents = read_u32(data, 56)?;
+    let number_of_extents = read_u16(data, 60)?;
+    let extent_size = read_u16(data, 62)?;
+    if number_of_extents == 0 {
+        return Err(RecordError::new(
+            UsnErrorKind::InvalidExtentLayout,
+            "V4 record declares zero extents",
+        ));
+    }
+    if extent_size < USN_V4_EXTENT_BYTES {
+        return Err(RecordError::new(
+            UsnErrorKind::InvalidExtentLayout,
+            format!(
+                "V4 extent size {extent_size} is smaller than the documented {USN_V4_EXTENT_BYTES}-byte offset/length pair"
+            ),
+        ));
+    }
+    let extent_bytes = usize::from(number_of_extents)
+        .checked_mul(usize::from(extent_size))
+        .ok_or_else(|| {
+            RecordError::new(
+                UsnErrorKind::CheckedArithmeticOverflow,
+                "V4 extent count times extent size overflows usize",
+            )
+        })?;
+    let expected_length = usize::try_from(USN_V4_HEADER_BYTES)
+        .unwrap_or(usize::MAX)
+        .checked_add(extent_bytes)
+        .ok_or_else(|| {
+            RecordError::new(
+                UsnErrorKind::CheckedArithmeticOverflow,
+                "V4 header plus extent bytes overflows usize",
+            )
+        })?;
+    if expected_length != data.len() {
+        return Err(RecordError::new(
+            UsnErrorKind::InvalidExtentLayout,
+            format!(
+                "V4 header and {number_of_extents} extent(s) of {extent_size} bytes require {expected_length} bytes, not {}",
+                data.len()
+            ),
+        ));
+    }
+
+    let mut extents = Vec::new();
+    extents
+        .try_reserve_exact(usize::from(number_of_extents))
+        .map_err(|error| {
+            RecordError::new(
+                UsnErrorKind::Allocation,
+                format!("reserving V4 extent vector: {error}"),
+            )
+        })?;
+    let extent_base = usize::try_from(USN_V4_HEADER_BYTES).unwrap_or(usize::MAX);
+    for index in 0..usize::from(number_of_extents) {
+        let offset_in_record = index
+            .checked_mul(usize::from(extent_size))
+            .and_then(|offset| extent_base.checked_add(offset))
+            .ok_or_else(|| {
+                RecordError::new(
+                    UsnErrorKind::CheckedArithmeticOverflow,
+                    "V4 extent byte offset overflows usize",
+                )
+            })?;
+        let offset = read_i64(data, offset_in_record)?;
+        let length_offset = offset_in_record.checked_add(8).ok_or_else(|| {
+            RecordError::new(
+                UsnErrorKind::CheckedArithmeticOverflow,
+                "V4 extent length offset overflows usize",
+            )
+        })?;
+        let length = read_i64(data, length_offset)?;
+        if offset < 0 || length <= 0 || offset.checked_add(length).is_none() {
+            return Err(RecordError::new(
+                UsnErrorKind::InvalidExtentLayout,
+                format!(
+                    "V4 extent {index} has invalid byte range offset={offset}, length={length}"
+                ),
+            ));
+        }
+        extents.push(UsnExtent {
+            offset,
+            length,
+            raw_bytes: checked_slice(data, offset_in_record, usize::from(extent_size))?.to_vec(),
+        });
+    }
+
+    Ok(UsnRecord {
+        version: UsnVersion::V4,
+        major_version: 4,
+        minor_version,
+        record_length,
+        file_reference,
+        parent_reference,
+        usn,
+        timestamp_filetime: None,
+        timestamp_utc: None,
+        reason,
+        reason_flags: decode_reason_flags(reason),
+        unknown_reason_bits: reason & !KNOWN_REASON_MASK,
+        rename_role: rename_role(reason),
+        source_info,
+        source_info_flags: decode_source_info_flags(source_info),
+        unknown_source_info_bits: source_info & !KNOWN_SOURCE_INFO_MASK,
+        security_id: None,
+        file_attributes: None,
+        file_attribute_flags: Vec::new(),
+        unknown_file_attribute_bits: 0,
+        file_name: None,
+        file_name_offset: None,
+        file_name_length: None,
+        file_name_utf16le: None,
+        file_name_decode_lossy: false,
+        remaining_extents: Some(remaining_extents),
+        number_of_extents: Some(number_of_extents),
+        extent_size: Some(extent_size),
+        extent_unknown_trailing_bytes: Some(extent_size - USN_V4_EXTENT_BYTES),
+        extents,
         byte_offset,
     })
 }
@@ -896,6 +1188,71 @@ fn decode_reason_flags(reason: u32) -> Vec<&'static str> {
     flags
 }
 
+fn rename_role(reason: u32) -> UsnRenameRole {
+    match (
+        reason & USN_REASON_RENAME_OLD_NAME != 0,
+        reason & USN_REASON_RENAME_NEW_NAME != 0,
+    ) {
+        (false, false) => UsnRenameRole::None,
+        (true, false) => UsnRenameRole::OldName,
+        (false, true) => UsnRenameRole::NewName,
+        (true, true) => UsnRenameRole::BothFlags,
+    }
+}
+
+fn decode_source_info_flags(source_info: u32) -> Vec<&'static str> {
+    let mut flags = Vec::with_capacity(4);
+    for (mask, name) in [
+        (USN_SOURCE_DATA_MANAGEMENT, "USN_SOURCE_DATA_MANAGEMENT"),
+        (USN_SOURCE_AUXILIARY_DATA, "USN_SOURCE_AUXILIARY_DATA"),
+        (
+            USN_SOURCE_REPLICATION_MANAGEMENT,
+            "USN_SOURCE_REPLICATION_MANAGEMENT",
+        ),
+        (
+            USN_SOURCE_CLIENT_REPLICATION_MANAGEMENT,
+            "USN_SOURCE_CLIENT_REPLICATION_MANAGEMENT",
+        ),
+    ] {
+        if source_info & mask != 0 {
+            flags.push(name);
+        }
+    }
+    flags
+}
+
+fn decode_file_attribute_flags(attributes: u32) -> Vec<&'static str> {
+    let mut flags = Vec::with_capacity(21);
+    for (mask, name) in [
+        (0x0000_0001, "FILE_ATTRIBUTE_READONLY"),
+        (0x0000_0002, "FILE_ATTRIBUTE_HIDDEN"),
+        (0x0000_0004, "FILE_ATTRIBUTE_SYSTEM"),
+        (0x0000_0010, "FILE_ATTRIBUTE_DIRECTORY"),
+        (0x0000_0020, "FILE_ATTRIBUTE_ARCHIVE"),
+        (0x0000_0040, "FILE_ATTRIBUTE_DEVICE"),
+        (0x0000_0080, "FILE_ATTRIBUTE_NORMAL"),
+        (0x0000_0100, "FILE_ATTRIBUTE_TEMPORARY"),
+        (0x0000_0200, "FILE_ATTRIBUTE_SPARSE_FILE"),
+        (0x0000_0400, "FILE_ATTRIBUTE_REPARSE_POINT"),
+        (0x0000_0800, "FILE_ATTRIBUTE_COMPRESSED"),
+        (0x0000_1000, "FILE_ATTRIBUTE_OFFLINE"),
+        (0x0000_2000, "FILE_ATTRIBUTE_NOT_CONTENT_INDEXED"),
+        (0x0000_4000, "FILE_ATTRIBUTE_ENCRYPTED"),
+        (0x0000_8000, "FILE_ATTRIBUTE_INTEGRITY_STREAM"),
+        (0x0001_0000, "FILE_ATTRIBUTE_VIRTUAL"),
+        (0x0002_0000, "FILE_ATTRIBUTE_NO_SCRUB_DATA"),
+        (0x0004_0000, "FILE_ATTRIBUTE_EA_OR_RECALL_ON_OPEN"),
+        (0x0008_0000, "FILE_ATTRIBUTE_PINNED"),
+        (0x0010_0000, "FILE_ATTRIBUTE_UNPINNED"),
+        (0x0040_0000, "FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS"),
+    ] {
+        if attributes & mask != 0 {
+            flags.push(name);
+        }
+    }
+    flags
+}
+
 /// Convert a positive Windows FILETIME to UTC with its native 100 ns precision. Years outside
 /// 1601..=9999 are rejected instead of wrapping date arithmetic.
 fn filetime_to_rfc3339(filetime: i64) -> Option<String> {
@@ -979,10 +1336,10 @@ mod tests {
 
     fn build_v2(name: &str, reason: u32, timestamp: i64) -> Vec<u8> {
         let name_bytes = utf16_bytes(name);
-        let record_length = 60_u32 + u32::try_from(name_bytes.len()).unwrap();
-        let aligned = usize::try_from(align_record_length(record_length).unwrap()).unwrap();
-        let mut bytes = vec![0_u8; aligned];
-        bytes[0..4].copy_from_slice(&record_length.to_le_bytes());
+        let content_length = 60_u32 + u32::try_from(name_bytes.len()).unwrap();
+        let record_length = align_record_length(content_length).unwrap();
+        let mut bytes = vec![0_u8; usize::try_from(record_length).unwrap()];
+        bytes[0..4].copy_from_slice(&u32::try_from(record_length).unwrap().to_le_bytes());
         bytes[4..6].copy_from_slice(&2_u16.to_le_bytes());
         bytes[6..8].copy_from_slice(&1_u16.to_le_bytes());
         bytes[8..16].copy_from_slice(&0x0007_0000_0000_0042_u64.to_le_bytes());
@@ -1001,10 +1358,10 @@ mod tests {
 
     fn build_v3(name: &str) -> Vec<u8> {
         let name_bytes = utf16_bytes(name);
-        let record_length = 76_u32 + u32::try_from(name_bytes.len()).unwrap();
-        let aligned = usize::try_from(align_record_length(record_length).unwrap()).unwrap();
-        let mut bytes = vec![0_u8; aligned];
-        bytes[0..4].copy_from_slice(&record_length.to_le_bytes());
+        let content_length = 76_u32 + u32::try_from(name_bytes.len()).unwrap();
+        let record_length = align_record_length(content_length).unwrap();
+        let mut bytes = vec![0_u8; usize::try_from(record_length).unwrap()];
+        bytes[0..4].copy_from_slice(&u32::try_from(record_length).unwrap().to_le_bytes());
         bytes[4..6].copy_from_slice(&3_u16.to_le_bytes());
         bytes[8..16].copy_from_slice(&1_u64.to_le_bytes());
         bytes[16..24].copy_from_slice(&2_u64.to_le_bytes());
@@ -1016,6 +1373,30 @@ mod tests {
         bytes[72..74].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         bytes[74..76].copy_from_slice(&76_u16.to_le_bytes());
         bytes[76..76 + name_bytes.len()].copy_from_slice(&name_bytes);
+        bytes
+    }
+
+    fn build_v4(extents: &[(i64, i64)], remaining_extents: u32) -> Vec<u8> {
+        let extent_bytes = extents.len() * usize::from(USN_V4_EXTENT_BYTES);
+        let record_length = usize::try_from(USN_V4_HEADER_BYTES).unwrap() + extent_bytes;
+        let mut bytes = vec![0_u8; record_length];
+        bytes[0..4].copy_from_slice(&u32::try_from(record_length).unwrap().to_le_bytes());
+        bytes[4..6].copy_from_slice(&4_u16.to_le_bytes());
+        bytes[8..16].copy_from_slice(&1_u64.to_le_bytes());
+        bytes[16..24].copy_from_slice(&2_u64.to_le_bytes());
+        bytes[24..32].copy_from_slice(&3_u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&4_u64.to_le_bytes());
+        bytes[40..48].copy_from_slice(&1_234_i64.to_le_bytes());
+        bytes[48..52].copy_from_slice(&USN_REASON_DATA_OVERWRITE.to_le_bytes());
+        bytes[52..56].copy_from_slice(&USN_SOURCE_DATA_MANAGEMENT.to_le_bytes());
+        bytes[56..60].copy_from_slice(&remaining_extents.to_le_bytes());
+        bytes[60..62].copy_from_slice(&u16::try_from(extents.len()).unwrap().to_le_bytes());
+        bytes[62..64].copy_from_slice(&USN_V4_EXTENT_BYTES.to_le_bytes());
+        for (index, (offset, length)) in extents.iter().enumerate() {
+            let start = 64 + index * usize::from(USN_V4_EXTENT_BYTES);
+            bytes[start..start + 8].copy_from_slice(&offset.to_le_bytes());
+            bytes[start + 8..start + 16].copy_from_slice(&length.to_le_bytes());
+        }
         bytes
     }
 
@@ -1048,12 +1429,18 @@ mod tests {
         assert_eq!(result.stats.v3_records, 1);
         assert_eq!(result.stats.sparse_zero_bytes_skipped, 16);
         assert!(reader.largest_request <= READ_CHUNK_BYTES);
-        assert_eq!(sink.records[0].file_name, "created.txt");
+        assert_eq!(sink.records[0].file_name.as_deref(), Some("created.txt"));
+        assert_eq!(
+            sink.records[0].file_name_utf16le.as_deref(),
+            Some(utf16_bytes("created.txt").as_slice())
+        );
+        assert!(!sink.records[0].file_name_decode_lossy);
         assert_eq!(
             sink.records[0].timestamp_utc.as_deref(),
             Some("1970-01-01T00:00:01.2345678Z")
         );
         assert_eq!(sink.records[0].minor_version, 1);
+        assert_eq!(sink.records[0].timestamp_filetime, Some(timestamp));
         assert_eq!(
             sink.records[0].file_reference,
             UsnFileReference::V2 {
@@ -1170,11 +1557,11 @@ mod tests {
         assert_eq!(result.status, UsnTerminalStatus::Partial);
         assert_eq!(result.stats.oversized_records, 1);
         assert_eq!(result.stats.records_emitted, 1);
-        assert_eq!(sink.records[0].file_name, "after.txt");
+        assert_eq!(sink.records[0].file_name.as_deref(), Some("after.txt"));
     }
 
     #[test]
-    fn truncated_record_and_unsupported_version_are_explicit_partial() {
+    fn truncated_record_and_invalid_v4_layout_are_explicit_partial() {
         let mut unsupported = vec![0_u8; 80];
         unsupported[0..4].copy_from_slice(&80_u32.to_le_bytes());
         unsupported[4..6].copy_from_slice(&4_u16.to_le_bytes());
@@ -1189,9 +1576,149 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.status, UsnTerminalStatus::Partial);
-        assert_eq!(result.stats.unsupported_v4_records, 1);
+        assert_eq!(result.stats.corrupt_records, 2);
+        assert_eq!(result.stats.v4_records, 0);
         assert_eq!(result.stats.truncated_records, 1);
         assert_eq!(result.stats.records_emitted, 0);
+    }
+
+    #[test]
+    fn decodes_v4_range_tracking_without_inventing_name_timestamp_or_path() {
+        let journal = build_v4(&[(4096, 512), (16384, 4096)], 3);
+        let mut sink = CollectSink::default();
+        let result =
+            parse_usn_journal(Cursor::new(journal), &mut sink, &UsnParseOptions::default())
+                .unwrap();
+
+        assert_eq!(result.status, UsnTerminalStatus::Recognized);
+        assert_eq!(result.stats.v4_records, 1);
+        assert_eq!(sink.records.len(), 1);
+        let record = &sink.records[0];
+        assert_eq!(record.version, UsnVersion::V4);
+        assert_eq!(
+            record.file_reference,
+            UsnFileReference::V4 { low: 1, high: 2 }
+        );
+        assert_eq!(
+            record.parent_reference,
+            UsnFileReference::V4 { low: 3, high: 4 }
+        );
+        assert_eq!(record.file_name, None);
+        assert_eq!(record.timestamp_filetime, None);
+        assert_eq!(record.timestamp_utc, None);
+        assert_eq!(record.security_id, None);
+        assert_eq!(record.file_attributes, None);
+        assert_eq!(record.remaining_extents, Some(3));
+        assert_eq!(record.number_of_extents, Some(2));
+        assert_eq!(record.extent_size, Some(16));
+        assert_eq!(record.extent_unknown_trailing_bytes, Some(0));
+        assert_eq!(
+            record.extents,
+            vec![
+                UsnExtent {
+                    offset: 4096,
+                    length: 512,
+                    raw_bytes: journal_extent_bytes(4096, 512),
+                },
+                UsnExtent {
+                    offset: 16384,
+                    length: 4096,
+                    raw_bytes: journal_extent_bytes(16384, 4096),
+                },
+            ]
+        );
+    }
+
+    fn journal_extent_bytes(offset: i64, length: i64) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(&offset.to_le_bytes());
+        bytes.extend_from_slice(&length.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn forged_headers_resynchronize_by_one_aligned_slot_without_skipping_valid_record() {
+        let mut journal = Vec::new();
+        journal.extend_from_slice(&65_u32.to_le_bytes());
+        journal.extend_from_slice(&2_u16.to_le_bytes());
+        journal.extend_from_slice(&0_u16.to_le_bytes());
+        journal.extend_from_slice(&16_u32.to_le_bytes());
+        journal.extend_from_slice(&2_u16.to_le_bytes());
+        journal.extend_from_slice(&0_u16.to_le_bytes());
+        journal.extend_from_slice(&1_048_576_u32.to_le_bytes());
+        journal.extend_from_slice(&99_u16.to_le_bytes());
+        journal.extend_from_slice(&0_u16.to_le_bytes());
+        journal.extend(build_v2("survives.txt", 0, 0));
+
+        let mut sink = CollectSink::default();
+        let result =
+            parse_usn_journal(Cursor::new(journal), &mut sink, &UsnParseOptions::default())
+                .unwrap();
+
+        assert_eq!(result.status, UsnTerminalStatus::Partial);
+        assert_eq!(result.stats.resync_slots_skipped, 3);
+        assert_eq!(result.stats.aligned_header_candidates, 4);
+        assert_eq!(result.stats.corrupt_records, 2);
+        assert_eq!(result.stats.unknown_version_records, 1);
+        assert_eq!(result.stats.records_seen, 1);
+        assert_eq!(sink.records[0].byte_offset, 24);
+        assert_eq!(sink.records[0].file_name.as_deref(), Some("survives.txt"));
+    }
+
+    #[test]
+    fn filename_offset_inside_fixed_header_is_rejected_but_next_frame_survives() {
+        let mut invalid = build_v2("hidden.txt", 0, 0);
+        invalid[58..60].copy_from_slice(&2_u16.to_le_bytes());
+        invalid.extend(build_v2("next.txt", 0, 0));
+        let mut sink = CollectSink::default();
+        let result =
+            parse_usn_journal(Cursor::new(invalid), &mut sink, &UsnParseOptions::default())
+                .unwrap();
+        assert_eq!(result.status, UsnTerminalStatus::Partial);
+        assert_eq!(result.stats.corrupt_records, 1);
+        assert_eq!(result.stats.records_seen, 2);
+        assert_eq!(result.stats.records_emitted, 1);
+        assert_eq!(sink.records[0].file_name.as_deref(), Some("next.txt"));
+    }
+
+    #[test]
+    fn unpaired_utf16_is_retained_exactly_without_dropping_the_record() {
+        let mut record = build_v2("x", USN_REASON_FILE_CREATE, 0);
+        record[60..62].copy_from_slice(&0xd800_u16.to_le_bytes());
+        let mut sink = CollectSink::default();
+        let result = parse_usn_journal(Cursor::new(record), &mut sink, &UsnParseOptions::default())
+            .expect("an unpaired UTF-16 code unit must not erase the forensic record");
+
+        assert_eq!(result.status, UsnTerminalStatus::Recognized);
+        assert_eq!(result.stats.records_emitted, 1);
+        assert_eq!(sink.records[0].file_name.as_deref(), Some("\u{fffd}"));
+        assert_eq!(
+            sink.records[0].file_name_utf16le.as_deref(),
+            Some([0x00, 0xd8].as_slice())
+        );
+        assert!(sink.records[0].file_name_decode_lossy);
+    }
+
+    #[test]
+    fn v4_extent_bounds_and_minor_layout_are_never_silently_accepted() {
+        let mut invalid_extent = build_v4(&[(1, 1)], 0);
+        invalid_extent[72..80].copy_from_slice(&0_i64.to_le_bytes());
+        let mut future_minor = build_v4(&[(1, 1)], 0);
+        future_minor[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        invalid_extent.extend(future_minor);
+        invalid_extent.extend(build_v2("after-v4.txt", 0, 0));
+        let mut sink = CollectSink::default();
+        let result = parse_usn_journal(
+            Cursor::new(invalid_extent),
+            &mut sink,
+            &UsnParseOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.status, UsnTerminalStatus::Partial);
+        assert_eq!(result.stats.corrupt_records, 1);
+        assert_eq!(result.stats.unsupported_minor_version_records, 1);
+        assert_eq!(result.stats.v4_records, 0);
+        assert_eq!(sink.records[0].file_name.as_deref(), Some("after-v4.txt"));
     }
 
     #[test]
@@ -1206,6 +1733,96 @@ mod tests {
             Some("1970-01-01T00:00:00Z")
         );
         assert_eq!(filetime_to_rfc3339(0), None);
+        assert_eq!(
+            filetime_to_rfc3339(FILETIME_UNIX_EPOCH_100NS - 10_000_000).as_deref(),
+            Some("1969-12-31T23:59:59Z")
+        );
+        assert_eq!(
+            filetime_to_rfc3339(1).as_deref(),
+            Some("1601-01-01T00:00:00.0000001Z")
+        );
+        assert_eq!(
+            rename_role(USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME),
+            UsnRenameRole::BothFlags
+        );
+        assert_eq!(
+            decode_source_info_flags(USN_SOURCE_DATA_MANAGEMENT | USN_SOURCE_AUXILIARY_DATA),
+            vec!["USN_SOURCE_DATA_MANAGEMENT", "USN_SOURCE_AUXILIARY_DATA"]
+        );
+        assert_eq!(
+            decode_file_attribute_flags(0x20 | 0x4000),
+            vec!["FILE_ATTRIBUTE_ARCHIVE", "FILE_ATTRIBUTE_ENCRYPTED"]
+        );
+    }
+
+    #[test]
+    fn direct_record_parser_rejects_declared_length_mismatch() {
+        let mut record = build_v2("mismatch.txt", 0, 0);
+        let declared = u32::try_from(record.len()).unwrap() - 8;
+        record[0..4].copy_from_slice(&declared.to_le_bytes());
+        let error = parse_single_record(&record, 2, 0, &UsnParseOptions::default()).unwrap_err();
+        assert_eq!(error.kind, UsnErrorKind::InvalidRecordLength);
+    }
+
+    #[derive(Default)]
+    struct GoldCountingSink {
+        count: u64,
+        first_offset: Option<u64>,
+        last_offset: Option<u64>,
+    }
+
+    impl UsnSink for GoldCountingSink {
+        type Error = io::Error;
+
+        fn record(&mut self, record: &UsnRecord) -> Result<(), Self::Error> {
+            self.count = self.count.saturating_add(1);
+            self.first_offset.get_or_insert(record.byte_offset);
+            self.last_offset = Some(record.byte_offset);
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[ignore = "set KDFT_TEST_USN_JOURNAL to a read-only recovered $UsnJrnl:$J stream"]
+    fn validates_external_journal_stream_read_only() {
+        let path = std::env::var_os("KDFT_TEST_USN_JOURNAL")
+            .expect("KDFT_TEST_USN_JOURNAL must identify a recovered journal stream");
+        let file = std::fs::File::open(&path).expect("open read-only external USN stream");
+        let file_size = file.metadata().expect("read journal metadata").len();
+        let mut sink = GoldCountingSink::default();
+        let result = parse_usn_journal(file, &mut sink, &UsnParseOptions::default())
+            .expect("external journal parse must not fail");
+        assert_eq!(result.stats.bytes_read, file_size);
+        assert_eq!(result.stats.records_emitted, sink.count);
+        assert_eq!(
+            result.stats.records_emitted,
+            result
+                .stats
+                .v2_records
+                .saturating_add(result.stats.v3_records)
+                .saturating_add(result.stats.v4_records)
+        );
+        if let Some(expected) = std::env::var_os("KDFT_TEST_USN_EXPECTED_RECORDS") {
+            assert_eq!(
+                result.stats.records_emitted,
+                expected
+                    .to_string_lossy()
+                    .parse::<u64>()
+                    .expect("expected record count must be u64")
+            );
+        }
+        eprintln!(
+            "status={:?} bytes={} records={} v2={} v3={} v4={} first_offset={:?} last_offset={:?} diagnostics={}",
+            result.status,
+            result.stats.bytes_read,
+            result.stats.records_emitted,
+            result.stats.v2_records,
+            result.stats.v3_records,
+            result.stats.v4_records,
+            sink.first_offset,
+            sink.last_offset,
+            result.stats.diagnostic_count,
+        );
     }
 
     #[test]

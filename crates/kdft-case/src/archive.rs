@@ -1,25 +1,37 @@
 //! Bounded-memory, read-only ZIP package traversal.
 //!
-//! Members are never extracted to filesystem paths. The member name returned
-//! by [`zip::read::ZipFile::name`] is reported unchanged, alongside its raw ZIP
-//! bytes. Callers receive textual member payloads as ordered, borrowed byte
-//! segments so they can apply the appropriate character encoding without this
-//! layer altering forensic content.
+//! Members are never extracted to filesystem paths. Potentially dangerous
+//! member names are retained as evidence and labelled, never normalized into a
+//! host path. The member name returned by [`zip::read::ZipFile::name`] is
+//! reported unchanged alongside the filename bytes selected by the ZIP reader.
+//! (A valid Info-ZIP Unicode Path extra field can replace the literal central
+//! directory filename bytes, so those selected bytes are not falsely described
+//! as the on-disk filename field.) Callers receive textual member payloads as
+//! ordered, borrowed byte segments so they can apply the appropriate character
+//! encoding without this layer altering forensic content.
 //!
-//! There is deliberately no member-count or total-content limit. Memory use is
-//! bounded independently of archive size. Binary members are also streamed to
-//! EOF (without content callbacks) so decompression and CRC errors are surfaced.
+//! There is deliberately no member-count or total-content coverage limit.
+//! Payload buffering is bounded independently of archive size; the upstream ZIP
+//! reader retains central-directory metadata proportional to the member count.
+//! Binary members are also streamed to EOF (without content callbacks) so
+//! decompression and CRC errors are surfaced. A bad, encrypted, or unsupported
+//! member does not hide unrelated valid members.
 
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Seek};
 
+use zip::read::HasZipMetadata;
 use zip::result::ZipError;
 use zip::{CompressionMethod, ZipArchive};
 
 /// Maximum uncompressed payload in one text event.
 pub const TEXT_SEGMENT_BYTES: usize = 64 * 1024;
+
+/// Maximum number of representative member diagnostics retained in memory.
+/// Every affected member is still counted and emitted through [`ZipEvent`].
+pub const RETAINED_MEMBER_DIAGNOSTICS: usize = 128;
 
 const TEXT_EXTENSIONS: &[&str] = &[
     "txt", "csv", "tsv", "json", "xml", "html", "htm", "md", "log", "ini", "cfg", "yaml", "yml",
@@ -32,15 +44,88 @@ pub struct ZipMemberMetadata {
     pub archive_index: usize,
     /// Canonical decoded package name returned by the ZIP reader, unchanged.
     pub name: String,
-    /// Exact internal filename bytes reported by the ZIP reader.
-    pub name_raw: Vec<u8>,
+    /// Filename bytes selected by the ZIP reader. These are normally the
+    /// central-directory filename bytes, but a valid Unicode Path extra field
+    /// can replace them. They are therefore evidence-facing reader bytes, not
+    /// a claim about the literal on-disk filename field.
+    pub name_reader_bytes: Vec<u8>,
+    pub name_is_utf8: bool,
     pub is_directory: bool,
+    pub is_symlink: bool,
+    pub unix_mode: Option<u32>,
+    pub encrypted: bool,
+    pub uses_data_descriptor: bool,
+    pub uses_zip64: bool,
     pub compressed_size: u64,
     pub uncompressed_size: u64,
     pub crc32: u32,
     pub compression_method: CompressionMethod,
     /// Whether content is emitted, based only on the member's extension.
     pub is_textual: bool,
+    /// Offset of the ZIP payload within the recovered source stream. Usually
+    /// zero, but non-zero for self-extracting/prefixed ZIPs.
+    pub archive_stream_offset: u64,
+    /// All following offsets are relative to the recovered ZIP source stream,
+    /// not evidence-media offsets and not decoded member offsets.
+    pub local_header_offset: u64,
+    pub compressed_data_offset: u64,
+    pub compressed_data_end: u64,
+    pub central_directory_header_offset: u64,
+    /// Stable risk labels for an evidence name which must never be materialized
+    /// directly as a host filesystem path.
+    pub path_risk_codes: Vec<&'static str>,
+}
+
+impl ZipMemberMetadata {
+    pub fn has_path_risk(&self) -> bool {
+        !self.path_risk_codes.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZipMemberStatus {
+    Validated,
+    Encrypted,
+    UnsupportedCompression,
+    Corrupt,
+    IoError,
+    InternalError,
+}
+
+impl ZipMemberStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Validated => "validated",
+            Self::Encrypted => "encrypted",
+            Self::UnsupportedCompression => "unsupported_compression",
+            Self::Corrupt => "corrupt",
+            Self::IoError => "io_error",
+            Self::InternalError => "internal_error",
+        }
+    }
+}
+
+/// Terminal result for a member whose central/local metadata was readable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZipMemberOutcome {
+    pub status: ZipMemberStatus,
+    pub uncompressed_bytes_read: u64,
+    /// True only after the decoder reached EOF, the observed byte count matched
+    /// the central directory, and the ZIP reader accepted the CRC.
+    pub crc32_validated: bool,
+    pub content_complete: bool,
+    pub diagnostic: Option<ZipParserError>,
+}
+
+/// A central-directory member whose local metadata could not be read. Its
+/// stable index and any available decoded name are retained so later members
+/// can still be examined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZipUnavailableMember {
+    pub archive_index: usize,
+    pub member_name: Option<String>,
+    pub path_risk_codes: Vec<&'static str>,
+    pub diagnostic: ZipParserError,
 }
 
 /// A transient event emitted while walking an archive.
@@ -60,19 +145,95 @@ pub enum ZipEvent<'a> {
         bytes: &'a [u8],
         is_final: bool,
     },
+    /// Emitted exactly once after a member's content attempt. Callers which
+    /// persisted provisional text must discard it unless `content_complete`
+    /// and `crc32_validated` are both true.
+    MemberOutcome {
+        member: &'a ZipMemberMetadata,
+        outcome: &'a ZipMemberOutcome,
+    },
+    /// Emitted when local metadata is unreadable. The parser continues to later
+    /// central-directory members.
+    MemberUnavailable(&'a ZipUnavailableMember),
 }
 
 /// Aggregate counts returned after every member has been validated.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ZipParseSummary {
+    pub archive_stream_offset: u64,
+    pub central_directory_offset: u64,
+    pub archive_uses_zip64: bool,
     pub member_count: usize,
     pub directory_count: usize,
     pub file_count: usize,
+    pub validated_member_count: usize,
+    pub validated_file_count: usize,
+    pub encrypted_member_count: usize,
+    pub unsupported_member_count: usize,
+    pub corrupt_member_count: usize,
+    pub io_error_member_count: usize,
+    pub internal_error_member_count: usize,
+    pub metadata_unavailable_member_count: usize,
+    pub path_risk_member_count: usize,
+    pub crc32_validated_member_count: usize,
     pub text_member_count: usize,
     pub text_segment_count: u64,
-    /// Includes content read only for validation, such as binary members.
+    /// Includes only members which reached EOF, matched their declared size,
+    /// and passed CRC validation.
     pub uncompressed_bytes_read: u128,
     pub text_bytes_emitted: u128,
+    /// Parser diagnostics exclude encrypted/unsupported members, which are
+    /// explicit coverage limitations rather than evidence corruption.
+    pub member_diagnostic_count: usize,
+    pub member_diagnostics: Vec<ZipParserError>,
+    pub member_diagnostics_omitted: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZipArchiveStatus {
+    Complete,
+    Partial,
+    Unsupported,
+}
+
+impl ZipArchiveStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Partial => "partial",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl ZipParseSummary {
+    pub fn status(&self) -> ZipArchiveStatus {
+        if self.validated_member_count == self.member_count {
+            return ZipArchiveStatus::Complete;
+        }
+        let structural_failures = self
+            .corrupt_member_count
+            .saturating_add(self.io_error_member_count)
+            .saturating_add(self.internal_error_member_count)
+            .saturating_add(self.metadata_unavailable_member_count);
+        if self.file_count > 0
+            && self.validated_file_count == 0
+            && structural_failures == 0
+            && self
+                .encrypted_member_count
+                .saturating_add(self.unsupported_member_count)
+                == self.file_count
+        {
+            ZipArchiveStatus::Unsupported
+        } else {
+            ZipArchiveStatus::Partial
+        }
+    }
+
+    pub fn limitation_member_count(&self) -> usize {
+        self.encrypted_member_count
+            .saturating_add(self.unsupported_member_count)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +320,8 @@ impl Error for ZipParserError {}
 pub enum ZipCallbackEventKind {
     Member,
     TextSegment,
+    MemberOutcome,
+    MemberUnavailable,
 }
 
 /// Either a parser failure or a caller callback failure.
@@ -239,56 +402,73 @@ where
         .map_err(|error| ZipParseError::Parser(classify_archive_error(error)))?;
     let member_count = archive.len();
     let mut summary = ZipParseSummary {
+        archive_stream_offset: archive.offset(),
+        central_directory_offset: archive.central_directory_start(),
+        archive_uses_zip64: archive.zip64_comment().is_some(),
         member_count,
         ..ZipParseSummary::default()
     };
 
     for archive_index in 0..member_count {
         let known_name = archive.name_for_index(archive_index).map(str::to_owned);
-        let raw_member = archive.by_index_raw(archive_index).map_err(|error| {
-            ZipParseError::Parser(classify_member_zip_error(
-                archive_index,
-                known_name.clone(),
-                None,
-                error,
-            ))
-        })?;
+        let raw_member = match archive.by_index_raw(archive_index) {
+            Ok(member) => member,
+            Err(error) => {
+                let unavailable = unavailable_member(
+                    archive_index,
+                    known_name,
+                    classify_member_zip_error(archive_index, None, None, error),
+                );
+                emit_unavailable_member(&mut on_event, &unavailable)?;
+                record_unavailable_member(&mut summary, unavailable);
+                continue;
+            }
+        };
 
         let compression_method = raw_member.compression();
+        let compressed_data_offset = raw_member.data_start();
+        let Some(compressed_data_end) =
+            compressed_data_offset.checked_add(raw_member.compressed_size())
+        else {
+            let name = raw_member.name().to_owned();
+            let diagnostic = ZipParserError::member(
+                ZipParserErrorKind::CounterOverflow,
+                archive_index,
+                Some(name.clone()),
+                Some(compression_method),
+                "compressed member data extent exceeds u64",
+            );
+            drop(raw_member);
+            let unavailable = unavailable_member(archive_index, Some(name), diagnostic);
+            emit_unavailable_member(&mut on_event, &unavailable)?;
+            record_unavailable_member(&mut summary, unavailable);
+            continue;
+        };
+        let zip_metadata = raw_member.get_metadata();
         let metadata = ZipMemberMetadata {
             archive_index,
             name: raw_member.name().to_owned(),
-            name_raw: raw_member.name_raw().to_vec(),
+            name_reader_bytes: raw_member.name_raw().to_vec(),
+            name_is_utf8: zip_metadata.is_utf8,
             is_directory: raw_member.is_dir(),
+            is_symlink: raw_member.is_symlink(),
+            unix_mode: raw_member.unix_mode(),
+            encrypted: raw_member.encrypted(),
+            uses_data_descriptor: zip_metadata.using_data_descriptor,
+            uses_zip64: zip_metadata.large_file,
             compressed_size: raw_member.compressed_size(),
             uncompressed_size: raw_member.size(),
             crc32: raw_member.crc32(),
             compression_method,
             is_textual: !raw_member.is_dir() && has_text_extension(raw_member.name()),
+            archive_stream_offset: summary.archive_stream_offset,
+            local_header_offset: raw_member.header_start(),
+            compressed_data_offset,
+            compressed_data_end,
+            central_directory_header_offset: raw_member.central_header_start(),
+            path_risk_codes: path_risk_codes(raw_member.name()),
         };
-        let encrypted = raw_member.encrypted();
         drop(raw_member);
-
-        if encrypted {
-            return Err(ZipParserError::member(
-                ZipParserErrorKind::EncryptedMember,
-                archive_index,
-                Some(metadata.name.clone()),
-                Some(compression_method),
-                "encrypted ZIP members require a password and are not accepted",
-            )
-            .into());
-        }
-        if let Some(method_code) = unsupported_method_code(compression_method) {
-            return Err(ZipParserError::member(
-                ZipParserErrorKind::UnsupportedMember,
-                archive_index,
-                Some(metadata.name.clone()),
-                Some(compression_method),
-                format!("compression method {method_code} is not supported by this build"),
-            )
-            .into());
-        }
 
         on_event(ZipEvent::Member(&metadata)).map_err(|source| ZipParseError::Callback {
             archive_index,
@@ -298,54 +478,284 @@ where
         })?;
 
         if metadata.is_directory {
-            summary.directory_count += 1;
+            summary.directory_count = summary.directory_count.saturating_add(1);
         } else {
-            summary.file_count += 1;
+            summary.file_count = summary.file_count.saturating_add(1);
         }
-        if metadata.is_textual {
-            summary.text_member_count += 1;
+        if metadata.has_path_risk() {
+            summary.path_risk_member_count = summary.path_risk_member_count.saturating_add(1);
+        }
+        if metadata.uses_zip64 {
+            summary.archive_uses_zip64 = true;
         }
 
-        let mut member = archive.by_index(archive_index).map_err(|error| {
-            ZipParseError::Parser(classify_member_zip_error(
-                archive_index,
-                Some(metadata.name.clone()),
-                Some(compression_method),
-                error,
-            ))
+        let (outcome, stream_stats) = member_outcome(&mut archive, &metadata, &mut on_event)?;
+        on_event(ZipEvent::MemberOutcome {
+            member: &metadata,
+            outcome: &outcome,
+        })
+        .map_err(|source| ZipParseError::Callback {
+            archive_index,
+            member_name: metadata.name.clone(),
+            event_kind: ZipCallbackEventKind::MemberOutcome,
+            source,
         })?;
-
-        let member_bytes_read = if metadata.is_textual {
-            stream_text_member(&mut member, &metadata, &mut on_event, &mut summary)?
-        } else {
-            stream_validation_only(&mut member, &metadata)?
-        };
-
-        if member_bytes_read != metadata.uncompressed_size {
-            return Err(ZipParserError::member(
-                ZipParserErrorKind::CorruptMember,
-                archive_index,
-                Some(metadata.name.clone()),
-                Some(compression_method),
-                format!(
-                    "uncompressed size mismatch: central directory declares {}, read {}",
-                    metadata.uncompressed_size, member_bytes_read
-                ),
-            )
-            .into());
-        }
-        summary.uncompressed_bytes_read += u128::from(member_bytes_read);
+        record_member_outcome(&mut summary, &metadata, &outcome, stream_stats);
     }
 
     Ok(summary)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MemberStreamStats {
+    bytes_read: u64,
+    text_segment_count: u64,
+    text_bytes_emitted: u128,
+}
+
+fn unavailable_member(
+    archive_index: usize,
+    member_name: Option<String>,
+    mut diagnostic: ZipParserError,
+) -> ZipUnavailableMember {
+    diagnostic.member_name.clone_from(&member_name);
+    ZipUnavailableMember {
+        archive_index,
+        path_risk_codes: member_name
+            .as_deref()
+            .map(path_risk_codes)
+            .unwrap_or_default(),
+        member_name,
+        diagnostic,
+    }
+}
+
+fn emit_unavailable_member<F, E>(
+    on_event: &mut F,
+    unavailable: &ZipUnavailableMember,
+) -> Result<(), ZipParseError<E>>
+where
+    F: for<'event> FnMut(ZipEvent<'event>) -> Result<(), E>,
+{
+    on_event(ZipEvent::MemberUnavailable(unavailable)).map_err(|source| ZipParseError::Callback {
+        archive_index: unavailable.archive_index,
+        member_name: unavailable
+            .member_name
+            .clone()
+            .unwrap_or_else(|| format!("Member-{}", unavailable.archive_index)),
+        event_kind: ZipCallbackEventKind::MemberUnavailable,
+        source,
+    })
+}
+
+fn record_unavailable_member(summary: &mut ZipParseSummary, unavailable: ZipUnavailableMember) {
+    summary.metadata_unavailable_member_count =
+        summary.metadata_unavailable_member_count.saturating_add(1);
+    if !unavailable.path_risk_codes.is_empty() {
+        summary.path_risk_member_count = summary.path_risk_member_count.saturating_add(1);
+    }
+    retain_member_diagnostic(summary, unavailable.diagnostic);
+}
+
+fn member_outcome<R, F, E>(
+    archive: &mut ZipArchive<R>,
+    metadata: &ZipMemberMetadata,
+    on_event: &mut F,
+) -> Result<(ZipMemberOutcome, Option<MemberStreamStats>), ZipParseError<E>>
+where
+    R: Read + Seek,
+    F: for<'event> FnMut(ZipEvent<'event>) -> Result<(), E>,
+{
+    if metadata.encrypted {
+        return Ok((
+            ZipMemberOutcome {
+                status: ZipMemberStatus::Encrypted,
+                uncompressed_bytes_read: 0,
+                crc32_validated: false,
+                content_complete: false,
+                diagnostic: Some(ZipParserError::member(
+                    ZipParserErrorKind::EncryptedMember,
+                    metadata.archive_index,
+                    Some(metadata.name.clone()),
+                    Some(metadata.compression_method),
+                    "encrypted member metadata retained; content was not attempted without an examiner-supplied password",
+                )),
+            },
+            None,
+        ));
+    }
+    if let Some(method_code) = unsupported_method_code(metadata.compression_method) {
+        return Ok((
+            ZipMemberOutcome {
+                status: ZipMemberStatus::UnsupportedCompression,
+                uncompressed_bytes_read: 0,
+                crc32_validated: false,
+                content_complete: false,
+                diagnostic: Some(ZipParserError::member(
+                    ZipParserErrorKind::UnsupportedMember,
+                    metadata.archive_index,
+                    Some(metadata.name.clone()),
+                    Some(metadata.compression_method),
+                    format!(
+                        "compression method {method_code} is not supported by this build; metadata retained"
+                    ),
+                )),
+            },
+            None,
+        ));
+    }
+
+    let mut member = match archive.by_index(metadata.archive_index) {
+        Ok(member) => member,
+        Err(error) => {
+            return Ok((
+                member_outcome_from_error(classify_member_zip_error(
+                    metadata.archive_index,
+                    Some(metadata.name.clone()),
+                    Some(metadata.compression_method),
+                    error,
+                )),
+                None,
+            ));
+        }
+    };
+    let streamed = if metadata.is_textual {
+        stream_text_member(&mut member, metadata, on_event)
+    } else {
+        stream_validation_only(&mut member, metadata)
+            .map(|bytes_read| MemberStreamStats {
+                bytes_read,
+                ..MemberStreamStats::default()
+            })
+            .map_err(ZipParseError::Parser)
+    };
+    match streamed {
+        Ok(stats) if stats.bytes_read == metadata.uncompressed_size => Ok((
+            ZipMemberOutcome {
+                status: ZipMemberStatus::Validated,
+                uncompressed_bytes_read: stats.bytes_read,
+                crc32_validated: true,
+                content_complete: true,
+                diagnostic: None,
+            },
+            Some(stats),
+        )),
+        Ok(stats) => Ok((
+            ZipMemberOutcome {
+                status: ZipMemberStatus::Corrupt,
+                uncompressed_bytes_read: stats.bytes_read,
+                crc32_validated: false,
+                content_complete: false,
+                diagnostic: Some(ZipParserError::member(
+                    ZipParserErrorKind::CorruptMember,
+                    metadata.archive_index,
+                    Some(metadata.name.clone()),
+                    Some(metadata.compression_method),
+                    format!(
+                        "uncompressed size mismatch: central directory declares {}, read {}",
+                        metadata.uncompressed_size, stats.bytes_read
+                    ),
+                )),
+            },
+            None,
+        )),
+        Err(ZipParseError::Parser(error)) => Ok((member_outcome_from_error(error), None)),
+        Err(callback @ ZipParseError::Callback { .. }) => Err(callback),
+    }
+}
+
+fn member_outcome_from_error(error: ZipParserError) -> ZipMemberOutcome {
+    let status = match error.kind {
+        ZipParserErrorKind::EncryptedMember => ZipMemberStatus::Encrypted,
+        ZipParserErrorKind::UnsupportedMember | ZipParserErrorKind::UnsupportedArchive => {
+            ZipMemberStatus::UnsupportedCompression
+        }
+        ZipParserErrorKind::CorruptMember | ZipParserErrorKind::InvalidArchive => {
+            ZipMemberStatus::Corrupt
+        }
+        ZipParserErrorKind::MemberIo | ZipParserErrorKind::ArchiveIo => ZipMemberStatus::IoError,
+        ZipParserErrorKind::CounterOverflow => ZipMemberStatus::InternalError,
+    };
+    ZipMemberOutcome {
+        status,
+        uncompressed_bytes_read: 0,
+        crc32_validated: false,
+        content_complete: false,
+        diagnostic: Some(error),
+    }
+}
+
+fn record_member_outcome(
+    summary: &mut ZipParseSummary,
+    metadata: &ZipMemberMetadata,
+    outcome: &ZipMemberOutcome,
+    stream_stats: Option<MemberStreamStats>,
+) {
+    match outcome.status {
+        ZipMemberStatus::Validated => {
+            summary.validated_member_count = summary.validated_member_count.saturating_add(1);
+            if !metadata.is_directory {
+                summary.validated_file_count = summary.validated_file_count.saturating_add(1);
+            }
+            summary.crc32_validated_member_count =
+                summary.crc32_validated_member_count.saturating_add(1);
+            if let Some(stats) = stream_stats {
+                summary.uncompressed_bytes_read = summary
+                    .uncompressed_bytes_read
+                    .saturating_add(u128::from(stats.bytes_read));
+                if metadata.is_textual {
+                    summary.text_member_count = summary.text_member_count.saturating_add(1);
+                    summary.text_segment_count = summary
+                        .text_segment_count
+                        .saturating_add(stats.text_segment_count);
+                    summary.text_bytes_emitted = summary
+                        .text_bytes_emitted
+                        .saturating_add(stats.text_bytes_emitted);
+                }
+            }
+        }
+        ZipMemberStatus::Encrypted => {
+            summary.encrypted_member_count = summary.encrypted_member_count.saturating_add(1);
+        }
+        ZipMemberStatus::UnsupportedCompression => {
+            summary.unsupported_member_count = summary.unsupported_member_count.saturating_add(1);
+        }
+        ZipMemberStatus::Corrupt => {
+            summary.corrupt_member_count = summary.corrupt_member_count.saturating_add(1);
+            retain_outcome_diagnostic(summary, outcome);
+        }
+        ZipMemberStatus::IoError => {
+            summary.io_error_member_count = summary.io_error_member_count.saturating_add(1);
+            retain_outcome_diagnostic(summary, outcome);
+        }
+        ZipMemberStatus::InternalError => {
+            summary.internal_error_member_count =
+                summary.internal_error_member_count.saturating_add(1);
+            retain_outcome_diagnostic(summary, outcome);
+        }
+    }
+}
+
+fn retain_outcome_diagnostic(summary: &mut ZipParseSummary, outcome: &ZipMemberOutcome) {
+    if let Some(diagnostic) = outcome.diagnostic.clone() {
+        retain_member_diagnostic(summary, diagnostic);
+    }
+}
+
+fn retain_member_diagnostic(summary: &mut ZipParseSummary, diagnostic: ZipParserError) {
+    summary.member_diagnostic_count = summary.member_diagnostic_count.saturating_add(1);
+    if summary.member_diagnostics.len() < RETAINED_MEMBER_DIAGNOSTICS {
+        summary.member_diagnostics.push(diagnostic);
+    } else {
+        summary.member_diagnostics_omitted = summary.member_diagnostics_omitted.saturating_add(1);
+    }
 }
 
 fn stream_text_member<R, F, E>(
     member: &mut R,
     metadata: &ZipMemberMetadata,
     on_event: &mut F,
-    summary: &mut ZipParseSummary,
-) -> Result<u64, ZipParseError<E>>
+) -> Result<MemberStreamStats, ZipParseError<E>>
 where
     R: Read,
     F: for<'event> FnMut(ZipEvent<'event>) -> Result<(), E>,
@@ -358,6 +768,7 @@ where
     let mut bytes_read = current_len as u64;
     let mut byte_offset = 0_u64;
     let mut segment_index = 0_u64;
+    let mut text_bytes_emitted = 0_u128;
 
     while current_len != 0 {
         let next_len = read_member_chunk(member, &mut next, metadata)?;
@@ -379,11 +790,11 @@ where
             source,
         })?;
 
-        summary.text_segment_count =
-            summary.text_segment_count.checked_add(1).ok_or_else(|| {
-                ZipParseError::Parser(counter_overflow_error(metadata, "text segment count"))
+        text_bytes_emitted = text_bytes_emitted
+            .checked_add(current_len as u128)
+            .ok_or_else(|| {
+                ZipParseError::Parser(counter_overflow_error(metadata, "text byte count"))
             })?;
-        summary.text_bytes_emitted += current_len as u128;
         byte_offset = byte_offset.checked_add(current_len as u64).ok_or_else(|| {
             ZipParseError::Parser(counter_overflow_error(metadata, "text byte offset"))
         })?;
@@ -395,7 +806,11 @@ where
         current_len = next_len;
     }
 
-    Ok(bytes_read)
+    Ok(MemberStreamStats {
+        bytes_read,
+        text_segment_count: segment_index,
+        text_bytes_emitted,
+    })
 }
 
 fn stream_validation_only<R: Read>(
@@ -446,6 +861,39 @@ fn has_text_extension(name: &str) -> bool {
     TEXT_EXTENSIONS
         .iter()
         .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+}
+
+fn path_risk_codes(name: &str) -> Vec<&'static str> {
+    let bytes = name.as_bytes();
+    let has_drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let has_unc_prefix = name.starts_with("\\\\") || name.starts_with("//");
+    let has_leading_separator = name.starts_with('/') || name.starts_with('\\');
+    let has_drive_absolute = has_drive_prefix
+        && bytes
+            .get(2)
+            .is_some_and(|separator| matches!(separator, b'/' | b'\\'));
+    let has_parent_component = name.split(['/', '\\']).any(|component| component == "..");
+
+    let mut risks = Vec::new();
+    if has_leading_separator || has_drive_absolute {
+        risks.push("absolute_path");
+    }
+    if has_parent_component {
+        risks.push("parent_component");
+    }
+    if name.contains('\\') {
+        risks.push("backslash_separator");
+    }
+    if has_drive_prefix {
+        risks.push("windows_drive_prefix");
+    }
+    if has_unc_prefix {
+        risks.push("unc_path");
+    }
+    if name.contains('\0') {
+        risks.push("nul_byte");
+    }
+    risks
 }
 
 #[allow(deprecated)]
@@ -582,6 +1030,10 @@ mod tests {
         let summary = parse_zip(Cursor::new(bytes), |event| match event {
             ZipEvent::Member(member) => members.push(member.clone()),
             ZipEvent::TextSegment { bytes, .. } => extracted.extend_from_slice(bytes),
+            ZipEvent::MemberOutcome { .. } => {}
+            ZipEvent::MemberUnavailable(member) => {
+                panic!("unexpected unavailable member: {member:?}")
+            }
         })
         .unwrap();
 
@@ -590,7 +1042,7 @@ mod tests {
         assert_eq!(members[0].name, "nested/");
         assert_eq!(members[1].archive_index, 1);
         assert_eq!(members[1].name, exact_name);
-        assert_eq!(members[1].name_raw, exact_name.as_bytes());
+        assert_eq!(members[1].name_reader_bytes, exact_name.as_bytes());
         assert!(members[1].is_textual);
         assert_eq!(extracted, payload);
     }
@@ -639,6 +1091,10 @@ mod tests {
         let summary = parse_zip(Cursor::new(bytes), |event| match event {
             ZipEvent::Member(member) => metadata = Some(member.clone()),
             ZipEvent::TextSegment { .. } => text_events += 1,
+            ZipEvent::MemberOutcome { .. } => {}
+            ZipEvent::MemberUnavailable(member) => {
+                panic!("unexpected unavailable member: {member:?}")
+            }
         })
         .unwrap();
         let metadata = metadata.unwrap();
@@ -654,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_and_checksum_corrupt_archives_explicitly() {
+    fn invalid_archive_is_fatal_but_checksum_failure_is_member_partial() {
         let invalid = parse_zip(Cursor::new(b"not a ZIP archive".to_vec()), |_| {}).unwrap_err();
         assert_eq!(invalid.kind, ZipParserErrorKind::InvalidArchive);
 
@@ -666,37 +1122,333 @@ mod tests {
             .unwrap();
         corrupt[payload_offset] ^= 0x40;
 
-        let checksum_error = parse_zip(Cursor::new(corrupt), |_| {}).unwrap_err();
+        let mut outcomes = Vec::new();
+        let summary = parse_zip(Cursor::new(corrupt), |event| {
+            if let ZipEvent::MemberOutcome { member, outcome } = event {
+                outcomes.push((member.archive_index, outcome.clone()));
+            }
+        })
+        .unwrap();
+        assert_eq!(summary.status(), ZipArchiveStatus::Partial);
+        assert_eq!(summary.corrupt_member_count, 1);
+        assert_eq!(summary.validated_member_count, 0);
+        assert_eq!(summary.member_diagnostic_count, 1);
+        assert_eq!(outcomes.len(), 1);
+        let checksum_error = outcomes[0].1.diagnostic.as_ref().unwrap();
+        assert_eq!(outcomes[0].1.status, ZipMemberStatus::Corrupt);
         assert_eq!(checksum_error.kind, ZipParserErrorKind::CorruptMember);
         assert_eq!(checksum_error.archive_index, Some(0));
         assert_eq!(checksum_error.member_name.as_deref(), Some("corrupt.txt"));
-        assert!(checksum_error.message.contains("checksum"));
+        assert!(checksum_error
+            .message
+            .to_ascii_lowercase()
+            .contains("checksum"));
     }
 
     #[test]
-    fn rejects_encrypted_and_unsupported_members_before_content_events() {
+    fn encrypted_and_unsupported_members_retain_metadata_without_content_claims() {
         let payload = b"content";
 
         let mut encrypted = single_file_zip("secret.txt", payload, CompressionMethod::Stored);
         patch_u16_after_signature(&mut encrypted, b"PK\x03\x04", 6, 1);
         patch_u16_after_signature(&mut encrypted, b"PK\x01\x02", 8, 1);
-        let mut encrypted_events = 0;
-        let encrypted_error =
-            parse_zip(Cursor::new(encrypted), |_| encrypted_events += 1).unwrap_err();
-        assert_eq!(encrypted_events, 0);
-        assert_eq!(encrypted_error.kind, ZipParserErrorKind::EncryptedMember);
-        assert_eq!(encrypted_error.member_name.as_deref(), Some("secret.txt"));
+        let mut encrypted_metadata = None;
+        let mut encrypted_outcome = None;
+        let mut encrypted_text_events = 0;
+        let encrypted_summary = parse_zip(Cursor::new(encrypted), |event| match event {
+            ZipEvent::Member(member) => encrypted_metadata = Some(member.clone()),
+            ZipEvent::TextSegment { .. } => encrypted_text_events += 1,
+            ZipEvent::MemberOutcome { outcome, .. } => encrypted_outcome = Some(outcome.clone()),
+            ZipEvent::MemberUnavailable(member) => {
+                panic!("unexpected unavailable member: {member:?}")
+            }
+        })
+        .unwrap();
+        let encrypted_metadata = encrypted_metadata.unwrap();
+        let encrypted_outcome = encrypted_outcome.unwrap();
+        assert!(encrypted_metadata.encrypted);
+        assert_eq!(encrypted_outcome.status, ZipMemberStatus::Encrypted);
+        assert!(!encrypted_outcome.content_complete);
+        assert!(!encrypted_outcome.crc32_validated);
+        assert_eq!(encrypted_text_events, 0);
+        assert_eq!(encrypted_summary.status(), ZipArchiveStatus::Unsupported);
+        assert_eq!(encrypted_summary.encrypted_member_count, 1);
+        assert_eq!(encrypted_summary.member_diagnostic_count, 0);
 
         let mut unsupported = single_file_zip("odd.txt", payload, CompressionMethod::Stored);
         patch_u16_after_signature(&mut unsupported, b"PK\x03\x04", 8, 98);
         patch_u16_after_signature(&mut unsupported, b"PK\x01\x02", 10, 98);
-        let unsupported_error = parse_zip(Cursor::new(unsupported), |_| {}).unwrap_err();
+        let mut unsupported_outcome = None;
+        let unsupported_summary = parse_zip(Cursor::new(unsupported), |event| {
+            if let ZipEvent::MemberOutcome { outcome, .. } = event {
+                unsupported_outcome = Some(outcome.clone());
+            }
+        })
+        .unwrap();
+        let unsupported_outcome = unsupported_outcome.unwrap();
         assert_eq!(
-            unsupported_error.kind,
-            ZipParserErrorKind::UnsupportedMember
+            unsupported_outcome.status,
+            ZipMemberStatus::UnsupportedCompression
         );
-        assert_eq!(unsupported_error.member_name.as_deref(), Some("odd.txt"));
-        assert!(unsupported_error.message.contains("98"));
+        assert!(!unsupported_outcome.content_complete);
+        assert!(!unsupported_outcome.crc32_validated);
+        assert_eq!(unsupported_summary.status(), ZipArchiveStatus::Unsupported);
+        assert_eq!(unsupported_summary.unsupported_member_count, 1);
+        assert_eq!(unsupported_summary.member_diagnostic_count, 0);
+    }
+
+    #[test]
+    fn corrupt_member_does_not_hide_a_later_valid_member() {
+        let corrupt_payload = vec![b'x'; TEXT_SEGMENT_BYTES + 17];
+        let valid_payload = b"later-valid-evidence";
+        let mut bytes = multi_file_zip(&[
+            ("first.txt", corrupt_payload.as_slice()),
+            ("second.txt", valid_payload.as_slice()),
+        ]);
+        let corrupt_offset = bytes
+            .windows(corrupt_payload.len())
+            .position(|window| window == corrupt_payload)
+            .unwrap();
+        bytes[corrupt_offset] ^= 0x40;
+
+        // This models the database integration: text is provisional until the
+        // terminal outcome confirms complete size and CRC validation.
+        let mut retained_text = [Vec::new(), Vec::new()];
+        let mut outcomes = Vec::new();
+        let summary = parse_zip(Cursor::new(bytes), |event| match event {
+            ZipEvent::Member(_) => {}
+            ZipEvent::TextSegment { member, bytes, .. } => {
+                retained_text[member.archive_index].extend_from_slice(bytes);
+            }
+            ZipEvent::MemberOutcome { member, outcome } => {
+                if !outcome.content_complete || !outcome.crc32_validated {
+                    retained_text[member.archive_index].clear();
+                }
+                outcomes.push((member.name.clone(), outcome.status));
+            }
+            ZipEvent::MemberUnavailable(member) => {
+                panic!("unexpected unavailable member: {member:?}")
+            }
+        })
+        .unwrap();
+
+        assert_eq!(summary.status(), ZipArchiveStatus::Partial);
+        assert_eq!(summary.corrupt_member_count, 1);
+        assert_eq!(summary.validated_member_count, 1);
+        assert_eq!(summary.validated_file_count, 1);
+        assert_eq!(summary.text_member_count, 1);
+        assert_eq!(retained_text[0], Vec::<u8>::new());
+        assert_eq!(retained_text[1], valid_payload);
+        assert_eq!(
+            outcomes,
+            vec![
+                ("first.txt".to_string(), ZipMemberStatus::Corrupt),
+                ("second.txt".to_string(), ZipMemberStatus::Validated),
+            ]
+        );
+    }
+
+    #[test]
+    fn reports_path_risks_without_normalizing_evidence_names() {
+        assert!(path_risk_codes("safe/nested/file.txt").is_empty());
+        assert_eq!(path_risk_codes("/absolute.txt"), vec!["absolute_path"]);
+        assert_eq!(path_risk_codes("../escape.txt"), vec!["parent_component"]);
+        assert_eq!(
+            path_risk_codes(r"nested\windows.txt"),
+            vec!["backslash_separator"]
+        );
+        assert_eq!(
+            path_risk_codes(r"C:relative.txt"),
+            vec!["windows_drive_prefix"]
+        );
+        assert_eq!(
+            path_risk_codes(r"C:\absolute.txt"),
+            vec![
+                "absolute_path",
+                "backslash_separator",
+                "windows_drive_prefix",
+            ]
+        );
+        assert_eq!(
+            path_risk_codes(r"\\server\share\evidence.txt"),
+            vec!["absolute_path", "backslash_separator", "unc_path"]
+        );
+    }
+
+    #[test]
+    fn source_offsets_remain_relative_to_the_recovered_zip_stream() {
+        let payload = b"offset-ground-truth";
+        let zip = single_file_zip("offset.txt", payload, CompressionMethod::Stored);
+        let prefix = b"self-extracting-prefix";
+        let mut prefixed = prefix.to_vec();
+        prefixed.extend_from_slice(&zip);
+        let source = prefixed.clone();
+        let mut metadata = None;
+
+        let summary = parse_zip(Cursor::new(prefixed), |event| {
+            if let ZipEvent::Member(member) = event {
+                metadata = Some(member.clone());
+            }
+        })
+        .unwrap();
+        let metadata = metadata.unwrap();
+
+        assert_eq!(summary.archive_stream_offset, prefix.len() as u64);
+        assert_eq!(metadata.archive_stream_offset, prefix.len() as u64);
+        assert_eq!(metadata.local_header_offset, prefix.len() as u64);
+        assert_eq!(
+            &source
+                [metadata.local_header_offset as usize..metadata.local_header_offset as usize + 4],
+            b"PK\x03\x04"
+        );
+        assert_eq!(
+            &source
+                [metadata.compressed_data_offset as usize..metadata.compressed_data_end as usize],
+            payload
+        );
+        assert!(metadata.compressed_data_end <= metadata.central_directory_header_offset);
+        assert_eq!(
+            metadata.central_directory_header_offset,
+            summary.central_directory_offset
+        );
+    }
+
+    #[test]
+    fn accepts_data_descriptor_and_records_its_semantics() {
+        let payload = b"descriptor-backed-text";
+        let name = "descriptor.txt";
+        let bytes = stored_zip_with_data_descriptor(name, payload);
+        let mut metadata = None;
+        let mut extracted = Vec::new();
+
+        let summary = parse_zip(Cursor::new(bytes), |event| match event {
+            ZipEvent::Member(member) => metadata = Some(member.clone()),
+            ZipEvent::TextSegment { bytes, .. } => extracted.extend_from_slice(bytes),
+            ZipEvent::MemberOutcome { .. } => {}
+            ZipEvent::MemberUnavailable(member) => {
+                panic!("unexpected unavailable member: {member:?}")
+            }
+        })
+        .unwrap();
+        let metadata = metadata.unwrap();
+
+        assert!(metadata.uses_data_descriptor);
+        assert_eq!(metadata.compressed_data_offset, (30 + name.len()) as u64);
+        assert_eq!(
+            metadata.compressed_data_end,
+            metadata.compressed_data_offset + payload.len() as u64
+        );
+        assert_eq!(summary.status(), ZipArchiveStatus::Complete);
+        assert_eq!(summary.crc32_validated_member_count, 1);
+        assert_eq!(extracted, payload);
+    }
+
+    #[test]
+    fn recognizes_zip64_member_metadata_without_large_allocation() {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .large_file(true);
+        writer.start_file("zip64.txt", options).unwrap();
+        writer.write_all(b"small fixture, ZIP64 metadata").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        let mut metadata = None;
+
+        let summary = parse_zip(Cursor::new(bytes), |event| {
+            if let ZipEvent::Member(member) = event {
+                metadata = Some(member.clone());
+            }
+        })
+        .unwrap();
+
+        assert!(metadata.unwrap().uses_zip64);
+        assert!(summary.archive_uses_zip64);
+        assert_eq!(summary.status(), ZipArchiveStatus::Complete);
+    }
+
+    fn multi_file_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, payload) in files {
+            writer.start_file(*name, options).unwrap();
+            writer.write_all(payload).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn stored_zip_with_data_descriptor(name: &str, payload: &[u8]) -> Vec<u8> {
+        let name_bytes = name.as_bytes();
+        let crc32 = test_crc32(payload);
+        let mut bytes = Vec::new();
+
+        push_u32(&mut bytes, 0x0403_4b50);
+        push_u16(&mut bytes, 20);
+        push_u16(&mut bytes, 1 << 3);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u16(&mut bytes, name_bytes.len() as u16);
+        push_u16(&mut bytes, 0);
+        bytes.extend_from_slice(name_bytes);
+        bytes.extend_from_slice(payload);
+        push_u32(&mut bytes, 0x0807_4b50);
+        push_u32(&mut bytes, crc32);
+        push_u32(&mut bytes, payload.len() as u32);
+        push_u32(&mut bytes, payload.len() as u32);
+
+        let central_start = bytes.len() as u32;
+        push_u32(&mut bytes, 0x0201_4b50);
+        push_u16(&mut bytes, 20);
+        push_u16(&mut bytes, 20);
+        push_u16(&mut bytes, 1 << 3);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u32(&mut bytes, crc32);
+        push_u32(&mut bytes, payload.len() as u32);
+        push_u32(&mut bytes, payload.len() as u32);
+        push_u16(&mut bytes, name_bytes.len() as u16);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, 0);
+        bytes.extend_from_slice(name_bytes);
+        let central_size = bytes.len() as u32 - central_start;
+
+        push_u32(&mut bytes, 0x0605_4b50);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 0);
+        push_u16(&mut bytes, 1);
+        push_u16(&mut bytes, 1);
+        push_u32(&mut bytes, central_size);
+        push_u32(&mut bytes, central_start);
+        push_u16(&mut bytes, 0);
+        bytes
+    }
+
+    fn test_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0_u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                let mask = 0_u32.wrapping_sub(crc & 1);
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     fn patch_u16_after_signature(bytes: &mut [u8], signature: &[u8], offset: usize, value: u16) {

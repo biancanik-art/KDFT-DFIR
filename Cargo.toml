@@ -19,14 +19,17 @@ repository = "https://github.com/biancanik-art/KDFT-DFIR"
 [workspace.dependencies]
 aho-corasick = "1"
 anyhow = "1.0"
+base64 = "=0.22.1"
 bitlocker-core = "0.3.0"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrome-cache-parser = "0.2.5"
 clap = { version = "4.5", features = ["derive"] }
 codepage-strings = "1"
 disk-forensic = "0.8.6"
+encoding_rs = "=0.8.35"
 evtx = { version = "0.12.2", default-features = false }
 ewf = "0.2.3"
+flate2 = "=1.1.9"
 # Vendored, not crates.io: see the notice at the top of crates/ext4-vendored/src/lib.rs
 # for why (upstream 0.9.0 rejects CSUM_SEED, which real-world modern ext4 filesystems set).
 ext4 = { path = "crates/ext4-vendored" }

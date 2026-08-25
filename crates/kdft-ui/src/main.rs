@@ -2879,8 +2879,8 @@ fn api_run_processors_tracked(
         stage_count,
     )?;
 
-    let pipeline_failed = response_contains_failed_pass(&response);
-    let pipeline_truncated = response_contains_truncated_pass(&response);
+    let pipeline_has_diagnostics =
+        response_contains_failed_pass(&response) || response_contains_truncated_pass(&response);
     stage_index += 1;
     tracker.start_stage(
         "Finalization",
@@ -2893,10 +2893,13 @@ fn api_run_processors_tracked(
         1,
         Some("Processor results committed; filesystem snapshot preserved".to_string()),
     );
-    let final_state = if pipeline_failed {
-        JobProgressState::Failed
-    } else if pipeline_truncated {
-        JobProgressState::Truncated
+    // Individual additive processors preserve every usable result and report
+    // their own failures/partial coverage. Reaching this finalization point
+    // therefore means the requested pipeline completed; a parser diagnostic
+    // must not be promoted into the false claim that the whole job failed or
+    // stopped early.
+    let final_state = if pipeline_has_diagnostics {
+        JobProgressState::CompleteWithDiagnostics
     } else {
         JobProgressState::Complete
     };
@@ -2910,6 +2913,7 @@ fn api_run_processors_tracked(
         serde_json::Value::String(
             match final_state {
                 JobProgressState::Complete => "completed",
+                JobProgressState::CompleteWithDiagnostics => "completed_with_diagnostics",
                 JobProgressState::Truncated => "truncated",
                 JobProgressState::Cancelled => "cancelled",
                 JobProgressState::Failed => "failed",
@@ -2918,9 +2922,14 @@ fn api_run_processors_tracked(
             .to_string(),
         ),
     );
+    object.insert("truncated".to_string(), serde_json::Value::Bool(false));
     object.insert(
-        "truncated".to_string(),
-        serde_json::Value::Bool(pipeline_truncated),
+        "completed_with_diagnostics".to_string(),
+        serde_json::Value::Bool(pipeline_has_diagnostics),
+    );
+    object.insert(
+        "partial_artifact_coverage".to_string(),
+        serde_json::Value::Bool(pipeline_has_diagnostics),
     );
     object.insert(
         "progress".to_string(),
@@ -2979,9 +2988,12 @@ fn api_process_evidence_tracked(
         &mut stage_index,
         stage_count,
     )?;
-    let pipeline_failed = response_contains_failed_pass(&response);
-    let pipeline_truncated = index_result.truncated || response_contains_truncated_pass(&response);
-    if pipeline_truncated && !index_result.truncated {
+    let optional_pass_has_diagnostics =
+        response_contains_failed_pass(&response) || response_contains_truncated_pass(&response);
+    let stopped_at_examiner_limit = index_result.truncated;
+    let completed_with_diagnostics = !stopped_at_examiner_limit
+        && (index_result.partial_artifact_coverage || optional_pass_has_diagnostics);
+    if optional_pass_has_diagnostics && !index_result.partial_artifact_coverage {
         tracker.record_truncation(
             "one or more optional parsing passes completed with partial coverage; filesystem indexing completed",
         );
@@ -2995,10 +3007,10 @@ fn api_process_evidence_tracked(
         Some(1),
     );
     tracker.advance(1, Some("Process results committed".to_string()));
-    let final_state = if pipeline_failed {
-        JobProgressState::Failed
-    } else if pipeline_truncated {
+    let final_state = if stopped_at_examiner_limit {
         JobProgressState::Truncated
+    } else if completed_with_diagnostics {
+        JobProgressState::CompleteWithDiagnostics
     } else {
         JobProgressState::Complete
     };
@@ -3013,6 +3025,7 @@ fn api_process_evidence_tracked(
         serde_json::Value::String(
             match final_state {
                 JobProgressState::Complete => "completed",
+                JobProgressState::CompleteWithDiagnostics => "completed_with_diagnostics",
                 JobProgressState::Truncated => "truncated",
                 JobProgressState::Cancelled => "cancelled",
                 JobProgressState::Failed => "failed",
@@ -3023,11 +3036,25 @@ fn api_process_evidence_tracked(
     );
     response_object.insert(
         "truncated".to_string(),
-        serde_json::Value::Bool(pipeline_truncated),
+        serde_json::Value::Bool(stopped_at_examiner_limit),
     );
     response_object.insert(
         "index_truncated".to_string(),
         serde_json::Value::Bool(index_result.truncated),
+    );
+    response_object.insert(
+        "index_partial_artifact_coverage".to_string(),
+        serde_json::Value::Bool(index_result.partial_artifact_coverage),
+    );
+    response_object.insert(
+        "completed_with_diagnostics".to_string(),
+        serde_json::Value::Bool(completed_with_diagnostics),
+    );
+    response_object.insert(
+        "partial_artifact_coverage".to_string(),
+        serde_json::Value::Bool(
+            index_result.partial_artifact_coverage || optional_pass_has_diagnostics,
+        ),
     );
     response_object.insert(
         "progress".to_string(),
@@ -3051,7 +3078,17 @@ fn response_contains_truncated_pass(response: &serde_json::Value) -> bool {
         object.iter().any(|(name, value)| {
             name != "truncated"
                 && (value.get("truncated").and_then(serde_json::Value::as_bool) == Some(true)
-                    || value.get("status").and_then(serde_json::Value::as_str) == Some("truncated"))
+                    || matches!(
+                        value.get("status").and_then(serde_json::Value::as_str),
+                        Some(
+                            "truncated"
+                                | "partial"
+                                | "completed_with_errors"
+                                | "completed_with_diagnostics"
+                                | "unsupported"
+                                | "recognized_unsupported"
+                        )
+                    ))
         })
     })
 }
@@ -4869,15 +4906,16 @@ fn is_separator(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_add_evidence, api_carve_evidence, api_image_dir, api_job_progress, api_state,
-        append_optional_processing_passes, browser_disclosure_diagnostic_count,
-        browser_disclosure_was_persisted, browser_profile_disclosure_matches,
-        cached_indexed_directory, external_preview_extension, external_preview_output_path,
-        inline_script_json, normalize_request_path, normalized_browser_profile_identity,
-        observed_browser_profile_count, parse_archives_enabled, parse_documents_enabled,
-        parse_windows_artifacts_enabled, process_stage_count, run_optional_processing_pass,
-        safe_external_preview_name, trim_balanced_path_quotes, ProcessEvidenceRequest, ServerArgs,
-        StreamingDiagnosticLog, INDEX_HTML,
+        api_add_evidence, api_carve_evidence, api_image_dir, api_job_progress,
+        api_process_evidence_tracked, api_state, append_optional_processing_passes,
+        browser_disclosure_diagnostic_count, browser_disclosure_was_persisted,
+        browser_profile_disclosure_matches, cached_indexed_directory, external_preview_extension,
+        external_preview_output_path, inline_script_json, normalize_request_path,
+        normalized_browser_profile_identity, observed_browser_profile_count,
+        parse_archives_enabled, parse_documents_enabled, parse_windows_artifacts_enabled,
+        process_stage_count, run_optional_processing_pass, safe_external_preview_name,
+        trim_balanced_path_quotes, ProcessEvidenceRequest, ServerArgs, StreamingDiagnosticLog,
+        INDEX_HTML,
     };
     use super::{DeepSearchRequest, RawSearchRequest};
     use kdft_case::progress::{JobProgressState, JobProgressTracker};
@@ -4987,6 +5025,62 @@ mod tests {
              INSERT INTO visits(id, url, visit_time, from_visit, transition, segment_id, visit_duration)
              VALUES (1, 1, 13300000020000000, 0, 1, 0, 1000);",
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn filesystem_parser_diagnostics_do_not_claim_the_index_stopped() -> anyhow::Result<()> {
+        let case_path = unique_test_path("diagnostic-index-status", ".kdft.sqlite");
+        cleanup_ui_test_case(&case_path);
+        create_ui_test_case(&case_path, "diagnostic-index-status")?;
+        let source_dir = unique_test_path("diagnostic-index-source", "");
+        std::fs::create_dir_all(&source_dir)?;
+        std::fs::write(
+            source_dir.join("invalid.eml"),
+            b"body text without an RFC 822 header\r\n",
+        )?;
+        let evidence_id = kdft_case::add_evidence(
+            &case_path,
+            kdft_case::AddEvidenceOptions {
+                path: source_dir.clone(),
+                kind: kdft_case::EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let request = ProcessEvidenceRequest {
+            case_path: case_path.to_string_lossy().into_owned(),
+            evidence_id,
+            max_entries: Some(0),
+            progress_id: None,
+            reindex_filesystem: Some(true),
+            capture_content: Some(true),
+            parse_emails: Some(true),
+            parse_browsers: Some(false),
+            parse_identities: Some(false),
+            parse_archives: Some(false),
+            parse_documents: Some(false),
+            parse_windows_artifacts: Some(false),
+            run_hash: Some(false),
+            run_file_hash: Some(false),
+            run_signature_analysis: Some(false),
+            run_carve: Some(false),
+            carve_max_scan_bytes: None,
+            carve_max_files: None,
+        };
+        let tracker = JobProgressTracker::new("diagnostic-index-status", "process", None);
+
+        let response = api_process_evidence_tracked(&case_path, &request, &tracker)?;
+
+        assert_eq!(response["status"], "completed_with_diagnostics");
+        assert_eq!(response["truncated"], false);
+        assert_eq!(response["index_truncated"], false);
+        assert_eq!(response["index_partial_artifact_coverage"], true);
+        assert_eq!(response["partial_artifact_coverage"], true);
+        assert_eq!(response["progress"]["state"], "complete_with_diagnostics");
+
+        cleanup_ui_test_case(&case_path);
+        let _ = std::fs::remove_dir_all(source_dir);
         Ok(())
     }
 
@@ -5359,6 +5453,30 @@ mod tests {
     }
 
     #[test]
+    fn evidence_badges_expose_terminal_processing_states() {
+        let status = INDEX_HTML
+            .split_once("function evidenceProcessingStatusText(item,")
+            .expect("evidence processing status function")
+            .1
+            .split_once("function evidenceProcessingStatusHtml(item,")
+            .expect("end of evidence processing status function")
+            .0;
+        for expected in [
+            "completed_with_diagnostics",
+            "stopped at limit",
+            "latest attempt failed",
+            "latest attempt cancelled",
+            "processing",
+        ] {
+            assert!(
+                status.contains(expected),
+                "missing status label: {expected}"
+            );
+        }
+        assert!(INDEX_HTML.contains("const processing = evidenceProcessingStatusHtml(item"));
+    }
+
+    #[test]
     fn restored_tabs_refresh_local_auth_and_tolerate_missing_optional_controls() {
         assert!(INDEX_HTML.contains("async function fetchWithLocalAuthRetry(request)"));
         assert!(INDEX_HTML.contains("if (response.status !== 403)"));
@@ -5675,7 +5793,15 @@ mod tests {
         let source_dir = unique_test_path("carve-unlimited-source", "");
         std::fs::create_dir_all(&source_dir)?;
         let image_path = source_dir.join("many-jpegs.img");
-        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, b'x', 0xFF, 0xD9, 0];
+        let jpeg = [
+            0xFF, 0xD8, // SOI
+            0xFF, 0xE0, 0x00, 0x02, // empty APP0
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11,
+            0x00, // one-component SOF0
+            0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, // SOS
+            0x00, 0x11, // bounded entropy-coded payload
+            0xFF, 0xD9, // EOI
+        ];
         let mut image = Vec::with_capacity(jpeg.len() * 1_001);
         for _ in 0..1_001 {
             image.extend_from_slice(&jpeg);
@@ -5698,6 +5824,7 @@ mod tests {
         .to_string();
         let result = api_carve_evidence(body.as_bytes())?;
         assert_eq!(result.carved_files, 1_001);
+        assert_eq!(result.recognized_candidates, 0);
         assert_eq!(result.status, "completed");
         assert!(!result.truncated);
 
@@ -6338,7 +6465,8 @@ mod tests {
 
         assert_ne!(first_path, second_path);
         let second_bytes = std::fs::read(second_path)?;
-        assert_eq!(first_bytes, second_bytes);
+        assert!(!second_bytes.is_empty());
+        assert_eq!(first_bytes, std::fs::read(first_path)?);
         assert_eq!(first_bytes, std::fs::read(&output_path)?);
 
         std::fs::remove_file(&output_path)?;
@@ -6929,7 +7057,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       text-transform: uppercase;
       color: #55c9bb;
     }
-    .progress-state.truncated, .progress-state.cancelled { color: #ffb454; }
+    .progress-state.complete_with_diagnostics, .progress-state.truncated, .progress-state.cancelled { color: #ffb454; }
     .progress-state.failed { color: #ff7b72; }
     .progress-state.complete { color: #64d488; }
     .analyzing-bar {
@@ -9273,7 +9401,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                   <label class="check-option" title="Verify file types by content signature after indexing and stamp match/mismatch/alias per entry. Enabled by default so renamed files are visible in new analyses."><input type="checkbox" id="optRunSignatures" checked> Verify file types (signatures)</label>
                   <label class="check-option" title="Signature-carve the whole decoded media after indexing (can take long on large images). Carved lengths are marked verified or not-verified per file."><input type="checkbox" id="optRunCarve"> Carve by file signature</label>
                   <label class="check-option" title="Detect browser profiles among the indexed entries (Chromium History, Firefox places.sqlite, Safari History.db) and parse their visit/download/login records into the case."><input type="checkbox" id="optRunBrowserParse" checked> Browser artifacts</label>
-                  <label class="check-option" title="Extract local accounts, SID-to-profile mappings, browser accounts, cookie/session indicators, host/network configuration, IP/DNS/gateway values, Wi-Fi profiles, known credential stores, and plaintext passwords/tokens from exact structured configuration fields. Encrypted material is never presented as decoded plaintext."><input type="checkbox" id="optParseIdentities" checked> Identities, accounts, networks and secrets</label>
+                  <label class="check-option" title="Extract local accounts, SID-to-profile mappings, browser accounts, host/network configuration, IP/DNS/gateway values, and Wi-Fi profiles; recognize known credential stores and sensitive values only at exact structured fields. Ordinary metadata stores the source locator, material state, byte length, and SHA-256 while withholding the value. Protected material is never presented as plaintext."><input type="checkbox" id="optParseIdentities" checked> Identities, accounts, networks and secrets</label>
                   <label class="check-option" title="Recover each indexed ZIP candidate and parse its members into provenance-linked records. Exact package names, CRC, sizes, compression, and complete textual-member segments are retained."><input type="checkbox" id="optParseArchives" checked> ZIP archive members</label>
                   <label class="check-option" title="Recover each indexed DOCX package and extract supported WordprocessingML text parts into complete ordered searchable segments. Unsupported text-bearing parts are disclosed as partial coverage."><input type="checkbox" id="optParseDocuments" checked> DOCX document text</label>
                   <label class="check-option" title="Recover and parse supported Windows artifact sources: LNK shortcuts, automatic/custom Jump Lists, Prefetch, EVTX event records, NTFS USN Journal streams, scheduled-task XML, Amcache, UserAssist, ShellBags, and exact Run/RunOnce Registry values. Unsupported Shimcache/SRUM decoding remains explicitly disclosed."><input type="checkbox" id="optParseWindowsArtifacts" checked> Windows artifacts (activity, execution, Registry)</label>
@@ -10723,11 +10851,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function progressStateLabel(value) {
-      return ({ active: "Active", complete: "Complete", truncated: "Truncated", cancelled: "Cancelled", failed: "Failed" })[value] || "Unknown";
+      return ({ active: "Active", complete: "Complete", complete_with_diagnostics: "Complete with diagnostics", truncated: "Stopped at limit", cancelled: "Cancelled", failed: "Failed" })[value] || "Unknown";
     }
 
     function progressStateClass(value) {
-      return ["active", "complete", "truncated", "cancelled", "failed"].includes(value)
+      return ["active", "complete", "complete_with_diagnostics", "truncated", "cancelled", "failed"].includes(value)
         ? value
         : "unknown";
     }
@@ -11055,8 +11183,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
             + Number(ip.network_artifacts_indexed || 0).toLocaleString() + " IP/network finding(s), "
             + Number(ip.wifi_profiles_indexed || 0).toLocaleString() + " Wi-Fi profile(s), "
             + Number(ip.credential_stores_indexed || 0).toLocaleString() + " credential/secret store(s), "
-            + Number(ip.plaintext_secrets_indexed || 0).toLocaleString() + " structured plaintext secret(s)"
-            + ((ip.parse_errors || []).length ? ", " + ip.parse_errors.length + " hive error(s) disclosed" : ""));
+            + Number(ip.structured_secret_findings_indexed ?? ip.plaintext_secrets_indexed ?? 0).toLocaleString() + " structured secret finding(s) (values withheld)"
+            + (Number(ip.parse_error_count || 0) ? ", " + Number(ip.parse_error_count).toLocaleString() + " parser diagnostic(s) disclosed" : ""));
       }
       return parts.length ? " " + parts.join("; ") + "." : "";
     }
@@ -11081,7 +11209,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const status = String(data && data.status || "unknown");
       const stateText = status === "completed"
         ? "completed"
-        : (status === "truncated" ? "completed with partial coverage" : status);
+        : (status === "completed_with_diagnostics"
+          ? "completed with artifact-level diagnostics"
+          : (status === "truncated" ? "stopped at the examiner-requested limit" : status));
       const progress = data && data.progress ? data.progress : {};
       const warningCount = Number(progress.truncation_reason_count
         ?? (data && data.truncation_reason_count)
@@ -12165,7 +12295,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function decodedRangeWithinDiskLocation(location, start, end) {
-      if (!location || location.decoded_media_offset == null) {
+      if (!location || location.decoded_media_offset == null || location.direct_logical_mapping === false) {
         return false;
       }
       const mappedStart = Number(location.decoded_media_offset);
@@ -12174,7 +12304,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function fileRangeWithinDiskLocation(location, start, end) {
-      if (!location || location.file_relative_offset == null) {
+      if (!location || location.file_relative_offset == null || location.direct_logical_mapping === false) {
         return false;
       }
       const mappedStart = Number(location.file_relative_offset);
@@ -12244,6 +12374,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         }
         if (!location || !location.available || location.decoded_media_offset == null) {
           setNotice((location && location.warning) || state.hex.locationError || "File-system location is unavailable for this entry.", true);
+          return;
+        }
+        if (location.direct_logical_mapping === false) {
+          setNotice(location.warning || "This raw allocation is exact but does not directly map logical file bytes.", true);
           return;
         }
         state.hex.byteContext = "filesystem";
@@ -13568,7 +13702,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           case_path: casePath,
           folder_name: "Search Hits",
           title: "Search hit: " + hit.display_name,
-          comment: "Match kind: " + hit.match_kind,
+          comment: "Match kind: " + hit.match_kind
+            + (hit.parsed_segment_kind ? "; parsed segment role: " + hit.parsed_segment_kind : ""),
           bookmark_type: hit.match_kind === "content" ? "highlighted_data" : "notable_file",
           data_type: "Search Hit",
           evidence_id: hit.evidence_id,
@@ -14112,16 +14247,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const entryCount = reportCounts.has(item.id)
           ? reportCounts.get(item.id)
           : (sampleCounts.get(item.id) || 0);
-        const indexed = item.indexed_at
-          ? escapeHtml(item.indexed_at)
-          : evidenceProcessingStatusHtml(item, entryCount);
+        const processing = evidenceProcessingStatusHtml(item, entryCount);
+        const indexedAt = item.indexed_at
+          ? `<br><span class="muted tiny">${escapeHtml(item.indexed_at)}</span>`
+          : "";
         return `
           <tr>
             <td><strong>${escapeHtml(item.display_name)}</strong><br><span class="muted tiny">${escapeHtml(item.source_path)}</span></td>
             <td><span class="pill">${escapeHtml(item.source_kind)}</span></td>
             <td>${item.size_bytes == null ? '<span class="muted tiny">unknown</span>' : escapeHtml(formatBytes(item.size_bytes))}</td>
             <td>${escapeHtml(Number(entryCount).toLocaleString())}</td>
-            <td>${indexed}</td>
+            <td>${processing}${indexedAt}</td>
           </tr>`;
       }).join("");
       return `<div class="dashboard-table-wrap">${table(["Source", "Kind", "Size", "Entries", "Indexed"], rows)}</div>`;
@@ -14148,10 +14284,29 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function evidenceProcessingStatusText(item, entryCount = evidenceIndexedEntryCount(item.id)) {
+      const jobStatus = String(item.last_job_status || "").toLowerCase();
+      if (jobStatus === "completed") {
+        return "indexed";
+      }
+      if (jobStatus === "completed_with_diagnostics" || jobStatus === "completed_with_errors" || jobStatus === "partial") {
+        return "indexed with diagnostics";
+      }
+      if (jobStatus === "truncated") {
+        return "stopped at limit";
+      }
+      if (jobStatus === "failed") {
+        return item.indexed_at ? "indexed; latest attempt failed" : "processing failed";
+      }
+      if (jobStatus === "cancelled") {
+        return item.indexed_at ? "indexed; latest attempt cancelled" : "processing cancelled";
+      }
+      if (jobStatus === "running") {
+        return "processing";
+      }
       if (item.indexed_at) {
         return "indexed";
       }
-      if (item.read_file_system_requested && (Number(entryCount) > 0 || item.last_job_status === "truncated")) {
+      if (item.read_file_system_requested && Number(entryCount) > 0) {
         return "partially indexed";
       }
       return "attached";
@@ -14168,8 +14323,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (status === "indexed") {
         return '<span class="pill good">indexed</span>' + metadataOnly;
       }
-      if (status === "partially indexed") {
-        return '<span class="pill warn">partially indexed</span>' + metadataOnly;
+      if (status === "indexed with diagnostics") {
+        return '<span class="pill warn">indexed with diagnostics</span>' + metadataOnly;
+      }
+      if (status === "processing") {
+        return '<span class="pill">processing</span>' + metadataOnly;
+      }
+      if (status === "partially indexed" || status === "stopped at limit"
+          || status.includes("failed") || status.includes("cancelled")) {
+        return `<span class="pill warn">${escapeHtml(status)}</span>` + metadataOnly;
       }
       return '<span class="pill warn">attached</span>' + metadataOnly;
     }
@@ -17860,7 +18022,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (artifact === "browser_preference") return { main: "Accounts and Identity", sub: "Browser profile settings" };
       if (["windows_local_account", "windows_domain_account", "browser_account"].includes(artifact)) return { main: "Accounts and Identity", sub: "Local and domain accounts" };
       if (["credential_store", "secret_store"].includes(artifact)) return { main: "Accounts and Identity", sub: "Credential and secret stores" };
-      if (artifact === "plaintext_secret") return { main: "Accounts and Identity", sub: "Recovered plaintext secrets" };
+      if (["structured_secret", "plaintext_secret"].includes(artifact)) return { main: "Accounts and Identity", sub: "Structured secret indicators" };
       if (artifact === "host_identity") return { main: "Accounts and Identity", sub: "Hosts and computer names" };
       if (artifact === "network_configuration") return { main: "Network and Connectivity", sub: "IP and network configuration" };
       if (artifact === "wifi_profile") return { main: "Network and Connectivity", sub: "Wi-Fi profiles" };
@@ -19391,6 +19553,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return {
         kind: "search_result",
         match_kind: hit.match_kind,
+        parsed_segment_kind: hit.parsed_segment_kind || null,
+        parsed_segment_provenance: hit.parsed_segment_provenance || null,
         evidence_id: hit.evidence_id,
         entry_id: hit.entry_id,
         logical_path: hit.logical_path,
@@ -19455,6 +19619,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const fileDataPhysicalOffset = firstDefined(isLive ? liveEntry.file_data_physical_offset : metadata.file_data_physical_offset);
       const fileDataFileOffset = Number(firstDefined(isLive ? liveEntry.file_data_file_offset : metadata.file_data_file_offset) || 0);
       const fileDataContiguousBytes = Number(firstDefined(isLive ? liveEntry.file_data_contiguous_bytes : metadata.file_data_contiguous_bytes));
+      const fileDataDirectMapping = firstDefined(isLive ? liveEntry.file_data_direct_logical_mapping : metadata.file_data_direct_logical_mapping);
+      const fileDataPhysicalBasis = firstDefined(isLive ? liveEntry.physical_offset_basis : metadata.physical_offset_basis);
       const diskLocation = !isRaw && !isLive ? resolvedDiskLocation() : null;
       const selectionLength = range.end - range.start + 1;
       let selectionFileStart = range.start;
@@ -19487,14 +19653,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
         physicalBasis = diskLocation.basis + " (verified contiguous mapping)";
       } else if (fileDataPhysicalOffset != null) {
         const delta = range.start - fileDataFileOffset;
-        const rangeIsVerified = delta >= 0 && Number.isFinite(fileDataContiguousBytes)
+        const rangeIsVerified = fileDataDirectMapping !== false && delta >= 0 && Number.isFinite(fileDataContiguousBytes)
           && range.end < fileDataFileOffset + fileDataContiguousBytes;
-        if (rangeIsVerified || (delta === 0 && selectionLength === 1)) {
+        if (rangeIsVerified || (fileDataDirectMapping !== false && delta === 0 && selectionLength === 1)) {
           selectionDecodedStart = Number(fileDataPhysicalOffset) + delta;
           selectionDecodedEnd = selectionDecodedStart + selectionLength - 1;
           physicalBasis = rangeIsVerified
-            ? "parser-recorded file-data range (verified contiguous mapping)"
-            : "parser-recorded exact file-data start";
+            ? (fileDataPhysicalBasis || "parser-recorded file-data range") + " (verified contiguous mapping)"
+            : (fileDataPhysicalBasis || "parser-recorded exact file-data start");
         }
       }
       const createdUtc = firstDefined(isLive ? liveEntry.created_utc : metadata.created_utc);
@@ -21770,7 +21936,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         hit.selection_length,
         hit.logical_path,
         hit.display_name,
-        hit.data_preview
+        hit.data_preview,
+        hit.parsed_segment_kind || "",
+        hit.parsed_segment_provenance || null
       ]);
     }
 
@@ -21840,7 +22008,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const host = searchResultHost(entry);
       const referrer = searchResultReferrer(entry);
       const time = searchResultTime(entry);
-      const match = compactParts([hit.match_kind, entry && entry.is_deleted ? "deleted" : ""]);
+      const match = compactParts([
+        hit.match_kind,
+        hit.parsed_segment_kind || "",
+        entry && entry.is_deleted ? "deleted" : ""
+      ]);
       const values = {
         entry: compactParts([hit.display_name, hit.logical_path]),
         match,
@@ -21966,7 +22138,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         <tr class="entry-row" onclick="goToSearchResult(${index})" data-entry-id="${hit.entry_id}" data-search-index="${index}">
           <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleSearchResultSelection(${index}, this.checked)"></td>
           <td title="${escapeAttr(row.values.entry)}"><strong>${escapeHtml(hit.display_name)}</strong><br><span class="muted tiny">${escapeHtml(hit.logical_path)}</span></td>
-          <td><span class="pill ${hit.match_kind === "content" ? "good" : ""}">${escapeHtml(hit.match_kind)}</span>${deleted}</td>
+          <td><span class="pill ${hit.match_kind === "content" ? "good" : ""}">${escapeHtml(hit.match_kind)}</span>${hit.parsed_segment_kind ? ' <span class="pill">' + escapeHtml(hit.parsed_segment_kind) + '</span>' : ''}${deleted}</td>
           <td title="${escapeAttr(row.values.host)}">${escapeHtml(row.values.host)}</td>
           <td title="${escapeAttr(row.values.referrer)}">${escapeHtml(row.values.referrer)}</td>
           <td class="entry-time" title="${escapeAttr(row.values.time)}">${escapeHtml(row.values.time)}</td>
