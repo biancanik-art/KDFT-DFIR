@@ -206,9 +206,11 @@ mod atomic_output_tests {
 }
 
 pub mod archive;
+pub mod corpus;
 pub mod jumplist;
 pub mod lnk;
 pub mod lost_scan;
+pub mod ntfs_forensic;
 pub mod ooxml;
 pub mod prefetch;
 pub mod progress;
@@ -224,6 +226,71 @@ const INITIAL_SCHEMA: &str = include_str!("../../../schemas/001_initial.sql");
 // spell "KDFT" and prevent an arbitrary SQLite database selected in the Open
 // Case field from being mistaken for a case and migrated in place.
 const KDFT_APPLICATION_ID: i64 = 0x4B44_4654;
+// Monotonically-bumped identifier for the filesystem-index parser/schema
+// combination. This is part of the processing-context fingerprint foundation;
+// it is not evidence identity and does not imply resume eligibility.
+const FILESYSTEM_INDEX_PARSER_SCHEMA_VERSION: &str = "kdft-fsindex-2026.09-v1";
+
+fn finalized_checkpoint_json(terminal_status: &str, source_processing_complete: bool) -> String {
+    serde_json::json!({
+        "stage": "finalized",
+        "terminal_status": terminal_status,
+        "source_processing_complete": source_processing_complete,
+    })
+    .to_string()
+}
+
+/// Returns true when `error` is (or wraps) a [`progress::JobCancelled`].
+/// Parser recovery wrappers use this to re-raise cancellations instead of
+/// converting them into filesystem_parser_error records.
+fn error_chain_is_job_cancelled(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<progress::JobCancelled>())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PARSER_CANCEL_AFTER_ENTRY_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_FINAL_CANCELLATION_BEFORE_FINALIZATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn test_set_parser_cancel_after_entries(count: usize) {
+    TEST_PARSER_CANCEL_AFTER_ENTRY_COUNT.with(|value| value.set(count));
+}
+
+#[cfg(test)]
+fn test_clear_parser_cancel_after_entries() {
+    TEST_PARSER_CANCEL_AFTER_ENTRY_COUNT.with(|value| value.set(0));
+}
+
+#[cfg(test)]
+fn test_maybe_inject_cancellation_in_parser(current_indexed: usize) -> Result<()> {
+    let threshold = TEST_PARSER_CANCEL_AFTER_ENTRY_COUNT.with(|value| value.get());
+    if threshold != 0 && current_indexed >= threshold {
+        return Err(progress::JobCancelled.into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_set_final_cancellation_before_finalization(enabled: bool) {
+    TEST_FINAL_CANCELLATION_BEFORE_FINALIZATION.with(|value| value.set(enabled));
+}
+
+#[cfg(test)]
+fn test_clear_final_cancellation_before_finalization() {
+    TEST_FINAL_CANCELLATION_BEFORE_FINALIZATION.with(|value| value.set(false));
+}
+
+#[cfg(test)]
+fn test_maybe_request_cancellation_before_finalization() {
+    if TEST_FINAL_CANCELLATION_BEFORE_FINALIZATION.with(|value| value.get()) {
+        progress::request_cancellation_on_active();
+    }
+}
+
 // Keyword-search preview window stored per file. Kept small so the case
 // database scales to very large evidence (a 64 KiB preview per file made a
 // 100k-file case ~1.7 GB, which is untenable for multi-terabyte disks). This
@@ -1399,11 +1466,17 @@ pub fn list_evidence(case_path: &Path) -> Result<Vec<EvidenceSource>> {
                        THEN 'browser_history_import' ELSE 'filesystem_index' END
                  ORDER BY j.id DESC LIMIT 1),
                 e.sha256_hex, e.hashed_at, e.sha256_scope, e.acquisition_manifest_json,
-                (SELECT json_extract(j.parameters_json, '$.capture_content')
+                (SELECT CASE
+                    WHEN j.job_type = 'content_head_backfill' THEN
+                        CASE WHEN j.status = 'completed' THEN 1 ELSE 0 END
+                    ELSE json_extract(j.parameters_json, '$.capture_content')
+                 END
                  FROM evidence_jobs j
                  WHERE j.case_id = e.case_id AND j.evidence_id = e.id
-                   AND j.job_type = 'filesystem_index'
-                   AND j.status IN ('completed', 'completed_with_diagnostics', 'truncated')
+                   AND j.job_type IN ('filesystem_index', 'content_head_backfill')
+                   AND j.status IN (
+                       'completed', 'completed_with_diagnostics', 'truncated', 'cancelled', 'failed'
+                   )
                  ORDER BY j.id DESC LIMIT 1)
          FROM evidence_sources e
          WHERE e.attach_status <> 'superseded'
@@ -2634,15 +2707,31 @@ enum HashWorkerReadSession {
     Failed(String),
 }
 
+const PROCESSING_WORKERS_ENV: &str = "KDFT_PROCESSING_WORKERS";
+
+fn configured_processing_worker_count(available: usize, configured: Option<&str>) -> usize {
+    let available = available.max(1);
+    configured
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map(|value| value.min(available))
+        .unwrap_or(available)
+}
+
 /// Number of logical processors made available to CPU-bound forensic work.
-/// A dedicated Rayon pool uses this exact value, so an unrelated environment
-/// variable or an earlier global-pool initialization cannot silently collapse
-/// a long hash pass back to one worker.
+///
+/// Dedicated Rayon pools use this exact value. By default KDFT uses every
+/// processor visible to the process. Examiners can set `KDFT_PROCESSING_WORKERS`
+/// to a positive integer to keep an interactive workstation responsive during
+/// sustained image recovery, hashing, and parser passes. Invalid values retain
+/// the default, and a requested value can never exceed the available CPUs.
 pub fn available_processing_worker_count() -> usize {
-    std::thread::available_parallelism()
+    let available = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1)
-        .max(1)
+        .max(1);
+    let configured = std::env::var(PROCESSING_WORKERS_ENV).ok();
+    configured_processing_worker_count(available, configured.as_deref())
 }
 
 fn hash_one_indexed_file(
@@ -3021,6 +3110,535 @@ pub fn hash_indexed_files(
         bytes_hashed: total_bytes_hashed,
         completed_with_diagnostics: files_skipped > 0,
         truncated,
+        status: status.to_string(),
+    })
+}
+
+pub struct BackfillContentHeadOptions {
+    pub evidence_id: i64,
+    /// Stop after this many entries; 0 = every eligible entry.
+    pub max_entries: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackfillContentHeadResult {
+    pub job_id: i64,
+    pub evidence_id: i64,
+    pub eligible_entries_total: usize,
+    pub pending_entries_total: usize,
+    pub up_to_date_entries_skipped: usize,
+    pub entries_captured: usize,
+    pub entries_empty: usize,
+    pub entries_unreadable: usize,
+    pub entries_cancelled: usize,
+    pub worker_threads: usize,
+    pub bytes_captured: u64,
+    pub completed_with_diagnostics: bool,
+    pub truncated: bool,
+    pub cancelled: bool,
+    pub status: String,
+}
+
+const CONTENT_HEAD_BACKFILL_WRITE_BATCH_SIZE: usize = 256;
+const CONTENT_HEAD_BACKFILL_CHECKPOINT_VERSION: &str = "content-head-backfill-v1";
+
+#[derive(Debug)]
+struct ContentHeadBackfillCandidate {
+    entry_id: i64,
+    logical_path: String,
+}
+
+#[derive(Debug)]
+enum ContentHeadBackfillDisposition {
+    Captured { bytes: Vec<u8> },
+    Empty,
+    Unreadable { reason: String },
+    Cancelled,
+}
+
+#[derive(Debug)]
+struct ContentHeadBackfillOutcome {
+    entry_id: i64,
+    logical_path: String,
+    disposition: ContentHeadBackfillDisposition,
+}
+
+fn capture_one_content_head(
+    session: &mut HashWorkerReadSession,
+    candidate: ContentHeadBackfillCandidate,
+) -> ContentHeadBackfillOutcome {
+    let cancelled_outcome = || ContentHeadBackfillOutcome {
+        entry_id: candidate.entry_id,
+        logical_path: candidate.logical_path.clone(),
+        disposition: ContentHeadBackfillDisposition::Cancelled,
+    };
+    if progress::is_cancellation_requested_active() {
+        return cancelled_outcome();
+    }
+    let session = match session {
+        HashWorkerReadSession::Ready(session) => session,
+        HashWorkerReadSession::Failed(error) => {
+            return ContentHeadBackfillOutcome {
+                entry_id: candidate.entry_id,
+                logical_path: candidate.logical_path.clone(),
+                disposition: ContentHeadBackfillDisposition::Unreadable {
+                    reason: format!("read session unavailable: {error}"),
+                },
+            };
+        }
+    };
+    match read_filesystem_entry_bytes_in_session(
+        session,
+        ReadEntryBytesOptions {
+            entry_id: candidate.entry_id,
+            offset: 0,
+            length: CONTENT_INDEX_BYTES,
+        },
+    ) {
+        Ok(chunk) => {
+            if chunk.bytes.is_empty() {
+                ContentHeadBackfillOutcome {
+                    entry_id: candidate.entry_id,
+                    logical_path: candidate.logical_path,
+                    disposition: ContentHeadBackfillDisposition::Empty,
+                }
+            } else {
+                ContentHeadBackfillOutcome {
+                    entry_id: candidate.entry_id,
+                    logical_path: candidate.logical_path,
+                    disposition: ContentHeadBackfillDisposition::Captured { bytes: chunk.bytes },
+                }
+            }
+        }
+        Err(error) => ContentHeadBackfillOutcome {
+            entry_id: candidate.entry_id,
+            logical_path: candidate.logical_path,
+            disposition: ContentHeadBackfillDisposition::Unreadable {
+                reason: format!("{error:#}"),
+            },
+        },
+    }
+}
+
+fn commit_content_head_backfill_batch(
+    conn: &mut Connection,
+    job_id: i64,
+    outcomes: &[ContentHeadBackfillOutcome],
+) -> Result<()> {
+    if outcomes.is_empty() {
+        return Ok(());
+    }
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut captured = tx.prepare_cached(
+        "UPDATE filesystem_entries
+         SET content_head = ?2,
+             metadata_json = json_remove(
+                 json_set(metadata_json,
+                     '$.content_head_backfill_at', ?3,
+                     '$.content_head_backfill_status', ?4,
+                     '$.content_head_backfill_job_id', ?5),
+                 '$.content_head_backfill_reason')
+         WHERE id = ?1",
+    )?;
+    let mut empty = tx.prepare_cached(
+        "UPDATE filesystem_entries
+         SET content_head = X'',
+             metadata_json = json_remove(
+                 json_set(metadata_json,
+                     '$.content_head_backfill_at', ?2,
+                     '$.content_head_backfill_status', ?3,
+                     '$.content_head_backfill_job_id', ?4),
+                 '$.content_head_backfill_reason')
+         WHERE id = ?1",
+    )?;
+    let mut unreadable = tx.prepare_cached(
+        "UPDATE filesystem_entries
+         SET metadata_json = json_set(metadata_json,
+                 '$.content_head_backfill_at', ?2,
+                 '$.content_head_backfill_status', ?3,
+                 '$.content_head_backfill_job_id', ?4,
+                 '$.content_head_backfill_reason', ?5)
+         WHERE id = ?1",
+    )?;
+    for outcome in outcomes {
+        let changed = match &outcome.disposition {
+            ContentHeadBackfillDisposition::Captured { bytes } => {
+                captured.execute(params![outcome.entry_id, bytes, now, "captured", job_id])?
+            }
+            ContentHeadBackfillDisposition::Empty => {
+                empty.execute(params![outcome.entry_id, now, "empty", job_id])?
+            }
+            ContentHeadBackfillDisposition::Unreadable { reason } => {
+                unreadable.execute(params![outcome.entry_id, now, "unreadable", job_id, reason])?
+            }
+            ContentHeadBackfillDisposition::Cancelled => 0,
+        };
+        if changed != 1 {
+            bail!(
+                "writing content-head backfill result for entry {} affected {changed} rows",
+                outcome.entry_id
+            );
+        }
+    }
+    drop(captured);
+    drop(empty);
+    drop(unreadable);
+    tx.execute(
+        "UPDATE evidence_jobs
+         SET checkpoint_json = json_object(
+             'version', ?2,
+             'durable_attempted_entries', (
+                 SELECT COUNT(*) FROM filesystem_entries
+                 WHERE json_extract(metadata_json, '$.content_head_backfill_job_id') = ?1
+             ),
+             'last_commit_at', ?3
+         )
+         WHERE id = ?1",
+        params![job_id, CONTENT_HEAD_BACKFILL_CHECKPOINT_VERSION, now],
+    )?;
+    tx.commit()
+        .context("committing a content-head backfill result batch")?;
+    Ok(())
+}
+
+fn mark_content_head_backfill_failed(conn: &Connection, job_id: i64, error: &str) {
+    let _ = conn.execute(
+        "UPDATE evidence_jobs
+         SET status = 'failed',
+             error = ?2,
+             finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             checkpoint_json = json_set(
+                 COALESCE(checkpoint_json, '{}'),
+                 '$.version', ?3,
+                 '$.status', 'failed')
+         WHERE id = ?1",
+        params![job_id, error, CONTENT_HEAD_BACKFILL_CHECKPOINT_VERSION],
+    );
+}
+
+/// Additive content-head capture for an existing filesystem index. Preserves
+/// every filesystem row and only reads from the existing evidence/session APIs,
+/// honoring the same 4,096-byte head policy and eligibility rules as the base
+/// filesystem inventory. Idempotent: rows that already have content_head are
+/// skipped. Rows that were unreadable remain pending so a later run can retry
+/// them after a transient source/read problem is corrected.
+pub fn backfill_content_head(
+    case_path: &Path,
+    options: BackfillContentHeadOptions,
+) -> Result<BackfillContentHeadResult> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    ensure_evidence_source(&conn, case_id, options.evidence_id)?;
+
+    let eligible_entries_total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
+           AND COALESCE(json_extract(metadata_json, '$.artifact_kind'), '')
+               NOT IN ('unallocated_space')
+           AND COALESCE(json_extract(metadata_json, '$.storage_area'), '')
+               <> 'alternate_data_stream'
+           AND COALESCE(json_extract(metadata_json, '$.category_main'), '')
+               <> 'Pictures and Media'",
+        params![case_id, options.evidence_id],
+        |row| row.get(0),
+    )?;
+    let eligible_entries_total = usize::try_from(eligible_entries_total)
+        .context("content-head backfill eligible entry count exceeds usize")?;
+
+    let candidates: Vec<ContentHeadBackfillCandidate> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, logical_path FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
+               AND content_head IS NULL
+               AND COALESCE(json_extract(metadata_json, '$.artifact_kind'), '')
+                   NOT IN ('unallocated_space')
+               AND COALESCE(json_extract(metadata_json, '$.storage_area'), '')
+                   <> 'alternate_data_stream'
+               AND COALESCE(json_extract(metadata_json, '$.category_main'), '')
+                   <> 'Pictures and Media'
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![case_id, options.evidence_id], |row| {
+            Ok(ContentHeadBackfillCandidate {
+                entry_id: row.get(0)?,
+                logical_path: row.get(1)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("listing entries for content-head backfill")?
+    };
+    let pending_entries_total = candidates.len();
+    let up_to_date_entries_skipped = eligible_entries_total.saturating_sub(pending_entries_total);
+    let entries_to_process = if options.max_entries == 0 {
+        pending_entries_total
+    } else {
+        pending_entries_total.min(options.max_entries)
+    };
+    let truncated = options.max_entries != 0 && pending_entries_total > options.max_entries;
+    let worker_threads = available_processing_worker_count();
+
+    let initial_parameters = serde_json::json!({
+        "evidence_id": options.evidence_id,
+        "max_entries": options.max_entries,
+        "eligible_entries_total": eligible_entries_total,
+        "pending_entries_total": pending_entries_total,
+        "up_to_date_entries_skipped": up_to_date_entries_skipped,
+        "worker_threads": worker_threads,
+        "write_batch_size": CONTENT_HEAD_BACKFILL_WRITE_BATCH_SIZE,
+        "checkpoint_version": CONTENT_HEAD_BACKFILL_CHECKPOINT_VERSION,
+        "capture_content": true,
+    });
+    conn.execute(
+        "INSERT INTO evidence_jobs(
+             case_id, evidence_id, job_type, status, parameters_json, started_at
+         ) VALUES (?1, ?2, 'content_head_backfill', 'running', ?3,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        params![case_id, options.evidence_id, initial_parameters.to_string(),],
+    )?;
+    let job_id = conn.last_insert_rowid();
+    progress::progress_set_job_id(job_id);
+
+    let mut entries_captured = 0_usize;
+    let mut entries_empty = 0_usize;
+    let mut entries_unreadable = 0_usize;
+    let mut entries_cancelled = 0_usize;
+    let mut total_bytes_captured = 0_u64;
+    let mut cancelled = false;
+
+    progress::progress_set_unit("entries");
+    progress::progress_set_total(Some(entries_to_process as u64));
+    if truncated {
+        progress::progress_truncated(format!(
+            "content-head backfill stopped at the examiner-requested {} entry limit",
+            options.max_entries
+        ));
+    }
+
+    let candidates = candidates
+        .into_iter()
+        .take(entries_to_process)
+        .collect::<Vec<_>>();
+    if !candidates.is_empty() {
+        let pool = match rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_threads)
+            .thread_name(|index| format!("kdft-content-head-{index}"))
+            .build()
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                let error = anyhow::Error::new(error)
+                    .context("creating the content-head backfill worker pool");
+                mark_content_head_backfill_failed(&conn, job_id, &format!("{error:#}"));
+                return Err(error);
+            }
+        };
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel(worker_threads.saturating_mul(2).max(1));
+        let case_path = case_path.to_path_buf();
+        let mut pending_batch = Vec::with_capacity(CONTENT_HEAD_BACKFILL_WRITE_BATCH_SIZE);
+        let mut write_error: Option<anyhow::Error> = None;
+        pool.spawn(move || {
+            candidates.into_par_iter().for_each_init(
+                || match EvidenceReadSession::open_worker_read_only(&case_path) {
+                    Ok(session) => HashWorkerReadSession::Ready(session),
+                    Err(error) => HashWorkerReadSession::Failed(format!("{error:#}")),
+                },
+                |session, candidate| {
+                    let outcome = capture_one_content_head(session, candidate);
+                    let _ = sender.send(outcome);
+                },
+            );
+        });
+
+        while let Ok(outcome) = receiver.recv() {
+            if matches!(
+                outcome.disposition,
+                ContentHeadBackfillDisposition::Cancelled
+            ) {
+                cancelled = true;
+            }
+            if cancelled {
+                // Drain the channel without committing so that cancelled rows
+                // remain eligible for a later backfill; work already committed
+                // in prior batches is preserved.
+                entries_cancelled = entries_cancelled.saturating_add(1);
+                progress::progress_skip(Some(outcome.logical_path.clone()));
+                continue;
+            }
+            pending_batch.push(outcome);
+            if pending_batch.len() < CONTENT_HEAD_BACKFILL_WRITE_BATCH_SIZE {
+                continue;
+            }
+            if write_error.is_none() {
+                if let Err(error) =
+                    commit_content_head_backfill_batch(&mut conn, job_id, &pending_batch)
+                {
+                    write_error = Some(error);
+                } else {
+                    for outcome in &pending_batch {
+                        match &outcome.disposition {
+                            ContentHeadBackfillDisposition::Captured { bytes } => {
+                                entries_captured = entries_captured.saturating_add(1);
+                                total_bytes_captured = total_bytes_captured
+                                    .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                            }
+                            ContentHeadBackfillDisposition::Empty => {
+                                entries_empty = entries_empty.saturating_add(1);
+                            }
+                            ContentHeadBackfillDisposition::Unreadable { .. } => {
+                                entries_unreadable = entries_unreadable.saturating_add(1);
+                                progress::progress_error(Some(outcome.logical_path.clone()));
+                                progress::progress_skip(Some(outcome.logical_path.clone()));
+                            }
+                            ContentHeadBackfillDisposition::Cancelled => {
+                                cancelled = true;
+                                entries_cancelled = entries_cancelled.saturating_add(1);
+                                progress::progress_skip(Some(outcome.logical_path.clone()));
+                                continue;
+                            }
+                        }
+                        progress::progress_advance(outcome.logical_path.clone());
+                    }
+                }
+            }
+            pending_batch.clear();
+            if progress::is_cancellation_requested_active() {
+                cancelled = true;
+            }
+        }
+        if write_error.is_none() && !pending_batch.is_empty() && !cancelled {
+            match commit_content_head_backfill_batch(&mut conn, job_id, &pending_batch) {
+                Ok(()) => {
+                    for outcome in &pending_batch {
+                        match &outcome.disposition {
+                            ContentHeadBackfillDisposition::Captured { bytes } => {
+                                entries_captured = entries_captured.saturating_add(1);
+                                total_bytes_captured = total_bytes_captured
+                                    .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                            }
+                            ContentHeadBackfillDisposition::Empty => {
+                                entries_empty = entries_empty.saturating_add(1);
+                            }
+                            ContentHeadBackfillDisposition::Unreadable { .. } => {
+                                entries_unreadable = entries_unreadable.saturating_add(1);
+                                progress::progress_error(Some(outcome.logical_path.clone()));
+                                progress::progress_skip(Some(outcome.logical_path.clone()));
+                            }
+                            ContentHeadBackfillDisposition::Cancelled => {
+                                cancelled = true;
+                                entries_cancelled = entries_cancelled.saturating_add(1);
+                                progress::progress_skip(Some(outcome.logical_path.clone()));
+                                continue;
+                            }
+                        }
+                        progress::progress_advance(outcome.logical_path.clone());
+                    }
+                }
+                Err(error) => write_error = Some(error),
+            }
+        } else if !pending_batch.is_empty() {
+            // Pending batch arrived while cancellation was detected; do not
+            // commit it so these rows remain eligible for resume.
+            entries_cancelled = entries_cancelled.saturating_add(pending_batch.len());
+            for outcome in &pending_batch {
+                progress::progress_skip(Some(outcome.logical_path.clone()));
+            }
+        }
+        if let Some(error) = write_error {
+            mark_content_head_backfill_failed(&conn, job_id, &format!("{error:#}"));
+            return Err(error.context("writing parallel content-head backfill results"));
+        }
+    }
+
+    let has_diagnostics = entries_unreadable > 0;
+    let status = if cancelled {
+        "cancelled"
+    } else if truncated {
+        "truncated"
+    } else if has_diagnostics {
+        "completed_with_diagnostics"
+    } else {
+        "completed"
+    };
+    let completed_with_diagnostics = !truncated && !cancelled && has_diagnostics;
+
+    conn.execute(
+        "UPDATE evidence_jobs
+         SET status = ?2,
+             finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             parameters_json = json_set(parameters_json,
+                 '$.entries_captured', ?3, '$.entries_empty', ?4,
+                 '$.entries_unreadable', ?5, '$.entries_cancelled', ?6,
+                 '$.bytes_captured', ?7, '$.worker_threads', ?8,
+                 '$.up_to_date_entries_skipped', ?9, '$.completed_with_diagnostics', ?10,
+                 '$.truncated', ?11, '$.cancelled', ?12),
+             checkpoint_json = json_object(
+                 'version', ?13, 'status', ?2,
+                 'entries_captured', ?3, 'entries_empty', ?4,
+                 'entries_unreadable', ?5, 'entries_cancelled', ?6,
+                 'durable_attempted_entries', ?3 + ?4 + ?5,
+                 'pending_entries_at_start', ?14)
+         WHERE id = ?1",
+        params![
+            job_id,
+            status,
+            i64::try_from(entries_captured).unwrap_or(i64::MAX),
+            i64::try_from(entries_empty).unwrap_or(i64::MAX),
+            i64::try_from(entries_unreadable).unwrap_or(i64::MAX),
+            i64::try_from(entries_cancelled).unwrap_or(i64::MAX),
+            i64::try_from(total_bytes_captured).unwrap_or(i64::MAX),
+            i64::try_from(worker_threads).unwrap_or(i64::MAX),
+            i64::try_from(up_to_date_entries_skipped).unwrap_or(i64::MAX),
+            completed_with_diagnostics,
+            truncated,
+            cancelled,
+            CONTENT_HEAD_BACKFILL_CHECKPOINT_VERSION,
+            i64::try_from(pending_entries_total).unwrap_or(i64::MAX),
+        ],
+    )?;
+    let actor = audit_actor(&conn, case_id)?;
+    conn.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'evidence.content_head_backfill', ?2, 'evidence', ?3,
+                 json_object('entries_captured', ?4, 'entries_empty', ?5,
+                             'entries_unreadable', ?6, 'entries_cancelled', ?7,
+                             'bytes_captured', ?8, 'worker_threads', ?9,
+                             'up_to_date_entries_skipped', ?10,
+                             'completed_with_diagnostics', ?11,
+                             'truncated', ?12, 'cancelled', ?13, 'status', ?14))",
+        params![
+            case_id,
+            actor,
+            options.evidence_id,
+            i64::try_from(entries_captured).unwrap_or(i64::MAX),
+            i64::try_from(entries_empty).unwrap_or(i64::MAX),
+            i64::try_from(entries_unreadable).unwrap_or(i64::MAX),
+            i64::try_from(entries_cancelled).unwrap_or(i64::MAX),
+            i64::try_from(total_bytes_captured).unwrap_or(i64::MAX),
+            i64::try_from(worker_threads).unwrap_or(i64::MAX),
+            i64::try_from(up_to_date_entries_skipped).unwrap_or(i64::MAX),
+            completed_with_diagnostics,
+            truncated,
+            cancelled,
+            status,
+        ],
+    )?;
+    Ok(BackfillContentHeadResult {
+        job_id,
+        evidence_id: options.evidence_id,
+        eligible_entries_total,
+        pending_entries_total,
+        up_to_date_entries_skipped,
+        entries_captured,
+        entries_empty,
+        entries_unreadable,
+        entries_cancelled,
+        worker_threads,
+        bytes_captured: total_bytes_captured,
+        completed_with_diagnostics,
+        truncated,
+        cancelled,
         status: status.to_string(),
     })
 }
@@ -8968,6 +9586,116 @@ pub fn process_evidence(
     process_evidence_with_profile(case_path, options, ProcessingProfile::default())
 }
 
+/// Versioned processing-context fingerprint for a filesystem-index attempt.
+///
+/// This captures the options and parser/schema version that influence how
+/// entries are produced. It is explicitly *not* evidence identity and must
+/// not be treated as resume eligibility until a separate hash/snapshot
+/// identity exists and partial checkpoint resume is implemented.
+fn filesystem_index_processing_context_fingerprint(
+    options: &ProcessEvidenceOptions,
+    profile: ProcessingProfile,
+) -> String {
+    let mut value = serde_json::Map::new();
+    value.insert(
+        "max_entries".to_string(),
+        serde_json::Value::Number(options.max_entries.into()),
+    );
+    value.insert(
+        "capture_content".to_string(),
+        serde_json::Value::Bool(profile.capture_content),
+    );
+    value.insert(
+        "parse_emails".to_string(),
+        serde_json::Value::Bool(profile.parse_emails),
+    );
+    value.insert(
+        "parse_browsers".to_string(),
+        serde_json::Value::Bool(profile.parse_browsers),
+    );
+    value.insert(
+        "parser_schema_version".to_string(),
+        serde_json::Value::String(FILESYSTEM_INDEX_PARSER_SCHEMA_VERSION.to_string()),
+    );
+    serde_json::Value::Object(value).to_string()
+}
+
+fn finalize_cancelled_filesystem_index(
+    conn: &mut Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    prior_complete_image_entry_count: usize,
+    requested_entry_limit: usize,
+) -> Result<ProcessEvidenceResult> {
+    let cancel_reason = "job cancelled";
+    // The in-process shared JobProgressTracker is the live interrupt: loops
+    // poll check_cancellation() at safe boundaries and roll back the active
+    // SQLite transaction. That rollback releases the SQLite writer lock, so
+    // this terminal update is what durably records the cancelled status and
+    // the accepted cancellation request for later inspection.
+    let checkpoint = finalized_checkpoint_json("cancelled", false);
+    // The caller has dropped the active indexing transaction, rolling back its
+    // unpublished generation and releasing SQLite's sole writer. This new
+    // IMMEDIATE transaction therefore observes exactly the retained prior
+    // generation (or an empty fresh case) while serializing the terminal job
+    // update, retained-row count, and cancellation audit event.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute(
+        "UPDATE evidence_jobs
+         SET status = 'cancelled',
+             cancellation_requested = 1,
+             finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             error = ?1,
+             checkpoint_json = ?2,
+             parameters_json = json_set(
+                 COALESCE(parameters_json, '{}'),
+                 '$.entries_indexed', 0
+             )
+         WHERE case_id = ?3 AND id = ?4",
+        params![cancel_reason, checkpoint, case_id, job_id],
+    )?;
+    let retained_entry_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2",
+        params![case_id, evidence.id],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO audit_events(
+             case_id, event_type, actor, object_type, object_id, details_json
+         ) VALUES (
+             ?1, 'evidence.process.cancelled', ?2, 'evidence', ?3,
+             json_object('job_id', ?4, 'retained_entry_count', ?5,
+                         'requested_entry_limit', ?6, 'status', 'cancelled')
+         )",
+        params![
+            case_id,
+            audit_actor(&tx, case_id)?,
+            evidence.id,
+            job_id,
+            retained_entry_count,
+            i64::try_from(requested_entry_limit).unwrap_or(i64::MAX),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(ProcessEvidenceResult {
+        job_id,
+        evidence_id: evidence.id,
+        entries_indexed: 0,
+        attempt_entries_indexed: 0,
+        replacement_committed: false,
+        canonical_generation_preserved: prior_complete_image_entry_count > 0,
+        retained_entry_count: retained_entry_count as usize,
+        truncated: false,
+        partial_artifact_coverage: false,
+        completed_with_diagnostics: false,
+        status: "cancelled".to_string(),
+        bookmark_items_relinked: 0,
+        truncation_reasons: Vec::new(),
+    })
+}
+
 fn record_standalone_mailbox_failed_attempt(
     conn: &Connection,
     case_id: i64,
@@ -9165,15 +9893,9 @@ fn process_evidence_with_profile_inner(
     let case_id = active_case_id(&conn)?;
     let evidence = read_evidence_for_processing(&conn, case_id, options.evidence_id)?;
     progress::progress_set_evidence_id(evidence.id);
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let actor = audit_actor(&tx, case_id)?;
-    let prior_complete_image_entry_count = if evidence.source_kind == "image" {
-        complete_image_snapshot_entry_count(&tx, case_id, evidence.id)?
-    } else {
-        0
-    };
     let requested_entry_limit = options.max_entries;
     let effective_entry_limit = (requested_entry_limit != 0).then_some(requested_entry_limit);
+    let context_fingerprint = filesystem_index_processing_context_fingerprint(&options, profile);
     let parameters_json = serde_json::json!({
         "max_entries": requested_entry_limit,
         "effective_max_entries": effective_entry_limit,
@@ -9182,24 +9904,66 @@ fn process_evidence_with_profile_inner(
         "parse_browsers": profile.parse_browsers,
     })
     .to_string();
-    tx.execute(
-        "INSERT INTO evidence_jobs(case_id, evidence_id, job_type, status, parameters_json, started_at)
-         VALUES (?1, ?2, 'filesystem_index', 'running', ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-        params![case_id, evidence.id, parameters_json],
+
+    // Automatic reuse of prior completed generations is disabled. The stored
+    // context fingerprint is a foundation for future partial/incomplete
+    // checkpoint resume, not evidence identity or resume eligibility. A later
+    // milestone can enable safe reuse once a hash/snapshot identity and
+    // resumable checkpoints exist.
+
+    // Persist the running job before starting the long indexing work so that a
+    // cancellation request can be durable and a crash/restart leaves a visible
+    // running record instead of a vanished attempt.
+    let prior_complete_image_entry_count = if evidence.source_kind == "image" {
+        complete_image_snapshot_entry_count(&conn, case_id, evidence.id)?
+    } else {
+        0
+    };
+    let job_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    job_tx.execute(
+        "INSERT INTO evidence_jobs(
+             case_id, evidence_id, job_type, status, parameters_json,
+             parser_schema_version, generation_fingerprint, started_at
+         ) VALUES (
+             ?1, ?2, 'filesystem_index', 'running', ?3, ?4, ?5,
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         )",
+        params![
+            case_id,
+            evidence.id,
+            parameters_json,
+            FILESYSTEM_INDEX_PARSER_SCHEMA_VERSION,
+            context_fingerprint,
+        ],
     )?;
-    let job_id = tx.last_insert_rowid();
+    let job_id = job_tx.last_insert_rowid();
     progress::progress_set_job_id(job_id);
+    job_tx.commit()?;
 
     // Image processing is destructive inside the transaction because its
     // first step replaces the filesystem snapshot. Keep that replacement in
     // a nested savepoint whenever a provably complete prior generation
-    // exists. A hard failure already rolls back the outer transaction; this
-    // savepoint additionally lets a successful-but-incomplete attempt retain
-    // the prior canonical rows while preserving the attempt's job record.
+    // exists. A hard failure rolls back the outer transaction; cancellation
+    // also rolls back so a prior completed generation is never replaced by a
+    // cancelled or failed attempt.
     const IMAGE_REPLACEMENT_SAVEPOINT: &str = "kdft_image_generation_replacement";
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
     let image_replacement_staged = prior_complete_image_entry_count > 0;
     if image_replacement_staged {
         tx.execute_batch(&format!("SAVEPOINT {IMAGE_REPLACEMENT_SAVEPOINT}"))?;
+    }
+
+    if progress::is_cancellation_requested_active() {
+        drop(tx);
+        return finalize_cancelled_filesystem_index(
+            &mut conn,
+            case_id,
+            &evidence,
+            job_id,
+            prior_complete_image_entry_count,
+            requested_entry_limit,
+        );
     }
 
     let processing_result = match evidence.source_kind.as_str() {
@@ -9212,33 +9976,43 @@ fn process_evidence_with_profile_inner(
     };
     let (attempt_entries_indexed, processing_reported_partial_coverage) = match processing_result {
         Ok(result) => result,
+        Err(error) if error_chain_is_job_cancelled(&error) => {
+            drop(tx);
+            return finalize_cancelled_filesystem_index(
+                &mut conn,
+                case_id,
+                &evidence,
+                job_id,
+                prior_complete_image_entry_count,
+                requested_entry_limit,
+            );
+        }
         Err(error) => {
             progress::progress_error(Some(evidence.source_path.clone()));
-            // Roll back every entry and the provisional running job, then
-            // record a separate failed job. This preserves the atomic indexing
-            // guarantee while making the failed attempt visible to examiners.
+            // Roll back every entry change, then update the committed running
+            // job to a terminal failed state. The prior canonical generation,
+            // if any, remains intact because this transaction never commits.
             let error_message = error.to_string().chars().take(2_000).collect::<String>();
             drop(tx);
             let failed_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let failed_parameters = serde_json::json!({
-                "max_entries": requested_entry_limit,
-                "effective_max_entries": effective_entry_limit,
-                "entries_indexed": 0,
-            })
-            .to_string();
             failed_tx.execute(
-                "INSERT INTO evidence_jobs(
-                     case_id, evidence_id, job_type, status, parameters_json,
-                     started_at, finished_at, error
-                 ) VALUES (
-                     ?1, ?2, 'filesystem_index', 'failed', ?3,
-                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4
-                 )",
-                params![case_id, evidence.id, failed_parameters, error_message],
+                "UPDATE evidence_jobs
+                 SET status = 'failed',
+                     finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     error = ?1,
+                     checkpoint_json = ?2,
+                     parameters_json = json_set(
+                         COALESCE(parameters_json, '{}'),
+                         '$.entries_indexed', 0
+                     )
+                 WHERE case_id = ?3 AND id = ?4",
+                params![
+                    error_message,
+                    finalized_checkpoint_json("failed", false),
+                    case_id,
+                    job_id
+                ],
             )?;
-            let failed_job_id = failed_tx.last_insert_rowid();
-            progress::progress_replace_job_id(failed_job_id);
             if let Err(record_error) = record_standalone_mailbox_failed_attempt(
                 &failed_tx,
                 case_id,
@@ -9265,7 +10039,7 @@ fn process_evidence_with_profile_inner(
                     case_id,
                     actor,
                     evidence.id,
-                    failed_job_id,
+                    job_id,
                     error_message,
                     i64::try_from(requested_entry_limit).unwrap_or(i64::MAX),
                 ],
@@ -9274,6 +10048,27 @@ fn process_evidence_with_profile_inner(
             return Err(error);
         }
     };
+
+    #[cfg(test)]
+    test_maybe_request_cancellation_before_finalization();
+
+    // A cancellation request that arrives after source processing returns must
+    // still prevent any status calculation, savepoint release, relinking,
+    // evidence indexed_at update, or commit. Roll back the active transaction
+    // and finalize as cancelled so a prior complete generation remains intact
+    // and a fresh case remains empty.
+    if progress::is_cancellation_requested_active() {
+        drop(tx);
+        return finalize_cancelled_filesystem_index(
+            &mut conn,
+            case_id,
+            &evidence,
+            job_id,
+            prior_complete_image_entry_count,
+            requested_entry_limit,
+        );
+    }
+
     let mut progress_truncation_reasons = progress::active_truncation_reasons();
     let explicit_examiner_limit = progress_truncation_reasons
         .iter()
@@ -9324,6 +10119,7 @@ fn process_evidence_with_profile_inner(
         }
     }
     let replacement_committed = !canonical_generation_preserved;
+    let source_processing_complete = replacement_committed && !processing_reported_partial_coverage;
     let entries_indexed = if canonical_generation_preserved {
         0
     } else {
@@ -9353,19 +10149,21 @@ fn process_evidence_with_profile_inner(
          SET status = ?1,
              finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
              error = ?2,
+             checkpoint_json = ?3,
              parameters_json = json_set(
                  parameters_json,
-                 '$.entries_indexed', ?3,
-                 '$.attempt_entries_indexed', ?4,
-                 '$.replacement_committed', json(?5),
-                 '$.canonical_generation_preserved', json(?6),
-                 '$.retained_entry_count', ?7,
-                 '$.canonical_generation_complete', json(?8)
+                 '$.entries_indexed', ?4,
+                 '$.attempt_entries_indexed', ?5,
+                 '$.replacement_committed', json(?6),
+                 '$.canonical_generation_preserved', json(?7),
+                 '$.retained_entry_count', ?8,
+                 '$.canonical_generation_complete', json(?9)
              )
-         WHERE id = ?9",
+         WHERE id = ?10",
         params![
             status,
             truncation_reason,
+            finalized_checkpoint_json(status, source_processing_complete),
             i64::try_from(entries_indexed).unwrap_or(i64::MAX),
             i64::try_from(attempt_entries_indexed).unwrap_or(i64::MAX),
             if replacement_committed {
@@ -9379,7 +10177,7 @@ fn process_evidence_with_profile_inner(
                 "false"
             },
             i64::try_from(retained_entry_count).unwrap_or(i64::MAX),
-            if replacement_committed && !processing_reported_partial_coverage {
+            if source_processing_complete {
                 "true"
             } else {
                 "false"
@@ -14399,6 +15197,7 @@ fn list_filesystem_entries_limited_inner(
 /// artifact kind (browser visit vs NTFS $STANDARD_INFORMATION vs EVTX log
 /// entry, etc.), so a date-range filter has to check all of them.
 const TIMELINE_TIME_FIELD_KEYS: &[&str] = &[
+    "artifact_time_utc",
     "email_date",
     "visit_time_utc",
     "last_visit_time_utc",
@@ -14490,14 +15289,14 @@ fn timeline_time_range_sql_clause() -> String {
 
 /// Like `list_filesystem_entries_limited`, but for the Timeline view: when
 /// `time_range` is given (inclusive RFC3339 bounds), only entries with at
-/// least one timestamp field in that range are returned. Filtering happens in
+/// least one timestamp field in that range are eligible. Filtering happens in
 /// SQL (via json_extract over every known timestamp field) so large cases
 /// don't have to ship every entry to the browser just to throw most of them
-/// away client-side - fetching + client-side-scanning the full entry set is
-/// what made the Timeline tab freeze the page on cases with tens of thousands
-/// of entries. Unlike a plain row-count cap, this never silently drops an
-/// entry that belongs in the requested window: the SQL predicate is
-/// authoritative over the whole table, not a "first N rows" preview.
+/// away client-side. When an examiner-selected safety cap is reached, derived
+/// parser records are returned before bulk filesystem metadata. Otherwise a
+/// disk image's `/Image Analysis` rows can consume the whole response before
+/// `/Parsed Artifacts` browser, email, execution, or event-log records are
+/// reached, leaving the Timeline with misleadingly uniform event classes.
 pub fn list_filesystem_entries_for_timeline(
     case_path: &Path,
     limit: Option<usize>,
@@ -14521,7 +15320,31 @@ pub fn list_filesystem_entries_for_timeline(
            AND (:from IS NULL OR (
            {range}
            ))
-         ORDER BY evidence_id, logical_path, id
+         ORDER BY CASE
+                    WHEN logical_path LIKE '/Parsed Artifacts/Browser/%'
+                      OR logical_path LIKE '/Mailbox/%'
+                      OR logical_path LIKE '%/Email/%'
+                      THEN 0
+                    WHEN logical_path LIKE '%/userassist/%'
+                      OR logical_path LIKE '%/shellbags/%'
+                      OR logical_path LIKE '%/jumplist/%'
+                      OR logical_path LIKE '%/lnk/%'
+                      THEN 1
+                    WHEN logical_path LIKE '%/prefetch/%'
+                      OR logical_path LIKE '%/amcache/%'
+                      OR logical_path LIKE '%/shimcache/%'
+                      OR logical_path LIKE '%/scheduled-task/%'
+                      OR logical_path LIKE '%/startup/%'
+                      THEN 2
+                    WHEN logical_path LIKE '%/evtx/%'
+                      OR logical_path LIKE '/Windows Artifacts/SRUM/%'
+                      OR logical_path LIKE '%/Registry/%'
+                      THEN 3
+                    WHEN logical_path LIKE '%/usn/%' THEN 4
+                    WHEN entry_kind = 'record' THEN 5
+                    ELSE 6
+                  END,
+                  evidence_id, logical_path, id
          LIMIT :limit",
         excluded = TIMELINE_EXCLUDED_ARTIFACT_KINDS_SQL,
         range = timeline_time_range_sql_clause()
@@ -14876,6 +15699,9 @@ pub(crate) fn read_filesystem_entry_bytes_in_session(
             entry.logical_path
         );
     }
+    if let Some(bytes) = read_standalone_mft_resident_entry_bytes(&entry, options.offset, length)? {
+        return Ok(bytes);
+    }
     if let Some(bytes) = read_image_physical_extent_bytes(&entry, options.offset, length)? {
         return Ok(bytes);
     };
@@ -14928,6 +15754,131 @@ pub(crate) fn read_filesystem_entry_bytes_in_session(
         eof: options.offset.saturating_add(bytes_read as u64) >= total_size,
         bytes,
     })
+}
+
+fn read_standalone_mft_resident_entry_bytes(
+    entry: &EntryForBytes,
+    offset: u64,
+    length: usize,
+) -> Result<Option<EntryBytes>> {
+    if entry.metadata_json["virtual_filesystem"].as_str() != Some("standalone_mft_reconstruction") {
+        return Ok(None);
+    }
+    if entry.metadata_json["ntfs_default_data_resident"].as_bool() != Some(true)
+        || entry.metadata_json["ntfs_default_data_content_available"].as_bool() != Some(true)
+    {
+        bail!(
+            "standalone $MFT entry has no verified readable resident default $DATA stream: {}",
+            entry.logical_path
+        );
+    }
+    let record_source_offset = entry.metadata_json["mft_record_source_offset"]
+        .as_u64()
+        .with_context(|| {
+            format!(
+                "standalone $MFT entry has no record source offset: {}",
+                entry.logical_path
+            )
+        })?;
+    let record_size = entry.metadata_json["mft_record_size"]
+        .as_u64()
+        .filter(|value| matches!(*value, 1024 | 2048 | 4096))
+        .with_context(|| {
+            format!(
+                "standalone $MFT entry has no supported record size: {}",
+                entry.logical_path
+            )
+        })?;
+    let data_record_offset = entry.metadata_json["file_data_record_offset"]
+        .as_u64()
+        .with_context(|| {
+            format!(
+                "standalone $MFT entry has no resident-data record offset: {}",
+                entry.logical_path
+            )
+        })?;
+    let total_size = metadata_u64_or_i64(&entry.metadata_json, "ntfs_data_size")
+        .or_else(|| entry.size_bytes.and_then(|value| u64::try_from(value).ok()))
+        .with_context(|| {
+            format!(
+                "standalone $MFT entry has no resident-data size: {}",
+                entry.logical_path
+            )
+        })?;
+    let data_record_end = data_record_offset
+        .checked_add(total_size)
+        .context("standalone $MFT resident-data record range overflows")?;
+    if data_record_end > record_size {
+        bail!(
+            "standalone $MFT resident-data range {}..{} exceeds its {}-byte record",
+            data_record_offset,
+            data_record_end,
+            record_size
+        );
+    }
+    let source_path = Path::new(&entry.source_path);
+    let mut file = fs::File::open(source_path)
+        .with_context(|| format!("opening standalone $MFT {}", source_path.display()))?;
+    let source_length = file
+        .metadata()
+        .with_context(|| format!("reading standalone $MFT metadata {}", source_path.display()))?
+        .len();
+    let record_source_end = record_source_offset
+        .checked_add(record_size)
+        .context("standalone $MFT record source range overflows")?;
+    if record_source_end > source_length {
+        bail!(
+            "standalone $MFT record source range {}..{} exceeds source length {}",
+            record_source_offset,
+            record_source_end,
+            source_length
+        );
+    }
+    file.seek(SeekFrom::Start(record_source_offset))
+        .with_context(|| format!("seeking standalone $MFT {}", source_path.display()))?;
+    let mut record = vec![0_u8; usize::try_from(record_size).context("MFT record too large")?];
+    file.read_exact(&mut record)
+        .with_context(|| format!("reading standalone $MFT {}", source_path.display()))?;
+    apply_ntfs_file_record_fixups(&mut record, 512, &entry.logical_path)?;
+    let data_start = usize::try_from(data_record_offset).context("MFT data offset too large")?;
+    let data_end = usize::try_from(data_record_end).context("MFT data end too large")?;
+    let resident_data = &record[data_start..data_end];
+    let expected_sha256 = entry.metadata_json["ntfs_default_data_sha256"]
+        .as_str()
+        .with_context(|| {
+            format!(
+                "standalone $MFT resident-data SHA-256 is unavailable: {}",
+                entry.logical_path
+            )
+        })?;
+    let observed_sha256 = sha256_hex(resident_data);
+    if observed_sha256 != expected_sha256 {
+        bail!(
+            "standalone $MFT resident-data hash no longer matches indexed metadata for {}",
+            entry.logical_path
+        );
+    }
+    let start_offset = offset.min(total_size);
+    let read_len = usize::try_from(total_size.saturating_sub(start_offset))
+        .unwrap_or(usize::MAX)
+        .min(length);
+    let start_index = usize::try_from(start_offset).context("MFT read offset too large")?;
+    let read_end = start_index
+        .checked_add(read_len)
+        .context("MFT read range overflows")?;
+    let bytes = resident_data[start_index..read_end].to_vec();
+    let bytes_read = bytes.len();
+    Ok(Some(EntryBytes {
+        entry_id: entry.entry_id,
+        evidence_id: entry.evidence_id,
+        logical_path: entry.logical_path.clone(),
+        offset,
+        requested_length: length,
+        bytes_read,
+        total_size,
+        eof: start_offset.saturating_add(bytes_read as u64) >= total_size,
+        bytes,
+    }))
 }
 
 fn unavailable_entry_disk_location(
@@ -17983,6 +18934,10 @@ impl TempFileGuard {
 
     fn add_sidecar(&mut self, path: PathBuf) {
         self.sidecar_paths.push(path);
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -22833,6 +23788,15 @@ fn classify_entry(
                 "Deleted filesystem record discovered from NTFS MFT metadata",
                 "high",
                 &["deleted", "recovery", "ntfs"],
+            );
+        }
+        "ntfs_mft_record" if name.starts_with('$') => {
+            return category(
+                "Operating System",
+                "NTFS metadata",
+                "Allocated NTFS metadata file reconstructed from a standalone $MFT source",
+                "high",
+                &["ntfs", "filesystem", "metadata", "mft"],
             );
         }
         "unallocated_space" => {
@@ -28285,6 +29249,7 @@ fn process_file_evidence(
     job_id: i64,
     max_entries: usize,
 ) -> Result<(usize, bool)> {
+    progress::check_cancellation()?;
     let path = PathBuf::from(&evidence.source_path);
     let metadata = fs::metadata(&path)
         .with_context(|| format!("reading file evidence metadata {}", path.display()))?;
@@ -28349,16 +29314,76 @@ fn process_standalone_mft_evidence(
     max_entries: usize,
 ) -> Result<(usize, bool)> {
     let path = PathBuf::from(&evidence.source_path);
-    let mut parser = mft::MftParser::from_path(&path)
+    let mut source_file = fs::File::open(&path)
         .with_context(|| format!("opening standalone MFT {}", path.display()))?;
+    let source_length = source_file
+        .metadata()
+        .with_context(|| format!("reading standalone MFT metadata {}", path.display()))?
+        .len();
+    let mut header = [0_u8; 32];
+    source_file
+        .read_exact(&mut header)
+        .with_context(|| format!("reading standalone MFT header {}", path.display()))?;
+    let record_size = u64::from(u32::from_le_bytes(
+        header[28..32].try_into().unwrap_or_default(),
+    ));
+    if &header[0..4] != b"FILE" || !matches!(record_size, 1024 | 2048 | 4096) {
+        bail!(
+            "standalone MFT {} has an invalid first-record signature or unsupported record size {}",
+            path.display(),
+            record_size
+        );
+    }
+    if source_length < record_size {
+        bail!(
+            "standalone MFT {} is shorter than its declared {}-byte first record",
+            path.display(),
+            record_size
+        );
+    }
+    let first_attribute_offset = u64::from(u16::from_le_bytes([header[20], header[21]]));
+    if !(48..record_size).contains(&first_attribute_offset) {
+        bail!(
+            "standalone MFT {} has an invalid first-attribute offset {}",
+            path.display(),
+            first_attribute_offset
+        );
+    }
+    let usa_offset = u64::from(u16::from_le_bytes([header[4], header[5]]));
+    let usa_count = u64::from(u16::from_le_bytes([header[6], header[7]]));
+    let expected_usa_count = record_size / 512 + 1;
+    let usa_end = usa_offset
+        .checked_add(
+            usa_count
+                .checked_mul(2)
+                .context("standalone MFT first-record update-sequence size overflows")?,
+        )
+        .context("standalone MFT first-record update-sequence range overflows")?;
+    if usa_count != expected_usa_count || usa_end > record_size {
+        bail!(
+            "standalone MFT {} has update-sequence count/range inconsistent with its first record",
+            path.display()
+        );
+    }
+    source_file
+        .rewind()
+        .with_context(|| format!("rewinding standalone MFT {}", path.display()))?;
+    let mut parser = mft::MftParser::from_read_seek(
+        std::io::BufReader::with_capacity(4096, source_file),
+        Some(source_length),
+    )
+    .with_context(|| format!("opening standalone MFT {}", path.display()))?;
     let record_count = parser.get_entry_count();
+    let trailing_source_bytes = source_length % record_size;
     let limit = record_count.min(max_entries as u64);
     let mut indexed = 0_usize;
     let mut omitted_records = 0_u64;
     let mut partially_parsed_records = 0_u64;
+    let mut used_logical_paths = HashSet::new();
     progress::progress_set_unit("MFT records");
     progress::progress_set_total(Some(record_count));
     for record_number in 0..limit {
+        progress::check_cancellation()?;
         let current_object = format!("$MFT record {record_number}");
         progress::progress_current(current_object.clone());
         let entry = match parser.get_entry(record_number) {
@@ -28381,6 +29406,9 @@ fn process_standalone_mft_evidence(
             progress::progress_advance(current_object);
             continue;
         }
+        let record_source_offset = record_number
+            .checked_mul(record_size)
+            .context("standalone MFT record source offset overflows")?;
         let in_use = entry.is_allocated();
         let is_directory = entry.is_dir();
         let sequence_number = entry.header.sequence;
@@ -28390,7 +29418,11 @@ fn process_standalone_mft_evidence(
             .map(|attr| attr.name.clone())
             .unwrap_or_else(|| format!("MFT record {record_number}"));
         let entry_kind = if is_directory { "directory" } else { "file" };
-        let mut record_partial = false;
+        let record_size_consistent = u64::from(entry.header.total_entry_size) == record_size;
+        let mut record_partial = entry.valid_fixup == Some(false) || !record_size_consistent;
+        if record_partial {
+            progress::progress_error(Some(current_object.clone()));
+        }
         let (reconstructed, path_reconstruction_error) =
             match parser.get_full_path_for_entry(&entry) {
                 Ok(path) => (path, None),
@@ -28417,27 +29449,36 @@ fn process_standalone_mft_evidence(
         } else {
             parent_status
         };
-        let logical_path = reconstructed_text
-            .as_ref()
-            .filter(|value| !value.is_empty() && parent_status == "resolved")
-            .map(|value| {
-                format!(
-                    "/Reconstructed filesystem/{}",
-                    value.trim_start_matches('/')
-                )
-            })
-            .unwrap_or_else(|| {
-                format!(
-                    "/{}/{}-{}",
-                    if in_use {
-                        "Orphaned records"
-                    } else {
-                        "Deleted records"
-                    },
-                    record_number,
-                    sanitize_logical_segment(&name)
-                )
-            });
+        let preferred_logical_path = if !in_use {
+            format!(
+                "/Deleted records/{}-{}",
+                record_number,
+                sanitize_logical_segment(&name)
+            )
+        } else {
+            reconstructed_text
+                .as_ref()
+                .filter(|value| !value.is_empty() && parent_status == "resolved")
+                .map(|value| {
+                    format!(
+                        "/Reconstructed filesystem/{}",
+                        value.trim_start_matches('/')
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "/Orphaned records/{}-{}",
+                        record_number,
+                        sanitize_logical_segment(&name)
+                    )
+                })
+        };
+        let logical_path = unique_standalone_mft_logical_path(
+            &mut used_logical_paths,
+            preferred_logical_path,
+            record_number,
+            sequence_number,
+        );
         let mut attributes = Vec::new();
         let mut attribute_parse_error_count = 0_usize;
         let mut attribute_parse_errors = Vec::new();
@@ -28468,6 +29509,18 @@ fn process_standalone_mft_evidence(
         let default_data = data_attributes
             .iter()
             .find(|attribute| attribute.header.name.is_empty());
+        let mut resident_payload_errors = Vec::new();
+        let default_resident_payload = default_data.and_then(|attribute| {
+            match standalone_mft_resident_payload(&entry, attribute, record_source_offset) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    record_partial = true;
+                    progress::progress_error(Some(current_object.clone()));
+                    resident_payload_errors.push(format!("default $DATA: {error}"));
+                    None
+                }
+            }
+        });
         let (data_size, allocated_size, data_resident) = default_data
             .map(|attribute| match &attribute.header.residential_header {
                 mft::attribute::header::ResidentialHeader::Resident(header) => (
@@ -28487,25 +29540,69 @@ fn process_standalone_mft_evidence(
         let alternate_data_streams = data_attributes
             .iter()
             .filter(|attribute| !attribute.header.name.is_empty())
-            .map(|attribute| serde_json::json!({
-                "name": attribute.header.name,
-                "resident": matches!(attribute.header.residential_header, mft::attribute::header::ResidentialHeader::Resident(_)),
-            }))
+            .map(|attribute| {
+                let structurally_resident = matches!(
+                    attribute.header.residential_header,
+                    mft::attribute::header::ResidentialHeader::Resident(_)
+                );
+                let resident_payload =
+                    match standalone_mft_resident_payload(&entry, attribute, record_source_offset) {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            record_partial = true;
+                            progress::progress_error(Some(current_object.clone()));
+                            resident_payload_errors
+                                .push(format!("named $DATA {}: {error}", attribute.header.name));
+                            None
+                        }
+                    };
+                let stream_size = match &attribute.header.residential_header {
+                    mft::attribute::header::ResidentialHeader::Resident(header) => {
+                        u64::from(header.data_size)
+                    }
+                    mft::attribute::header::ResidentialHeader::NonResident(header) => {
+                        header.file_size
+                    }
+                };
+                serde_json::json!({
+                    "name": attribute.header.name,
+                    "resident": structurally_resident,
+                    "content_available": resident_payload.is_some(),
+                    "size_bytes": stream_size,
+                    "record_offset": resident_payload.as_ref().map(|payload| payload.record_offset),
+                    "source_offset": resident_payload.as_ref().map(|payload| payload.source_offset),
+                    "source_range_contiguous": resident_payload.as_ref().map(|payload| payload.raw_source_range_contiguous),
+                    "sha256": resident_payload.as_ref().map(|payload| sha256_hex(&payload.bytes)),
+                    "offset_coordinate_system": resident_payload.as_ref().map(|_| "standalone_mft_record_after_usa_fixup"),
+                    "evidence_physical_offset_available": false,
+                })
+            })
             .collect::<Vec<_>>();
-        let record_size = u64::from(entry.header.total_entry_size);
-        let metadata = serde_json::json!({
+        let source_path_exact = reconstructed_text
+            .as_deref()
+            .filter(|value| !value.is_empty() && parent_status == "resolved");
+        let mut metadata = serde_json::json!({
             "artifact_kind": if in_use { "ntfs_mft_record" } else { "deleted_file_record" },
             "filesystem_parser": "mft crate 0.7.0",
             "virtual_filesystem": "standalone_mft_reconstruction",
-            "source_path_exact": evidence.display_name,
+            "source_path_exact": serde_json::Value::Null,
+            "source_path_availability": if source_path_exact.is_some() { "reconstructed from MFT parent references; not an exact path field recorded in the standalone source" } else { "unavailable" },
+            "evidence_source_path": evidence.source_path,
+            "source_display_name": evidence.display_name,
             "ntfs_file_record_number": record_number,
             "ntfs_parent_record_number": best_name.as_ref().map(|v| v.parent.entry),
             "ntfs_parent_sequence_number": best_name.as_ref().map(|v| v.parent.sequence),
             "ntfs_sequence_number": sequence_number,
             "ntfs_hard_link_count": entry.header.hard_link_count,
-            "mft_record_logical_offset": record_number * record_size,
-            "mft_record_physical_offset": record_number * record_size,
+            "mft_record_logical_offset": record_source_offset,
+            "mft_record_source_offset": record_source_offset,
+            "mft_record_physical_offset": serde_json::Value::Null,
+            "mft_record_offset_coordinate_system": "standalone_mft_source_stream",
+            "mft_record_offset_basis": "byte offset within the standalone $MFT source stream; not an evidence-media physical offset",
+            "evidence_physical_offset_available": false,
             "mft_record_size": record_size,
+            "mft_record_declared_size": entry.header.total_entry_size,
+            "mft_record_size_consistent": record_size_consistent,
             "mft_fixup_valid": entry.valid_fixup,
             "mft_path_reconstruction_status": path_reconstruction_status,
             "mft_reconstructed_path": reconstructed_text,
@@ -28513,9 +29610,22 @@ fn process_standalone_mft_evidence(
             "mft_attribute_parse_error_count": attribute_parse_error_count,
             "mft_attribute_parse_errors": attribute_parse_errors,
             "mft_attribute_parse_errors_omitted": attribute_parse_error_count.saturating_sub(8),
+            "mft_resident_payload_error_count": resident_payload_errors.len(),
+            "mft_resident_payload_errors": resident_payload_errors,
             "ntfs_allocated_size": allocated_size,
             "ntfs_data_size": data_size,
             "ntfs_default_data_resident": data_resident,
+            "ntfs_default_data_content_available": default_resident_payload.is_some(),
+            "ntfs_default_data_record_offset": default_resident_payload.as_ref().map(|payload| payload.record_offset),
+            "ntfs_default_data_source_offset": default_resident_payload.as_ref().map(|payload| payload.source_offset),
+            "ntfs_default_data_sha256": default_resident_payload.as_ref().map(|payload| sha256_hex(&payload.bytes)),
+            "file_data_record_offset": default_resident_payload.as_ref().map(|payload| payload.record_offset),
+            "file_data_source_offset": default_resident_payload.as_ref().map(|payload| payload.source_offset),
+            "file_data_source_range_contiguous": default_resident_payload.as_ref().map(|payload| payload.raw_source_range_contiguous),
+            "file_data_offset_coordinate_system": default_resident_payload.as_ref().map(|_| "standalone_mft_record_after_usa_fixup"),
+            "file_data_source_offset_basis": default_resident_payload.as_ref().map(|_| "resident $DATA value start within its standalone $MFT record; bytes are reconstructed after NTFS update-sequence fixups, may not form one contiguous raw-source extent, and are not an evidence-media physical offset"),
+            "file_data_encoding": default_resident_payload.as_ref().map(|_| "ntfs_usa_fixup_decoded"),
+            "file_data_physical_offset": serde_json::Value::Null,
             "ntfs_alternate_data_streams": alternate_data_streams,
             "ntfs_standard_creation_time_utc": standard.as_ref().map(|v| v.created.to_string()),
             "ntfs_standard_modification_time_utc": standard.as_ref().map(|v| v.modified.to_string()),
@@ -28528,9 +29638,14 @@ fn process_standalone_mft_evidence(
             "ntfs_filename_namespace": best_name.as_ref().map(|v| format!("{:?}", v.namespace)),
             "recovery_source": if in_use { serde_json::Value::Null } else { serde_json::json!("standalone_ntfs_mft") },
         });
+        add_entry_category(&mut metadata, &logical_path, &name, entry_kind);
         let size = (!is_directory).then(|| i64::try_from(data_size).unwrap_or(i64::MAX));
+        let content_head = default_resident_payload.as_ref().and_then(|payload| {
+            should_index_content_head(&metadata, entry_kind)
+                .then(|| payload.bytes[..payload.bytes.len().min(CONTENT_INDEX_BYTES)].to_vec())
+        });
         if in_use {
-            upsert_filesystem_entry(
+            upsert_filesystem_entry_with_content(
                 conn,
                 case_id,
                 evidence.id,
@@ -28540,6 +29655,7 @@ fn process_standalone_mft_evidence(
                 size,
                 &metadata.to_string(),
                 job_id,
+                content_head.as_deref(),
             )?;
         } else {
             upsert_deleted_filesystem_entry_with_content(
@@ -28552,7 +29668,7 @@ fn process_standalone_mft_evidence(
                 size,
                 &metadata.to_string(),
                 job_id,
-                None,
+                content_head.as_deref(),
             )?;
         }
         indexed += 1;
@@ -28576,10 +29692,144 @@ fn process_standalone_mft_evidence(
             omitted_records.saturating_sub(16)
         ));
     }
+    if trailing_source_bytes > 0 {
+        progress::progress_truncated(format!(
+            "standalone MFT source ends with {trailing_source_bytes} byte(s) that do not form a complete {record_size}-byte record"
+        ));
+    }
     Ok((
         indexed,
-        record_count > limit || partially_parsed_records > 0 || omitted_records > 0,
+        record_count > limit
+            || partially_parsed_records > 0
+            || omitted_records > 0
+            || trailing_source_bytes > 0,
     ))
+}
+
+struct StandaloneMftResidentPayload {
+    record_offset: u64,
+    source_offset: u64,
+    raw_source_range_contiguous: bool,
+    bytes: Vec<u8>,
+}
+
+fn standalone_mft_resident_payload(
+    entry: &mft::MftEntry,
+    attribute: &mft::attribute::MftAttribute,
+    record_source_offset: u64,
+) -> Result<Option<StandaloneMftResidentPayload>> {
+    let mft::attribute::header::ResidentialHeader::Resident(resident) =
+        &attribute.header.residential_header
+    else {
+        return Ok(None);
+    };
+    if entry.valid_fixup != Some(true) {
+        bail!("resident payload is unavailable because the record update-sequence check failed");
+    }
+    if entry.data.is_empty() || !entry.data.len().is_multiple_of(512) {
+        bail!("resident payload is unavailable because the record size is not 512-byte aligned");
+    }
+    if usize::try_from(entry.header.total_entry_size).ok() != Some(entry.data.len()) {
+        bail!("resident payload is unavailable because the record's declared size is inconsistent");
+    }
+    let expected_usa_count = entry.data.len() / 512 + 1;
+    if usize::from(entry.header.usa_size) != expected_usa_count {
+        bail!(
+            "resident payload is unavailable because the record update-sequence count is inconsistent with its size"
+        );
+    }
+    let usa_end = usize::from(entry.header.usa_offset)
+        .checked_add(
+            expected_usa_count
+                .checked_mul(2)
+                .context("record update-sequence byte count overflows")?,
+        )
+        .context("record update-sequence range overflows")?;
+    if usa_end > entry.data.len() {
+        bail!(
+            "resident payload is unavailable because the update-sequence array exceeds the record"
+        );
+    }
+    let attribute_start = usize::try_from(attribute.header.start_offset)
+        .context("resident attribute start offset exceeds addressable memory")?;
+    let attribute_length = usize::try_from(attribute.header.record_length)
+        .context("resident attribute length exceeds addressable memory")?;
+    if attribute_length == 0 || attribute_length % 8 != 0 {
+        bail!("resident attribute length is not nonzero quadword-aligned");
+    }
+    let attribute_end = attribute_start
+        .checked_add(attribute_length)
+        .context("resident attribute range overflows")?;
+    if attribute_end > entry.data.len() {
+        bail!("resident attribute exceeds its owning MFT record");
+    }
+    let data_offset = usize::from(resident.data_offset);
+    if data_offset < 24 || data_offset % 8 != 0 {
+        bail!("resident attribute value offset is not a valid quadword-aligned offset");
+    }
+    let data_start = attribute_start
+        .checked_add(data_offset)
+        .context("resident attribute value start overflows")?;
+    let data_end = data_start
+        .checked_add(
+            usize::try_from(resident.data_size)
+                .context("resident attribute value length exceeds addressable memory")?,
+        )
+        .context("resident attribute value range overflows")?;
+    if data_end > attribute_end || data_end > entry.data.len() {
+        bail!("resident attribute value exceeds its attribute or owning MFT record");
+    }
+    let record_offset = u64::try_from(data_start).context("resident record offset exceeds u64")?;
+    let source_offset = record_source_offset
+        .checked_add(record_offset)
+        .context("resident source offset overflows")?;
+    let raw_source_range_contiguous = !range_intersects_mft_usa_trailer(
+        record_offset,
+        u64::from(resident.data_size),
+        u64::try_from(entry.data.len()).context("MFT record size exceeds u64")?,
+    )?;
+    Ok(Some(StandaloneMftResidentPayload {
+        record_offset,
+        source_offset,
+        raw_source_range_contiguous,
+        bytes: entry.data[data_start..data_end].to_vec(),
+    }))
+}
+
+fn range_intersects_mft_usa_trailer(start: u64, length: u64, record_size: u64) -> Result<bool> {
+    let end = start
+        .checked_add(length)
+        .context("resident range overflows while checking update-sequence trailers")?;
+    for trailer_end in (512..=record_size).step_by(512) {
+        let trailer_start = trailer_end - 2;
+        if start < trailer_end && end > trailer_start {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn unique_standalone_mft_logical_path(
+    used_paths: &mut HashSet<String>,
+    preferred: String,
+    record_number: u64,
+    sequence_number: u16,
+) -> String {
+    if used_paths.insert(preferred.clone()) {
+        return preferred;
+    }
+    let mut suffix = 0_u64;
+    loop {
+        let candidate = if suffix == 0 {
+            format!("{preferred}~mft-{record_number}-{sequence_number}")
+        } else {
+            format!("{preferred}~mft-{record_number}-{sequence_number}-{suffix}")
+        };
+        if used_paths.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
 }
 
 fn process_folder_evidence(
@@ -28610,6 +29860,7 @@ fn process_folder_evidence(
     let mut truncated = false;
     let mut stack = vec![root.clone()];
     while let Some(folder) = stack.pop() {
+        progress::check_cancellation()?;
         let mut children = fs::read_dir(&folder)
             .with_context(|| format!("reading evidence folder {}", folder.display()))?
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -28733,6 +29984,9 @@ fn process_image_evidence(
     let mut indexed = 0_usize;
     let mut truncated = false;
 
+    // Check cancellation before the destructive snapshot replacement so a
+    // prior completed generation is never touched by a cancelled run.
+    progress::check_cancellation()?;
     conn.execute(
         "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
         params![case_id, evidence.id],
@@ -28827,6 +30081,7 @@ fn process_image_evidence(
             }
 
             for (index, partition) in layout.partitions.iter().enumerate() {
+                progress::check_cancellation()?;
                 if indexed >= max_entries {
                     truncated = true;
                     break;
@@ -28968,6 +30223,9 @@ fn process_image_evidence(
                     ) {
                         Ok(fat_truncated) => truncated |= fat_truncated,
                         Err(err) => {
+                            if error_chain_is_job_cancelled(&err) {
+                                return Err(err);
+                            }
                             if indexed >= max_entries {
                                 truncated = true;
                             } else {
@@ -29020,6 +30278,9 @@ fn process_image_evidence(
                     ) {
                         Ok(ntfs_truncated) => truncated |= ntfs_truncated,
                         Err(err) => {
+                            if error_chain_is_job_cancelled(&err) {
+                                return Err(err);
+                            }
                             if indexed >= max_entries {
                                 truncated = true;
                             } else {
@@ -29072,6 +30333,9 @@ fn process_image_evidence(
                     ) {
                         Ok(ext_truncated) => truncated |= ext_truncated,
                         Err(err) => {
+                            if error_chain_is_job_cancelled(&err) {
+                                return Err(err);
+                            }
                             if indexed >= max_entries {
                                 truncated = true;
                             } else {
@@ -29166,6 +30430,7 @@ fn process_image_evidence(
             // embedded in ordinary file data as false lost partitions.
             if indexed < max_entries && (!layout.partitions.is_empty() || !whole_volume_recognized)
             {
+                progress::check_cancellation()?;
                 let declared: Vec<(u64, u64)> = layout
                     .partitions
                     .iter()
@@ -29231,6 +30496,7 @@ fn process_image_evidence(
                 truncated = true;
             }
             if indexed < max_entries && !whole_volume_recognized {
+                progress::check_cancellation()?;
                 // No partition table at all (e.g. wiped/zeroed sector 0):
                 // sweep the whole disk for orphaned boot sectors. Offset 0 was
                 // already probed by the fallback.
@@ -31957,6 +33223,22 @@ pub struct LiveTreeFileRef {
     pub created_utc: Option<String>,
     pub modified_utc: Option<String>,
     pub accessed_utc: Option<String>,
+    pub is_deleted: bool,
+    pub provenance: Option<String>,
+    pub reconstruction_status: Option<String>,
+    pub recovery_status: Option<String>,
+    pub ntfs_file_record_number: Option<u64>,
+    pub ntfs_sequence_number: Option<u16>,
+    pub ntfs_parent_record_number: Option<u64>,
+    pub mft_record_logical_offset: Option<u64>,
+    pub mft_record_physical_offset: Option<u64>,
+    pub file_data_logical_offset: Option<u64>,
+    pub file_data_physical_offset: Option<u64>,
+    pub file_data_file_offset: Option<u64>,
+    pub file_data_contiguous_bytes: Option<u64>,
+    pub physical_offset_basis: Option<String>,
+    pub file_data_direct_logical_mapping: Option<bool>,
+    pub offset_coordinate_system: Option<String>,
 }
 
 pub struct LiveTreeListResult {
@@ -32026,6 +33308,22 @@ impl TreeListSink {
             created_utc,
             modified_utc,
             accessed_utc,
+            is_deleted: false,
+            provenance: None,
+            reconstruction_status: None,
+            recovery_status: None,
+            ntfs_file_record_number: None,
+            ntfs_sequence_number: None,
+            ntfs_parent_record_number: None,
+            mft_record_logical_offset: None,
+            mft_record_physical_offset: None,
+            file_data_logical_offset: None,
+            file_data_physical_offset: None,
+            file_data_file_offset: None,
+            file_data_contiguous_bytes: None,
+            physical_offset_basis: None,
+            file_data_direct_logical_mapping: None,
+            offset_coordinate_system: None,
         });
     }
 
@@ -32610,12 +33908,27 @@ pub fn bulk_add_live_bookmark_items(
             "volume_name": volume_name,
             "filesystem": filesystem,
             "size_bytes": file.size_bytes,
-            "is_deleted": false,
+            "is_deleted": file.is_deleted,
             "symlink": false,
             "file_extension": file_extension,
             "created_utc": file.created_utc,
             "modified_utc": file.modified_utc,
             "accessed_utc": file.accessed_utc,
+            "provenance": file.provenance,
+            "reconstruction_status": file.reconstruction_status,
+            "recovery_status": file.recovery_status,
+            "ntfs_file_record_number": file.ntfs_file_record_number,
+            "ntfs_sequence_number": file.ntfs_sequence_number,
+            "ntfs_parent_record_number": file.ntfs_parent_record_number,
+            "mft_record_logical_offset": file.mft_record_logical_offset,
+            "mft_record_physical_offset": file.mft_record_physical_offset,
+            "file_data_logical_offset": file.file_data_logical_offset,
+            "file_data_physical_offset": file.file_data_physical_offset,
+            "file_data_file_offset": file.file_data_file_offset,
+            "file_data_contiguous_bytes": file.file_data_contiguous_bytes,
+            "physical_offset_basis": file.physical_offset_basis,
+            "file_data_direct_logical_mapping": file.file_data_direct_logical_mapping,
+            "offset_coordinate_system": file.offset_coordinate_system,
             "metadata": {
                 "source_kind": source_kind,
                 "source_path": source_path,
@@ -33101,6 +34414,9 @@ fn process_whole_volume_fallback(
                 recognized: true,
             }),
             Err(err) => {
+                if error_chain_is_job_cancelled(&err) {
+                    return Err(err);
+                }
                 if *indexed >= max_entries {
                     return Ok(WholeVolumeProcessResult {
                         truncated: true,
@@ -33153,6 +34469,9 @@ fn process_whole_volume_fallback(
                 recognized: true,
             }),
             Err(err) => {
+                if error_chain_is_job_cancelled(&err) {
+                    return Err(err);
+                }
                 if *indexed >= max_entries {
                     return Ok(WholeVolumeProcessResult {
                         truncated: true,
@@ -33206,6 +34525,9 @@ fn process_whole_volume_fallback(
                 recognized: true,
             }),
             Err(err) => {
+                if error_chain_is_job_cancelled(&err) {
+                    return Err(err);
+                }
                 if *indexed >= max_entries {
                     return Ok(WholeVolumeProcessResult {
                         truncated: true,
@@ -34980,10 +36302,14 @@ fn process_ext_partition_entries(
     let mut visited_directory_inodes = HashSet::new();
 
     while let Some((ext_path, parent_logical)) = queue.pop_front() {
+        progress::check_cancellation()?;
         dirs_walked += 1;
         let children = match ext4_list_dir(&fs, &ext_path) {
             Ok(children) => children,
             Err(error) => {
+                if error_chain_is_job_cancelled(&error) {
+                    return Err(error);
+                }
                 let current = if ext_path == "/" {
                     volume_prefix.to_string()
                 } else {
@@ -35476,6 +36802,7 @@ fn scan_lost_partitions(
     let config = lost_scan::LostScanConfig::default();
 
     for &(gap_start, gap_end) in &gaps {
+        progress::check_cancellation()?;
         if output_limit_hit {
             break;
         }
@@ -36194,6 +37521,9 @@ fn process_fat_partition_entries(
             max_entries,
             &mut truncated,
         ) {
+            if error_chain_is_job_cancelled(&err) {
+                return Err(err);
+            }
             insert_image_record(
                 conn,
                 case_id,
@@ -36427,6 +37757,7 @@ fn scan_fat_deleted_entries(
     }
     let recovery_prefix = format!("{volume_prefix}/Recovery/Deleted Files");
     while region_index < regions.len() {
+        progress::check_cancellation()?;
         let (region_offset, region_len, parent_rel) = regions[region_index].clone();
         region_index += 1;
         if region_offset >= size_bytes {
@@ -36448,6 +37779,7 @@ fn scan_fat_deleted_entries(
         region.truncate(read);
 
         for entry in region.chunks_exact(32) {
+            progress::check_cancellation()?;
             if entry[0] == 0x00 {
                 break;
             }
@@ -36638,6 +37970,7 @@ fn process_ntfs_partition_entries(
         .root_directory(&mut slice)
         .context("opening NTFS root directory")?
         .file_record_number();
+    progress::check_cancellation()?;
 
     upsert_filesystem_entry(
         conn,
@@ -36793,7 +38126,7 @@ fn process_ntfs_partition_entries(
     // correctness-critical: a single unreadable INDX node must not leave a
     // visible Users directory with an empty subtree when the allocated MFT
     // parent references are still intact.
-    truncated |= enrich_ntfs_entries_with_shared_mft_parser(
+    let mft_reconciliation = enrich_ntfs_entries_with_shared_mft_parser(
         conn,
         case_id,
         evidence_id,
@@ -36808,6 +38141,8 @@ fn process_ntfs_partition_entries(
         max_entries,
     )
     .context("normalizing disk NTFS records through shared MFT parser")?;
+    truncated |= mft_reconciliation.truncated;
+    let mut used_logical_paths = mft_reconciliation.used_logical_paths;
 
     // A partial allocated pass must not suppress deleted-record recovery;
     // continue while examiner-requested capacity remains and combine status.
@@ -36823,6 +38158,8 @@ fn process_ntfs_partition_entries(
             partition_index,
             start_offset,
             size_bytes,
+            &mft_reconciliation.deleted_paths,
+            &mut used_logical_paths,
             indexed,
             max_entries,
         )?;
@@ -36953,6 +38290,7 @@ fn walk_ntfs_volume<T: Read + Seek>(
     )];
 
     while let Some((dir_record_number, parent_path, parent_ntfs_path)) = stack.pop() {
+        progress::check_cancellation()?;
         if *indexed >= max_entries {
             truncated = true;
             break;
@@ -37043,6 +38381,7 @@ fn walk_ntfs_volume<T: Read + Seek>(
         let children = child_result.children;
         let mut used_child_paths = HashSet::new();
         for child in children {
+            progress::check_cancellation()?;
             if *indexed >= max_entries {
                 truncated = true;
                 break;
@@ -37534,6 +38873,254 @@ fn ntfs_deleted_candidate_record_numbers<T: Read + Seek>(
     Ok(candidates)
 }
 
+#[derive(Clone, Debug)]
+struct ResolvedDeletedNtfsPath {
+    ntfs_path: String,
+    source_name: String,
+    parent_record_number: u64,
+    parent_sequence_number: u16,
+    sequence_number: u16,
+}
+
+#[derive(Clone, Debug)]
+enum DeletedNtfsPathResolution {
+    Resolved(ResolvedDeletedNtfsPath),
+    Unresolved(&'static str),
+}
+
+#[derive(Debug)]
+struct DeletedNtfsPathSelection {
+    logical_path: String,
+    source_path_exact: Option<String>,
+    parent_sequence_number: Option<u16>,
+    reconstruction_status: &'static str,
+    original_hierarchy: bool,
+    deleted_identity_discriminator_applied: bool,
+    collision_disambiguated: bool,
+}
+
+fn reserve_deleted_ntfs_logical_path(
+    base_path: String,
+    record_number: u64,
+    sequence_number: u16,
+    always_discriminate: bool,
+    used_logical_paths: &mut HashSet<String>,
+) -> (String, bool) {
+    let candidate = if always_discriminate {
+        format!("{base_path}~deleted-mft{record_number}-{sequence_number}")
+    } else {
+        base_path
+    };
+    if used_logical_paths.insert(candidate.clone()) {
+        return (candidate, false);
+    }
+    let mut suffix = 2_usize;
+    loop {
+        let suffixed = format!("{candidate}-{suffix}");
+        if used_logical_paths.insert(suffixed.clone()) {
+            return (suffixed, true);
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+fn select_deleted_ntfs_path(
+    volume_prefix: &str,
+    source_name: &str,
+    record_number: u64,
+    parent_record_number: u64,
+    sequence_number: u16,
+    resolution: Option<&DeletedNtfsPathResolution>,
+    used_logical_paths: &mut HashSet<String>,
+) -> DeletedNtfsPathSelection {
+    let fallback = |status, used_paths: &mut HashSet<String>| {
+        let logical_path = format!(
+            "{volume_prefix}/Recovery/Deleted Files/{}-mft{record_number}",
+            sanitize_logical_segment(source_name)
+        );
+        let (logical_path, collision_disambiguated) = reserve_deleted_ntfs_logical_path(
+            logical_path,
+            record_number,
+            sequence_number,
+            false,
+            used_paths,
+        );
+        DeletedNtfsPathSelection {
+            logical_path,
+            source_path_exact: None,
+            parent_sequence_number: None,
+            reconstruction_status: status,
+            original_hierarchy: false,
+            deleted_identity_discriminator_applied: false,
+            collision_disambiguated,
+        }
+    };
+
+    let resolution = match resolution {
+        Some(DeletedNtfsPathResolution::Resolved(resolution)) => resolution,
+        Some(DeletedNtfsPathResolution::Unresolved(status)) => {
+            return fallback(status, used_logical_paths)
+        }
+        None => return fallback("not_evaluated_by_shared_mft_parser", used_logical_paths),
+    };
+    if resolution.sequence_number != sequence_number {
+        return fallback("record_sequence_mismatch", used_logical_paths);
+    }
+    if resolution.parent_record_number != parent_record_number {
+        return fallback("parent_record_mismatch", used_logical_paths);
+    }
+    if resolution.source_name != source_name {
+        return fallback("file_name_mismatch", used_logical_paths);
+    }
+
+    let base_path = ntfs_internal_logical_path(volume_prefix, &resolution.ntfs_path);
+    let (logical_path, collision_disambiguated) = reserve_deleted_ntfs_logical_path(
+        base_path,
+        record_number,
+        sequence_number,
+        true,
+        used_logical_paths,
+    );
+    DeletedNtfsPathSelection {
+        collision_disambiguated,
+        logical_path,
+        source_path_exact: Some(resolution.ntfs_path.clone()),
+        parent_sequence_number: Some(resolution.parent_sequence_number),
+        reconstruction_status: "resolved_and_sequence_validated",
+        original_hierarchy: true,
+        deleted_identity_discriminator_applied: true,
+    }
+}
+
+#[cfg(test)]
+mod deleted_ntfs_path_selection_tests {
+    use super::{select_deleted_ntfs_path, DeletedNtfsPathResolution, ResolvedDeletedNtfsPath};
+    use std::collections::HashSet;
+
+    fn resolution() -> DeletedNtfsPathResolution {
+        DeletedNtfsPathResolution::Resolved(ResolvedDeletedNtfsPath {
+            ntfs_path: "Users/Alice/Documents/evidence.txt".to_string(),
+            source_name: "evidence.txt".to_string(),
+            parent_record_number: 42,
+            parent_sequence_number: 7,
+            sequence_number: 11,
+        })
+    }
+
+    #[test]
+    fn places_sequence_validated_deleted_record_in_original_hierarchy() {
+        let mut used = HashSet::new();
+        let selection = select_deleted_ntfs_path(
+            "/Image Analysis/Volumes/000-ntfs",
+            "evidence.txt",
+            99,
+            42,
+            11,
+            Some(&resolution()),
+            &mut used,
+        );
+
+        assert_eq!(
+            selection.logical_path,
+            "/Image Analysis/Volumes/000-ntfs/Users/Alice/Documents/evidence.txt~deleted-mft99-11"
+        );
+        assert_eq!(
+            selection.source_path_exact.as_deref(),
+            Some("Users/Alice/Documents/evidence.txt")
+        );
+        assert_eq!(selection.parent_sequence_number, Some(7));
+        assert!(selection.original_hierarchy);
+        assert!(!selection.collision_disambiguated);
+    }
+
+    #[test]
+    fn deleted_identity_is_stable_when_the_live_path_exists() {
+        let base = "/Image Analysis/Volumes/000-ntfs/Users/Alice/Documents/evidence.txt";
+        let mut used = HashSet::from([base.to_string()]);
+        let selection = select_deleted_ntfs_path(
+            "/Image Analysis/Volumes/000-ntfs",
+            "evidence.txt",
+            99,
+            42,
+            11,
+            Some(&resolution()),
+            &mut used,
+        );
+
+        assert_eq!(selection.logical_path, format!("{base}~deleted-mft99-11"));
+        assert_eq!(
+            selection.source_path_exact.as_deref(),
+            Some("Users/Alice/Documents/evidence.txt")
+        );
+        assert!(selection.original_hierarchy);
+        assert!(!selection.collision_disambiguated);
+    }
+
+    #[test]
+    fn repeated_deleted_identity_gets_a_deterministic_numeric_suffix() {
+        let candidate =
+            "/Image Analysis/Volumes/000-ntfs/Users/Alice/Documents/evidence.txt~deleted-mft99-11";
+        let mut used = HashSet::from([candidate.to_string()]);
+        let selection = select_deleted_ntfs_path(
+            "/Image Analysis/Volumes/000-ntfs",
+            "evidence.txt",
+            99,
+            42,
+            11,
+            Some(&resolution()),
+            &mut used,
+        );
+
+        assert_eq!(selection.logical_path, format!("{candidate}-2"));
+        assert!(selection.collision_disambiguated);
+    }
+
+    #[test]
+    fn sequence_mismatch_retains_the_synthetic_recovery_path() {
+        let mut used = HashSet::new();
+        let selection = select_deleted_ntfs_path(
+            "/Image Analysis/Volumes/000-ntfs",
+            "evidence.txt",
+            99,
+            42,
+            12,
+            Some(&resolution()),
+            &mut used,
+        );
+
+        assert_eq!(
+            selection.logical_path,
+            "/Image Analysis/Volumes/000-ntfs/Recovery/Deleted Files/evidence.txt-mft99"
+        );
+        assert!(selection.source_path_exact.is_none());
+        assert!(!selection.original_hierarchy);
+        assert_eq!(selection.reconstruction_status, "record_sequence_mismatch");
+    }
+
+    #[test]
+    fn preserves_the_specific_parent_chain_failure_reason() {
+        let mut used = HashSet::new();
+        let resolution = DeletedNtfsPathResolution::Unresolved("parent_sequence_mismatch");
+        let selection = select_deleted_ntfs_path(
+            "/Image Analysis/Volumes/000-ntfs",
+            "evidence.txt",
+            99,
+            42,
+            11,
+            Some(&resolution),
+            &mut used,
+        );
+
+        assert_eq!(
+            selection.logical_path,
+            "/Image Analysis/Volumes/000-ntfs/Recovery/Deleted Files/evidence.txt-mft99"
+        );
+        assert!(selection.source_path_exact.is_none());
+        assert!(!selection.original_hierarchy);
+        assert_eq!(selection.reconstruction_status, "parent_sequence_mismatch");
+    }
+}
+
 fn process_deleted_ntfs_mft_records<T: Read + Seek>(
     conn: &Connection,
     case_id: i64,
@@ -37545,6 +39132,8 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
     partition_index: usize,
     partition_start_offset: u64,
     partition_size_bytes: u64,
+    resolved_paths: &HashMap<u64, DeletedNtfsPathResolution>,
+    used_logical_paths: &mut HashSet<String>,
     indexed: &mut usize,
     max_entries: usize,
 ) -> Result<bool> {
@@ -37612,9 +39201,8 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
     diagnostics.records_scanned = record_count.saturating_sub(16);
     diagnostics.deleted_record_candidates = deleted_candidates.len() as u64;
     let mut truncated = false;
-    let recovery_prefix = format!("{volume_prefix}/Recovery/Deleted Files");
-
     for record_number in deleted_candidates {
+        progress::check_cancellation()?;
         if *indexed >= max_entries {
             truncated = true;
             progress::progress_truncated(format!(
@@ -37650,11 +39238,16 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
         } else {
             Some(i64::try_from(name.data_size).unwrap_or(i64::MAX))
         };
-        let logical_path = format!(
-            "{recovery_prefix}/{}-mft{}",
-            sanitize_logical_segment(&name.name),
-            record_number
+        let path_selection = select_deleted_ntfs_path(
+            volume_prefix,
+            &name.name,
+            record_number,
+            name.parent_record_number,
+            file.sequence_number(),
+            resolved_paths.get(&record_number),
+            used_logical_paths,
         );
+        let logical_path = path_selection.logical_path.clone();
         let standard_info = match file.info() {
             Ok(info) => Some(info),
             Err(error) => {
@@ -37698,9 +39291,20 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
             "partition_start_offset": partition_start_offset,
             "partition_size_bytes": partition_size_bytes,
             "source_entry_name": name.name,
+            "source_path_exact": path_selection.source_path_exact,
+            "ntfs_path": path_selection.source_path_exact,
             "ntfs_parent_record_number": name.parent_record_number,
+            "ntfs_parent_sequence_number": path_selection.parent_sequence_number,
             "ntfs_file_record_number": record_number,
             "ntfs_sequence_number": file.sequence_number(),
+            "ntfs_directory_entry_source": if path_selection.original_hierarchy { "validated_mft_parent_chain" } else { "synthetic_deleted_record_fallback" },
+            "ntfs_directory_reference_sequence_validated": path_selection.original_hierarchy,
+            "ntfs_path_reconciled": path_selection.original_hierarchy,
+            "mft_path_reconstruction_status": path_selection.reconstruction_status,
+            "recovery_path_strategy": if path_selection.original_hierarchy { "original_hierarchy" } else { "synthetic_recovery_fallback" },
+            "recovery_original_hierarchy": path_selection.original_hierarchy,
+            "logical_path_deleted_identity_discriminator_applied": path_selection.deleted_identity_discriminator_applied,
+            "logical_path_collision_disambiguated": path_selection.collision_disambiguated,
             "ntfs_file_name_attribute_flags": name.file_attribute_flags,
             "mft_record_logical_offset": mft_record_logical_offset,
             "mft_record_physical_offset": mft_record_physical_offset,
@@ -39146,6 +40750,85 @@ fn mft_summary_data_size(summary: &serde_json::Value, stream_name: &str) -> Opti
     mft_stream_summary(summary, stream_name).and_then(|stream| stream["size"].as_u64())
 }
 
+#[derive(Default)]
+struct NtfsMftReconciliationResult {
+    truncated: bool,
+    deleted_paths: HashMap<u64, DeletedNtfsPathResolution>,
+    used_logical_paths: HashSet<String>,
+}
+
+fn reconstruct_validated_deleted_mft_path<R: Read + Seek>(
+    parser: &mut mft::MftParser<R>,
+    entry: &mft::MftEntry,
+) -> std::result::Result<ResolvedDeletedNtfsPath, &'static str> {
+    if !entry.header.is_valid() {
+        return Err("target_record_invalid_header");
+    }
+    if entry.valid_fixup == Some(false) {
+        return Err("target_record_fixup_failed");
+    }
+    if entry.is_allocated() {
+        return Err("target_record_allocated");
+    }
+    let target_name = entry
+        .find_best_name_attribute()
+        .ok_or("target_file_name_missing")?;
+    let direct_parent_record_number = target_name.parent.entry;
+    let direct_parent_sequence_number = target_name.parent.sequence;
+    let mut components = vec![target_name.name.clone()];
+    let mut parent_reference = target_name.parent;
+    let mut visited = HashSet::from([entry.header.record_number]);
+
+    for _ in 0..4096 {
+        if parent_reference.entry == 0 {
+            return Err("parent_chain_terminated_at_record_zero");
+        }
+        if !visited.insert(parent_reference.entry) {
+            return Err("parent_chain_cycle");
+        }
+        let parent = parser
+            .get_entry(parent_reference.entry)
+            .map_err(|_| "parent_record_unavailable")?;
+        if !parent.header.is_valid() {
+            return Err("parent_record_invalid_header");
+        }
+        if parent.valid_fixup == Some(false) {
+            return Err("parent_record_fixup_failed");
+        }
+        if parent.header.sequence != parent_reference.sequence {
+            return Err("parent_sequence_mismatch");
+        }
+        if !parent.is_dir() {
+            return Err("parent_record_not_directory");
+        }
+        if parent_reference.entry == 5 {
+            components.reverse();
+            let ntfs_path = components.join("/");
+            if ntfs_path.is_empty() {
+                return Err("reconstructed_path_empty");
+            }
+            return Ok(ResolvedDeletedNtfsPath {
+                ntfs_path,
+                source_name: target_name.name,
+                parent_record_number: direct_parent_record_number,
+                parent_sequence_number: direct_parent_sequence_number,
+                sequence_number: entry.header.sequence,
+            });
+        }
+        let parent_name = parent
+            .find_best_name_attribute()
+            .ok_or("parent_file_name_missing")?;
+        if !parent_name.name.is_empty()
+            && parent_name.name != "."
+            && !parent_name.name.eq_ignore_ascii_case("$Root")
+        {
+            components.push(parent_name.name.clone());
+        }
+        parent_reference = parent_name.parent;
+    }
+    Err("parent_chain_safety_limit_exceeded")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
     conn: &Connection,
@@ -39160,7 +40843,7 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
     partition_size_bytes: u64,
     indexed: &mut usize,
     max_entries: usize,
-) -> Result<bool> {
+) -> Result<NtfsMftReconciliationResult> {
     let guard = match copy_ntfs_mft_stream_to_temp(ntfs, fs, partition_size_bytes) {
         Ok(guard) => guard,
         Err(error) => {
@@ -39169,7 +40852,10 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
             progress::progress_truncated(format!(
                 "optional NTFS MFT path reconciliation was skipped on partition {partition_index}: {error:#}"
             ));
-            return Ok(true);
+            return Ok(NtfsMftReconciliationResult {
+                truncated: true,
+                ..NtfsMftReconciliationResult::default()
+            });
         }
     };
     let mut parser = mft::MftParser::from_path(&guard.path).with_context(|| {
@@ -39315,9 +41001,11 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
     let mut native_record_errors = 0_u64;
     let mut reconciled_entries = 0_u64;
     let mut reconciled_streams = 0_u64;
+    let mut deleted_paths = HashMap::new();
     let mut diagnostic_samples = Vec::new();
 
     for record_number in 0..record_count {
+        progress::check_cancellation()?;
         // Directory-index traversal already produced and normalized these
         // allocated records. The reconciliation scan is a fallback for records
         // whose path was omitted after an index error; re-walking every known
@@ -39355,6 +41043,36 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
         let raw_flags = u16::from_le_bytes([raw_header[22], raw_header[23]]);
         let raw_allocated = raw_flags & 0x0001 != 0;
         if !raw_allocated {
+            if &raw_header[..4] != b"FILE" {
+                continue;
+            }
+            let Ok(entry) = parser.get_entry(record_number) else {
+                deleted_paths.insert(
+                    record_number,
+                    DeletedNtfsPathResolution::Unresolved("target_record_unavailable"),
+                );
+                continue;
+            };
+            let unresolved_status = if entry.header.record_number != record_number {
+                Some("target_record_number_mismatch")
+            } else if !entry.header.is_valid() {
+                Some("target_record_invalid_header")
+            } else if entry.valid_fixup == Some(false) {
+                Some("target_record_fixup_failed")
+            } else if entry.is_allocated() {
+                Some("target_record_allocated")
+            } else {
+                None
+            };
+            if let Some(status) = unresolved_status {
+                deleted_paths.insert(record_number, DeletedNtfsPathResolution::Unresolved(status));
+                continue;
+            }
+            let resolution = match reconstruct_validated_deleted_mft_path(&mut parser, &entry) {
+                Ok(resolution) => DeletedNtfsPathResolution::Resolved(resolution),
+                Err(status) => DeletedNtfsPathResolution::Unresolved(status),
+            };
+            deleted_paths.insert(record_number, resolution);
             continue;
         }
         if &raw_header[..4] != b"FILE" {
@@ -39770,7 +41488,11 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
             *indexed += 1;
         }
     }
-    Ok(truncated)
+    Ok(NtfsMftReconciliationResult {
+        truncated,
+        deleted_paths,
+        used_logical_paths,
+    })
 }
 
 fn ntfs_default_data_location<T: Read + Seek>(
@@ -41808,6 +43530,7 @@ fn walk_fat_dir<T: fatfs::ReadWriteSeek>(
 ) -> Result<()> {
     let mut used_child_paths = HashSet::new();
     for entry_result in dir.iter() {
+        progress::check_cancellation()?;
         if *indexed >= max_entries {
             *truncated = true;
             break;
@@ -41927,6 +43650,8 @@ fn walk_fat_dir<T: fatfs::ReadWriteSeek>(
             content_head.as_deref(),
         )?;
         *indexed += 1;
+        #[cfg(test)]
+        test_maybe_inject_cancellation_in_parser(*indexed)?;
 
         if entry.is_dir() {
             let child_dir = entry.to_dir();
@@ -44497,7 +46222,8 @@ fn apply_schema_migrations(conn: &Connection) -> Result<()> {
     ensure_cases_metadata_columns(conn)?;
     ensure_evidence_hash_columns(conn)?;
     ensure_installed_resources_config_column(conn)?;
-    ensure_filesystem_entries_indexes(conn)
+    ensure_filesystem_entries_indexes(conn)?;
+    ensure_evidence_jobs_checkpoint_columns(conn)
 }
 
 fn ensure_filesystem_entry_text_segments_table(conn: &Connection) -> Result<()> {
@@ -44644,6 +46370,34 @@ fn ensure_filesystem_entries_indexes(conn: &Connection) -> Result<()> {
         if !sqlite_index_exists(conn, name)? {
             conn.execute(sql, [])
                 .with_context(|| format!("creating SQLite index {name}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_evidence_jobs_checkpoint_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(evidence_jobs)")
+        .context("reading evidence_jobs columns")?;
+    let existing = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("collecting evidence_jobs columns")?;
+    for (column, declaration) in [
+        (
+            "cancellation_requested",
+            "cancellation_requested INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("checkpoint_json", "checkpoint_json TEXT"),
+        ("parser_schema_version", "parser_schema_version TEXT"),
+        ("generation_fingerprint", "generation_fingerprint TEXT"),
+    ] {
+        if !existing.iter().any(|name| name == column) {
+            conn.execute(
+                &format!("ALTER TABLE evidence_jobs ADD COLUMN {declaration}"),
+                [],
+            )
+            .with_context(|| format!("adding evidence_jobs.{column} column"))?;
         }
     }
     Ok(())
@@ -50209,41 +51963,135 @@ mod tests {
     }
 
     fn synthetic_mft_record(record_number: u32, name: &str, in_use: bool) -> Vec<u8> {
+        synthetic_mft_record_with_streams(
+            record_number,
+            name,
+            5,
+            0,
+            1,
+            in_use,
+            false,
+            1234,
+            4096,
+            None,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn synthetic_mft_record_with_streams(
+        record_number: u32,
+        name: &str,
+        parent_record: u64,
+        parent_sequence: u16,
+        sequence: u16,
+        in_use: bool,
+        is_directory: bool,
+        logical_size: u64,
+        allocated_size: u64,
+        default_data: Option<&[u8]>,
+        named_data: &[(&str, &[u8])],
+    ) -> Vec<u8> {
         let mut record = vec![0_u8; 1024];
         record[0..4].copy_from_slice(b"FILE");
         record[4..6].copy_from_slice(&48_u16.to_le_bytes());
         record[6..8].copy_from_slice(&3_u16.to_le_bytes());
-        record[16..18].copy_from_slice(&1_u16.to_le_bytes());
+        record[16..18].copy_from_slice(&sequence.to_le_bytes());
+        record[18..20].copy_from_slice(&1_u16.to_le_bytes());
         record[20..22].copy_from_slice(&56_u16.to_le_bytes());
-        record[22..24].copy_from_slice(&(if in_use { 1_u16 } else { 0 }).to_le_bytes());
-        record[24..28].copy_from_slice(&256_u32.to_le_bytes());
+        let mut flags = if in_use { 1_u16 } else { 0 };
+        if is_directory {
+            flags |= 2;
+        }
+        record[22..24].copy_from_slice(&flags.to_le_bytes());
         record[28..32].copy_from_slice(&1024_u32.to_le_bytes());
         record[44..48].copy_from_slice(&record_number.to_le_bytes());
-        record[48..50].copy_from_slice(&0xAAAA_u16.to_le_bytes());
-        record[50..52].copy_from_slice(&0_u16.to_le_bytes());
-        record[52..54].copy_from_slice(&0_u16.to_le_bytes());
-        record[510..512].copy_from_slice(&0xAAAA_u16.to_le_bytes());
-        record[1022..1024].copy_from_slice(&0xAAAA_u16.to_le_bytes());
         let name_utf16 = name.encode_utf16().collect::<Vec<_>>();
         let value_len = 66 + name_utf16.len() * 2;
-        let attr_len = (24 + value_len + 7) & !7;
-        let attr = 56;
-        record[attr..attr + 4].copy_from_slice(&0x30_u32.to_le_bytes());
-        record[attr + 4..attr + 8].copy_from_slice(&(attr_len as u32).to_le_bytes());
-        record[attr + 16..attr + 20].copy_from_slice(&(value_len as u32).to_le_bytes());
-        record[attr + 20..attr + 22].copy_from_slice(&24_u16.to_le_bytes());
-        let value = attr + 24;
-        record[value..value + 8].copy_from_slice(&5_u64.to_le_bytes());
-        record[value + 40..value + 48].copy_from_slice(&1234_u64.to_le_bytes());
-        record[value + 48..value + 56].copy_from_slice(&4096_u64.to_le_bytes());
-        record[value + 64] = name_utf16.len() as u8;
-        record[value + 65] = 1;
+        let mut filename_value = vec![0_u8; value_len];
+        let parent_reference = parent_record | (u64::from(parent_sequence) << 48);
+        filename_value[0..8].copy_from_slice(&parent_reference.to_le_bytes());
+        filename_value[40..48].copy_from_slice(&logical_size.to_le_bytes());
+        filename_value[48..56].copy_from_slice(&allocated_size.to_le_bytes());
+        filename_value[64] = name_utf16.len() as u8;
+        filename_value[65] = 1;
         for (index, ch) in name_utf16.into_iter().enumerate() {
-            let start = value + 66 + index * 2;
-            record[start..start + 2].copy_from_slice(&ch.to_le_bytes());
+            let start = 66 + index * 2;
+            filename_value[start..start + 2].copy_from_slice(&ch.to_le_bytes());
         }
-        record[attr + attr_len..attr + attr_len + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut attribute_offset = 56;
+        append_synthetic_resident_mft_attribute(
+            &mut record,
+            &mut attribute_offset,
+            0x30,
+            "",
+            &filename_value,
+            0,
+        );
+        if let Some(bytes) = default_data {
+            append_synthetic_resident_mft_attribute(
+                &mut record,
+                &mut attribute_offset,
+                0x80,
+                "",
+                bytes,
+                1,
+            );
+        }
+        for (index, (stream_name, bytes)) in named_data.iter().enumerate() {
+            append_synthetic_resident_mft_attribute(
+                &mut record,
+                &mut attribute_offset,
+                0x80,
+                stream_name,
+                bytes,
+                u16::try_from(index + 2).expect("test attribute index fits u16"),
+            );
+        }
+        record[attribute_offset..attribute_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let used_size = u32::try_from(attribute_offset + 4).expect("test record size fits u32");
+        record[24..28].copy_from_slice(&used_size.to_le_bytes());
+
+        let first_trailer = [record[510], record[511]];
+        let second_trailer = [record[1022], record[1023]];
+        record[48..50].copy_from_slice(&0xAAAA_u16.to_le_bytes());
+        record[50..52].copy_from_slice(&first_trailer);
+        record[52..54].copy_from_slice(&second_trailer);
+        record[510..512].copy_from_slice(&0xAAAA_u16.to_le_bytes());
+        record[1022..1024].copy_from_slice(&0xAAAA_u16.to_le_bytes());
         record
+    }
+
+    fn append_synthetic_resident_mft_attribute(
+        record: &mut [u8],
+        attribute_offset: &mut usize,
+        type_code: u32,
+        attribute_name: &str,
+        value: &[u8],
+        instance: u16,
+    ) {
+        let name_utf16 = attribute_name.encode_utf16().collect::<Vec<_>>();
+        let name_bytes = name_utf16.len() * 2;
+        let data_offset = (24 + name_bytes + 7) & !7;
+        let record_length = (data_offset + value.len() + 7) & !7;
+        let start = *attribute_offset;
+        assert!(start + record_length + 4 <= record.len());
+        record[start..start + 4].copy_from_slice(&type_code.to_le_bytes());
+        record[start + 4..start + 8].copy_from_slice(&(record_length as u32).to_le_bytes());
+        record[start + 9] = name_utf16.len() as u8;
+        if !name_utf16.is_empty() {
+            record[start + 10..start + 12].copy_from_slice(&24_u16.to_le_bytes());
+        }
+        record[start + 14..start + 16].copy_from_slice(&instance.to_le_bytes());
+        record[start + 16..start + 20].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        record[start + 20..start + 22].copy_from_slice(&(data_offset as u16).to_le_bytes());
+        for (index, ch) in name_utf16.into_iter().enumerate() {
+            let position = start + 24 + index * 2;
+            record[position..position + 2].copy_from_slice(&ch.to_le_bytes());
+        }
+        let value_start = start + data_offset;
+        record[value_start..value_start + value.len()].copy_from_slice(value);
+        *attribute_offset += record_length;
     }
 
     #[test]
@@ -50277,6 +52125,18 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry.name == "$MFT" && !entry.is_deleted));
+        let live_mft = entries
+            .iter()
+            .find(|entry| entry.name == "$MFT" && !entry.is_deleted)
+            .expect("allocated $MFT record should exist");
+        assert_eq!(
+            live_mft.metadata_json["category_main"].as_str(),
+            Some("Operating System")
+        );
+        assert_eq!(
+            live_mft.metadata_json["category_sub"].as_str(),
+            Some("NTFS metadata")
+        );
         let deleted = entries
             .iter()
             .find(|entry| entry.name == "deleted.txt")
@@ -50291,6 +52151,298 @@ mod tests {
             deleted.metadata_json["virtual_filesystem"],
             "standalone_mft_reconstruction"
         );
+        assert_eq!(
+            deleted.metadata_json["mft_record_logical_offset"].as_u64(),
+            Some(1024)
+        );
+        assert_eq!(
+            deleted.metadata_json["mft_record_source_offset"].as_u64(),
+            Some(1024)
+        );
+        assert!(deleted.metadata_json["mft_record_physical_offset"].is_null());
+        assert_eq!(
+            deleted.metadata_json["mft_record_offset_coordinate_system"].as_str(),
+            Some("standalone_mft_source_stream")
+        );
+        assert_eq!(
+            deleted.metadata_json["evidence_physical_offset_available"].as_bool(),
+            Some(false)
+        );
+        assert!(deleted.metadata_json["mft_record_offset_basis"]
+            .as_str()
+            .is_some_and(|basis| basis.contains("not an evidence-media physical offset")));
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_mft_discloses_incomplete_trailing_record() -> Result<()> {
+        let case_path = unique_case_path("standalone-mft-trailing-record");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("standalone-mft-trailing-record-source");
+        let path = dir.join("truncated-$MFT");
+        let mut bytes = synthetic_mft_record(0, "$MFT", true);
+        bytes.extend_from_slice(&[0x41; 17]);
+        fs::write(&path, bytes)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let processed = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        assert_eq!(processed.status, "completed_with_diagnostics");
+        assert!(processed.partial_artifact_coverage);
+        assert!(!processed.truncated);
+        assert!(processed
+            .truncation_reasons
+            .iter()
+            .any(|reason| reason.contains("17 byte(s)")));
+        assert_eq!(
+            list_filesystem_entries(&case_path, Some(evidence_id))?.len(),
+            1
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_mft_resident_streams_and_offsets_are_source_relative() -> Result<()> {
+        const DELETED_BYTES: &[u8] = b"recoverable deleted resident payload";
+        const ADS_BYTES: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\n";
+        let resident_bytes = (0..350)
+            .map(|index| u8::try_from(index % 251).expect("bounded test byte"))
+            .collect::<Vec<_>>();
+        let resident_sha256 = sha256_hex(&resident_bytes);
+
+        let case_path = unique_case_path("standalone-mft-resident-provenance");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("standalone-mft-resident-provenance-source");
+        let path = dir.join("validation-$MFT");
+        let mut bytes = synthetic_mft_record_with_streams(
+            0,
+            "$MFT",
+            5,
+            1,
+            1,
+            true,
+            false,
+            0,
+            0,
+            Some(&[]),
+            &[],
+        );
+        for _ in 1..5 {
+            bytes.extend(vec![0_u8; 1024]);
+        }
+        bytes.extend(synthetic_mft_record_with_streams(
+            5,
+            ".",
+            5,
+            1,
+            1,
+            true,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+        bytes.extend(synthetic_mft_record_with_streams(
+            6,
+            "resident.txt",
+            5,
+            1,
+            2,
+            true,
+            false,
+            resident_bytes.len() as u64,
+            resident_bytes.len() as u64,
+            Some(&resident_bytes),
+            &[("Zone.Identifier", ADS_BYTES)],
+        ));
+        bytes.extend(synthetic_mft_record_with_streams(
+            7,
+            "resident.txt",
+            5,
+            1,
+            3,
+            false,
+            false,
+            DELETED_BYTES.len() as u64,
+            DELETED_BYTES.len() as u64,
+            Some(DELETED_BYTES),
+            &[],
+        ));
+        fs::write(&path, bytes)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let processed = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        assert_eq!(processed.status, "completed");
+
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        assert_eq!(entries.len(), 4);
+        let resident = entries
+            .iter()
+            .find(|entry| entry.name == "resident.txt" && !entry.is_deleted)
+            .expect("resident file should be reconstructed");
+        assert_eq!(
+            resident.logical_path,
+            "/Reconstructed filesystem/resident.txt"
+        );
+        assert!(!resident.is_deleted);
+        assert!(resident.metadata_json["source_path_exact"].is_null());
+        assert!(resident.metadata_json["source_path_availability"]
+            .as_str()
+            .is_some_and(|value| value.contains("reconstructed from MFT parent references")));
+        assert!(resident.metadata_json["evidence_source_path"]
+            .as_str()
+            .is_some_and(|value| value.ends_with("validation-$MFT")));
+        assert_eq!(resident.size_bytes, Some(resident_bytes.len() as i64));
+        assert_eq!(
+            resident.metadata_json["mft_record_source_offset"].as_u64(),
+            Some(6 * 1024)
+        );
+        assert!(resident.metadata_json["mft_record_physical_offset"].is_null());
+        assert!(resident.metadata_json["file_data_physical_offset"].is_null());
+        assert_eq!(
+            resident.metadata_json["ntfs_default_data_sha256"].as_str(),
+            Some(resident_sha256.as_str())
+        );
+        assert_eq!(
+            resident.metadata_json["file_data_offset_coordinate_system"].as_str(),
+            Some("standalone_mft_record_after_usa_fixup")
+        );
+        let resident_record_offset = resident.metadata_json["file_data_record_offset"]
+            .as_u64()
+            .expect("resident data should have a record offset");
+        assert_eq!(resident_record_offset % 8, 0);
+        assert_eq!(
+            resident.metadata_json["file_data_source_offset"].as_u64(),
+            Some(6 * 1024 + resident_record_offset)
+        );
+        assert_eq!(
+            resident.metadata_json["file_data_source_range_contiguous"].as_bool(),
+            Some(false),
+            "the fixture deliberately crosses the first NTFS USA trailer"
+        );
+        assert!(resident.metadata_json["file_data_source_offset_basis"]
+            .as_str()
+            .is_some_and(|basis| basis.contains("not an evidence-media physical offset")));
+        assert!(resident.metadata_json["category_main"].is_string());
+        assert_eq!(
+            resident.metadata_json["category_main"].as_str(),
+            Some("Documents and Office")
+        );
+
+        let resident_read = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: resident.id,
+                offset: 0,
+                length: 4096,
+            },
+        )?;
+        assert_eq!(resident_read.bytes, resident_bytes);
+        assert_eq!(resident_read.total_size, resident_bytes.len() as u64);
+        let trailer_relative_offset = 510_u64
+            .checked_sub(resident_record_offset)
+            .expect("fixture data starts before the first USA trailer");
+        let cross_fixup_read = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: resident.id,
+                offset: trailer_relative_offset - 4,
+                length: 12,
+            },
+        )?;
+        assert_eq!(
+            cross_fixup_read.bytes,
+            resident_bytes[usize::try_from(trailer_relative_offset - 4)?
+                ..usize::try_from(trailer_relative_offset + 8)?]
+        );
+        let disk_location = filesystem_entry_disk_location(&case_path, resident.id)?;
+        assert!(!disk_location.available);
+        assert_eq!(disk_location.decoded_media_offset, None);
+
+        let streams = resident.metadata_json["ntfs_alternate_data_streams"]
+            .as_array()
+            .expect("ADS inventory should be an array");
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0]["name"].as_str(), Some("Zone.Identifier"));
+        assert_eq!(streams[0]["resident"].as_bool(), Some(true));
+        assert_eq!(
+            streams[0]["size_bytes"].as_u64(),
+            Some(ADS_BYTES.len() as u64)
+        );
+        assert_eq!(
+            streams[0]["sha256"].as_str(),
+            Some(sha256_hex(ADS_BYTES).as_str())
+        );
+        let ads_record_offset = streams[0]["record_offset"]
+            .as_u64()
+            .expect("ADS should have a record offset");
+        assert_eq!(ads_record_offset % 8, 0);
+        assert_eq!(
+            streams[0]["source_offset"].as_u64(),
+            Some(6 * 1024 + ads_record_offset)
+        );
+        assert_eq!(
+            streams[0]["evidence_physical_offset_available"].as_bool(),
+            Some(false)
+        );
+
+        let deleted = entries
+            .iter()
+            .find(|entry| entry.name == "resident.txt" && entry.is_deleted)
+            .expect("deleted resident file should be reconstructed");
+        assert!(deleted.is_deleted);
+        assert_eq!(
+            deleted.metadata_json["category_main"].as_str(),
+            Some("Recovery")
+        );
+        assert_eq!(deleted.logical_path, "/Deleted records/7-resident.txt");
+        assert_eq!(
+            deleted.metadata_json["ntfs_default_data_sha256"].as_str(),
+            Some(sha256_hex(DELETED_BYTES).as_str())
+        );
+        let deleted_read = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: deleted.id,
+                offset: 0,
+                length: 4096,
+            },
+        )?;
+        assert_eq!(deleted_read.bytes, DELETED_BYTES);
+
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(dir);
         Ok(())
@@ -51424,6 +53576,22 @@ mod tests {
                 "fat_modified": "DateTime { date: Date { year: 2022, month: 8, day: 16 }, time: Time { hour: 5, min: 47, sec: 40, millis: 0 } }"
             }),
         )?;
+        insert(
+            "/Parsed Artifacts/Browser/visit.record",
+            "visit.record",
+            serde_json::json!({
+                "artifact_kind": "browser_history_visit",
+                "visit_time_utc": "2022-08-18T10:30:00Z"
+            }),
+        )?;
+        insert(
+            "/Windows Artifacts/1/prefetch/1.record",
+            "prefetch.record",
+            serde_json::json!({
+                "artifact_kind": "windows_prefetch_record",
+                "artifact_time_utc": "2022-08-19T09:15:00Z"
+            }),
+        )?;
         // Tool bookkeeping rows (image container etc.) carry tool-side
         // timestamps like "when KDFT read the image"; they must NEVER appear
         // as timeline events, even when their timestamp falls in the range.
@@ -51440,14 +53608,30 @@ mod tests {
         let range = Some(("2022-08-01T00:00:00Z", "2022-08-31T23:59:59Z"));
         let entries = list_filesystem_entries_for_timeline(&case_path, Some(100), range)?;
         let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, vec!["fat-in-range.txt", "ntfs-in-range.txt"]);
-        assert_eq!(count_filesystem_entries_for_timeline(&case_path, range)?, 2);
+        assert_eq!(
+            names,
+            vec![
+                "visit.record",
+                "prefetch.record",
+                "fat-in-range.txt",
+                "ntfs-in-range.txt"
+            ]
+        );
+        assert_eq!(count_filesystem_entries_for_timeline(&case_path, range)?, 4);
+        let prioritized = list_filesystem_entries_for_timeline(&case_path, Some(2), range)?;
+        assert_eq!(
+            prioritized
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["visit.record", "prefetch.record"]
+        );
 
         // Without a range every REAL entry is eligible, including legacy
         // rows; the container stays excluded.
         assert_eq!(
             list_filesystem_entries_for_timeline(&case_path, Some(100), None)?.len(),
-            4
+            6
         );
         cleanup_case_path(&case_path);
         Ok(())
@@ -55467,6 +57651,17 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
+    }
+
+    #[test]
+    fn processing_worker_limit_is_bounded_and_rejects_invalid_values() {
+        assert_eq!(configured_processing_worker_count(12, None), 12);
+        assert_eq!(configured_processing_worker_count(12, Some("2")), 2);
+        assert_eq!(configured_processing_worker_count(12, Some(" 4 ")), 4);
+        assert_eq!(configured_processing_worker_count(12, Some("99")), 12);
+        assert_eq!(configured_processing_worker_count(12, Some("0")), 12);
+        assert_eq!(configured_processing_worker_count(12, Some("invalid")), 12);
+        assert_eq!(configured_processing_worker_count(0, Some("1")), 1);
     }
 
     #[test]
@@ -63995,6 +66190,22 @@ mod tests {
             failed_jobs, 1,
             "the rolled-back attempt should remain visible as a failed job"
         );
+        let failed_checkpoint: String = conn.query_row(
+            "SELECT checkpoint_json FROM evidence_jobs
+             WHERE case_id = ?1 AND evidence_id = ?2 AND job_type = 'filesystem_index'
+               AND status = 'failed'",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        let failed_checkpoint: serde_json::Value = serde_json::from_str(&failed_checkpoint)?;
+        assert_eq!(
+            failed_checkpoint["terminal_status"].as_str(),
+            Some("failed")
+        );
+        assert_eq!(
+            failed_checkpoint["source_processing_complete"].as_bool(),
+            Some(false)
+        );
         let entry_count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
             params![case_id, evidence_id],
@@ -66418,6 +68629,771 @@ mod tests {
         path.push(format!("kdft-v1-{label}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&path).expect("create test temp directory");
         path
+    }
+
+    fn filesystem_entry_count_for_evidence(case_path: &Path, evidence_id: i64) -> Result<i64> {
+        let conn = open_existing_case(case_path)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
+            params![active_case_id(&conn)?, evidence_id],
+            |row| row.get(0),
+        )
+        .context("counting filesystem entries for evidence")
+    }
+
+    fn filesystem_index_job_status(case_path: &Path, job_id: i64) -> Result<String> {
+        let conn = open_existing_case(case_path)?;
+        conn.query_row(
+            "SELECT status FROM evidence_jobs WHERE case_id = ?1 AND id = ?2",
+            params![active_case_id(&conn)?, job_id],
+            |row| row.get(0),
+        )
+        .context("reading filesystem index job status")
+    }
+
+    fn filesystem_index_job_cancellation_requested(case_path: &Path, job_id: i64) -> Result<bool> {
+        let conn = open_existing_case(case_path)?;
+        let value: i64 = conn.query_row(
+            "SELECT cancellation_requested FROM evidence_jobs WHERE case_id = ?1 AND id = ?2",
+            params![active_case_id(&conn)?, job_id],
+            |row| row.get(0),
+        )?;
+        Ok(value != 0)
+    }
+
+    fn filesystem_index_job_count(case_path: &Path, evidence_id: i64) -> Result<i64> {
+        let conn = open_existing_case(case_path)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM evidence_jobs
+             WHERE case_id = ?1 AND evidence_id = ?2 AND job_type = 'filesystem_index'",
+            params![active_case_id(&conn)?, evidence_id],
+            |row| row.get(0),
+        )
+        .context("counting filesystem index jobs")
+    }
+
+    #[test]
+    fn folder_index_cancels_before_committing_partial_entries() -> Result<()> {
+        let case_path = unique_case_path("folder-index-cancel");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("folder-index-cancel-source");
+        for index in 0..100 {
+            fs::write(
+                evidence_dir.join(format!("file-{index:03}.txt")),
+                b"content",
+            )?;
+        }
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let tracker = progress::JobProgressTracker::new(
+            format!("cancel-test-{}", std::process::id()),
+            "process",
+            None,
+        );
+        tracker.request_cancellation();
+        let result = progress::with_job_progress(&tracker, || {
+            process_evidence_with_profile(
+                &case_path,
+                ProcessEvidenceOptions {
+                    evidence_id,
+                    max_entries: 0,
+                },
+                ProcessingProfile::default(),
+            )
+        })?;
+
+        assert_eq!(result.status, "cancelled");
+        assert_eq!(result.entries_indexed, 0);
+        assert_eq!(result.retained_entry_count, 0);
+        assert_eq!(
+            filesystem_entry_count_for_evidence(&case_path, evidence_id)?,
+            0
+        );
+        assert_eq!(
+            filesystem_index_job_status(&case_path, result.job_id)?,
+            "cancelled"
+        );
+        assert!(
+            filesystem_index_job_cancellation_requested(&case_path, result.job_id)?,
+            "cancelled job must durably record cancellation_requested = 1"
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_reprocess_restarts_safely_instead_of_reusing_prior_generation() -> Result<()> {
+        let case_path = unique_case_path("folder-restart-safely");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("folder-restart-source");
+        for index in 0..5 {
+            fs::write(
+                evidence_dir.join(format!("file-{index:03}.txt")),
+                b"content",
+            )?;
+        }
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let first = process_evidence_with_profile(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile::default(),
+        )?;
+        assert_eq!(first.status, "completed");
+        let first_entry_count = first.retained_entry_count;
+
+        let second = process_evidence_with_profile(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile::default(),
+        )?;
+        assert_eq!(second.status, "completed");
+        assert!(second.attempt_entries_indexed > 0);
+        assert_eq!(second.retained_entry_count, first_entry_count);
+        assert_eq!(
+            filesystem_index_job_count(&case_path, evidence_id)?,
+            2,
+            "every explicit process request creates a new job record"
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn image_cancellation_preserves_prior_complete_generation() -> Result<()> {
+        let case_path = unique_case_path("image-cancel-preserves-generation");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("image-cancel-source");
+        let image_path = evidence_dir.join("fat-disk.img");
+        create_test_fat_mbr_image(&image_path)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path.clone(),
+                kind: EvidenceKind::Image,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let first = process_evidence_with_profile(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile::default(),
+        )?;
+        assert_eq!(first.status, "completed");
+        let first_entry_count = first.retained_entry_count;
+        assert!(first_entry_count > 0);
+
+        // Change options so reuse is not eligible, then cancel before the
+        // destructive replacement can commit. The prior generation must survive.
+        let tracker = progress::JobProgressTracker::new(
+            format!("image-cancel-test-{}", std::process::id()),
+            "process",
+            None,
+        );
+        tracker.request_cancellation();
+        let result = progress::with_job_progress(&tracker, || {
+            process_evidence_with_profile(
+                &case_path,
+                ProcessEvidenceOptions {
+                    evidence_id,
+                    max_entries: 2,
+                },
+                ProcessingProfile::default(),
+            )
+        })?;
+
+        assert_eq!(result.status, "cancelled");
+        assert_eq!(result.retained_entry_count, first_entry_count);
+        assert_eq!(
+            filesystem_entry_count_for_evidence(&case_path, evidence_id)?,
+            first_entry_count as i64
+        );
+        assert!(
+            filesystem_index_job_cancellation_requested(&case_path, result.job_id)?,
+            "cancelled image job must durably record cancellation_requested = 1"
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn fat_partition_parser_cancellation_does_not_commit_partial_entries() -> Result<()> {
+        struct ClearGuard;
+        impl Drop for ClearGuard {
+            fn drop(&mut self) {
+                test_clear_parser_cancel_after_entries();
+            }
+        }
+        let _guard = ClearGuard;
+        test_set_parser_cancel_after_entries(2);
+
+        let case_path = unique_case_path("fat-partition-parser-cancel");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("fat-partition-parser-cancel-source");
+        let image_path = evidence_dir.join("fat-disk.img");
+        create_test_fat_mbr_image(&image_path)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path.clone(),
+                kind: EvidenceKind::Image,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let result = process_evidence_with_profile(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile::default(),
+        )?;
+
+        assert_eq!(result.status, "cancelled");
+        assert_eq!(result.entries_indexed, 0);
+        assert_eq!(result.retained_entry_count, 0);
+        assert_eq!(
+            filesystem_entry_count_for_evidence(&case_path, evidence_id)?,
+            0
+        );
+        assert_eq!(
+            filesystem_index_job_status(&case_path, result.job_id)?,
+            "cancelled"
+        );
+        assert!(
+            filesystem_index_job_cancellation_requested(&case_path, result.job_id)?,
+            "cancelled job must durably record cancellation_requested = 1"
+        );
+
+        let conn = open_existing_case(&case_path)?;
+        let checkpoint: String = conn.query_row(
+            "SELECT checkpoint_json FROM evidence_jobs WHERE case_id = ?1 AND id = ?2",
+            params![active_case_id(&conn)?, result.job_id],
+            |row| row.get(0),
+        )?;
+        let checkpoint: serde_json::Value = serde_json::from_str(&checkpoint)?;
+        assert_eq!(checkpoint["stage"].as_str(), Some("finalized"));
+        assert_eq!(checkpoint["terminal_status"].as_str(), Some("cancelled"));
+        assert_eq!(
+            checkpoint["source_processing_complete"].as_bool(),
+            Some(false)
+        );
+
+        let parser_errors: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_extract(metadata_json, '$.artifact_kind') = 'filesystem_parser_error'",
+            params![active_case_id(&conn)?, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            parser_errors, 0,
+            "cancellation must not be recorded as a filesystem_parser_error record"
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn whole_volume_fat_parser_cancellation_does_not_commit_partial_entries() -> Result<()> {
+        struct ClearGuard;
+        impl Drop for ClearGuard {
+            fn drop(&mut self) {
+                test_clear_parser_cancel_after_entries();
+            }
+        }
+        let _guard = ClearGuard;
+        test_set_parser_cancel_after_entries(2);
+
+        let case_path = unique_case_path("whole-volume-fat-parser-cancel");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("whole-volume-fat-parser-cancel-source");
+        let image_path = evidence_dir.join("fat-volume.img");
+        create_test_whole_fat_image(&image_path)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path.clone(),
+                kind: EvidenceKind::Image,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let result = process_evidence_with_profile(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile::default(),
+        )?;
+
+        assert_eq!(result.status, "cancelled");
+        assert_eq!(result.entries_indexed, 0);
+        assert_eq!(result.retained_entry_count, 0);
+        assert_eq!(
+            filesystem_entry_count_for_evidence(&case_path, evidence_id)?,
+            0
+        );
+        assert_eq!(
+            filesystem_index_job_status(&case_path, result.job_id)?,
+            "cancelled"
+        );
+        assert!(
+            filesystem_index_job_cancellation_requested(&case_path, result.job_id)?,
+            "cancelled whole-volume job must durably record cancellation_requested = 1"
+        );
+
+        let conn = open_existing_case(&case_path)?;
+        let checkpoint: String = conn.query_row(
+            "SELECT checkpoint_json FROM evidence_jobs WHERE case_id = ?1 AND id = ?2",
+            params![active_case_id(&conn)?, result.job_id],
+            |row| row.get(0),
+        )?;
+        let checkpoint: serde_json::Value = serde_json::from_str(&checkpoint)?;
+        assert_eq!(checkpoint["terminal_status"].as_str(), Some("cancelled"));
+        assert_eq!(
+            checkpoint["source_processing_complete"].as_bool(),
+            Some(false)
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn folder_source_processing_final_cancellation_check_rolls_back() -> Result<()> {
+        struct ClearGuard;
+        impl Drop for ClearGuard {
+            fn drop(&mut self) {
+                test_clear_final_cancellation_before_finalization();
+            }
+        }
+        let _guard = ClearGuard;
+        test_set_final_cancellation_before_finalization(true);
+
+        let case_path = unique_case_path("folder-final-cancel-check");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("folder-final-cancel-check-source");
+        for index in 0..5 {
+            fs::write(
+                evidence_dir.join(format!("file-{index:03}.txt")),
+                b"content",
+            )?;
+        }
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let result = process_evidence_with_profile(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile::default(),
+        )?;
+
+        assert_eq!(result.status, "cancelled");
+        assert_eq!(result.entries_indexed, 0);
+        assert_eq!(result.retained_entry_count, 0);
+        assert_eq!(
+            filesystem_entry_count_for_evidence(&case_path, evidence_id)?,
+            0
+        );
+        assert!(
+            filesystem_index_job_cancellation_requested(&case_path, result.job_id)?,
+            "cancelled job must durably record cancellation_requested = 1"
+        );
+
+        let conn = open_existing_case(&case_path)?;
+        let checkpoint: String = conn.query_row(
+            "SELECT checkpoint_json FROM evidence_jobs WHERE case_id = ?1 AND id = ?2",
+            params![active_case_id(&conn)?, result.job_id],
+            |row| row.get(0),
+        )?;
+        let checkpoint: serde_json::Value = serde_json::from_str(&checkpoint)?;
+        assert_eq!(checkpoint["terminal_status"].as_str(), Some("cancelled"));
+        assert_eq!(
+            checkpoint["source_processing_complete"].as_bool(),
+            Some(false)
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    fn count_content_head_for_evidence(case_path: &Path, evidence_id: i64) -> Result<i64> {
+        let conn = open_existing_case(case_path)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2 AND content_head IS NOT NULL",
+            params![active_case_id(&conn)?, evidence_id],
+            |row| row.get(0),
+        )
+        .context("counting content_head rows for evidence")
+    }
+
+    #[test]
+    fn content_head_backfill_populates_metadata_only_index_without_reindexing() -> Result<()> {
+        let case_path = unique_case_path("content-head-backfill");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("content-head-backfill-source");
+        fs::write(evidence_dir.join("searchable.txt"), b"searchable text body")?;
+        fs::write(evidence_dir.join("empty.txt"), b"")?;
+        fs::write(evidence_dir.join("media.jpg"), b"fake image bytes")?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let index = process_evidence_with_profile(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile {
+                capture_content: false,
+                parse_emails: false,
+                parse_browsers: false,
+            },
+        )?;
+        assert_eq!(index.status, "completed");
+        assert_eq!(count_content_head_for_evidence(&case_path, evidence_id)?, 0);
+        let entry_count_before = filesystem_entry_count_for_evidence(&case_path, evidence_id)?;
+
+        let result = backfill_content_head(
+            &case_path,
+            BackfillContentHeadOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        assert_eq!(result.status, "completed");
+        assert!(result.entries_captured >= 1, "text file must be captured");
+        assert_eq!(result.entries_unreadable, 0);
+
+        assert_eq!(
+            filesystem_entry_count_for_evidence(&case_path, evidence_id)?,
+            entry_count_before,
+            "backfill must not add or remove filesystem rows"
+        );
+        assert!(
+            count_content_head_for_evidence(&case_path, evidence_id)? >= 1,
+            "content_head must be populated"
+        );
+
+        let conn = open_existing_case(&case_path)?;
+        let searchable: Vec<u8> = conn.query_row(
+            "SELECT content_head FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2 AND name = 'searchable.txt'",
+            params![active_case_id(&conn)?, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(searchable, b"searchable text body");
+
+        let evidence_rows = list_evidence(&case_path)?;
+        assert_eq!(
+            evidence_rows
+                .iter()
+                .find(|row| row.id == evidence_id)
+                .and_then(|row| row.content_indexed),
+            Some(true),
+            "backfill must make content_indexed true"
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn content_head_backfill_is_idempotent_and_skips_captured_entries() -> Result<()> {
+        let case_path = unique_case_path("content-head-backfill-idempotent");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("content-head-backfill-idempotent-source");
+        fs::write(evidence_dir.join("keep.txt"), b"keep me")?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        process_evidence_with_profile(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile {
+                capture_content: false,
+                parse_emails: false,
+                parse_browsers: false,
+            },
+        )?;
+
+        let first = backfill_content_head(
+            &case_path,
+            BackfillContentHeadOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        assert_eq!(first.status, "completed");
+        assert_eq!(first.entries_captured, 1);
+
+        let second = backfill_content_head(
+            &case_path,
+            BackfillContentHeadOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        assert_eq!(second.status, "completed");
+        assert_eq!(second.pending_entries_total, 0);
+        assert_eq!(second.up_to_date_entries_skipped, 1);
+        assert_eq!(second.entries_captured, 0);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn content_head_backfill_retries_unreadable_entries_and_reports_coverage_truthfully(
+    ) -> Result<()> {
+        let case_path = unique_case_path("content-head-backfill-retry");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("content-head-backfill-retry-source");
+        let source_file = evidence_dir.join("retry.txt");
+        fs::write(&source_file, b"available during inventory")?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence_with_profile(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile {
+                capture_content: false,
+                parse_emails: false,
+                parse_browsers: false,
+            },
+        )?;
+
+        fs::remove_file(&source_file)?;
+        let first = backfill_content_head(
+            &case_path,
+            BackfillContentHeadOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        assert_eq!(first.status, "completed_with_diagnostics");
+        assert_eq!(first.entries_unreadable, 1);
+        assert_eq!(
+            list_evidence(&case_path)?
+                .iter()
+                .find(|row| row.id == evidence_id)
+                .and_then(|row| row.content_indexed),
+            Some(false),
+            "an unreadable eligible file must not be reported as complete content coverage"
+        );
+
+        fs::write(&source_file, b"available again")?;
+        let second = backfill_content_head(
+            &case_path,
+            BackfillContentHeadOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        assert_eq!(second.status, "completed");
+        assert_eq!(second.entries_captured, 1);
+        assert_eq!(second.entries_unreadable, 0);
+        assert_eq!(
+            list_evidence(&case_path)?
+                .iter()
+                .find(|row| row.id == evidence_id)
+                .and_then(|row| row.content_indexed),
+            Some(true)
+        );
+
+        let conn = open_existing_case(&case_path)?;
+        let metadata_json: String = conn.query_row(
+            "SELECT metadata_json FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2 AND name = 'retry.txt'",
+            params![active_case_id(&conn)?, evidence_id],
+            |row| row.get(0),
+        )?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_json)?;
+        assert_eq!(
+            metadata["content_head_backfill_status"].as_str(),
+            Some("captured")
+        );
+        assert!(metadata.get("content_head_backfill_reason").is_none());
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn content_head_backfill_cancellation_preserves_committed_work() -> Result<()> {
+        let case_path = unique_case_path("content-head-backfill-cancel");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("content-head-backfill-cancel-source");
+        for index in 0..500 {
+            fs::write(
+                evidence_dir.join(format!("file-{index:03}.txt")),
+                format!("content {index}"),
+            )?;
+        }
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        process_evidence_with_profile(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile {
+                capture_content: false,
+                parse_emails: false,
+                parse_browsers: false,
+            },
+        )?;
+
+        let tracker = progress::JobProgressTracker::new(
+            format!("backfill-cancel-test-{}", std::process::id()),
+            "content_head_backfill",
+            None,
+        );
+        let cancel_tracker = tracker.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            cancel_tracker.request_cancellation();
+        });
+
+        let result = progress::with_job_progress(&tracker, || {
+            backfill_content_head(
+                &case_path,
+                BackfillContentHeadOptions {
+                    evidence_id,
+                    max_entries: 0,
+                },
+            )
+        })?;
+
+        assert_eq!(result.status, "cancelled");
+        let captured = count_content_head_for_evidence(&case_path, evidence_id)?;
+        let total = filesystem_entry_count_for_evidence(&case_path, evidence_id)?;
+        assert!(
+            captured > 0 && captured < total,
+            "cancellation must preserve some committed work and leave rows eligible: captured {captured} of {total}"
+        );
+
+        let conn = open_existing_case(&case_path)?;
+        let remaining_eligible: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND entry_kind = 'file'
+               AND content_head IS NULL
+               AND json_extract(metadata_json, '$.content_head_backfill_at') IS NULL",
+            params![active_case_id(&conn)?, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert!(
+            remaining_eligible > 0,
+            "cancelled rows must remain eligible for resume"
+        );
+
+        let job_status: String = conn.query_row(
+            "SELECT status FROM evidence_jobs WHERE id = ?1",
+            params![result.job_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(job_status, "cancelled");
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
     }
 
     fn path_str(path: &Path) -> String {

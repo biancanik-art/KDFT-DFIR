@@ -1,6 +1,8 @@
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,20 @@ impl JobProgressState {
         self != Self::Active
     }
 }
+
+/// Non-retryable examiner-requested cancellation. Returned from long-running
+/// loops when [`check_cancellation`] detects a cancellation request on the
+/// active progress tracker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobCancelled;
+
+impl fmt::Display for JobCancelled {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("job cancelled")
+    }
+}
+
+impl std::error::Error for JobCancelled {}
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -155,6 +171,7 @@ struct TrackerShared {
     observer: Option<ProgressObserver>,
     diagnostic_observer: Option<DiagnosticObserver>,
     state: Mutex<TrackerState>,
+    cancellation_requested: AtomicBool,
 }
 
 impl TrackerShared {
@@ -284,8 +301,22 @@ impl JobProgressTracker {
                     last_progress_at: now,
                     last_publish_at: None,
                 }),
+                cancellation_requested: AtomicBool::new(false),
             }),
         }
+    }
+
+    /// Records an examiner cancellation request for this tracker. The request
+    /// is in-memory only; callers that need durability must also persist it to
+    /// the case database.
+    pub fn request_cancellation(&self) {
+        self.shared
+            .cancellation_requested
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancellation_requested(&self) -> bool {
+        self.shared.cancellation_requested.load(Ordering::SeqCst)
     }
 
     pub fn start_stage(
@@ -330,10 +361,6 @@ impl JobProgressTracker {
                 state.job_id = Some(job_id);
             }
         });
-    }
-
-    pub(crate) fn replace_job_id(&self, job_id: i64) {
-        self.mutate(false, |state, _| state.job_id = Some(job_id));
     }
 
     pub fn set_evidence_id(&self, evidence_id: i64) {
@@ -737,10 +764,6 @@ pub(crate) fn progress_set_job_id(job_id: i64) {
     with_active_progress(|tracker| tracker.set_job_id(job_id));
 }
 
-pub(crate) fn progress_replace_job_id(job_id: i64) {
-    with_active_progress(|tracker| tracker.replace_job_id(job_id));
-}
-
 pub(crate) fn progress_set_evidence_id(evidence_id: i64) {
     with_active_progress(|tracker| tracker.set_evidence_id(evidence_id));
 }
@@ -810,6 +833,38 @@ pub(crate) fn progress_truncated(reason: impl Into<String>) {
 pub(crate) fn progress_diagnostic(kind: JobDiagnosticKind, message: impl Into<String>) {
     let message = message.into();
     with_active_progress(|tracker| tracker.record_diagnostic(kind, message));
+}
+
+/// Returns true if the active in-memory progress tracker has received a
+/// cancellation request.
+pub fn is_cancellation_requested_active() -> bool {
+    ACTIVE_PROGRESS.with(|active| {
+        active
+            .borrow()
+            .as_ref()
+            .is_some_and(JobProgressTracker::is_cancellation_requested)
+    })
+}
+
+/// Returns `Err(JobCancelled)` if the active in-memory progress tracker has
+/// received a cancellation request. Long-running loops call this at safe,
+/// deterministic boundaries so cancellation never leaves a transaction in an
+/// inconsistent partial state.
+pub fn check_cancellation() -> Result<(), JobCancelled> {
+    if is_cancellation_requested_active() {
+        Err(JobCancelled)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub fn request_cancellation_on_active() {
+    ACTIVE_PROGRESS.with(|active| {
+        if let Some(tracker) = active.borrow().as_ref() {
+            tracker.request_cancellation();
+        }
+    });
 }
 
 pub(crate) fn has_active_progress() -> bool {
@@ -1141,5 +1196,35 @@ mod tests {
         assert_eq!(snapshot.truncation_reasons_omitted, 3);
         assert_eq!(snapshot.truncation_reasons.first().unwrap(), "reason-00");
         assert_eq!(snapshot.truncation_reasons.last().unwrap(), "reason-15");
+    }
+
+    #[test]
+    fn cancellation_request_is_reflected_by_is_cancellation_requested() {
+        let tracker = tracker(Arc::new(FakeClock::default()));
+        assert!(!tracker.is_cancellation_requested());
+        tracker.request_cancellation();
+        assert!(tracker.is_cancellation_requested());
+    }
+
+    #[test]
+    fn check_cancellation_only_errs_after_request() {
+        let tracker = tracker(Arc::new(FakeClock::default()));
+        with_job_progress(&tracker, || {
+            assert!(check_cancellation().is_ok());
+            tracker.request_cancellation();
+            assert_eq!(check_cancellation(), Err(JobCancelled));
+            Ok::<(), JobCancelled>(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn cancellation_does_not_change_terminal_state_until_finish_is_called() {
+        let tracker = tracker(Arc::new(FakeClock::default()));
+        tracker.start_stage("Inventory", 1, Some(1), "entries", None);
+        tracker.request_cancellation();
+        assert_eq!(tracker.snapshot().state, JobProgressState::Active);
+        tracker.finish(JobProgressState::Cancelled);
+        assert_eq!(tracker.snapshot().state, JobProgressState::Cancelled);
     }
 }

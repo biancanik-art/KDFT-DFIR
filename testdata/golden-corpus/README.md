@@ -10,3 +10,12 @@ SHA-256 and expected results in a manifest that conforms to:
 
 See `../../docs/FORENSIC_VALIDATION_CORPUS.md` for the validation policy and
 first dataset milestone list.
+
+Validate a manifest and an available local source with:
+
+```text
+kdft corpus validate --manifest testdata/golden-corpus/<manifest.json> --json
+```
+
+The example manifest intentionally references unavailable external data and
+declares expectations, so validation reports it as `incomplete`, not passed.

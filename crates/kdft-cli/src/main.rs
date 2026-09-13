@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use kdft_case::corpus::validate_corpus_manifest;
 use kdft_case::progress::{
     with_job_progress, EtaStatus, JobProgressSnapshot, JobProgressState, JobProgressTracker,
     ProgressObserver, RateStatus,
@@ -65,6 +66,23 @@ enum Command {
         #[command(subcommand)]
         command: HistoryCommand,
     },
+    Corpus {
+        #[command(subcommand)]
+        command: CorpusCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CorpusCommand {
+    Validate(ValidateCorpusArgs),
+}
+
+#[derive(Debug, Args)]
+struct ValidateCorpusArgs {
+    #[arg(long)]
+    manifest: PathBuf,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -540,6 +558,28 @@ fn execute_deep_search(args: &DeepSearchArgs) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Corpus { command } => match command {
+            CorpusCommand::Validate(args) => {
+                let report = validate_corpus_manifest(&args.manifest);
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", report.to_human_string());
+                    if !report.structural_errors.is_empty() {
+                        println!("Structural errors:");
+                        for error in &report.structural_errors {
+                            println!("- {error}");
+                        }
+                    }
+                }
+                if !report.passed {
+                    anyhow::bail!(
+                        "golden corpus validation did not pass ({})",
+                        report.status.as_str()
+                    );
+                }
+            }
+        },
         Command::Case { command } => match command {
             CaseCommand::Create(args) => {
                 let args = *args;
@@ -1297,6 +1337,28 @@ mod tests {
         assert_eq!(defaults.max_results, 0);
         assert_eq!(defaults.max_file_bytes, 4096);
         assert_eq!(parsed_deep_args(&["--max-results", "17"]).max_results, 17);
+    }
+
+    #[test]
+    fn corpus_validate_cli_accepts_manifest_and_json_flag() {
+        let cli = Cli::try_parse_from([
+            "kdft",
+            "corpus",
+            "validate",
+            "--manifest",
+            "manifest.json",
+            "--json",
+        ])
+        .expect("corpus validation arguments should parse");
+        match cli.command {
+            Command::Corpus {
+                command: CorpusCommand::Validate(args),
+            } => {
+                assert_eq!(args.manifest, PathBuf::from("manifest.json"));
+                assert!(args.json);
+            }
+            _ => panic!("expected corpus validate command"),
+        }
     }
 
     #[test]

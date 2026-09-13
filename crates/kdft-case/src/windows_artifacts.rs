@@ -1668,6 +1668,11 @@ fn parse_prefetch_source(
         ));
     }
 
+    let artifact_time_utc = parsed
+        .header
+        .as_ref()
+        .and_then(|header| header.last_run_timestamps.first())
+        .map(|timestamp| timestamp.to_rfc3339());
     let parsed_json = serde_json::to_value(&parsed).context("serializing Prefetch parse result")?;
     let search_text =
         serde_json::to_string(&parsed).context("rendering searchable Prefetch text")?;
@@ -1675,6 +1680,8 @@ fn parse_prefetch_source(
         "artifact_kind": "windows_prefetch_record",
         "parser_name": WINDOWS_ARTIFACT_PARSER_NAME,
         "parser_status": if partial { "partial" } else { "parsed" },
+        "artifact_time_utc": artifact_time_utc,
+        "artifact_time_semantics": "most recent Prefetch last-run timestamp retained by this record; execution evidence, not process lifetime",
         "supported_scope_complete": !partial,
         "supported_scope": source_supported_scope(candidate.kind),
         "safety_bounds": {

@@ -35,6 +35,9 @@ RESUME_STATE.md
 *.patch
 *.md
 !README.md
+!docs/
+docs/*
+!docs/FORENSIC_VALIDATION_CORPUS.md
 *.pdf
 *.doc
 *.docx

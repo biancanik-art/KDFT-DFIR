@@ -225,7 +225,7 @@ impl ServerConfig {
                     cwd.join(path)
                 }
             })
-            .unwrap_or_else(|| output.join("workbench.kdft.sqlite"));
+            .unwrap_or_default();
         Ok(Self {
             default_case_path: default_case_path.to_string_lossy().into_owned(),
             default_case_pinned,
@@ -350,6 +350,28 @@ impl ProgressRegistry {
             .jobs
             .get(operation_id)
             .and_then(|registered| registered.diagnostic_log_path.clone()))
+    }
+
+    /// Requests cancellation for the active progress operation with the given
+    /// id. Returns `true` when the operation exists and is not already terminal,
+    /// `false` when it is unknown or already finished. The mutex is held only
+    /// long enough to locate the shared tracker and request cancellation; all
+    /// long-running work happens on the processing thread that owns the cloned
+    /// tracker.
+    fn cancel(&self, operation_id: &str) -> Result<bool> {
+        validate_progress_id(operation_id)?;
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(registered) = state.jobs.get(operation_id) else {
+            return Ok(false);
+        };
+        if registered.tracker.snapshot().state.is_terminal() {
+            return Ok(false);
+        }
+        registered.tracker.request_cancellation();
+        Ok(true)
     }
 }
 
@@ -988,6 +1010,47 @@ mod http_security_tests {
         drop(guards);
         assert_eq!(counter.load(Ordering::Acquire), 0);
     }
+
+    #[test]
+    fn job_cancel_route_requires_same_origin_and_auth_token() {
+        let config = ServerConfig::new(None).unwrap();
+        let cancel_request = |host: &str, origin: Option<&str>, token: bool| {
+            let mut headers = HashMap::from([("host".to_string(), host.to_string())]);
+            if let Some(origin) = origin {
+                headers.insert("origin".to_string(), origin.to_string());
+            }
+            if token {
+                headers.insert(
+                    "cookie".to_string(),
+                    format!("KDFT-Auth={}", config.auth_token),
+                );
+            }
+            HttpRequest {
+                method: "POST".to_string(),
+                target: "/api/jobs/cancel".to_string(),
+                headers,
+                body: br#"{"progress_id":"x"}"#.to_vec(),
+            }
+        };
+        assert!(authorize_request(
+            &cancel_request("127.0.0.1:8777", Some("http://127.0.0.1:8777"), true),
+            &config,
+            8777
+        )
+        .is_ok());
+        assert!(authorize_request(
+            &cancel_request("127.0.0.1:8777", None, false),
+            &config,
+            8777
+        )
+        .is_err());
+        assert!(authorize_request(
+            &cancel_request("127.0.0.1:8777", Some("http://evil.example"), true),
+            &config,
+            8777
+        )
+        .is_err());
+    }
 }
 
 fn route_request(request: &HttpRequest, config: &ServerConfig) -> HttpResponse {
@@ -1007,8 +1070,13 @@ fn route_request(request: &HttpRequest, config: &ServerConfig) -> HttpResponse {
         ("GET", "/api/health") => json_ok(json!({ "status": "ok" })),
         ("GET", "/api/pick") => api_response(api_pick_path(&query)),
         ("GET", "/api/jobs/progress") => api_response(api_job_progress(&query, config)),
+        ("POST", "/api/jobs/cancel") => api_response(api_job_cancel(&request.body, config)),
         ("GET", "/api/fs/list") => api_response(api_fs_list(&query)),
         ("GET", "/api/image/volumes") => api_response(api_image_volumes(&query)),
+        ("GET", "/api/image/forensic/status") => api_response(api_image_forensic_status(&query)),
+        ("POST", "/api/image/forensic/build") => {
+            api_response(api_image_forensic_build(&request.body, config))
+        }
         ("GET", "/api/image/dir") => api_response(api_image_dir(&query)),
         ("GET", "/api/image/bytes") => api_response(api_image_bytes(&query)),
         ("GET", "/api/image/find") => api_response(api_image_find(&query)),
@@ -1163,6 +1231,17 @@ fn api_job_progress(
         }
         None => bail!("progress operation was not found"),
     }
+}
+
+#[derive(Deserialize)]
+struct CancelJobRequest {
+    progress_id: String,
+}
+
+fn api_job_cancel(body: &[u8], config: &ServerConfig) -> Result<serde_json::Value> {
+    let request: CancelJobRequest = parse_json_body(body)?;
+    let accepted = config.progress.cancel(&request.progress_id)?;
+    Ok(serde_json::json!({ "accepted": accepted }))
 }
 
 #[derive(Serialize)]
@@ -1358,13 +1437,23 @@ fn api_image_raw(query: &HashMap<String, String>) -> Result<(&'static str, Vec<u
                 .context("volume query parameter is required")?
                 .parse()
                 .context("volume must be an integer")?;
-            kdft_case::read_image_directory_bytes(
-                Path::new(&source.source_path),
-                volume_index,
-                path,
-                0,
-                length,
-            )?
+            let image_path = Path::new(&source.source_path);
+            let volumes = kdft_case::list_image_volumes(image_path)?;
+            let volume = volumes
+                .get(volume_index)
+                .with_context(|| format!("volume index {volume_index} out of range"))?;
+            if volume.filesystem == "NTFS" {
+                kdft_case::ntfs_forensic::read_ntfs_forensic_file_bytes(
+                    image_path,
+                    volume_index,
+                    path,
+                    0,
+                    length,
+                    None,
+                )?
+            } else {
+                kdft_case::read_image_directory_bytes(image_path, volume_index, path, 0, length)?
+            }
         }
         "folder" | "file" => {
             kdft_case::read_local_evidence_bytes(&case_path, source.id, path, 0, length)?
@@ -1475,6 +1564,79 @@ fn api_image_volumes(query: &HashMap<String, String>) -> Result<serde_json::Valu
     )
 }
 
+#[derive(Deserialize)]
+struct ForensicCatalogBuildRequest {
+    case_path: String,
+    evidence_id: i64,
+    volume: usize,
+    progress_id: String,
+}
+
+fn api_image_forensic_status(query: &HashMap<String, String>) -> Result<serde_json::Value> {
+    let (_case_path, source) = live_evidence_from_query(query)?;
+    if source.source_kind != "image" {
+        bail!("transient forensic reconstruction is only available for image evidence");
+    }
+    let volume_index: usize = query
+        .get("volume")
+        .context("volume query parameter is required")?
+        .parse()
+        .context("volume must be an integer")?;
+    Ok(serde_json::to_value(
+        kdft_case::ntfs_forensic::forensic_cache_status(
+            Path::new(&source.source_path),
+            volume_index,
+        )?,
+    )?)
+}
+
+fn api_image_forensic_build(body: &[u8], config: &ServerConfig) -> Result<serde_json::Value> {
+    let request: ForensicCatalogBuildRequest = parse_json_body(body)?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    let source = live_evidence_source(&case_path, request.evidence_id)?;
+    if source.source_kind != "image" {
+        bail!("transient forensic reconstruction is only available for image evidence");
+    }
+    let tracker =
+        config
+            .progress
+            .start(&request.progress_id, "forensic_live_browse", None, None)?;
+    tracker.set_evidence_id(request.evidence_id);
+    let result = with_job_progress(&tracker, || {
+        kdft_case::ntfs_forensic::build_ntfs_forensic_volume_cache(
+            Path::new(&source.source_path),
+            request.volume,
+            Some(&tracker),
+        )
+    });
+    match result {
+        Ok(_) => {
+            tracker.finish(JobProgressState::Complete);
+            let status = kdft_case::ntfs_forensic::forensic_cache_status(
+                Path::new(&source.source_path),
+                request.volume,
+            )?;
+            Ok(json!({
+                "status": status,
+                "progress": tracker.snapshot(),
+                "case_index_written": false,
+            }))
+        }
+        Err(error) => {
+            tracker.record_error(Some(format!("NTFS forensic catalog: {error:#}")));
+            let cancelled = error
+                .downcast_ref::<kdft_case::progress::JobCancelled>()
+                .is_some();
+            tracker.finish(if cancelled {
+                JobProgressState::Cancelled
+            } else {
+                JobProgressState::Failed
+            });
+            Err(error)
+        }
+    }
+}
+
 fn api_image_dir(query: &HashMap<String, String>) -> Result<serde_json::Value> {
     let (case_path, source) = live_evidence_from_query(query)?;
     let path = query.get("path").map(String::as_str).unwrap_or("/");
@@ -1485,6 +1647,47 @@ fn api_image_dir(query: &HashMap<String, String>) -> Result<serde_json::Value> {
                 .context("volume query parameter is required")?
                 .parse()
                 .context("volume must be an integer")?;
+            let volumes = kdft_case::list_image_volumes(Path::new(&source.source_path))?;
+            let volume = volumes
+                .get(volume_index)
+                .with_context(|| format!("volume index {volume_index} out of range"))?;
+            if volume.filesystem == "NTFS" {
+                const FORENSIC_DIRECTORY_PAGE_SIZE: usize = 1_000;
+                const FORENSIC_DIRECTORY_MAX_PAGE_SIZE: usize = 5_000;
+                let limit = query
+                    .get("limit")
+                    .map(|value| value.parse::<usize>().context("limit must be an integer"))
+                    .transpose()?
+                    .unwrap_or(FORENSIC_DIRECTORY_PAGE_SIZE)
+                    .clamp(1, FORENSIC_DIRECTORY_MAX_PAGE_SIZE);
+                let offset = query
+                    .get("offset")
+                    .map(|value| value.parse::<usize>().context("offset must be an integer"))
+                    .transpose()?
+                    .unwrap_or(0);
+                let listing = kdft_case::ntfs_forensic::list_ntfs_forensic_directory(
+                    Path::new(&source.source_path),
+                    volume_index,
+                    path,
+                    &kdft_case::ntfs_forensic::NtfsForensicBrowseOptions { limit, offset },
+                    None,
+                )?;
+                let next_cursor = listing.truncated.then(|| {
+                    json!({
+                        "offset": offset.saturating_add(listing.entries.len()),
+                    })
+                });
+                return Ok(json!({
+                    "entries": listing.entries,
+                    "total_entries": listing.total_children,
+                    "next_cursor": next_cursor,
+                    "truncated": listing.truncated,
+                    "forensic_reconstruction": true,
+                    "orphan_count": listing.orphan_count,
+                    "diagnostic_count": listing.diagnostic_count,
+                    "diagnostics": listing.diagnostics,
+                }));
+            }
             let entries = kdft_case::list_image_directory(
                 Path::new(&source.source_path),
                 volume_index,
@@ -1555,12 +1758,21 @@ fn api_image_export(body: &[u8]) -> Result<kdft_case::LiveExportResult> {
     let source = live_evidence_source(&case_path, request.evidence_id)?;
     let result = match source.source_kind.as_str() {
         "image" => {
-            let result = export_image_file(
-                Path::new(&source.source_path),
-                request.volume,
-                &request.path,
-                &output_path,
-            )?;
+            let image_path = Path::new(&source.source_path);
+            let volumes = kdft_case::list_image_volumes(image_path)?;
+            let volume = volumes
+                .get(request.volume)
+                .with_context(|| format!("volume index {} out of range", request.volume))?;
+            let result = if volume.filesystem == "NTFS" {
+                kdft_case::ntfs_forensic::export_ntfs_forensic_file(
+                    image_path,
+                    request.volume,
+                    &request.path,
+                    &output_path,
+                )?
+            } else {
+                export_image_file(image_path, request.volume, &request.path, &output_path)?
+            };
             record_live_export(
                 &case_path,
                 request.evidence_id,
@@ -1605,13 +1817,28 @@ fn api_image_export_tree(body: &[u8]) -> Result<kdft_case::LiveTreeExportResult>
     let source = live_evidence_source(&case_path, request.evidence_id)?;
     let result = match source.source_kind.as_str() {
         "image" => {
-            let result = export_image_tree(
-                Path::new(&source.source_path),
-                request.volume,
-                &request.path,
-                &output_dir,
-                request.max_files,
-            )?;
+            let image_path = Path::new(&source.source_path);
+            let volumes = kdft_case::list_image_volumes(image_path)?;
+            let volume = volumes
+                .get(request.volume)
+                .with_context(|| format!("volume index {} out of range", request.volume))?;
+            let result = if volume.filesystem == "NTFS" {
+                kdft_case::ntfs_forensic::export_ntfs_forensic_tree(
+                    image_path,
+                    request.volume,
+                    &request.path,
+                    &output_dir,
+                    request.max_files,
+                )?
+            } else {
+                export_image_tree(
+                    image_path,
+                    request.volume,
+                    &request.path,
+                    &output_dir,
+                    request.max_files,
+                )?
+            };
             record_live_tree_export(
                 &case_path,
                 request.evidence_id,
@@ -1775,13 +2002,29 @@ fn api_image_bytes(query: &HashMap<String, String>) -> Result<serde_json::Value>
                 .context("volume query parameter is required")?
                 .parse()
                 .context("volume must be an integer")?;
-            kdft_case::read_image_directory_bytes(
-                Path::new(&source.source_path),
-                volume_index,
-                path,
-                offset,
-                length,
-            )?
+            let image_path = Path::new(&source.source_path);
+            let volumes = kdft_case::list_image_volumes(image_path)?;
+            let volume = volumes
+                .get(volume_index)
+                .with_context(|| format!("volume index {volume_index} out of range"))?;
+            if volume.filesystem == "NTFS" {
+                kdft_case::ntfs_forensic::read_ntfs_forensic_file_bytes(
+                    image_path,
+                    volume_index,
+                    path,
+                    offset,
+                    length,
+                    None,
+                )?
+            } else {
+                kdft_case::read_image_directory_bytes(
+                    image_path,
+                    volume_index,
+                    path,
+                    offset,
+                    length,
+                )?
+            }
         }
         "folder" | "file" => {
             kdft_case::read_local_evidence_bytes(&case_path, source.id, path, offset, length)?
@@ -2864,20 +3107,50 @@ fn api_run_processors_tracked(
         bail!("evidence source does not exist in the active case");
     }
 
-    let stage_count = optional_processing_stage_count(request).saturating_add(1);
+    let stage_count = run_processors_optional_stage_count(request).saturating_add(1);
     let mut stage_index = 0_usize;
     let mut response = serde_json::json!({
         "evidence_id": request.evidence_id,
         "reindexed": false,
     });
-    append_optional_processing_passes(
+    let passes_outcome = append_optional_processing_passes(
         case_path,
         request,
         &mut response,
         tracker,
         &mut stage_index,
         stage_count,
+        true,
     )?;
+
+    // If cancellation was requested between processor stages, stop before
+    // starting any later processor. The in-progress indivisible processor may
+    // finish, but no later processor starts.
+    if passes_outcome == OptionalPassesOutcome::Cancelled {
+        tracker.finish(JobProgressState::Cancelled);
+        let final_progress = tracker.snapshot();
+        let object = response
+            .as_object_mut()
+            .context("processor response serialized to a non-object")?;
+        object.insert(
+            "status".to_string(),
+            serde_json::Value::String("cancelled".to_string()),
+        );
+        object.insert("truncated".to_string(), serde_json::Value::Bool(false));
+        object.insert(
+            "completed_with_diagnostics".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        object.insert(
+            "partial_artifact_coverage".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        object.insert(
+            "progress".to_string(),
+            serde_json::to_value(final_progress).context("serializing processor progress")?,
+        );
+        return Ok(response);
+    }
 
     let pipeline_has_diagnostics =
         response_contains_failed_pass(&response) || response_contains_truncated_pass(&response);
@@ -2974,20 +3247,100 @@ fn api_process_evidence_tracked(
         },
     )?;
     tracker.set_auto_advance_database_entries(false);
+
+    // If the base filesystem index was cancelled, do not start any optional
+    // pass and report the whole operation as cancelled.
+    if index_result.status == "cancelled" {
+        tracker.finish(JobProgressState::Cancelled);
+        let final_progress = tracker.snapshot();
+        kdft_case::record_job_progress_summary(case_path, index_result.job_id, &final_progress)?;
+        let mut response =
+            serde_json::to_value(&index_result).context("serializing processing result")?;
+        let response_object = response
+            .as_object_mut()
+            .context("processing result serialized to a non-object")?;
+        response_object.insert(
+            "status".to_string(),
+            serde_json::Value::String("cancelled".to_string()),
+        );
+        response_object.insert("truncated".to_string(), serde_json::Value::Bool(false));
+        response_object.insert(
+            "index_truncated".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        response_object.insert(
+            "index_partial_artifact_coverage".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        response_object.insert(
+            "completed_with_diagnostics".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        response_object.insert(
+            "partial_artifact_coverage".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        response_object.insert(
+            "progress".to_string(),
+            serde_json::to_value(final_progress).context("serializing final job progress")?,
+        );
+        return Ok(response);
+    }
+
     // Examiner-selected follow-up passes, each already an independent audited
     // job. The base index result stays at the top level so existing callers
     // keep working; per-pass results (or their failure text) are nested. A
     // failed optional pass must not discard the completed index.
     let mut response =
         serde_json::to_value(&index_result).context("serializing processing result")?;
-    append_optional_processing_passes(
+    let passes_outcome = append_optional_processing_passes(
         case_path,
         request,
         &mut response,
         tracker,
         &mut stage_index,
         stage_count,
+        false,
     )?;
+
+    // If cancellation was requested between passes, stop the pipeline before
+    // starting any later processor. The in-progress pass may finish, but no
+    // new pass will start.
+    if passes_outcome == OptionalPassesOutcome::Cancelled {
+        tracker.finish(JobProgressState::Cancelled);
+        let final_progress = tracker.snapshot();
+        kdft_case::record_job_progress_summary(case_path, index_result.job_id, &final_progress)?;
+        let response_object = response
+            .as_object_mut()
+            .context("processing result serialized to a non-object")?;
+        response_object.insert(
+            "status".to_string(),
+            serde_json::Value::String("cancelled".to_string()),
+        );
+        response_object.insert("truncated".to_string(), serde_json::Value::Bool(false));
+        response_object.insert(
+            "index_truncated".to_string(),
+            serde_json::Value::Bool(index_result.truncated),
+        );
+        response_object.insert(
+            "index_partial_artifact_coverage".to_string(),
+            serde_json::Value::Bool(index_result.partial_artifact_coverage),
+        );
+        response_object.insert(
+            "completed_with_diagnostics".to_string(),
+            serde_json::Value::Bool(false),
+        );
+        response_object.insert(
+            "partial_artifact_coverage".to_string(),
+            serde_json::Value::Bool(index_result.partial_artifact_coverage),
+        );
+        response_object.insert(
+            "progress".to_string(),
+            serde_json::to_value(final_progress).context("serializing final job progress")?,
+        );
+        return Ok(response);
+    }
+
     let optional_pass_has_diagnostics =
         response_contains_failed_pass(&response) || response_contains_truncated_pass(&response);
     let stopped_at_examiner_limit = index_result.truncated;
@@ -3133,6 +3486,13 @@ fn optional_processing_stage_count(request: &ProcessEvidenceRequest) -> usize {
         + usize::from(request.parse_identities.unwrap_or(true))
 }
 
+/// The additive run-processors endpoint may also backfill content_head for an
+/// existing metadata-only index when capture_content=true. That pass needs its
+/// own stage so progress accounting matches what the UI shows.
+fn run_processors_optional_stage_count(request: &ProcessEvidenceRequest) -> usize {
+    optional_processing_stage_count(request) + usize::from(request.capture_content.unwrap_or(true))
+}
+
 fn begin_processing_stage(
     tracker: &JobProgressTracker,
     stage_index: &mut usize,
@@ -3144,6 +3504,12 @@ fn begin_processing_stage(
     tracker.start_stage(name, *stage_index, Some(stage_count), unit, None);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionalPassesOutcome {
+    Completed,
+    Cancelled,
+}
+
 fn append_optional_processing_passes(
     case_path: &Path,
     request: &ProcessEvidenceRequest,
@@ -3151,10 +3517,44 @@ fn append_optional_processing_passes(
     tracker: &JobProgressTracker,
     stage_index: &mut usize,
     stage_count: usize,
-) -> Result<()> {
+    run_content_head_backfill: bool,
+) -> Result<OptionalPassesOutcome> {
     let extras = response
         .as_object_mut()
         .context("processing result serialized to a non-object")?;
+    if tracker.is_cancellation_requested() {
+        return Ok(OptionalPassesOutcome::Cancelled);
+    }
+    if run_content_head_backfill && request.capture_content.unwrap_or(true) {
+        begin_processing_stage(
+            tracker,
+            stage_index,
+            stage_count,
+            "Content capture backfill",
+            "entries",
+        );
+        extras.insert(
+            "content_head_backfill".to_string(),
+            run_optional_processing_pass(
+                case_path,
+                request.evidence_id,
+                "content head backfill",
+                tracker,
+                || {
+                    kdft_case::backfill_content_head(
+                        case_path,
+                        kdft_case::BackfillContentHeadOptions {
+                            evidence_id: request.evidence_id,
+                            max_entries: 0,
+                        },
+                    )
+                },
+            )?,
+        );
+    }
+    if tracker.is_cancellation_requested() {
+        return Ok(OptionalPassesOutcome::Cancelled);
+    }
     if parse_archives_enabled(request) {
         begin_processing_stage(
             tracker,
@@ -3174,6 +3574,9 @@ fn append_optional_processing_passes(
             )?,
         );
     }
+    if tracker.is_cancellation_requested() {
+        return Ok(OptionalPassesOutcome::Cancelled);
+    }
     if parse_documents_enabled(request) {
         begin_processing_stage(
             tracker,
@@ -3192,6 +3595,9 @@ fn append_optional_processing_passes(
                 || parse_document_artifacts(case_path, request.evidence_id),
             )?,
         );
+    }
+    if tracker.is_cancellation_requested() {
+        return Ok(OptionalPassesOutcome::Cancelled);
     }
     if parse_windows_artifacts_enabled(request) {
         begin_processing_stage(
@@ -3239,6 +3645,9 @@ fn append_optional_processing_passes(
             )?,
         );
     }
+    if tracker.is_cancellation_requested() {
+        return Ok(OptionalPassesOutcome::Cancelled);
+    }
     if request.parse_emails.unwrap_or(true) {
         begin_processing_stage(
             tracker,
@@ -3257,6 +3666,9 @@ fn append_optional_processing_passes(
                 || parse_embedded_mailboxes(case_path, request.evidence_id, 0),
             )?,
         );
+    }
+    if tracker.is_cancellation_requested() {
+        return Ok(OptionalPassesOutcome::Cancelled);
     }
     if request.parse_browsers.unwrap_or(true) {
         // ext volumes auto-import during the walk itself; this post-index pass
@@ -3279,6 +3691,9 @@ fn append_optional_processing_passes(
             )?,
         );
     }
+    if tracker.is_cancellation_requested() {
+        return Ok(OptionalPassesOutcome::Cancelled);
+    }
     if request.parse_identities.unwrap_or(true) {
         begin_processing_stage(
             tracker,
@@ -3298,7 +3713,7 @@ fn append_optional_processing_passes(
             )?,
         );
     }
-    append_slow_integrity_passes(
+    let outcome = append_slow_integrity_passes(
         case_path,
         request,
         extras,
@@ -3306,7 +3721,7 @@ fn append_optional_processing_passes(
         stage_index,
         stage_count,
     )?;
-    Ok(())
+    Ok(outcome)
 }
 
 /// Expensive whole-source and per-file verification belongs after the
@@ -3320,7 +3735,10 @@ fn append_slow_integrity_passes(
     tracker: &JobProgressTracker,
     stage_index: &mut usize,
     stage_count: usize,
-) -> Result<()> {
+) -> Result<OptionalPassesOutcome> {
+    if tracker.is_cancellation_requested() {
+        return Ok(OptionalPassesOutcome::Cancelled);
+    }
     if request.run_signature_analysis.unwrap_or(false) {
         begin_processing_stage(
             tracker,
@@ -3348,6 +3766,9 @@ fn append_slow_integrity_passes(
                 },
             )?,
         );
+    }
+    if tracker.is_cancellation_requested() {
+        return Ok(OptionalPassesOutcome::Cancelled);
     }
     if request.run_file_hash.unwrap_or(false) {
         begin_processing_stage(
@@ -3377,6 +3798,9 @@ fn append_slow_integrity_passes(
             )?,
         );
     }
+    if tracker.is_cancellation_requested() {
+        return Ok(OptionalPassesOutcome::Cancelled);
+    }
     if request.run_hash.unwrap_or(false) {
         begin_processing_stage(
             tracker,
@@ -3391,6 +3815,9 @@ fn append_slow_integrity_passes(
                 hash_evidence(case_path, request.evidence_id)
             })?,
         );
+    }
+    if tracker.is_cancellation_requested() {
+        return Ok(OptionalPassesOutcome::Cancelled);
     }
     if request.run_carve.unwrap_or(false) {
         begin_processing_stage(tracker, stage_index, stage_count, "File carving", "bytes");
@@ -3408,7 +3835,13 @@ fn append_slow_integrity_passes(
             })?,
         );
     }
-    Ok(())
+    // A cancellation that arrives while the last selected slow pass is running
+    // must not be overwritten as Completed once that pass returns.
+    if tracker.is_cancellation_requested() {
+        Ok(OptionalPassesOutcome::Cancelled)
+    } else {
+        Ok(OptionalPassesOutcome::Completed)
+    }
 }
 
 fn run_optional_processing_pass<T, F>(
@@ -4511,12 +4944,21 @@ fn api_bookmark_folder_recursive_live(body: &[u8]) -> Result<kdft_case::Recursiv
             let volume = volumes
                 .get(request.volume)
                 .with_context(|| format!("volume index {} out of range", request.volume))?;
-            let listing = list_image_tree_files(
-                Path::new(&source.source_path),
-                request.volume,
-                &request.path,
-                max_entries,
-            )?;
+            let listing = if volume.filesystem == "NTFS" {
+                kdft_case::ntfs_forensic::list_ntfs_forensic_tree_files(
+                    Path::new(&source.source_path),
+                    request.volume,
+                    &request.path,
+                    max_entries,
+                )?
+            } else {
+                list_image_tree_files(
+                    Path::new(&source.source_path),
+                    request.volume,
+                    &request.path,
+                    max_entries,
+                )?
+            };
             (volume.name.clone(), volume.filesystem.clone(), listing)
         }
         "folder" => {
@@ -4906,24 +5348,27 @@ fn is_separator(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_add_evidence, api_carve_evidence, api_image_dir, api_job_progress,
-        api_process_evidence_tracked, api_state, append_optional_processing_passes,
-        browser_disclosure_diagnostic_count, browser_disclosure_was_persisted,
-        browser_profile_disclosure_matches, cached_indexed_directory, external_preview_extension,
-        external_preview_output_path, inline_script_json, normalize_request_path,
-        normalized_browser_profile_identity, observed_browser_profile_count,
-        parse_archives_enabled, parse_documents_enabled, parse_windows_artifacts_enabled,
-        process_stage_count, run_optional_processing_pass, safe_external_preview_name,
-        trim_balanced_path_quotes, ProcessEvidenceRequest, ServerArgs, StreamingDiagnosticLog,
-        INDEX_HTML,
+        api_add_evidence, api_carve_evidence, api_image_dir, api_job_cancel, api_job_progress,
+        api_process_evidence_tracked, api_run_processors_tracked, api_state,
+        append_optional_processing_passes, browser_disclosure_diagnostic_count,
+        browser_disclosure_was_persisted, browser_profile_disclosure_matches,
+        cached_indexed_directory, external_preview_extension, external_preview_output_path,
+        inline_script_json, normalize_request_path, normalized_browser_profile_identity,
+        observed_browser_profile_count, parse_archives_enabled, parse_documents_enabled,
+        parse_windows_artifacts_enabled, process_stage_count, run_optional_processing_pass,
+        safe_external_preview_name, trim_balanced_path_quotes, ProcessEvidenceRequest, ServerArgs,
+        ServerConfig, StreamingDiagnosticLog, INDEX_HTML,
     };
-    use super::{DeepSearchRequest, RawSearchRequest};
+    use super::{DeepSearchRequest, ProgressRegistry, RawSearchRequest};
     use kdft_case::progress::{JobProgressState, JobProgressTracker};
     use rusqlite::{params, Connection};
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
 
     fn unique_test_path(label: &str, suffix: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -4980,6 +5425,28 @@ mod tests {
         assert!(encoded.contains("\\u2028\\u2029\\u0026\\u003c\\u003e"));
         let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn normal_launch_does_not_invent_or_restore_a_case_path() -> anyhow::Result<()> {
+        let config = ServerConfig::new(None)?;
+        assert!(config.default_case_path.is_empty());
+        assert!(!config.default_case_pinned);
+
+        let html = super::index_html(&config);
+        assert!(html.contains("\"defaultCasePath\":\"\""));
+        assert!(!INDEX_HTML.contains("localStorage.getItem(\"kdft.casePath\")"));
+        assert!(!INDEX_HTML.contains("localStorage.setItem(\"kdft.casePath\""));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_case_argument_is_the_only_server_default() -> anyhow::Result<()> {
+        let requested = std::env::temp_dir().join("examiner-selected.kdft.sqlite");
+        let config = ServerConfig::new(Some(&requested))?;
+        assert_eq!(config.default_case_path, requested.to_string_lossy());
+        assert!(config.default_case_pinned);
+        Ok(())
     }
 
     fn create_ui_test_case(case_path: &Path, name: &str) -> anyhow::Result<()> {
@@ -5078,6 +5545,148 @@ mod tests {
         assert_eq!(response["index_partial_artifact_coverage"], true);
         assert_eq!(response["partial_artifact_coverage"], true);
         assert_eq!(response["progress"]["state"], "complete_with_diagnostics");
+
+        cleanup_ui_test_case(&case_path);
+        let _ = std::fs::remove_dir_all(source_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn run_processors_capture_content_backfills_existing_index() -> anyhow::Result<()> {
+        let case_path = unique_test_path("run-processors-backfill", ".kdft.sqlite");
+        cleanup_ui_test_case(&case_path);
+        create_ui_test_case(&case_path, "run-processors-backfill")?;
+        let source_dir = unique_test_path("run-processors-backfill-source", "");
+        std::fs::create_dir_all(&source_dir)?;
+        std::fs::write(source_dir.join("searchable.txt"), b"searchable text body")?;
+        std::fs::write(source_dir.join("empty.txt"), b"")?;
+        let evidence_id = kdft_case::add_evidence(
+            &case_path,
+            kdft_case::AddEvidenceOptions {
+                path: source_dir.clone(),
+                kind: kdft_case::EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let index_request = ProcessEvidenceRequest {
+            case_path: case_path.to_string_lossy().into_owned(),
+            evidence_id,
+            max_entries: Some(0),
+            progress_id: None,
+            reindex_filesystem: Some(true),
+            capture_content: Some(false),
+            parse_emails: Some(false),
+            parse_browsers: Some(false),
+            parse_identities: Some(false),
+            parse_archives: Some(false),
+            parse_documents: Some(false),
+            parse_windows_artifacts: Some(false),
+            run_hash: Some(false),
+            run_file_hash: Some(false),
+            run_signature_analysis: Some(false),
+            run_carve: Some(false),
+            carve_max_scan_bytes: None,
+            carve_max_files: None,
+        };
+        let tracker = JobProgressTracker::new("backfill-index", "process", None);
+        let index_response = api_process_evidence_tracked(&case_path, &index_request, &tracker)?;
+        assert_eq!(index_response["status"], "completed");
+
+        let entry_count_before = {
+            let conn = rusqlite::Connection::open(&case_path)?;
+            conn.query_row(
+                "SELECT COUNT(*) FROM filesystem_entries WHERE evidence_id = ?1",
+                params![evidence_id],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        let content_head_before = {
+            let conn = rusqlite::Connection::open(&case_path)?;
+            conn.query_row(
+                "SELECT COUNT(*) FROM filesystem_entries
+                 WHERE evidence_id = ?1 AND content_head IS NOT NULL",
+                params![evidence_id],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        assert_eq!(content_head_before, 0);
+
+        let processor_request = ProcessEvidenceRequest {
+            case_path: case_path.to_string_lossy().into_owned(),
+            evidence_id,
+            max_entries: Some(0),
+            progress_id: None,
+            reindex_filesystem: Some(false),
+            capture_content: Some(true),
+            parse_emails: Some(false),
+            parse_browsers: Some(false),
+            parse_identities: Some(false),
+            parse_archives: Some(false),
+            parse_documents: Some(false),
+            parse_windows_artifacts: Some(false),
+            run_hash: Some(false),
+            run_file_hash: Some(false),
+            run_signature_analysis: Some(false),
+            run_carve: Some(false),
+            carve_max_scan_bytes: None,
+            carve_max_files: None,
+        };
+        let tracker = JobProgressTracker::new("backfill-run-processors", "processors", None);
+        let response = api_run_processors_tracked(&case_path, &processor_request, &tracker)?;
+
+        assert_eq!(response["status"], "completed");
+        assert!(
+            response["content_head_backfill"]["entries_captured"]
+                .as_i64()
+                .unwrap_or(0)
+                >= 1,
+            "capture_content=true must invoke the content-head backfill"
+        );
+        assert_eq!(
+            response["content_head_backfill"]["entries_unreadable"]
+                .as_i64()
+                .unwrap_or(-1),
+            0
+        );
+
+        let entry_count_after = {
+            let conn = rusqlite::Connection::open(&case_path)?;
+            conn.query_row(
+                "SELECT COUNT(*) FROM filesystem_entries WHERE evidence_id = ?1",
+                params![evidence_id],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        assert_eq!(
+            entry_count_after, entry_count_before,
+            "run-processors must not reindex or remove filesystem rows"
+        );
+
+        let content_head_after = {
+            let conn = rusqlite::Connection::open(&case_path)?;
+            conn.query_row(
+                "SELECT COUNT(*) FROM filesystem_entries
+                 WHERE evidence_id = ?1 AND content_head IS NOT NULL",
+                params![evidence_id],
+                |row| row.get::<_, i64>(0),
+            )?
+        };
+        assert!(
+            content_head_after > content_head_before,
+            "backfill must populate content_head for eligible files"
+        );
+
+        let evidence_rows = kdft_case::list_evidence(&case_path)?;
+        assert_eq!(
+            evidence_rows
+                .iter()
+                .find(|row| row.id == evidence_id)
+                .and_then(|row| row.content_indexed),
+            Some(true),
+            "run-processors with capture_content=true must mark evidence content-indexed"
+        );
 
         cleanup_ui_test_case(&case_path);
         let _ = std::fs::remove_dir_all(source_dir);
@@ -5453,6 +6062,55 @@ mod tests {
     }
 
     #[test]
+    fn case_open_blocks_duplicate_input_with_visible_progress() {
+        let refresh = INDEX_HTML
+            .split_once("async function refresh() {")
+            .expect("refresh function")
+            .1
+            .split_once("function suggestedNewCasePath()")
+            .expect("end of refresh function")
+            .0;
+        assert!(refresh.contains("beginCaseLoading(casePath, generation)"));
+        assert!(refresh.contains("finally"));
+        assert!(refresh.contains("endCaseLoading(generation)"));
+        assert!(INDEX_HTML.contains("id = \"caseLoadingOverlay\""));
+        assert!(INDEX_HTML.contains("Controls are paused to prevent duplicate requests"));
+    }
+
+    #[test]
+    fn routine_notices_expire_but_errors_remain_visible() {
+        assert!(INDEX_HTML.contains("let noticeGeneration = 0"));
+        assert!(INDEX_HTML.contains("if (text && !bad)"));
+        assert!(INDEX_HTML.contains("notice.classList.add(\"is-fading\")"));
+        assert!(INDEX_HTML.contains(".notice.is-fading"));
+    }
+
+    #[test]
+    fn timeline_uses_modal_details_and_evidence_aware_classes() {
+        assert!(INDEX_HTML.contains("id=\"timelineDetailOverlay\""));
+        assert!(INDEX_HTML.contains("function openTimelineDetail()"));
+        assert!(INDEX_HTML.contains("function closeTimelineDetail()"));
+        assert!(INDEX_HTML.contains("Web browsing"));
+        assert!(INDEX_HTML.contains("Copy/paste activity"));
+        assert!(INDEX_HTML.contains("System activity"));
+        assert!(INDEX_HTML.contains("User activity"));
+        assert!(INDEX_HTML.contains("Program evidence"));
+        assert!(INDEX_HTML.contains("Execution configuration"));
+        assert!(INDEX_HTML.contains("Shortcut evidence"));
+        assert!(INDEX_HTML.contains("A raw NTFS"));
+        assert!(
+            INDEX_HTML.contains("{ key: \"artifact_time_utc\", label: \"Artifact Date/Time\" }")
+        );
+        assert!(INDEX_HTML.contains("prioritizes parsed artifact records"));
+        assert!(INDEX_HTML.contains("timeline-capable records matched"));
+        assert!(INDEX_HTML
+            .contains("const matchingRows = visibleGridRows(\"timeline\", columns, rows)"));
+        assert!(INDEX_HTML
+            .contains("const renderedRows = matchingRows.slice(0, TIMELINE_TABLE_RENDER_LIMIT)"));
+        assert!(INDEX_HTML.contains(".timeline-bottom {\n      display: block;"));
+    }
+
+    #[test]
     fn evidence_badges_expose_terminal_processing_states() {
         let status = INDEX_HTML
             .split_once("function evidenceProcessingStatusText(item,")
@@ -5486,6 +6144,89 @@ mod tests {
         assert!(!INDEX_HTML.contains("$(\"recategorizeBtn\").hidden"));
         assert!(!INDEX_HTML.contains("$(\"fsOptionsRow\").hidden"));
         assert!(!INDEX_HTML.contains("$(\"historyOptionsRow\").hidden"));
+    }
+
+    #[test]
+    fn analyzing_overlay_javascript_has_exact_async_modifiers() {
+        let script = INDEX_HTML
+            .split_once("<script>")
+            .expect("embedded script start")
+            .1
+            .split_once("</script>")
+            .expect("embedded script end")
+            .0;
+        let tokens: Vec<&str> = script.split_whitespace().collect();
+        assert!(
+            !tokens.windows(2).any(|window| window == ["async", "async"]),
+            "embedded script must not contain duplicate async keywords"
+        );
+        assert!(
+            script.contains("async function cancelAnalyzingProgress()"),
+            "cancelAnalyzingProgress must be declared as an async function"
+        );
+        assert!(
+            script.contains("async function runAnalyze("),
+            "runAnalyze must be declared as an async function"
+        );
+
+        // Regression: the analyzing overlay must keep a stable Cancel button
+        // node across telemetry refreshes. The markup uses a placeholder slot
+        // and renderAnalyzingOverlay preserves/reattaches the existing button.
+        assert!(
+            script.contains(r#"id="analyzingCancelSlot""#),
+            "analyzing overlay must use a stable cancel slot"
+        );
+        assert!(
+            script.contains(
+                r##"const existingButton = el.querySelector("#analyzingCancelSlot button")"##
+            ),
+            "renderAnalyzingOverlay must preserve the existing cancel button node"
+        );
+        assert!(
+            script.contains("slot.replaceChildren(btn)"),
+            "renderAnalyzingOverlay must reattach the stable cancel button"
+        );
+        assert!(
+            script.contains("btn.disabled = state.analyzing.cancelPending"),
+            "cancel button must reflect cancelPending state"
+        );
+        assert!(
+            script.contains(
+                r#"btn.textContent = state.analyzing.cancelPending ? "Cancelling…" : "Cancel""#
+            ),
+            "cancel button must expose its accepted cancellation state"
+        );
+        assert!(
+            !script.contains(r#"onclick="cancelAnalyzingProgress()""#),
+            "cancel button must not be recreated from inline HTML each poll"
+        );
+        assert!(
+            script.contains("if (state.analyzing === analyzing)")
+                && script.contains("analyzing.cancelPending = accepted"),
+            "an accepted cancellation must remain disabled without mutating a later operation"
+        );
+
+        // If Node is available on PATH, perform a real syntax check on the
+        // extracted script so duplicate/missing async keywords are caught as
+        // parse errors as well as by the assertions above. Repository tests
+        // must remain portable, so no hardcoded runtime path is used here.
+        let temp_path =
+            std::env::temp_dir().join(format!("kdft-ui-script-check-{}.js", std::process::id()));
+        if std::fs::write(&temp_path, script).is_err() {
+            return;
+        }
+        let check_result = std::process::Command::new("node")
+            .args(["--check", temp_path.to_str().unwrap_or("")])
+            .output()
+            .ok();
+        let _ = std::fs::remove_file(&temp_path);
+        if let Some(output) = check_result {
+            assert!(
+                output.status.success(),
+                "embedded JavaScript failed Node syntax check: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
@@ -5716,9 +6457,28 @@ mod tests {
     }
 
     #[test]
+    fn directory_tables_keep_forensic_navigation_rows_when_no_children_exist() {
+        assert!(INDEX_HTML.contains("function directoryNavigationRow("));
+        assert!(INDEX_HTML.contains("function liveDirectoryNavigationRows("));
+        assert!(INDEX_HTML.contains("function indexedDirectoryNavigationRows("));
+        assert!(INDEX_HTML.contains("directoryNavigationRow(\n        \".\","));
+        assert!(INDEX_HTML.contains("directoryNavigationRow(\n        \"..\","));
+        assert!(INDEX_HTML.contains("liveDirectoryNavigationRows(selVolume, selPath)"));
+        assert!(INDEX_HTML.contains("indexedDirectoryNavigationRows(selPath)"));
+        assert!(!INDEX_HTML.contains("This folder is empty."));
+        assert!(!INDEX_HTML.contains("This folder has no direct children."));
+    }
+
+    #[test]
     fn picture_gallery_is_available_for_indexed_and_live_images() {
         assert!(INDEX_HTML.contains("function renderThumbnailCategoryContents"));
         assert!(INDEX_HTML.contains("function renderLiveThumbnailContents"));
+        assert!(INDEX_HTML.contains("function selectedCategoryUsesPictureGallery()"));
+        assert!(INDEX_HTML
+            .contains("selected.main === \"Pictures and Media\" && selected.sub === \"Pictures\""));
+        assert!(INDEX_HTML.contains(
+            "if (!filtersActive && !cache.loading && !cache.nextCursor && rows.length >= total)"
+        ));
         assert!(INDEX_HTML.contains("Gallery view"));
         assert!(INDEX_HTML.contains("/api/image/raw?case_path="));
         assert!(INDEX_HTML.contains("/api/entry/raw?case_path="));
@@ -6092,6 +6852,7 @@ mod tests {
             &tracker,
             &mut stage_index,
             stage_count,
+            false,
         )?;
 
         assert_eq!(response["job_id"], expected_job_id);
@@ -6722,6 +7483,329 @@ mod tests {
         assert!(super::INDEX_HTML
             .contains(r#"{ key: "last_access_time_utc", label: "Last Access Date/Time" }"#));
     }
+
+    #[test]
+    fn progress_registry_cancel_signals_tracker_across_threads() {
+        let registry = ProgressRegistry::default();
+        let tracker = registry
+            .start("cross-thread-cancel", "process", None, None)
+            .expect("start progress operation");
+        let saw_cancel = Arc::new(AtomicBool::new(false));
+        let saw_cancel_clone = saw_cancel.clone();
+        let tracker_clone = tracker.clone();
+        let handle = thread::spawn(move || {
+            for _ in 0..100_000 {
+                if tracker_clone.is_cancellation_requested() {
+                    saw_cancel_clone.store(true, Ordering::SeqCst);
+                    return;
+                }
+                thread::yield_now();
+            }
+        });
+        assert!(registry.cancel("cross-thread-cancel").unwrap());
+        handle.join().unwrap();
+        assert!(
+            saw_cancel.load(Ordering::SeqCst),
+            "registry cancel must reach the cloned tracker on another thread"
+        );
+        tracker.finish(JobProgressState::Cancelled);
+        assert!(
+            !registry.cancel("cross-thread-cancel").unwrap(),
+            "cancel on a terminal operation must return false"
+        );
+        assert!(
+            !registry.cancel("missing-id").unwrap(),
+            "cancel on an unknown operation must return false"
+        );
+    }
+
+    #[test]
+    fn api_job_cancel_truthfully_reports_active_and_missing_operations() {
+        let config = ServerConfig::new(None).expect("create server config");
+        let tracker = config
+            .progress
+            .start("cancel-api-test", "process", None, None)
+            .expect("start progress operation");
+        let active_body = br#"{"progress_id":"cancel-api-test"}"#;
+        let response = api_job_cancel(active_body, &config).expect("cancel active operation");
+        assert_eq!(response["accepted"], true);
+        assert!(tracker.is_cancellation_requested());
+
+        let missing_body = br#"{"progress_id":"does-not-exist"}"#;
+        let response = api_job_cancel(missing_body, &config).expect("cancel missing operation");
+        assert_eq!(response["accepted"], false);
+    }
+
+    #[test]
+    fn base_cancellation_skips_optional_processing_passes() -> anyhow::Result<()> {
+        let case_path = unique_test_path("base-cancel-skips-passes", ".kdft.sqlite");
+        cleanup_ui_test_case(&case_path);
+        create_ui_test_case(&case_path, "base-cancel-skips-passes")?;
+        let source_dir = unique_test_path("base-cancel-source", "");
+        std::fs::create_dir_all(&source_dir)?;
+        std::fs::write(source_dir.join("file.txt"), b"content")?;
+        let evidence_id = kdft_case::add_evidence(
+            &case_path,
+            kdft_case::AddEvidenceOptions {
+                path: source_dir.clone(),
+                kind: kdft_case::EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let request = ProcessEvidenceRequest {
+            case_path: case_path.to_string_lossy().into_owned(),
+            evidence_id,
+            max_entries: Some(0),
+            progress_id: None,
+            reindex_filesystem: Some(true),
+            capture_content: Some(true),
+            parse_emails: Some(true),
+            parse_browsers: Some(true),
+            parse_identities: Some(true),
+            parse_archives: Some(true),
+            parse_documents: Some(true),
+            parse_windows_artifacts: Some(true),
+            run_hash: Some(true),
+            run_file_hash: Some(true),
+            run_signature_analysis: Some(true),
+            run_carve: Some(true),
+            carve_max_scan_bytes: Some(0),
+            carve_max_files: Some(0),
+        };
+        let tracker = JobProgressTracker::new("base-cancel-skips-passes", "process", None);
+        tracker.request_cancellation();
+        let response = kdft_case::progress::with_job_progress(&tracker, || {
+            api_process_evidence_tracked(&case_path, &request, &tracker)
+        })?;
+
+        assert_eq!(response["status"], "cancelled");
+        assert_eq!(response["progress"]["state"], "cancelled");
+        for pass in [
+            "archive_parsing",
+            "document_parsing",
+            "windows_artifact_parsing",
+            "windows_registry_artifact_parsing",
+            "email_parsing",
+            "browser_parsing",
+            "identity_parsing",
+            "signature_analysis",
+            "file_hash",
+            "hash",
+            "carve",
+        ] {
+            assert!(
+                response.get(pass).is_none(),
+                "cancelled base index must not produce {pass} result"
+            );
+        }
+
+        cleanup_ui_test_case(&case_path);
+        let _ = std::fs::remove_dir_all(source_dir);
+        Ok(())
+    }
+
+    // This test only proves that a pre-existing cancellation request prevents
+    // any processor stage from starting; it does not exercise a later boundary.
+    #[test]
+    fn run_processors_pre_cancellation_skips_all_stages() -> anyhow::Result<()> {
+        let case_path = unique_test_path("run-processors-pre-cancel", ".kdft.sqlite");
+        cleanup_ui_test_case(&case_path);
+        create_ui_test_case(&case_path, "run-processors-cancel-boundary")?;
+        let source_dir = unique_test_path("run-processors-source", "");
+        std::fs::create_dir_all(&source_dir)?;
+        std::fs::write(source_dir.join("file.txt"), b"content")?;
+        let evidence_id = kdft_case::add_evidence(
+            &case_path,
+            kdft_case::AddEvidenceOptions {
+                path: source_dir.clone(),
+                kind: kdft_case::EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let index_request = ProcessEvidenceRequest {
+            case_path: case_path.to_string_lossy().into_owned(),
+            evidence_id,
+            max_entries: Some(0),
+            progress_id: None,
+            reindex_filesystem: Some(true),
+            capture_content: Some(true),
+            parse_emails: Some(false),
+            parse_browsers: Some(false),
+            parse_identities: Some(false),
+            parse_archives: Some(false),
+            parse_documents: Some(false),
+            parse_windows_artifacts: Some(false),
+            run_hash: Some(false),
+            run_file_hash: Some(false),
+            run_signature_analysis: Some(false),
+            run_carve: Some(false),
+            carve_max_scan_bytes: None,
+            carve_max_files: None,
+        };
+        let tracker = JobProgressTracker::new("run-processors-index", "process", None);
+        let index_response = api_process_evidence_tracked(&case_path, &index_request, &tracker)?;
+        assert_eq!(index_response["status"], "completed");
+
+        let processor_request = ProcessEvidenceRequest {
+            case_path: case_path.to_string_lossy().into_owned(),
+            evidence_id,
+            max_entries: Some(0),
+            progress_id: None,
+            reindex_filesystem: Some(false),
+            capture_content: Some(true),
+            parse_emails: Some(true),
+            parse_browsers: Some(true),
+            parse_identities: Some(true),
+            parse_archives: Some(true),
+            parse_documents: Some(true),
+            parse_windows_artifacts: Some(true),
+            run_hash: Some(true),
+            run_file_hash: Some(true),
+            run_signature_analysis: Some(true),
+            run_carve: Some(true),
+            carve_max_scan_bytes: Some(0),
+            carve_max_files: Some(0),
+        };
+        let tracker = JobProgressTracker::new("run-processors-cancel", "processors", None);
+        tracker.request_cancellation();
+        let response = kdft_case::progress::with_job_progress(&tracker, || {
+            api_run_processors_tracked(&case_path, &processor_request, &tracker)
+        })?;
+
+        assert_eq!(response["status"], "cancelled");
+        assert_eq!(response["progress"]["state"], "cancelled");
+        for pass in [
+            "archive_parsing",
+            "document_parsing",
+            "windows_artifact_parsing",
+            "windows_registry_artifact_parsing",
+            "email_parsing",
+            "browser_parsing",
+            "identity_parsing",
+            "signature_analysis",
+            "file_hash",
+            "hash",
+            "carve",
+        ] {
+            assert!(
+                response.get(pass).is_none(),
+                "cancelled processor pipeline must not produce {pass} result"
+            );
+        }
+
+        cleanup_ui_test_case(&case_path);
+        let _ = std::fs::remove_dir_all(source_dir);
+        Ok(())
+    }
+
+    // Cancellation requested while the last selected slow-integrity pass is
+    // running must be respected at the final boundary, not overwritten as
+    // Completed after that pass returns.
+    #[test]
+    fn run_processors_cancels_after_last_selected_stage() -> anyhow::Result<()> {
+        let case_path = unique_test_path("run-processors-final-boundary", ".kdft.sqlite");
+        cleanup_ui_test_case(&case_path);
+        create_ui_test_case(&case_path, "run-processors-final-boundary")?;
+        let source_dir = unique_test_path("run-processors-final-source", "");
+        std::fs::create_dir_all(&source_dir)?;
+        std::fs::write(source_dir.join("file.txt"), b"content")?;
+        let evidence_id = kdft_case::add_evidence(
+            &case_path,
+            kdft_case::AddEvidenceOptions {
+                path: source_dir.clone(),
+                kind: kdft_case::EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        let index_request = ProcessEvidenceRequest {
+            case_path: case_path.to_string_lossy().into_owned(),
+            evidence_id,
+            max_entries: Some(0),
+            progress_id: None,
+            reindex_filesystem: Some(true),
+            capture_content: Some(true),
+            parse_emails: Some(false),
+            parse_browsers: Some(false),
+            parse_identities: Some(false),
+            parse_archives: Some(false),
+            parse_documents: Some(false),
+            parse_windows_artifacts: Some(false),
+            run_hash: Some(false),
+            run_file_hash: Some(false),
+            run_signature_analysis: Some(false),
+            run_carve: Some(false),
+            carve_max_scan_bytes: None,
+            carve_max_files: None,
+        };
+        let tracker = JobProgressTracker::new("run-processors-final-index", "process", None);
+        let index_response = api_process_evidence_tracked(&case_path, &index_request, &tracker)?;
+        assert_eq!(index_response["status"], "completed");
+
+        let processor_request = ProcessEvidenceRequest {
+            case_path: case_path.to_string_lossy().into_owned(),
+            evidence_id,
+            max_entries: Some(0),
+            progress_id: None,
+            reindex_filesystem: Some(false),
+            capture_content: Some(true),
+            parse_emails: Some(false),
+            parse_browsers: Some(false),
+            parse_identities: Some(false),
+            parse_archives: Some(false),
+            parse_documents: Some(false),
+            parse_windows_artifacts: Some(false),
+            run_hash: Some(false),
+            run_file_hash: Some(false),
+            run_signature_analysis: Some(false),
+            run_carve: Some(true),
+            carve_max_scan_bytes: Some(0),
+            carve_max_files: Some(0),
+        };
+
+        let tracker = JobProgressTracker::new("run-processors-final-cancel", "processors", None);
+        let response = std::thread::scope(|scope| {
+            let worker_tracker = tracker.clone();
+            let case_path_ref = &case_path;
+            let processor_request_ref = &processor_request;
+            let handle = scope.spawn(move || {
+                kdft_case::progress::with_job_progress(&worker_tracker, || {
+                    api_run_processors_tracked(
+                        case_path_ref,
+                        processor_request_ref,
+                        &worker_tracker,
+                    )
+                })
+            });
+
+            // Wait until the last selected stage has actually started, then
+            // request cancellation. This exercises the final boundary in
+            // append_slow_integrity_passes without relying on sleep timing.
+            loop {
+                if tracker.snapshot().stage_name.as_deref() == Some("File carving") {
+                    tracker.request_cancellation();
+                    break;
+                }
+                if handle.is_finished() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+
+            handle.join().expect("processor worker panicked")
+        })?;
+
+        assert_eq!(response["status"], "cancelled");
+        assert_eq!(response["progress"]["state"], "cancelled");
+
+        cleanup_ui_test_case(&case_path);
+        let _ = std::fs::remove_dir_all(source_dir);
+        Ok(())
+    }
 }
 
 fn query_i64(query: &HashMap<String, String>, field: &str) -> Result<i64> {
@@ -7088,6 +8172,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       user-select: none;
     }
     .analyzing-note { font-size: 12px; opacity: .82; line-height: 1.45; }
+    .analyzing-actions { margin-top: 14px; text-align: center; }
+    .analyzing-card.telemetry .analyzing-actions { text-align: right; }
     .progress-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -7512,6 +8598,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
       padding: 10px 12px;
       border-radius: 6px;
       min-height: 40px;
+      opacity: 1;
+      transition: opacity .35s ease, max-height .35s ease, padding .35s ease, min-height .35s ease;
+      overflow: hidden;
+    }
+    .notice[hidden] { display: none; }
+    .notice.is-fading {
+      opacity: 0;
+      max-height: 0;
+      min-height: 0;
+      padding-top: 0;
+      padding-bottom: 0;
     }
     .notice.bad {
       border-color: var(--bad);
@@ -7880,6 +8977,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .browser-table-wrap .live-table td:nth-child(5) {
       width: 170px;
     }
+    .browser-table-wrap .directory-nav-row td {
+      background: var(--surface-2);
+      color: var(--muted);
+    }
+    .browser-table-wrap .directory-nav-row:hover td {
+      background: #e8f3f0;
+      color: var(--accent);
+    }
+    .browser-table-wrap .directory-nav-row .entry-name {
+      color: var(--text);
+      font-family: Consolas, "Cascadia Mono", monospace;
+      font-weight: 900;
+    }
     .timeline-panel {
       grid-column: 1 / -1;
       min-height: calc(100vh - 180px);
@@ -7897,9 +9007,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       min-height: 0;
     }
     .timeline-bottom {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(300px, 360px);
-      gap: 10px;
+      display: block;
       min-height: 0;
       min-width: 0;
     }
@@ -7917,14 +9025,45 @@ const INDEX_HTML: &str = r###"<!doctype html>
       font-size: 13px;
     }
     .timeline-detail {
-      border: 1px solid var(--line);
-      border-radius: 8px;
       background: #fff;
       overflow: auto;
       min-height: 0;
       padding: 10px;
       font-size: 12px;
+      flex: 1;
     }
+    .timeline-detail-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 9997;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(15, 23, 23, .45);
+    }
+    .timeline-detail-overlay[hidden] { display: none; }
+    .timeline-detail-modal {
+      display: flex;
+      flex-direction: column;
+      width: min(760px, calc(100vw - 48px));
+      max-height: min(840px, calc(100vh - 48px));
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: 0 24px 70px rgba(15, 23, 23, .28);
+      overflow: hidden;
+    }
+    .timeline-detail-modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-2);
+    }
+    .timeline-detail-modal-head h3 { margin: 0; font-size: 14px; }
     .timeline-detail .timeline-detail-empty {
       color: var(--muted);
       font-size: 12px;
@@ -7983,12 +9122,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     .timeline-jump .timeline-jump-attr {
       color: var(--muted);
-    }
-    @media (max-width: 1180px) {
-      .timeline-bottom {
-        grid-template-columns: minmax(0, 1fr);
-        grid-auto-rows: minmax(0, 1fr);
-      }
     }
     .timeline-controls {
       display: flex;
@@ -8147,7 +9280,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     .timeline-table {
       table-layout: fixed;
-      min-width: 1220px;
+      min-width: 920px;
       font-size: 12px;
     }
     .timeline-table th {
@@ -8167,7 +9300,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     .timeline-table th:nth-child(2),
     .timeline-table td:nth-child(2) {
-      width: 190px;
+      width: 220px;
     }
     .timeline-table th:nth-child(3),
     .timeline-table td:nth-child(3) {
@@ -8175,11 +9308,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     .timeline-table th:nth-child(4),
     .timeline-table td:nth-child(4) {
-      width: 190px;
+      width: 240px;
     }
     .timeline-table th:nth-child(5),
     .timeline-table td:nth-child(5) {
-      width: 110px;
+      width: 260px;
     }
     .timeline-badge {
       display: inline-flex;
@@ -8207,6 +9340,44 @@ const INDEX_HTML: &str = r###"<!doctype html>
       color: #4b5563;
       border-color: rgba(107, 114, 128, .35);
       background: #f3f4f6;
+    }
+    .timeline-badge.timeline-web {
+      color: #075985;
+      border-color: rgba(3, 105, 161, .32);
+      background: #f0f9ff;
+    }
+    .timeline-badge.timeline-transfer {
+      color: #7c2d12;
+      border-color: rgba(194, 65, 12, .30);
+      background: #fff7ed;
+    }
+    .timeline-badge.timeline-clipboard {
+      color: #6b21a8;
+      border-color: rgba(126, 34, 206, .30);
+      background: #faf5ff;
+    }
+    .timeline-badge.timeline-user {
+      color: #166534;
+      border-color: rgba(22, 101, 52, .30);
+      background: #f0fdf4;
+    }
+    .timeline-badge.timeline-system,
+    .timeline-badge.timeline-execution {
+      color: #1e3a8a;
+      border-color: rgba(30, 64, 175, .28);
+      background: #eff6ff;
+    }
+    .timeline-scope-chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border: 1px solid rgba(183, 121, 31, .35);
+      border-radius: 999px;
+      padding: 2px 8px;
+      color: #7a4b08;
+      background: #fffaf0;
+      font-size: 11px;
+      font-weight: 700;
     }
     .timeline-item-name {
       display: inline;
@@ -9540,7 +10711,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
               <div id="timelineTimestampNav" class="timeline-selection-nav"></div>
               <div class="timeline-bottom">
                 <div id="timelineTable" class="timeline-table-wrap"></div>
-                <aside id="timelineDetail" class="timeline-detail"></aside>
               </div>
             </div>
           </div>
@@ -9637,6 +10807,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
   </div>
 
   <div id="ctxMenu" class="ctx-menu" hidden></div>
+  <div id="timelineDetailOverlay" class="timeline-detail-overlay" hidden onclick="if (event.target === this) closeTimelineDetail()">
+    <section class="timeline-detail-modal" role="dialog" aria-modal="true" aria-labelledby="timelineDetailTitle">
+      <div class="timeline-detail-modal-head">
+        <h3 id="timelineDetailTitle">Timeline event details</h3>
+        <button type="button" class="ghost" onclick="closeTimelineDetail()">Close</button>
+      </div>
+      <aside id="timelineDetail" class="timeline-detail"></aside>
+    </section>
+  </div>
 
   <script>
     const BOOTSTRAP = __KDFT_BOOTSTRAP__;
@@ -9661,8 +10840,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     // Timeline event expansion happens in the browser and produces several
-    // events per entry. Keep one build bounded; examiners can use the date
-    // range to page through the complete case without freezing the tab.
+    // events per entry. Keep one build bounded; the backend filters the full
+    // requested date range and prioritizes parsed artifact records before
+    // bulk filesystem metadata so the cap cannot erase every activity class.
     function currentTimelineBuildLimit() {
       return 20000;
     }
@@ -9687,13 +10867,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
         find: { query: "", kind: "text", status: "", continuation: null, nextStart: null, active: false, lastMatch: null, matchLength: null }
       };
     }
+    // Case selection is deliberately session-explicit. Restoring an absolute
+    // path from browser storage made a normal launch look as though an old case
+    // belonged to the new session (and exposed machine-specific paths). Only a
+    // URL case_path or the process --case argument may open a case at startup.
+    localStorage.removeItem("kdft.casePath");
     const state = {
       casePath: PAGE_PARAMS.get("case_path")
-        || (BOOTSTRAP.defaultCasePinned
-          ? BOOTSTRAP.defaultCasePath
-          : (localStorage.getItem("kdft.casePath") || BOOTSTRAP.defaultCasePath)),
+        || (BOOTSTRAP.defaultCasePinned ? BOOTSTRAP.defaultCasePath : ""),
       loadedCasePath: null,
       refreshGeneration: 0,
+      caseLoading: null,
       data: null,
       searchResults: [],
       searchCursor: null,
@@ -9761,6 +10945,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       } : null
     };
     const $ = (id) => document.getElementById(id);
+    let noticeGeneration = 0;
     let hexSelecting = false;
     let hexSelectionAnchor = null;
     let hexPointerId = null;
@@ -9785,6 +10970,55 @@ const INDEX_HTML: &str = r###"<!doctype html>
       });
       liveVolumeRequests.set(requestKey, request);
       return request;
+    }
+
+    async function ensureLiveForensicCatalog(liveState, volumeIndex) {
+      const volume = (liveState.volumes || []).find((item) => Number(item.index) === Number(volumeIndex));
+      const evidence = state.data && state.data.evidence.find((item) => Number(item.id) === Number(liveState.evidenceId));
+      if (!volume || !evidence || evidence.source_kind !== "image" || volume.filesystem !== "NTFS") {
+        return false;
+      }
+      liveState.forensicReady = liveState.forensicReady || new Set();
+      liveState.forensicSummary = liveState.forensicSummary || {};
+      if (liveState.forensicReady.has(Number(volumeIndex))) {
+        return true;
+      }
+
+      const status = await apiGet("/api/image/forensic/status", {
+        case_path: currentCasePath(),
+        evidence_id: liveState.evidenceId,
+        volume: volumeIndex
+      });
+      let finalStatus = status;
+      if (!status.cached) {
+        const progressId = newJobProgressId();
+        const build = async () => apiPost("/api/image/forensic/build", {
+          case_path: currentCasePath(),
+          evidence_id: liveState.evidenceId,
+          volume: Number(volumeIndex),
+          progress_id: progressId
+        });
+        let result;
+        if (state.analyzing) {
+          // Attach-only auto-browse may still be inside its protected overlay.
+          // Reuse that visible barrier instead of nesting another operation.
+          result = await build();
+        } else {
+          result = await runAnalyze(evidence.display_name, build, {
+            mode: "forensic-browse",
+            title: "Reconstructing filesystem for ",
+            note: "Reading NTFS metadata to expose allocated, deleted, and orphan records in memory. This does not index the case or run artifact processors.",
+            progressId
+          });
+        }
+        finalStatus = result && result.status ? result.status : status;
+      }
+      if (state.live !== liveState) {
+        return false;
+      }
+      liveState.forensicReady.add(Number(volumeIndex));
+      liveState.forensicSummary[Number(volumeIndex)] = finalStatus;
+      return true;
     }
 
     function newCategoryCache(evidenceId = null, key = "") {
@@ -10166,9 +11400,68 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function setNotice(message, bad) {
       const notice = $("notice");
       if (notice) {
-        notice.textContent = message;
+        const text = String(message || "");
+        const generation = ++noticeGeneration;
+        notice.classList.remove("is-fading");
+        notice.hidden = !text;
+        notice.textContent = text;
         notice.classList.toggle("bad", Boolean(bad));
+        // Successful operational feedback should not permanently consume the
+        // sidebar. Errors stay until the next action so they are not missed.
+        if (text && !bad) {
+          window.setTimeout(() => {
+            if (generation !== noticeGeneration) return;
+            notice.classList.add("is-fading");
+            window.setTimeout(() => {
+              if (generation === noticeGeneration) notice.hidden = true;
+            }, 400);
+          }, 6000);
+        }
       }
+    }
+
+    function renderCaseLoadingOverlay() {
+      let overlay = $("caseLoadingOverlay");
+      const loading = state.caseLoading;
+      if (!loading) {
+        if (overlay) overlay.remove();
+        document.body.removeAttribute("aria-busy");
+        return;
+      }
+      if (!overlay) {
+        overlay = document.createElement("div");
+        overlay.id = "caseLoadingOverlay";
+        overlay.className = "analyzing-overlay";
+        overlay.style.zIndex = "9998";
+        document.body.appendChild(overlay);
+      }
+      const seconds = Math.max(0, Math.floor((Date.now() - loading.startedAt) / 1000));
+      const name = String(loading.casePath || "case").split(/[\\/]/).pop() || "case";
+      overlay.innerHTML = `<div class="analyzing-card" role="status" aria-live="polite" aria-busy="true">
+        <div class="analyzing-title">Opening ${escapeHtml(name)}…</div>
+        <div class="analyzing-bar"><div class="analyzing-bar-fill"></div></div>
+        <div class="analyzing-note">Reading the case database and preparing the evidence views. Controls are paused to prevent duplicate requests. Elapsed: ${seconds}s</div>
+      </div>`;
+      document.body.setAttribute("aria-busy", "true");
+    }
+
+    function beginCaseLoading(casePath, generation) {
+      if (state.caseLoading && state.caseLoading.timerId) {
+        window.clearInterval(state.caseLoading.timerId);
+      }
+      const loading = { casePath, generation, startedAt: Date.now(), timerId: null };
+      state.caseLoading = loading;
+      loading.timerId = window.setInterval(() => {
+        if (state.caseLoading === loading) renderCaseLoadingOverlay();
+      }, 1000);
+      renderCaseLoadingOverlay();
+    }
+
+    function endCaseLoading(generation) {
+      if (!state.caseLoading || state.caseLoading.generation !== generation) return;
+      if (state.caseLoading.timerId) window.clearInterval(state.caseLoading.timerId);
+      state.caseLoading = null;
+      renderCaseLoadingOverlay();
     }
 
     async function refreshLocalUiAuthentication() {
@@ -10260,7 +11553,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const value = normalizePathInput($("casePath").value);
       $("casePath").value = value;
       state.casePath = value;
-      localStorage.setItem("kdft.casePath", value);
       return value;
     }
 
@@ -10519,9 +11811,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const generation = ++state.refreshGeneration;
       const casePath = currentCasePath();
       if (!casePath) {
-        setNotice("Case path is empty.", true);
+        renderEmptyState();
+        if (!ANALYSIS_MODE) {
+          caseOpenSetupView();
+        }
+        setNotice("Create a new case or choose an existing case database.");
         return false;
       }
+      beginCaseLoading(casePath, generation);
       clearLoadedCaseForRefresh(casePath);
       try {
         const nextData = await apiGet("/api/state", { case_path: casePath });
@@ -10587,6 +11884,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         }
         setNotice(err.message, true);
         return false;
+      } finally {
+        endCaseLoading(generation);
       }
     }
 
@@ -10629,7 +11928,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
         }
         $("casePath").value = target;
         state.casePath = target;
-        localStorage.setItem("kdft.casePath", target);
         clearLoadedCaseForRefresh(target);
         const data = await apiPost("/api/case/create", {
           case_path: target,
@@ -10660,7 +11958,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       $("casePath").value = target;
       state.casePath = target;
-      localStorage.setItem("kdft.casePath", target);
       const loaded = await refresh();
       if (loaded && state.loadedCasePath === target) {
         switchView("dashboardView");
@@ -10860,7 +12157,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         : "unknown";
     }
 
-    function progressTelemetryHtml(progress, receivedAt) {
+    function progressTelemetryHtml(progress, receivedAt, operationId, cancelPending) {
       const activeAge = progress.state === "active" ? Math.max(0, Date.now() - Number(receivedAt || Date.now())) : 0;
       const elapsedMs = Number(progress.elapsed_ms || 0) + activeAge;
       const stageElapsedMs = Number(progress.stage_elapsed_ms || 0) + activeAge;
@@ -10914,6 +12211,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
           + progress.completed_stages.map((stage) => escapeHtml(stage.name) + " " + escapeHtml(formatJobDuration(stage.elapsed_ms))).join(" · ")
           + '</div>'
         : "";
+      const cancelSlot = progress.state === "active" && operationId
+        ? '<div class="analyzing-actions" id="analyzingCancelSlot"></div>'
+        : "";
       return '<div class="analyzing-card telemetry" role="alertdialog" aria-busy="' + (progress.state === "active" ? "true" : "false") + '">' +
         '<div class="analyzing-heading-row"><div class="analyzing-title">' + escapeHtml(progress.stage_name || "Processing") +
           '<div class="analyzing-note">' + escapeHtml(stagePosition) + ' · stage elapsed ' + escapeHtml(formatJobDuration(stageElapsedMs)) + '</div></div>' +
@@ -10925,7 +12225,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           '<div class="progress-metric"><span class="progress-metric-label">Recent rate</span><span class="progress-metric-value">' + rateText + '</span></div>' +
           etaMetric +
           '<div class="progress-metric"><span class="progress-metric-label">Skipped / errors</span><span class="progress-metric-value">' + Number(progress.skipped_count || 0).toLocaleString() + ' / ' + Number(progress.error_count || 0).toLocaleString() + '</span></div>' +
-        '</div><div class="progress-context">' + volume + current + recent + truncationDetails + diagnosticPath + '</div>' + stageTimes + '</div>';
+        '</div><div class="progress-context">' + volume + current + recent + truncationDetails + diagnosticPath + '</div>' + stageTimes + cancelSlot + '</div>';
     }
 
     function renderAnalyzingOverlay() {
@@ -10940,40 +12240,61 @@ const INDEX_HTML: &str = r###"<!doctype html>
         el.className = "analyzing-overlay";
         document.body.appendChild(el);
       }
+      // Preserve the existing Cancel button node across innerHTML replacements.
+      // Telemetry refreshes every poll, so recreating the button each time made
+      // it detached/stale before an automation or user click could land.
+      const existingButton = el.querySelector("#analyzingCancelSlot button");
       const secs = Math.max(0, Math.floor((Date.now() - state.analyzing.startedAt) / 1000));
       const mins = Math.floor(secs / 60);
       const elapsed = mins > 0 ? mins + "m " + (secs % 60) + "s" : secs + "s";
       if (state.analyzing.telemetry) {
-        el.innerHTML = progressTelemetryHtml(state.analyzing.telemetry, state.analyzing.telemetryReceivedAt);
-        return;
-      }
-      const asciiFrames = [
-        "  /\\_/\\   🔎\\n ( o.o )  [·  ]\\n  > ^ <   indexing",
-        "  /\\_/\\    🔎\\n ( o.o )  [·· ]\\n  > ^ <   indexing",
-        "  /\\_/\\     🔎\\n ( -.- )  [···]\\n  > ^ <   indexing",
-        "  /\\_/\\    🔎\\n ( o.o )  [ ··]\\n  > ^ <   indexing"
-      ];
-      const reducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-      const asciiFrame = asciiFrames[reducedMotion ? 0 : (secs % asciiFrames.length)];
-      el.innerHTML =
-        '<div class="analyzing-card" role="alertdialog" aria-busy="true">' +
-          '<div class="analyzing-title">Analyzing ' + escapeHtml(state.analyzing.name) + '…</div>' +
-          '<pre class="analyzing-ascii" aria-hidden="true">' + escapeHtml(asciiFrame) + '</pre>' +
-          '<div class="analyzing-bar"><div class="analyzing-bar-fill"></div></div>' +
-          '<div class="analyzing-note">Reading and indexing the whole disk. This can take a while on a large image - ' +
-          'please wait and do not click Analyze again or open other views until it finishes. Elapsed: ' + escapeHtml(elapsed) + '</div>' +
-        '</div>';
-      if (state.analyzing.mode === "attach") {
-        const attachingFrames = [
-          "  /\\_/\\    .--.\n ( o.o )  [E01]--\n  > ^ <   gathering",
-          "  /\\_/\\      .--.\n ( o.o )  [E01][E02]--\n  > ^ <   gathering",
-          "  /\\_/\\        .--.\n ( -.- )  [E01][E02][...]\n  > ^ <   gathering",
-          "  /\\_/\\      .--.\n ( o.o )  [E01][E02]--\n  > ^ <   gathering"
+        el.innerHTML = progressTelemetryHtml(state.analyzing.telemetry, state.analyzing.telemetryReceivedAt, state.analyzing.progressId, state.analyzing.cancelPending);
+      } else {
+        const asciiFrames = [
+          "  /\\_/\\   🔎\\n ( o.o )  [·  ]\\n  > ^ <   indexing",
+          "  /\\_/\\    🔎\\n ( o.o )  [·· ]\\n  > ^ <   indexing",
+          "  /\\_/\\     🔎\\n ( -.- )  [···]\\n  > ^ <   indexing",
+          "  /\\_/\\    🔎\\n ( o.o )  [ ··]\\n  > ^ <   indexing"
         ];
         const reducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-        el.querySelector(".analyzing-title").textContent = state.analyzing.title + state.analyzing.name + "…";
-        el.querySelector(".analyzing-ascii").textContent = attachingFrames[reducedMotion ? 0 : (secs % attachingFrames.length)];
-        el.querySelector(".analyzing-note").textContent = state.analyzing.note + " Elapsed: " + elapsed;
+        const asciiFrame = asciiFrames[reducedMotion ? 0 : (secs % asciiFrames.length)];
+        const initialCancelSlot = state.analyzing.progressId
+          ? '<div class="analyzing-actions" id="analyzingCancelSlot"></div>'
+          : "";
+        el.innerHTML =
+          '<div class="analyzing-card" role="alertdialog" aria-busy="true">' +
+            '<div class="analyzing-title">' + escapeHtml(state.analyzing.title + state.analyzing.name) + '…</div>' +
+            '<pre class="analyzing-ascii" aria-hidden="true">' + escapeHtml(asciiFrame) + '</pre>' +
+            '<div class="analyzing-bar"><div class="analyzing-bar-fill"></div></div>' +
+            '<div class="analyzing-note">' + escapeHtml(state.analyzing.note + ' Elapsed: ' + elapsed) + '</div>' +
+            initialCancelSlot +
+          '</div>';
+        if (state.analyzing.mode === "attach") {
+          const attachingFrames = [
+            "  /\\_/\\    .--.\n ( o.o )  [E01]--\n  > ^ <   gathering",
+            "  /\\_/\\      .--.\n ( o.o )  [E01][E02]--\n  > ^ <   gathering",
+            "  /\\_/\\        .--.\n ( -.- )  [E01][E02][...]\n  > ^ <   gathering",
+            "  /\\_/\\      .--.\n ( o.o )  [E01][E02]--\n  > ^ <   gathering"
+          ];
+          const reducedMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+          el.querySelector(".analyzing-title").textContent = state.analyzing.title + state.analyzing.name + "…";
+          el.querySelector(".analyzing-ascii").textContent = attachingFrames[reducedMotion ? 0 : (secs % attachingFrames.length)];
+          el.querySelector(".analyzing-note").textContent = state.analyzing.note + " Elapsed: " + elapsed;
+        } else if (state.analyzing.mode === "forensic-browse") {
+          el.querySelector(".analyzing-ascii").textContent = asciiFrame.replaceAll("indexing", "reconstructing");
+        }
+      }
+      const slot = el.querySelector("#analyzingCancelSlot");
+      if (slot && state.analyzing.progressId) {
+        let btn = existingButton;
+        if (!btn) {
+          btn = document.createElement("button");
+          btn.className = "ghost";
+          btn.onclick = cancelAnalyzingProgress;
+        }
+        btn.disabled = state.analyzing.cancelPending;
+        btn.textContent = state.analyzing.cancelPending ? "Cancelling…" : "Cancel";
+        slot.replaceChildren(btn);
       }
     }
 
@@ -10998,6 +12319,34 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
+    async function cancelAnalyzingProgress() {
+      const analyzing = state.analyzing;
+      if (!analyzing || !analyzing.progressId || analyzing.cancelPending) {
+        return;
+      }
+      analyzing.cancelPending = true;
+      renderAnalyzingOverlay();
+      let accepted = false;
+      try {
+        const result = await apiPost("/api/jobs/cancel", { progress_id: analyzing.progressId });
+        if (result && result.accepted) {
+          accepted = true;
+          setNotice("Cancellation requested. The current operation will stop at the next safe boundary.");
+        } else {
+          setNotice("The operation is no longer active or could not be cancelled.", true);
+        }
+      } catch (err) {
+        setNotice("Could not request cancellation: " + (err.message || String(err)), true);
+      } finally {
+        if (state.analyzing === analyzing) {
+          // Keep an accepted request disabled until runAnalyze receives the
+          // terminal response. Only a rejected/failed request is retryable.
+          analyzing.cancelPending = accepted;
+          renderAnalyzingOverlay();
+        }
+      }
+    }
+
     async function runAnalyze(name, worker, options = {}) {
       if (state.analyzing) {
         setNotice("A protected evidence operation is already running - wait for it to finish before starting another.", true);
@@ -11013,6 +12362,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         progressTimer: null,
         progressId: options.progressId || null,
         pollPending: false,
+        cancelPending: false,
         telemetry: null,
         telemetryReceivedAt: null
       };
@@ -14706,6 +16056,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const evidenceId = liveState.evidenceId;
       liveState.dirPaging = liveState.dirPaging || {};
       if (!liveState.dirCache[key]) {
+        await ensureLiveForensicCatalog(liveState, volume);
+        if (state.live !== liveState || state.live.evidenceId !== evidenceId) {
+          return null;
+        }
         const data = await apiGet("/api/image/dir", {
           case_path: currentCasePath(),
           evidence_id: evidenceId,
@@ -14722,6 +16076,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
           totalEntries: Number(data.total_entries || (data.entries || []).length),
           loading: false
         };
+        if (data.forensic_reconstruction) {
+          liveState.forensicSummary = liveState.forensicSummary || {};
+          liveState.forensicSummary[Number(volume)] = {
+            ...(liveState.forensicSummary[Number(volume)] || {}),
+            cached: true,
+            orphan_count: Number(data.orphan_count || 0),
+            diagnostic_count: Number(data.diagnostic_count || 0)
+          };
+        }
       }
       return liveState.dirCache[key];
     }
@@ -14737,15 +16100,20 @@ const INDEX_HTML: &str = r###"<!doctype html>
       paging.loading = true;
       try {
         const cursor = paging.nextCursor;
-        const data = await apiGet("/api/image/dir", {
+        const request = {
           case_path: currentCasePath(),
           evidence_id: liveState.evidenceId,
           volume: volume,
           path: path,
-          limit: 1000,
-          after_name: cursor.name,
-          after_is_dir: Boolean(cursor.is_dir)
-        });
+          limit: 1000
+        };
+        if (cursor.offset !== null && cursor.offset !== undefined) {
+          request.offset = Number(cursor.offset);
+        } else {
+          request.after_name = cursor.name;
+          request.after_is_dir = Boolean(cursor.is_dir);
+        }
+        const data = await apiGet("/api/image/dir", request);
         if (state.live !== liveState) {
           return;
         }
@@ -14805,7 +16173,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       state.live.selKey = liveKey(volume, path);
       state.live.expanded.add(state.live.selKey);
+      state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
       renderLiveBrowse();
+      renderHexViewer();
       if (recordNavigation) {
         commitAnalyzeNavigation(previous);
       } else {
@@ -14819,7 +16189,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     async function openLiveFile(volume, path, name) {
       state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
-      state.hex.live = { evidenceId: state.live.evidenceId, volume: volume, path: path, name: name };
+      state.hex.live = {
+        evidenceId: state.live.evidenceId,
+        volume: volume,
+        path: path,
+        name: name,
+        entry: liveEntryByPath(volume, path)
+      };
       // Pictures open straight into Details so the inspector shows the image;
       // everything else keeps the hex-first flow.
       const image = isImageEntry(currentHexEntry());
@@ -14897,11 +16273,21 @@ const INDEX_HTML: &str = r###"<!doctype html>
         modified_utc: entry.modified_utc,
         accessed_utc: entry.accessed_utc,
         ntfs_file_record_number: entry.ntfs_file_record_number,
+        ntfs_sequence_number: entry.ntfs_sequence_number,
+        ntfs_parent_record_number: entry.ntfs_parent_record_number,
         mft_record_logical_offset: entry.mft_record_logical_offset,
         mft_record_physical_offset: entry.mft_record_physical_offset,
         file_data_logical_offset: entry.file_data_logical_offset,
         file_data_physical_offset: entry.file_data_physical_offset,
-        ntfs_mft_record_modification_time_utc: entry.ntfs_mft_record_modification_time_utc,
+        file_data_file_offset: entry.file_data_file_offset,
+        file_data_contiguous_bytes: entry.file_data_contiguous_bytes,
+        physical_offset_basis: entry.physical_offset_basis,
+        file_data_direct_logical_mapping: entry.file_data_direct_logical_mapping,
+        offset_coordinate_system: entry.offset_coordinate_system,
+        recovery_source: entry.provenance,
+        reconstruction_status: entry.reconstruction_status,
+        recovery_status: entry.recovery_status,
+        ntfs_mft_record_modification_time_utc: entry.mft_record_modification_time_utc || entry.ntfs_mft_record_modification_time_utc,
         symlink: Boolean(entry.symlink)
       };
       return {
@@ -14922,12 +16308,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
         modified_utc: entry.modified_utc,
         accessed_utc: entry.accessed_utc,
         ntfs_file_record_number: entry.ntfs_file_record_number,
+        ntfs_sequence_number: entry.ntfs_sequence_number,
+        ntfs_parent_record_number: entry.ntfs_parent_record_number,
         mft_record_logical_offset: entry.mft_record_logical_offset,
         mft_record_physical_offset: entry.mft_record_physical_offset,
         file_data_logical_offset: entry.file_data_logical_offset,
         file_data_physical_offset: entry.file_data_physical_offset,
-        ntfs_mft_record_modification_time_utc: entry.ntfs_mft_record_modification_time_utc,
-        is_deleted: false,
+        file_data_file_offset: entry.file_data_file_offset,
+        file_data_contiguous_bytes: entry.file_data_contiguous_bytes,
+        physical_offset_basis: entry.physical_offset_basis,
+        file_data_direct_logical_mapping: entry.file_data_direct_logical_mapping,
+        offset_coordinate_system: entry.offset_coordinate_system,
+        recovery_source: entry.provenance,
+        reconstruction_status: entry.reconstruction_status,
+        recovery_status: entry.recovery_status,
+        ntfs_mft_record_modification_time_utc: entry.mft_record_modification_time_utc || entry.ntfs_mft_record_modification_time_utc,
+        is_deleted: Boolean(entry.is_deleted),
         symlink: Boolean(entry.symlink),
         file_extension: isDir ? "" : fileExtension(name || path),
         metadata
@@ -15582,14 +16978,49 @@ const INDEX_HTML: &str = r###"<!doctype html>
         { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
         { key: "name", label: "Name", sortable: true, filterable: true, sortType: "text" },
         { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
+        { key: "status", label: "Status", sortable: true, filterable: true, sortType: "text" },
         { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
         { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" }
       ];
     }
 
+    function directoryNavigationRow(name, targetPath, onOpen, columnCount) {
+      const label = name === "." ? "Current folder" : "Parent folder";
+      const trailingCells = Array.from({ length: Math.max(0, columnCount - 3) }, () => "<td></td>").join("");
+      return `<tr class="entry-row directory-nav-row" style="cursor:pointer" onclick="${onOpen}" title="${escapeAttr(label + ": " + displayPath(targetPath))}">
+          <td></td>
+          <td><span class="entry-name">${escapeHtml(name)}</span></td>
+          <td class="entry-kind">Folder</td>
+          ${trailingCells}
+        </tr>`;
+    }
+
+    function liveDirectoryNavigationRows(volume, path) {
+      const current = normalizeLogicalPath(path || "/");
+      const parent = parentLogicalPath(current);
+      return directoryNavigationRow(
+        ".",
+        current,
+        `liveSelectDir(${volume}, '${escapeAttr(escapeJs(current))}')`,
+        liveGridColumns().length
+      ) + directoryNavigationRow(
+        "..",
+        parent,
+        `liveSelectDir(${volume}, '${escapeAttr(escapeJs(parent))}')`,
+        liveGridColumns().length
+      );
+    }
+
     function liveGridRow(entry, selVolume, selPath, viewedPath) {
       const childPath = liveChildPath(selPath, entry.name);
       const type = entry.symlink ? "Symlink" : (entry.is_dir ? "Folder" : "File");
+      const status = !entry.provenance
+        ? ""
+        : (entry.provenance === "synthetic_recovery"
+          ? "Recovery view"
+          : (entry.is_deleted
+            ? (entry.provenance === "deleted_reconstructed" ? "Deleted · path reconstructed" : "Deleted · orphan")
+            : (entry.provenance === "allocated_orphan" ? "Allocated · orphan path" : "Allocated")));
       const size = entry.size_bytes == null ? "" : formatBytes(entry.size_bytes);
       const modified = entry.modified_utc || entry.created_utc || "";
       return {
@@ -15606,6 +17037,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         values: {
           name: entry.name,
           type,
+          status,
           size,
           modified
         },
@@ -15623,10 +17055,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const isChecked = state.live.selected.has(row.key);
       const rowClasses = "entry-row" + (isChecked ? " multi-selected" : "") + (row.viewed ? " selected" : "");
       const rowArgs = `event, ${row.item.volume}, '${escChild}', '${escName}', ${entry.is_dir}, ${entry.symlink ? "true" : "false"}`;
+      const recoveryFlag = entry.is_deleted
+        ? '<span class="pill bad">deleted</span>'
+        : (entry.provenance === "allocated_orphan" ? '<span class="pill warn">orphan path</span>' : '');
       return `<tr class="${rowClasses}" onclick="handleLiveRowClick(${rowArgs})" oncontextmenu="showLiveContextMenu(${rowArgs})">
           <td><input type="checkbox"${isChecked ? " checked" : ""} onclick="event.stopPropagation(); toggleLiveSelection(${row.item.volume}, '${escChild}', '${escName}', ${entry.is_dir}, this.checked, event)"></td>
-          <td><span class="entry-name">${escapeHtml(entry.name)}</span></td>
+          <td><span class="entry-name">${escapeHtml(entry.name)}</span>${recoveryFlag}</td>
           <td class="entry-kind">${escapeHtml(row.values.type)}</td>
+          <td class="entry-flags">${escapeHtml(row.values.status)}</td>
           <td class="entry-size">${row.values.size}</td>
           <td class="entry-time">${escapeHtml(row.values.modified)}</td>
         </tr>`;
@@ -15723,11 +17159,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       const viewedPath = state.hex.live && state.hex.live.volume === selVolume ? state.hex.live.path : null;
       const columns = liveGridColumns();
-      const tableResult = sortableGridTable("live", columns, entries.map((entry) => liveGridRow(entry, selVolume, selPath, viewedPath)), "live-table", renderLiveGridRow);
+      const tableResult = sortableGridTable(
+        "live",
+        columns,
+        entries.map((entry) => liveGridRow(entry, selVolume, selPath, viewedPath)),
+        "live-table",
+        renderLiveGridRow,
+        liveDirectoryNavigationRows(selVolume, selPath)
+      );
       setCurrentLiveGrid("live", tableResult.visibleRows.map((row) => row.item));
       renderSelectionCount();
       const caveat = evidence && evidence.source_kind === "folder"
         ? `<div class="analysis-status">Direct browse reads the current disk state (not a preserved snapshot).</div>`
+        : "";
+      const forensicSummary = state.live.forensicSummary && state.live.forensicSummary[Number(selVolume)];
+      const reconstruction = forensicSummary && forensicSummary.cached
+        ? `<div class="analysis-status">Transient NTFS reconstruction (no case index): ${Number(forensicSummary.allocated_count || 0).toLocaleString()} allocated record${Number(forensicSummary.allocated_count || 0) === 1 ? "" : "s"}, ${Number(forensicSummary.deleted_reconstructed_count || 0).toLocaleString()} deleted path${Number(forensicSummary.deleted_reconstructed_count || 0) === 1 ? "" : "s"} reconstructed, ${Number(forensicSummary.orphan_count || 0).toLocaleString()} unresolved/orphan record${Number(forensicSummary.orphan_count || 0) === 1 ? "" : "s"}. Open <strong>$OrphanFiles</strong> for records whose original path cannot be claimed.</div>`
         : "";
       const guidanceRemainingMs = Math.max(0, Number(state.liveGuidanceExpiresAt || 0) - Date.now());
       const guidanceStyle = `style="--guidance-duration:${guidanceRemainingMs}ms"`;
@@ -15737,7 +17184,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const liveHint = guidanceRemainingMs > 0
         ? `<div class="analysis-status transient-guidance" role="status" ${guidanceStyle}>Browse: click a file for hex/text, right-click a row for bookmark/export (folders can bookmark or export recursively), Ctrl/Shift-click or checkboxes to multi-select.</div>`
         : "";
-      const hint = caveat + imageLayout + liveHint;
+      const hint = caveat + reconstruction + imageLayout + liveHint;
       const filterStatus = gridFilterStatusHtml("live", columns, tableResult.visibleRows.length, entries.length, "items");
       const pageStatus = paging && paging.nextCursor
         ? `<div class="analysis-status">Loaded ${entries.length.toLocaleString()} of ${paging.totalEntries.toLocaleString()} items. <button class="ghost" onclick="liveLoadMore(${selVolume}, '${escapeAttr(escapeJs(selPath))}')"${paging.loading ? " disabled" : ""}>Load more</button></div>`
@@ -15751,9 +17198,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const galleryToggle = allPictures
           ? `<div class="thumb-toolbar"><button class="ghost" onclick="setPictureViewMode('grid')">Gallery view</button></div>`
           : "";
-        $("entryTable").innerHTML = entries.length
-          ? hint + pageStatus + galleryToggle + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No items match the column filters."))
-          : empty("This folder is empty.");
+        $("entryTable").innerHTML = hint + pageStatus + galleryToggle + filterStatus + tableResult.html
+          + (entries.length && !tableResult.visibleRows.length ? empty("No items match the column filters.") : "");
       }
     }
 
@@ -16051,7 +17497,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.browserState.treeMode = "filesystem";
       state.browserState.selectedPath = normalizeLogicalPath(path || "/");
       state.idx.expanded.add(path);
+      state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
       renderIndexedBrowse();
+      renderHexViewer();
       if (recordNavigation) {
         commitAnalyzeNavigation(previous);
       } else {
@@ -16192,6 +17640,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
         </tr>`;
     }
 
+    function indexedDirectoryNavigationRows(path) {
+      const current = normalizeLogicalPath(path || "/");
+      const parent = parentLogicalPath(current);
+      return directoryNavigationRow(
+        ".",
+        current,
+        `idxSelectDir('${escapeAttr(escapeJs(current))}')`,
+        indexedGridColumns().length
+      ) + directoryNavigationRow(
+        "..",
+        parent,
+        `idxSelectDir('${escapeAttr(escapeJs(parent))}')`,
+        indexedGridColumns().length
+      );
+    }
+
     function visibleIndexedGridRows(children) {
       return visibleGridRows("indexed", indexedGridColumns(), children.map(indexedGridRow));
     }
@@ -16254,7 +17718,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       $("folderTitle").textContent = displayPath(selPath);
       const columns = indexedGridColumns();
       const gridRows = children.map(indexedGridRow);
-      const tableResult = sortableGridTable("indexed", columns, gridRows, "idx-table", renderIndexedGridRow);
+      const tableResult = sortableGridTable(
+        "indexed",
+        columns,
+        gridRows,
+        "idx-table",
+        renderIndexedGridRow,
+        indexedDirectoryNavigationRows(selPath)
+      );
       setCurrentEntryGrid("indexed", tableResult.visibleRows.filter((row) => row.selectable).map((row) => row.entry).filter(Boolean));
       const banner = `<div class="analysis-status">Large case (${(state.data.entry_count || 0).toLocaleString()} entries): browsing the full index folder by folder. Open folders on the left; use Deep Search to find files by name or content.</div>`;
       const paging = state.idx.dirPaging && state.idx.dirPaging[selPath];
@@ -16262,9 +17733,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         ? `<div class="analysis-status">Showing ${children.length.toLocaleString()} of ${paging.totalChildren.toLocaleString()} direct children. <button class="ghost tiny" onclick="idxLoadMore('${escapeAttr(escapeJs(selPath))}')">Load next 1,000</button></div>`
         : "";
       const filterStatus = gridFilterStatusHtml("indexed", columns, tableResult.visibleRows.length, children.length, "items");
-      $("entryTable").innerHTML = banner + pageControl + (children.length
-        ? filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No indexed items match the column filters."))
-        : empty("This folder has no direct children."));
+      $("entryTable").innerHTML = banner + pageControl + filterStatus + tableResult.html
+        + (children.length && !tableResult.visibleRows.length ? empty("No indexed items match the column filters.") : "");
       renderSelectionCount();
     }
 
@@ -16675,6 +18145,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const total = Number(cache.total || 0);
       const categoryTotal = Number(cache.categoryTotal ?? total);
       const filtersActive = gridColumnFiltersActive("category", categoryGridColumns()) || dateFilterActive();
+      if (!filtersActive && !cache.loading && !cache.nextCursor && rows.length >= total) {
+        return "";
+      }
       const matchNote = filtersActive && categoryTotal !== total
         ? ` matches from ${categoryTotal.toLocaleString()} category entries`
         : "";
@@ -16954,7 +18427,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function renderCategoryRows(rows, prefixHtml = "", suffixHtml = "") {
       const columns = categoryGridColumns();
       const tableResult = sortableGridTable("category", columns, rows.map(categoryGridRow), "category-table", renderCategoryGridRow);
-      const gridToggle = rows.length > 0 && rows.every((entry) => isImageEntry(entry))
+      const gridToggle = rows.length > 0 && (selectedCategoryUsesPictureGallery() || rows.every((entry) => isImageEntry(entry)))
         ? `<div class="thumb-toolbar"><button class="ghost" onclick="setPictureViewMode('grid')">Gallery view</button></div>`
         : "";
       setCurrentEntryGrid("category", tableResult.visibleRows.map((row) => row.entry));
@@ -17039,14 +18512,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return false;
       }
       const name = (entry.name || entry.logical_path || "").toLowerCase();
-      return [".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico"]
+      return [".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".gif", ".bmp", ".webp", ".ico", ".tif", ".tiff", ".heic", ".avif", ".svg"]
         .some((ext) => name.endsWith(ext));
+    }
+
+    function selectedCategoryUsesPictureGallery() {
+      const selected = splitCategoryKey(state.browserState.selectedCategory || "");
+      return selected.main === "Pictures and Media" && selected.sub === "Pictures";
     }
 
     function shouldRenderThumbnailCategory(rows) {
       return state.pictureViewMode !== "list"
         && rows.length > 0
-        && rows.every((entry) => isImageEntry(entry));
+        && (selectedCategoryUsesPictureGallery() || rows.every((entry) => isImageEntry(entry)));
     }
 
     function setPictureViewMode(mode) {
@@ -18104,6 +19582,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     const TIMELINE_DAY_MS = 24 * TIMELINE_HOUR_MS;
     const TIMELINE_TABLE_RENDER_LIMIT = 2000;
     const TIMELINE_METADATA_TIME_FIELDS = [
+      { key: "artifact_time_utc", label: "Artifact Date/Time" },
       { key: "email_date", label: "Email Date/Time" },
       { key: "visit_time_utc", label: "Visit Date/Time" },
       { key: "last_visit_time_utc", label: "Last Visit Date/Time" },
@@ -18251,7 +19730,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.timeline.casePath = state.casePath;
       state.timeline.sourceEntries = entries.length;
       state.timeline.loadedEntryCount = entries.length;
-      state.timeline.totalEntryCount = Number(state.data.entry_count || entries.length);
+      if (!Number(state.timeline.totalEntryCount || 0)) {
+        state.timeline.totalEntryCount = Number(state.data.entry_count || entries.length);
+      }
       state.timeline.events = collectTimelineEvents(entries);
     }
 
@@ -18307,16 +19788,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
         state.timeline.built = true;
         state.timeline.entries = (data.entries || []).map((entry) => ({ ...entry, logical_path: normalizeLogicalPath(entry.logical_path) }));
         state.timeline.truncated = Boolean(data.truncated);
+        const matchedTotal = Number(data.entry_count || total);
+        state.timeline.totalEntryCount = matchedTotal;
         rebuildTimelineEvents();
         renderTimeline();
-        const matchedTotal = Number(data.entry_count || total);
         const scopeNote = rangeActive
-          ? " (" + matchedTotal.toLocaleString() + " indexed entries fell in the selected date range)"
+          ? " (" + matchedTotal.toLocaleString() + " timeline-capable records matched the selected date range)"
           : "";
         const truncatedNote = state.timeline.truncated
           ? " Scan was truncated - narrow the date range for full coverage."
           : "";
-        setNotice("Built timeline with " + state.timeline.events.length.toLocaleString() + " timestamped event" + (state.timeline.events.length === 1 ? "" : "s") + "." + scopeNote + truncatedNote, state.timeline.truncated);
+        setNotice("Built timeline with " + state.timeline.events.length.toLocaleString() + " timestamped event" + (state.timeline.events.length === 1 ? "" : "s") + "." + scopeNote + truncatedNote);
       } catch (err) {
         state.timeline.prompted = true;
         setNotice(err.message, true);
@@ -18733,9 +20215,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return [
         { key: "time", label: "Date/time", sortable: true, filterable: true, sortType: "time" },
         { key: "attribute", label: "Date/time attribute", sortable: true, filterable: true, sortType: "text" },
-        { key: "timelineCategory", label: "Timeline category", sortable: true, filterable: true, sortType: "text" },
-        { key: "category", label: "Category", sortable: true, filterable: true, sortType: "text" },
-        { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
+        { key: "timelineCategory", label: "Event class", sortable: true, filterable: true, sortType: "text" },
         { key: "item", label: "Item", sortable: true, filterable: true, sortType: "text" },
         { key: "itemValue", label: "Item value", sortable: true, filterable: true, sortType: "text" }
       ];
@@ -18745,16 +20225,66 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const entry = event.entry;
       const metadata = entry.metadata_json || {};
       const category = entryCategory(entry);
-      const text = String(event.attribute || "").toLowerCase();
+      const kind = String(metadata.artifact_kind || "").toLowerCase();
+      const intentText = compactParts([
+        metadata.action,
+        metadata.event_name,
+        metadata.activity
+      ]).toLowerCase();
+      const text = compactParts([
+        event.attribute,
+        intentText,
+        metadata.reason,
+        metadata.description
+      ]).toLowerCase();
       if (isEmailEntry(entry) || category.main === "Email and Communications") {
         return { label: "User communication", tone: "communication" };
       }
-      if (/access|visit|last used|opened|started|download/.test(text)
-        || metadata.artifact_kind === "browser_history_visit"
-        || metadata.artifact_kind === "browser_download") {
+      // Browser records express observed application artifacts. A raw NTFS
+      // Accessed timestamp alone must never be promoted to "opened".
+      if (kind === "browser_download") {
+        return { label: "File download", tone: "transfer" };
+      }
+      if (["browser_history_visit", "browser_visit", "browser_url", "browser_search_term", "browser_omnibox_shortcut"].includes(kind)) {
+        return { label: "Web browsing", tone: "web" };
+      }
+      if (kind.startsWith("browser_")) {
+        return { label: "Browser activity", tone: "web" };
+      }
+      if (kind.includes("clipboard") || /\b(copy|copied|paste|pasted|clipboard)\b/.test(intentText)) {
+        return { label: "Copy/paste activity", tone: "clipboard" };
+      }
+      if (["windows_shellbag_record", "windows_jumplist_lnk_record"].includes(kind)) {
+        return { label: "User activity", tone: "user" };
+      }
+      if (["windows_prefetch_record", "windows_userassist_record"].includes(kind)) {
+        return { label: "Program execution", tone: "execution" };
+      }
+      if (["windows_amcache_record", "windows_shimcache_record"].includes(kind)) {
+        return { label: "Program evidence", tone: "knowledge" };
+      }
+      if (["windows_scheduled_task", "windows_startup_record"].includes(kind)) {
+        return { label: "Execution configuration", tone: "system" };
+      }
+      if (kind === "windows_shell_link_record") {
+        return { label: "Shortcut evidence", tone: "knowledge" };
+      }
+      if (["evtx_event_record", "evtx_log", "windows_srum_record", "registry_hive", "registry_key", "registry_value", "windows_local_account", "windows_user_profile", "wifi_profile"].includes(kind)) {
+        return { label: "System activity", tone: "system" };
+      }
+      if (kind === "windows_usn_record") {
+        return { label: "File-system activity", tone: "system" };
+      }
+      if (/\b(opened|last used|launched)\b/.test(text)) {
         return { label: "File/folder opening", tone: "opening" };
       }
-      return { label: "File knowledge", tone: "knowledge" };
+      return { label: "File metadata", tone: "knowledge" };
+    }
+
+    function timelineAttributeSummary(attribute) {
+      const labels = String(attribute || "").split(" / ").filter(Boolean);
+      if (labels.length <= 2) return labels.join(" / ");
+      return labels[0] + " +" + (labels.length - 1) + " equivalent timestamps";
     }
 
     function timelineItemName(entry) {
@@ -18795,10 +20325,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         event,
         values: {
           time: event.timestamp,
-          attribute: event.attribute,
+          attribute: timelineAttributeSummary(event.attribute),
           timelineCategory: timelineCategory.label,
-          category: entryCategoryLabel(entry),
-          type: activityLabel(entry),
           item,
           itemValue
         },
@@ -18812,26 +20340,38 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function renderTimelineGridRow(row) {
       const event = row.event;
       const entry = event.entry;
-      const category = entryCategory(entry);
       const selected = Number(state.timeline.selectedEntryId) === Number(entry.id)
         && Number(state.timeline.selectedEventIndex) === Number(event.index)
         ? " selected"
         : "";
       const tone = row.timelineCategory.tone || "knowledge";
       return `
-          <tr class="entry-row${selected}" data-entry-id="${entry.id}" data-timeline-event-index="${event.index}" onclick="selectTimelineEntry(${entry.id}, ${event.index})" ondblclick="goToEntryFolder(${entry.id})">
+          <tr class="entry-row${selected}" data-entry-id="${entry.id}" data-timeline-event-index="${event.index}" onclick="selectTimelineEntry(${entry.id}, ${event.index})" ondblclick="event.stopPropagation(); closeTimelineDetail(); goToEntryFolder(${entry.id})">
             <td class="entry-time" title="${escapeAttr(row.values.time)}">${escapeHtml(row.values.time)}</td>
-            <td title="${escapeAttr(row.values.attribute)}">${escapeHtml(row.values.attribute)}</td>
+            <td title="${escapeAttr(event.attribute || row.values.attribute)}">${escapeHtml(row.values.attribute)}</td>
             <td><span class="timeline-badge timeline-${escapeAttr(tone)}">${escapeHtml(row.values.timelineCategory)}</span></td>
-            <td title="${escapeAttr(row.values.category)}">${categoryIconHtml(category.main)}<span class="entry-category">${escapeHtml(row.values.category)}</span></td>
-            <td class="entry-kind">${escapeHtml(row.values.type)}</td>
-            <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="timeline-item-name">${escapeHtml(row.values.item)}</span><span class="timeline-item-path">${escapeHtml(displayPath(entry.logical_path))}</span></td>
+            <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="timeline-item-name">${escapeHtml(row.values.item)}</span></td>
             <td class="timeline-item-value" title="${escapeAttr(row.values.itemValue)}">${escapeHtml(row.values.itemValue)}</td>
           </tr>`;
     }
 
     function selectTimelineEntry(entryId, eventIndex) {
       selectTimelineEvent(entryId, eventIndex, false);
+      openTimelineDetail();
+    }
+
+    function openTimelineDetail() {
+      const overlay = $("timelineDetailOverlay");
+      if (!overlay) return;
+      renderTimelineDetail();
+      overlay.hidden = false;
+      const closeButton = overlay.querySelector("button");
+      if (closeButton) closeButton.focus();
+    }
+
+    function closeTimelineDetail() {
+      const overlay = $("timelineDetailOverlay");
+      if (overlay) overlay.hidden = true;
     }
 
     // Which plotted graph bucket holds a given timestamp, so the detail pane's
@@ -18886,7 +20426,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return `<div class="timeline-detail-jumps"><h4>Timestamps (${events.length})</h4>${chips}</div>`;
     }
 
-    // Right-hand detail pane. Reuses the shared metadataView inspector, which
+    // Modal detail view. Reuses the shared metadataView inspector, which
     // already adapts by artifact type (file entries -> Forensic Location +
     // MAC Times; email/browser records -> their artifact info sections), so the
     // "detail pane adapts by type" requirement is satisfied without a bespoke
@@ -18975,7 +20515,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const numericEventIndex = Number(eventIndex);
       const rows = [];
       if (Number.isFinite(numericEventIndex)) {
-        rows.push(ctxItem("Select event", `selectTimelineEvent(${entryId}, ${numericEventIndex}, false)`));
+        rows.push(ctxItem("Select event", `selectTimelineEntry(${entryId}, ${numericEventIndex})`));
         rows.push(ctxItem("Jump to this timestamp", `jumpTimelineToEvent(${entryId}, ${numericEventIndex})`));
       }
       if (entry.entry_kind === "file" && entry.id != null) {
@@ -18993,12 +20533,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function timelineScopeNoticeHtml() {
-      if (!state.data || !state.data.entries_truncated) {
+      if (!state.timeline.truncated) {
         return "";
       }
       const loaded = Number(state.timeline.loadedEntryCount || 0).toLocaleString();
       const total = Number(state.timeline.totalEntryCount || state.data.entry_count || 0).toLocaleString();
-      return `<div class="analysis-status">Timeline is built client-side from ${loaded} loaded entries out of ${total} indexed entries.</div>`;
+      return `<span class="timeline-scope-chip" title="The bounded build prioritizes parsed artifact records, then file metadata. Narrow the date range and rebuild to examine another window.">Coverage: ${loaded} of ${total} timeline records</span>`;
     }
 
     function renderTimeline() {
@@ -19042,29 +20582,32 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const tableEvents = timelineFocusFilteredEvents(dateFilteredEvents);
       renderTimelineGraph(dateFilteredEvents);
       timestampNav.innerHTML = timelineSelectionNavHtml();
-      // Never create hundreds of thousands of DOM rows. The complete bounded
-      // event set remains available for the graph/date/bucket calculations;
-      // the table shows a safe window and asks for a narrower range/bucket.
-      const renderedEvents = tableEvents.slice(0, TIMELINE_TABLE_RENDER_LIMIT);
-      const rows = renderedEvents.map(timelineGridRow);
+      // Apply column filters and sorting to the complete bounded event set
+      // before taking the DOM-safe table window. Slicing first made a valid
+      // "Web browsing" or "File download" filter report zero whenever the
+      // chronologically first 2,000 events happened to be NTFS/USN metadata.
+      const rows = tableEvents.map(timelineGridRow);
       const columns = timelineGridColumns();
-      const tableResult = sortableGridTable("timeline", columns, rows, "timeline-table", renderTimelineGridRow);
-      count.textContent = tableResult.visibleRows.length.toLocaleString() + " events";
+      const matchingRows = visibleGridRows("timeline", columns, rows);
+      const renderedRows = matchingRows.slice(0, TIMELINE_TABLE_RENDER_LIMIT);
+      const tableResult = sortableGridTable("timeline", columns, renderedRows, "timeline-table", renderTimelineGridRow);
+      count.textContent = matchingRows.length.toLocaleString() + " events";
       const baseText = dateFilterActive()
         ? "date filtered from " + allEvents.length.toLocaleString() + " total events"
         : allEvents.length.toLocaleString() + " total events";
       const focusText = state.timeline.focusBucket
         ? "bucket " + timelineBucketLabel(state.timeline.focusBucket.startMs, state.timeline.focusBucket.unit)
         : "";
-      summary.innerHTML = `<span><strong>${tableResult.visibleRows.length.toLocaleString()}</strong> table rows</span><span>${tableEvents.length.toLocaleString()} matching events</span><span>${escapeHtml(focusText || baseText)}</span><span>${Number(state.timeline.sourceEntries || 0).toLocaleString()} loaded entries scanned</span>`;
-      const filterStatus = gridFilterStatusHtml("timeline", columns, tableResult.visibleRows.length, renderedEvents.length, "rendered events");
-      const renderLimitNotice = tableEvents.length > renderedEvents.length
-        ? `<div class="analysis-status">Showing the first ${TIMELINE_TABLE_RENDER_LIMIT.toLocaleString()} of ${tableEvents.length.toLocaleString()} matching events to keep the browser responsive. Narrow the date range or select a graph bucket to inspect another window.</div>`
+      const scopeChip = timelineScopeNoticeHtml();
+      const tableWindowChip = matchingRows.length > renderedRows.length
+        ? `<span class="timeline-scope-chip" title="Narrow the date range or select a graph bucket to inspect another table window.">Table window: first ${TIMELINE_TABLE_RENDER_LIMIT.toLocaleString()}</span>`
         : "";
-      const noRows = tableResult.visibleRows.length
+      summary.innerHTML = `<span><strong>${tableResult.visibleRows.length.toLocaleString()}</strong> shown</span><span>${matchingRows.length.toLocaleString()} match current filters</span><span>${tableEvents.length.toLocaleString()} in date/bucket scope</span><span>${escapeHtml(focusText || baseText)}</span>${scopeChip}${tableWindowChip}`;
+      const filterStatus = gridFilterStatusHtml("timeline", columns, matchingRows.length, rows.length, "events");
+      const noRows = matchingRows.length
         ? ""
         : empty(tableEvents.length ? "No timeline events match the column filters." : "No timestamped events match the active date or bucket filter.");
-      table.innerHTML = timelineScopeNoticeHtml() + renderLimitNotice + filterStatus + tableResult.html + noRows;
+      table.innerHTML = filterStatus + tableResult.html + noRows;
       renderTimelineDetail();
       scrollTimelineToSelectedEvent();
     }
@@ -19809,13 +21352,41 @@ const INDEX_HTML: &str = r###"<!doctype html>
       // Live-browse files have no indexed entry row; synthesize one so the
       // viewer renders instead of falling back to "No item selected".
       if (state.hex.live) {
+        const liveEntry = state.hex.live.entry || liveEntryByPath(state.hex.live.volume, state.hex.live.path) || {};
+        const metadata = {
+          source: "live_browse",
+          volume: state.hex.live.volume,
+          image_path: state.hex.live.path,
+          recovery_source: liveEntry.provenance || "",
+          recovery_status: liveEntry.recovery_status || "",
+          reconstruction_status: liveEntry.reconstruction_status || "",
+          ntfs_file_record_number: liveEntry.ntfs_file_record_number,
+          ntfs_sequence_number: liveEntry.ntfs_sequence_number,
+          ntfs_parent_record_number: liveEntry.ntfs_parent_record_number,
+          mft_record_logical_offset: liveEntry.mft_record_logical_offset,
+          mft_record_physical_offset: liveEntry.mft_record_physical_offset,
+          file_data_logical_offset: liveEntry.file_data_logical_offset,
+          file_data_physical_offset: liveEntry.file_data_physical_offset,
+          file_data_file_offset: liveEntry.file_data_file_offset,
+          file_data_contiguous_bytes: liveEntry.file_data_contiguous_bytes,
+          physical_offset_basis: liveEntry.physical_offset_basis,
+          file_data_direct_logical_mapping: liveEntry.file_data_direct_logical_mapping,
+          offset_coordinate_system: liveEntry.offset_coordinate_system,
+          ntfs_mft_record_modification_time_utc: liveEntry.mft_record_modification_time_utc,
+          diagnostics: liveEntry.diagnostics || []
+        };
         return {
           id: null,
           entry_kind: "file",
           evidence_id: state.hex.live.evidenceId,
           name: state.hex.live.name,
           logical_path: "[vol " + state.hex.live.volume + "] " + state.hex.live.path,
-          metadata_json: { source: "live_browse", volume: state.hex.live.volume, image_path: state.hex.live.path }
+          size_bytes: liveEntry.size_bytes == null ? null : liveEntry.size_bytes,
+          is_deleted: Boolean(liveEntry.is_deleted),
+          created_utc: liveEntry.created_utc,
+          modified_utc: liveEntry.modified_utc,
+          accessed_utc: liveEntry.accessed_utc,
+          metadata_json: metadata
         };
       }
       return state.data && state.hex.entryId ? findLoadedEntry(state.hex.entryId) : null;
@@ -21895,14 +23466,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return `<th class="${escapeAttr(columnClass)}"><div class="grid-header-cell"><button type="button" class="grid-sort-button${active}" title="Sort ${escapeAttr(column.label)}" onclick="toggleGridSort('${grid}', '${key}')">${label}${indicatorHtml}</button>${filter}</div></th>`;
     }
 
-    function sortableGridTable(gridId, columns, rows, className, renderRow) {
+    function sortableGridTable(gridId, columns, rows, className, renderRow, pinnedBodyHtml = "") {
       const visibleRows = visibleGridRows(gridId, columns, rows);
       const classAttr = className ? ` class="${escapeAttr(className)}"` : "";
       const headers = columns.map((column) => gridHeaderCell(gridId, column)).join("");
       const body = visibleRows.map(renderRow).join("");
       return {
         visibleRows,
-        html: `<table${classAttr}><thead><tr>${headers}</tr></thead><tbody>${body}</tbody></table>`
+        html: `<table${classAttr}><thead><tr>${headers}</tr></thead><tbody>${pinnedBodyHtml}${body}</tbody></table>`
       };
     }
 
@@ -22486,6 +24057,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         hideContextMenu();
+        closeTimelineDetail();
       }
     });
     document.addEventListener("scroll", hideContextMenu, true);
