@@ -3142,6 +3142,21 @@ pub struct BackfillContentHeadResult {
 const CONTENT_HEAD_BACKFILL_WRITE_BATCH_SIZE: usize = 256;
 const CONTENT_HEAD_BACKFILL_CHECKPOINT_VERSION: &str = "content-head-backfill-v1";
 
+#[cfg(test)]
+std::thread_local! {
+    static CANCEL_CONTENT_HEAD_BACKFILL_AFTER_NEXT_COMMIT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn request_test_cancellation_after_content_head_commit() {
+    CANCEL_CONTENT_HEAD_BACKFILL_AFTER_NEXT_COMMIT.with(|requested| {
+        if requested.replace(false) {
+            progress::request_cancellation_on_active();
+        }
+    });
+}
+
 #[derive(Debug)]
 struct ContentHeadBackfillCandidate {
     entry_id: i64,
@@ -3476,6 +3491,8 @@ pub fn backfill_content_head(
                 {
                     write_error = Some(error);
                 } else {
+                    #[cfg(test)]
+                    request_test_cancellation_after_content_head_commit();
                     for outcome in &pending_batch {
                         match &outcome.disposition {
                             ContentHeadBackfillDisposition::Captured { bytes } => {
@@ -69345,10 +69362,8 @@ mod tests {
             "content_head_backfill",
             None,
         );
-        let cancel_tracker = tracker.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            cancel_tracker.request_cancellation();
+        CANCEL_CONTENT_HEAD_BACKFILL_AFTER_NEXT_COMMIT.with(|requested| {
+            requested.set(true);
         });
 
         let result = progress::with_job_progress(&tracker, || {
