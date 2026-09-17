@@ -4888,12 +4888,14 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn unique_test_path(label: &str, suffix: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
         std::env::temp_dir().join(format!(
-            "kdft-ui-{label}-{}-{nonce}{suffix}",
+            "kdft-ui-{label}-{}-{nonce}-{seq}{suffix}",
             std::process::id()
         ))
     }

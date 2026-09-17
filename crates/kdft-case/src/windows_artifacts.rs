@@ -60,6 +60,7 @@ const CANDIDATE_FILTER_SQL: &str = r#"
         OR lower(name) LIKE '%.evtx'
         OR lower(name) LIKE '%.automaticdestinations-ms'
         OR lower(name) LIKE '%.customdestinations-ms'
+        OR lower(name) = 'activitiescache.db'
         OR lower(name) = '$usnjrnl:$j'
         OR (
             lower(COALESCE(json_extract(metadata_json, '$.ntfs_base_name'), '')) = '$usnjrnl'
@@ -121,6 +122,14 @@ const CANDIDATE_FILTER_SQL: &str = r#"
             NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''),
             logical_path
         ), '\', '/')) LIKE '%/windows/system32/tasks/%'
+        OR lower('/' || replace(COALESCE(
+            NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''),
+            NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''),
+            NULLIF(json_extract(metadata_json, '$.fat_path'), ''),
+            NULLIF(json_extract(metadata_json, '$.ext_path'), ''),
+            NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''),
+            logical_path
+        ), '\', '/')) LIKE '%/activitiescache.db'
     )
 "#;
 
@@ -152,6 +161,7 @@ pub enum WindowsArtifactKind {
     CustomJumpList,
     UsnJournal,
     ScheduledTask,
+    ActivitiesCache,
 }
 
 impl WindowsArtifactKind {
@@ -164,6 +174,7 @@ impl WindowsArtifactKind {
             Self::CustomJumpList => "custom_jumplist",
             Self::UsnJournal => "usn",
             Self::ScheduledTask => "scheduled_task",
+            Self::ActivitiesCache => "activities_cache",
         }
     }
 
@@ -176,6 +187,7 @@ impl WindowsArtifactKind {
             Self::CustomJumpList => "customDestinations-ms",
             Self::UsnJournal => "usn-journal",
             Self::ScheduledTask => "task.xml",
+            Self::ActivitiesCache => "ActivitiesCache.db",
         }
     }
 }
@@ -824,6 +836,8 @@ fn classify_windows_source(
         || (base_name == "$usnjrnl" && stream_name == "$j")
     {
         Some(WindowsArtifactKind::UsnJournal)
+    } else if name == "activitiescache.db" || path.ends_with("/activitiescache.db") {
+        Some(WindowsArtifactKind::ActivitiesCache)
     } else {
         None
     }
@@ -874,6 +888,7 @@ fn pass_safety_bounds() -> serde_json::Value {
         "jumplist_diagnostic_sample_limit": jump.diagnostic_sample_limit,
         "jumplist_embedded_lnk_spooling": "one embedded LNK temporary file at a time",
         "scheduled_task_max_source_bytes": 16 * 1024 * 1024,
+        "activities_cache_max_source_bytes": super::windows_timeline::MAX_TIMELINE_SOURCE_BYTES,
         "pass_diagnostic_sample_limit": DIAGNOSTIC_SAMPLE_LIMIT,
     })
 }
@@ -900,6 +915,9 @@ fn source_supported_scope(kind: WindowsArtifactKind) -> &'static str {
         }
         WindowsArtifactKind::ScheduledTask => {
             "One indexed, recoverable Windows Task Scheduler XML definition; registration, principals, settings, triggers, and actions are decoded without executing the task"
+        }
+        WindowsArtifactKind::ActivitiesCache => {
+            "One indexed, recoverable Windows Timeline ActivitiesCache.db SQLite database; user engagements, app launches, active focus durations, and clipboard events are decoded into structured records"
         }
     }
 }
@@ -1150,6 +1168,9 @@ fn parse_source_to_staging_database(
         WindowsArtifactKind::UsnJournal => parse_usn_source(&tx, candidate, recovered_source)?,
         WindowsArtifactKind::ScheduledTask => {
             parse_scheduled_task_source(&tx, candidate, recovered_source)?
+        }
+        WindowsArtifactKind::ActivitiesCache => {
+            parse_activities_cache_source(&tx, candidate, recovered_source)?
         }
     };
     tx.commit()
@@ -1455,6 +1476,100 @@ fn parse_scheduled_task_source(
             "task_trigger_count": parsed.triggers.len(),
             "task_action_count": parsed.actions.len(),
             "task_default_coverage_cap": null,
+        }),
+    })
+}
+
+fn parse_activities_cache_source(
+    tx: &Transaction<'_>,
+    candidate: &WindowsArtifactCandidate,
+    staging_path: &Path,
+) -> Result<SourceParseSummary> {
+    let parsed = super::windows_timeline::parse_timeline_database(staging_path)
+        .with_context(|| format!("parsing ActivitiesCache.db {}", candidate.source_path_exact))?;
+
+    let mut diagnostics = DiagnosticAccumulator::default();
+    for err in &parsed.parse_errors {
+        diagnostics.push(source_diagnostic(
+            candidate.entry_id,
+            candidate.kind,
+            &candidate.source_path_exact,
+            err.clone(),
+        ));
+    }
+
+    let mut derived_entries = 0_u64;
+    let mut text_segments = 0_u64;
+
+    for (index, record) in parsed.records.iter().enumerate() {
+        let ordinal = (index as u64).saturating_add(1);
+        let display_name = record
+            .display_text
+            .clone()
+            .or_else(|| record.app_display_name.clone())
+            .or_else(|| record.application.clone())
+            .unwrap_or_else(|| format!("{}-{}", record.activity_type_name, record.activity_id));
+        let logical_path = derived_logical_path(candidate, "timeline", ordinal, &display_name);
+
+        let metadata = serde_json::json!({
+            "artifact_kind": "windows_timeline_record",
+            "parser": WINDOWS_ARTIFACT_PARSER_NAME,
+            "supported_scope": source_supported_scope(candidate.kind),
+            "activity_id": record.activity_id,
+            "application": record.application,
+            "app_platform": record.app_platform,
+            "app_activity_id": record.app_activity_id,
+            "activity_type": record.activity_type,
+            "activity_type_name": record.activity_type_name,
+            "activity_status": record.activity_status,
+            "parent_activity_id": record.parent_activity_id,
+            "tag": record.tag,
+            "group": record.group,
+            "match_id": record.match_id,
+            "start_time_utc": record.start_time_utc,
+            "end_time_utc": record.end_time_utc,
+            "last_modified_utc": record.last_modified_utc,
+            "expiration_time_utc": record.expiration_time_utc,
+            "artifact_time_utc": record.start_time_utc.as_ref().or(record.end_time_utc.as_ref()),
+            "display_text": record.display_text,
+            "app_display_name": record.app_display_name,
+            "description": record.description,
+            "activation_uri": record.activation_uri,
+            "content_url": record.content_url,
+            "active_duration_seconds": record.active_duration_seconds,
+            "user_timezone": record.user_timezone,
+            "reporting_app": record.reporting_app,
+            "clipboard_text": record.clipboard_text,
+            "payload": record.payload_json,
+            "package_name": record.package_name,
+        });
+
+        let search_text = serde_json::to_string(&metadata)
+            .context("serializing timeline searchable metadata")?;
+
+        insert_derived_entry(
+            tx,
+            candidate,
+            &logical_path,
+            &display_name,
+            "record",
+            metadata,
+            &search_text,
+        )?;
+
+        derived_entries = derived_entries.saturating_add(1);
+        text_segments = text_segments.saturating_add(1);
+    }
+
+    Ok(SourceParseSummary {
+        partial: !parsed.parse_errors.is_empty(),
+        derived_entries,
+        text_segments,
+        diagnostics,
+        details: serde_json::json!({
+            "timeline_activities_total": parsed.total_activities,
+            "timeline_type_counts": parsed.type_counts,
+            "timeline_parse_errors": parsed.parse_errors,
         }),
     })
 }
@@ -2812,6 +2927,14 @@ mod tests {
                 &empty,
             ),
             Some(WindowsArtifactKind::ScheduledTask)
+        );
+        assert_eq!(
+            classify_windows_source(
+                "ActivitiesCache.db",
+                "Users\\Alice\\AppData\\Local\\ConnectedDevicesPlatform\\L.Alice\\ActivitiesCache.db",
+                &empty,
+            ),
+            Some(WindowsArtifactKind::ActivitiesCache)
         );
         assert_eq!(
             classify_windows_source(

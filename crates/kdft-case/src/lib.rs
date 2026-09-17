@@ -205,6 +205,7 @@ pub mod shimcache;
 pub mod usn;
 pub mod windows_artifacts;
 pub mod windows_registry_artifacts;
+pub mod windows_timeline;
 
 const INITIAL_SCHEMA: &str = include_str!("../../../schemas/001_initial.sql");
 // SQLite reserves application_id for file-format identification. The bytes
@@ -16783,6 +16784,15 @@ fn classify_entry(
                 &["windows", "ntfs", "usn", "journal", "timeline", "parsed"],
             );
         }
+        "windows_timeline_record" => {
+            return category(
+                "User Activity",
+                "Windows Timeline",
+                "Structured Windows Timeline activity record",
+                "high",
+                &["windows", "timeline", "activities", "engagement", "parsed"],
+            );
+        }
         "windows_prefetch_record" => {
             return category(
                 "Program Execution",
@@ -17546,6 +17556,16 @@ fn precise_forensic_artifact_category(
             "Windows System Resource Usage Monitor database source",
             "high",
             &["windows", "srum", "network", "execution", "source"],
+        ));
+    }
+
+    if filename == "activitiescache.db" && normalized_full_path.contains("/connecteddevicesplatform/") {
+        return Some(category(
+            "User Activity",
+            "Windows Timeline sources",
+            "Windows Timeline ActivitiesCache.db database source",
+            "high",
+            &["windows", "timeline", "activities", "source"],
         ));
     }
 
