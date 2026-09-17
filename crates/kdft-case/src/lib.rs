@@ -206,6 +206,7 @@ pub mod usn;
 pub mod windows_artifacts;
 pub mod windows_registry_artifacts;
 pub mod windows_timeline;
+pub mod windows_srum;
 
 const INITIAL_SCHEMA: &str = include_str!("../../../schemas/001_initial.sql");
 // SQLite reserves application_id for file-format identification. The bytes

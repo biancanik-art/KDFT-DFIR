@@ -1,4 +1,4 @@
-﻿[workspace]
+[workspace]
 resolver = "2"
 members = [
     "crates/bitlocker-decrypt",
@@ -55,6 +55,7 @@ vdi = "0.2.0"
 zeroize = "1.8"
 zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
 xpress-huffman = { version = "=0.1.2", features = ["std"] }
+srum-parser = "0.4.0"
 
 [patch.crates-io]
 # The vendored EWF reader uses bounded cumulative allocation while supporting

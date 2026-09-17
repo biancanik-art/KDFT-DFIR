@@ -94,7 +94,7 @@ pub fn parse_windows_registry_artifacts(
         hives_found: candidates.len(),
         srum_sources_seen,
         limitations: vec![
-            "SRUDB.dat is an ESE database; this build identifies the source but does not claim decoded SRUM rows without a validated ESE decoder.".to_string(),
+            "SRUDB.dat is an ESE database; parsed and indexed via the dedicated Windows artifact pipeline (windows_artifacts / windows_srum).".to_string(),
             "ShellBag item names use bounded shell-item string recovery when a complete typed-shell-item decoder is unavailable; the raw Registry value and decode method remain explicit.".to_string(),
         ],
         status: "completed".to_string(),
