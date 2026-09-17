@@ -139,6 +139,27 @@ const CANDIDATE_FILTER_SQL: &str = r#"
             NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''),
             logical_path
         ), '\', '/')) LIKE '%/system32/sru/srudb.dat'
+        OR (
+            lower(name) LIKE '$i%'
+            AND (
+                lower('/' || replace(COALESCE(
+                    NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''),
+                    NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''),
+                    NULLIF(json_extract(metadata_json, '$.fat_path'), ''),
+                    NULLIF(json_extract(metadata_json, '$.ext_path'), ''),
+                    NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''),
+                    logical_path
+                ), '\', '/')) LIKE '%/$recycle.bin/%'
+                OR lower('/' || replace(COALESCE(
+                    NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''),
+                    NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''),
+                    NULLIF(json_extract(metadata_json, '$.fat_path'), ''),
+                    NULLIF(json_extract(metadata_json, '$.ext_path'), ''),
+                    NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''),
+                    logical_path
+                ), '\', '/')) LIKE '%/recycle.bin/%'
+            )
+        )
     )
 "#;
 
@@ -172,6 +193,7 @@ pub enum WindowsArtifactKind {
     ScheduledTask,
     ActivitiesCache,
     Srum,
+    RecycleBin,
 }
 
 impl WindowsArtifactKind {
@@ -186,6 +208,7 @@ impl WindowsArtifactKind {
             Self::ScheduledTask => "scheduled_task",
             Self::ActivitiesCache => "activities_cache",
             Self::Srum => "srum",
+            Self::RecycleBin => "recycle_bin",
         }
     }
 
@@ -200,6 +223,7 @@ impl WindowsArtifactKind {
             Self::ScheduledTask => "task.xml",
             Self::ActivitiesCache => "ActivitiesCache.db",
             Self::Srum => "SRUDB.dat",
+            Self::RecycleBin => "recycle.bin",
         }
     }
 }
@@ -852,6 +876,8 @@ fn classify_windows_source(
         Some(WindowsArtifactKind::ActivitiesCache)
     } else if name == "srudb.dat" || path.ends_with("/system32/sru/srudb.dat") {
         Some(WindowsArtifactKind::Srum)
+    } else if is_recycle_bin_i_file(&name, &path) {
+        Some(WindowsArtifactKind::RecycleBin)
     } else {
         None
     }
@@ -863,6 +889,15 @@ fn normalize_windows_path_for_matching(path: &str) -> String {
         normalized.insert(0, '/');
     }
     normalized
+}
+
+fn is_recycle_bin_i_file(name: &str, path: &str) -> bool {
+    let normalized = normalize_windows_path_for_matching(path);
+    if !normalized.contains("/$recycle.bin/") && !normalized.contains("/recycle.bin/") {
+        return false;
+    }
+    let filename = normalized.split('/').last().unwrap_or(name);
+    filename.starts_with("$i")
 }
 
 fn is_scheduled_task_path(path: &str) -> bool {
@@ -904,6 +939,7 @@ fn pass_safety_bounds() -> serde_json::Value {
         "scheduled_task_max_source_bytes": 16 * 1024 * 1024,
         "activities_cache_max_source_bytes": super::windows_timeline::MAX_TIMELINE_SOURCE_BYTES,
         "srum_max_source_bytes": super::windows_srum::MAX_SRUM_SOURCE_BYTES,
+        "recycle_bin_max_source_bytes": super::windows_recycle_bin::MAX_RECYCLE_BIN_SOURCE_BYTES,
         "pass_diagnostic_sample_limit": DIAGNOSTIC_SAMPLE_LIMIT,
     })
 }
@@ -936,6 +972,9 @@ fn source_supported_scope(kind: WindowsArtifactKind) -> &'static str {
         }
         WindowsArtifactKind::Srum => {
             "One indexed, recoverable Windows System Resource Usage Monitor SRUDB.dat ESE database; application timeline, network bandwidth (bytes sent/received), and network connectivity durations are decoded into structured records"
+        }
+        WindowsArtifactKind::RecycleBin => {
+            "One indexed, recoverable Windows Recycle Bin $I deletion metadata index file; original file path, file size, deletion timestamp, and associated user SID are decoded into structured records"
         }
     }
 }
@@ -1192,6 +1231,9 @@ fn parse_source_to_staging_database(
         }
         WindowsArtifactKind::Srum => {
             parse_srum_source(&tx, candidate, recovered_source)?
+        }
+        WindowsArtifactKind::RecycleBin => {
+            parse_recycle_bin_source(&tx, candidate, recovered_source)?
         }
     };
     tx.commit()
@@ -1670,6 +1712,73 @@ fn parse_srum_source(
             "srum_network_connectivity_count": parsed.network_connectivity_count,
             "srum_energy_usage_count": parsed.energy_usage_count,
             "srum_parse_errors": parsed.parse_errors,
+        }),
+    })
+}
+
+fn parse_recycle_bin_source(
+    tx: &Transaction<'_>,
+    candidate: &WindowsArtifactCandidate,
+    staging_path: &Path,
+) -> Result<SourceParseSummary> {
+    let record = super::windows_recycle_bin::parse_recycle_bin_file(
+        staging_path,
+        &candidate.name,
+        &candidate.source_path_exact,
+    )
+    .with_context(|| {
+        format!(
+            "parsing Recycle Bin $I file {}",
+            candidate.source_path_exact
+        )
+    })?;
+
+    let diagnostics = DiagnosticAccumulator::default();
+
+    let display_name = format!("{} ({})", record.original_filename, candidate.name);
+    let logical_path = derived_logical_path(candidate, "recycle_bin", 1, &record.original_filename);
+
+    let metadata = serde_json::json!({
+        "artifact_kind": "windows_recycle_bin_record",
+        "parser": WINDOWS_ARTIFACT_PARSER_NAME,
+        "supported_scope": source_supported_scope(candidate.kind),
+        "format_version": record.format_version,
+        "original_file_size": record.original_file_size,
+        "deletion_timestamp_filetime": record.deletion_timestamp_filetime,
+        "deletion_timestamp_utc": record.deletion_timestamp_utc,
+        "artifact_time_utc": record.deletion_timestamp_utc,
+        "original_path": record.original_path,
+        "original_filename": record.original_filename,
+        "original_extension": record.original_extension,
+        "data_file_name": record.data_file_name,
+        "user_sid": record.user_sid,
+    });
+
+    let search_text = serde_json::to_string(&metadata)
+        .context("serializing Recycle Bin searchable metadata")?;
+
+    insert_derived_entry(
+        tx,
+        candidate,
+        &logical_path,
+        &display_name,
+        "record",
+        metadata,
+        &search_text,
+    )?;
+
+    Ok(SourceParseSummary {
+        partial: false,
+        derived_entries: 1,
+        text_segments: 1,
+        diagnostics,
+        details: serde_json::json!({
+            "format_version": record.format_version,
+            "original_file_size": record.original_file_size,
+            "deletion_timestamp_utc": record.deletion_timestamp_utc,
+            "original_path": record.original_path,
+            "data_file_name": record.data_file_name,
+            "user_sid": record.user_sid,
         }),
     })
 }
@@ -3051,6 +3160,30 @@ mod tests {
                 &empty,
             ),
             Some(WindowsArtifactKind::Srum)
+        );
+        assert_eq!(
+            classify_windows_source(
+                "$IGCCV6M.xlsx",
+                "C:\\$Recycle.Bin\\S-1-5-21-1234567890-123456789-123456789-1001\\$IGCCV6M.xlsx",
+                &empty,
+            ),
+            Some(WindowsArtifactKind::RecycleBin)
+        );
+        assert_eq!(
+            classify_windows_source(
+                "$i123456.txt",
+                "recycle.bin/s-1-5-18/$i123456.txt",
+                &empty,
+            ),
+            Some(WindowsArtifactKind::RecycleBin)
+        );
+        assert_eq!(
+            classify_windows_source(
+                "$RGCCV6M.xlsx",
+                "C:\\$Recycle.Bin\\S-1-5-21-1234567890-123456789-123456789-1001\\$RGCCV6M.xlsx",
+                &empty,
+            ),
+            None
         );
         assert_eq!(
             classify_windows_source(

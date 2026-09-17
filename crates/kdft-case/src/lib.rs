@@ -49,6 +49,7 @@ pub mod windows_artifacts;
 pub mod windows_registry_artifacts;
 pub mod windows_timeline;
 pub mod windows_srum;
+pub mod windows_recycle_bin;
 pub mod types;
 pub use types::*;
 
