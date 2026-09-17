@@ -2737,11 +2737,16 @@
         find: { query: "", kind: "text", status: "", continuation: null, nextStart: null, active: false, lastMatch: null, matchLength: null }
       };
     }
+    const storedCasePath = localStorage.getItem("kdft.casePath") || "";
+    if (storedCasePath.includes("workbench.kdft.sqlite")) {
+      localStorage.removeItem("kdft.casePath");
+    }
+    const cleanStoredCasePath = storedCasePath.includes("workbench.kdft.sqlite") ? "" : storedCasePath;
     const state = {
       casePath: PAGE_PARAMS.get("case_path")
         || (BOOTSTRAP.defaultCasePinned
           ? BOOTSTRAP.defaultCasePath
-          : (localStorage.getItem("kdft.casePath") || BOOTSTRAP.defaultCasePath)),
+          : (cleanStoredCasePath || BOOTSTRAP.defaultCasePath || "")),
       loadedCasePath: null,
       refreshGeneration: 0,
       data: null,
@@ -3310,7 +3315,11 @@
       const value = normalizePathInput($("casePath").value);
       $("casePath").value = value;
       state.casePath = value;
-      localStorage.setItem("kdft.casePath", value);
+      if (value) {
+        localStorage.setItem("kdft.casePath", value);
+      } else {
+        localStorage.removeItem("kdft.casePath");
+      }
       return value;
     }
 
@@ -3569,7 +3578,13 @@
       const generation = ++state.refreshGeneration;
       const casePath = currentCasePath();
       if (!casePath) {
-        setNotice("Case path is empty.", true);
+        state.data = null;
+        state.loadedCasePath = null;
+        renderEmptyState();
+        if (!ANALYSIS_MODE) {
+          caseOpenSetupView();
+        }
+        setNotice("Ready. Create a new case or open an existing case database.");
         return false;
       }
       clearLoadedCaseForRefresh(casePath);
@@ -3654,9 +3669,7 @@
       if (!$("setupCasePath").value) {
         $("setupCasePath").value = suggestedNewCasePath();
       }
-      if (!$("caseOpenPath").value) {
-        $("caseOpenPath").value = normalizePathInput($("casePath").value || "");
-      }
+      $("caseOpenPath").value = "";
       switchView("setupView");
     }
 
@@ -15497,7 +15510,8 @@
     document.addEventListener("scroll", hideContextMenu, true);
     document.addEventListener("contextmenu", handleGlobalContextMenu);
 
-    $("casePath").value = normalizePathInput(state.casePath);
+    $("casePath").value = normalizePathInput(state.casePath || "");
+    $("caseOpenPath").value = "";
     $("evidencePath").value = normalizePathInput(localStorage.getItem("kdft.evidencePath") || BOOTSTRAP.defaultEvidencePath);
     $("reportPath").value = normalizePathInput(BOOTSTRAP.defaultReportPath);
     // Clear any persisted processing cap from the removed "Processing limit" input.

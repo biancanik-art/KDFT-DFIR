@@ -225,7 +225,7 @@ impl ServerConfig {
                     cwd.join(path)
                 }
             })
-            .unwrap_or_else(|| output.join("workbench.kdft.sqlite"));
+            .unwrap_or_default();
         Ok(Self {
             default_case_path: default_case_path.to_string_lossy().into_owned(),
             default_case_pinned,
