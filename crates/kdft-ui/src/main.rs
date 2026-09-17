@@ -2369,31 +2369,9 @@ fn filesystem_roots() -> Vec<String> {
 }
 
 fn default_history_path() -> String {
-    let mut candidates = Vec::new();
-    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        let local_app_data = PathBuf::from(local_app_data);
-        candidates.push(
-            local_app_data
-                .join("Google")
-                .join("Chrome")
-                .join("User Data")
-                .join("Default")
-                .join("History"),
-        );
-        candidates.push(
-            local_app_data
-                .join("Microsoft")
-                .join("Edge")
-                .join("User Data")
-                .join("Default")
-                .join("History"),
-        );
-    }
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_default()
+    // Return empty by default. Forensic tools should analyze target evidence images
+    // and cases, never probe the investigator's own host browser paths on startup.
+    String::new()
 }
 
 fn api_create_case(body: &[u8]) -> Result<serde_json::Value> {
@@ -6768,12 +6746,26 @@ fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> Result
 fn open_target(target: &str) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
-        // Pass the path as one argument instead of through cmd.exe's command
-        // parser; evidence filenames can legally contain shell metacharacters.
-        Command::new("explorer.exe")
-            .arg(target)
-            .spawn()
-            .context("opening target")?;
+        // For web URLs and documents, invoke the standard Windows Shell protocol
+        // handler via url.dll. Direct explorer.exe invocation is reserved strictly
+        // for local filesystem directories, avoiding heuristic behavioral flags on
+        // unsigned binaries launching URLs.
+        if target.starts_with("http://") || target.starts_with("https://") {
+            Command::new("rundll32.exe")
+                .args(["url.dll,FileProtocolHandler", target])
+                .spawn()
+                .context("opening URL in default browser")?;
+        } else if std::path::Path::new(target).is_dir() {
+            Command::new("explorer.exe")
+                .arg(target)
+                .spawn()
+                .context("opening directory in explorer")?;
+        } else {
+            Command::new("rundll32.exe")
+                .args(["url.dll,FileProtocolHandler", target])
+                .spawn()
+                .context("opening target file")?;
+        }
     }
     #[cfg(target_os = "macos")]
     {
