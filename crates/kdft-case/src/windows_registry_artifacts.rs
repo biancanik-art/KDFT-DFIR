@@ -426,9 +426,17 @@ fn derive_amcache(
 ) -> Vec<DerivedRecord> {
     let mut keys: BTreeMap<String, Vec<&ValueObservation>> = BTreeMap::new();
     for observation in observations {
-        let lower = observation.key_path.replace('\\', "/").to_ascii_lowercase();
+        let normalized = observation.key_path.replace('\\', "/").to_ascii_lowercase();
+        let lower = if normalized.starts_with('/') {
+            normalized
+        } else {
+            format!("/{}", normalized)
+        };
         if lower.contains("/root/inventoryapplicationfile/")
             || lower.contains("/root/inventoryapplication/")
+            || lower.contains("/root/inventorydriverbinary/")
+            || lower.contains("/root/inventoryapplicationdirectory/")
+            || lower.contains("/root/inventoryapplicationshortcut/")
             || lower.contains("/root/file/")
             || lower.contains("/root/programs/")
         {
@@ -446,9 +454,9 @@ fn derive_amcache(
                 .collect::<BTreeMap<_, _>>();
             let path = field_ci(
                 &fields,
-                &["LowerCaseLongPath", "LongPathHash", "Path", "15"],
+                &["LowerCaseLongPath", "LongPathHash", "Path", "DriverName", "15"],
             );
-            let program_name = field_ci(&fields, &["Name", "ProductName", "0"]);
+            let program_name = field_ci(&fields, &["Name", "ProductName", "DriverName", "0"]);
             let display_name = path.clone().or(program_name.clone()).unwrap_or_else(|| {
                 key_path
                     .rsplit(['\\', '/'])
@@ -459,6 +467,13 @@ fn derive_amcache(
             let artifact_time = values
                 .first()
                 .and_then(|value| value.key_last_write_utc.clone());
+            let sha1 = field_ci(&fields, &["SHA1", "FileId"]).map(|v| {
+                if v.starts_with("0000") && v.len() > 4 {
+                    v[4..].to_string()
+                } else {
+                    v
+                }
+            });
             let logical_path = format!(
                 "/Windows Artifacts/Registry/{}/amcache/{ordinal:020}-{}.record",
                 candidate.entry_id,
@@ -470,11 +485,14 @@ fn derive_amcache(
                 "amcache_key_path": key_path,
                 "amcache_path": path,
                 "amcache_name": program_name,
-                "amcache_publisher": field_ci(&fields, &["Publisher"]),
-                "amcache_version": field_ci(&fields, &["Version", "ProductVersion"]),
+                "amcache_publisher": field_ci(&fields, &["Publisher", "DriverPublisher"]),
+                "amcache_version": field_ci(&fields, &["Version", "ProductVersion", "DriverVersion"]),
                 "amcache_product_name": field_ci(&fields, &["ProductName"]),
-                "amcache_sha1": field_ci(&fields, &["SHA1"]),
-                "amcache_link_date": field_ci(&fields, &["LinkDate"]),
+                "amcache_sha1": sha1,
+                "amcache_link_date": field_ci(&fields, &["LinkDate", "LinkerDateTime"]),
+                "amcache_install_date": field_ci(&fields, &["InstallDate", "InstallDateArpLastModified"]),
+                "amcache_size": field_ci(&fields, &["Size", "FileSize"]),
+                "amcache_is_pe": field_ci(&fields, &["IsPeFile"]),
                 "amcache_fields": fields,
                 "artifact_time_utc": artifact_time,
                 "structured_source": true,
@@ -1046,5 +1064,53 @@ mod tests {
         assert_eq!(records[0].display_name, "C:\\Windows\\System32\\cmd.exe");
         assert_eq!(records[0].metadata["artifact_kind"], "windows_shimcache_record");
         assert_eq!(records[0].metadata["shimcache_path"], "C:\\Windows\\System32\\cmd.exe");
+    }
+
+    #[test]
+    fn derive_amcache_decodes_modern_win10_inventory_fields() {
+        let candidate = HiveCandidate {
+            entry_id: 88,
+            source_job_id: 2,
+            logical_path: "/Windows/appcompat/Programs/Amcache.hve".to_string(),
+            exact_path: "Amcache.hve".to_string(),
+            name: "Amcache.hve".to_string(),
+        };
+
+        let observations = vec![
+            ValueObservation {
+                key_path: "Root\\InventoryApplicationFile\\cmd.exe".to_string(),
+                key_last_write_utc: Some("2026-02-01T12:00:00Z".to_string()),
+                name: "LowerCaseLongPath".to_string(),
+                value_type: "REG_SZ".to_string(),
+                rendered: "c:\\windows\\system32\\cmd.exe".to_string(),
+                raw: None,
+            },
+            ValueObservation {
+                key_path: "Root\\InventoryApplicationFile\\cmd.exe".to_string(),
+                key_last_write_utc: Some("2026-02-01T12:00:00Z".to_string()),
+                name: "FileId".to_string(),
+                value_type: "REG_SZ".to_string(),
+                rendered: "0000a1b2c3d4e5f678901234567890abcdef12345678".to_string(),
+                raw: None,
+            },
+            ValueObservation {
+                key_path: "Root\\InventoryApplicationFile\\cmd.exe".to_string(),
+                key_last_write_utc: Some("2026-02-01T12:00:00Z".to_string()),
+                name: "LinkerDateTime".to_string(),
+                value_type: "REG_SZ".to_string(),
+                rendered: "2026-01-15T08:30:00Z".to_string(),
+                raw: None,
+            },
+        ];
+
+        let records = derive_amcache(&candidate, &observations);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].metadata["artifact_kind"], "windows_amcache_record");
+        assert_eq!(records[0].metadata["amcache_path"], "c:\\windows\\system32\\cmd.exe");
+        assert_eq!(
+            records[0].metadata["amcache_sha1"],
+            "a1b2c3d4e5f678901234567890abcdef12345678"
+        );
+        assert_eq!(records[0].metadata["amcache_link_date"], "2026-01-15T08:30:00Z");
     }
 }
