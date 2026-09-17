@@ -78,6 +78,7 @@ struct DerivedCounts {
     shellbags: usize,
     startup: usize,
     shimcache_sources: usize,
+    shimcache_records: usize,
 }
 
 pub fn parse_windows_registry_artifacts(
@@ -93,7 +94,6 @@ pub fn parse_windows_registry_artifacts(
         hives_found: candidates.len(),
         srum_sources_seen,
         limitations: vec![
-            "Shimcache/AppCompatCache binary layouts are retained as source evidence but are not decoded by this version.".to_string(),
             "SRUDB.dat is an ESE database; this build identifies the source but does not claim decoded SRUM rows without a validated ESE decoder.".to_string(),
             "ShellBag item names use bounded shell-item string recovery when a complete typed-shell-item decoder is unavailable; the raw Registry value and decode method remain explicit.".to_string(),
         ],
@@ -122,6 +122,9 @@ pub fn parse_windows_registry_artifacts(
                 result.shimcache_sources_seen = result
                     .shimcache_sources_seen
                     .saturating_add(counts.shimcache_sources);
+                result.shimcache_records_indexed = result
+                    .shimcache_records_indexed
+                    .saturating_add(counts.shimcache_records);
             }
             Err(error) => {
                 result.parse_error_count = result.parse_error_count.saturating_add(1);
@@ -335,16 +338,21 @@ fn derive_hive_records(
         counts.startup = derived.len();
         records.extend(derived);
     }
-    if hive == "system"
-        && observations.iter().any(|value| {
-            value
-                .key_path
-                .replace('\\', "/")
-                .to_ascii_lowercase()
-                .contains("/control/session manager/appcompatcache")
-        })
-    {
-        counts.shimcache_sources = 1;
+    if hive == "system" {
+        let derived = derive_shimcache_records(candidate, &observations);
+        counts.shimcache_records = derived.len();
+        if counts.shimcache_records > 0
+            || observations.iter().any(|value| {
+                value
+                    .key_path
+                    .replace('\\', "/")
+                    .to_ascii_lowercase()
+                    .contains("/control/session manager/appcompatcache")
+            })
+        {
+            counts.shimcache_sources = 1;
+        }
+        records.extend(derived);
     }
     (records, counts)
 }
@@ -369,6 +377,47 @@ fn value_observation(entry: &RegistryImportEntry) -> Option<ValueObservation> {
             .to_string(),
         raw: entry.raw_value_bytes.clone(),
     })
+}
+
+fn derive_shimcache_records(
+    candidate: &HiveCandidate,
+    observations: &[ValueObservation],
+) -> Vec<DerivedRecord> {
+    let mut derived = Vec::new();
+    for observation in observations {
+        let lower = observation.key_path.replace('\\', "/").to_ascii_lowercase();
+        if lower.contains("/control/session manager/appcompatcache") {
+            if let Some(raw) = &observation.raw {
+                if let Ok(entries) = super::shimcache::parse_shimcache(raw) {
+                    for (ordinal, entry) in entries.into_iter().enumerate() {
+                        let logical_path = format!(
+                            "/Windows Artifacts/Registry/{}/shimcache/{ordinal:020}-{}.record",
+                            candidate.entry_id,
+                            sanitize_logical_segment(&entry.path)
+                        );
+                        let mut metadata = serde_json::json!({
+                            "artifact_kind": "windows_shimcache_record",
+                            "parser": PARSER_NAME,
+                            "shimcache_path": entry.path,
+                            "shimcache_last_modified_utc": entry.last_modified_utc,
+                            "shimcache_file_size": entry.file_size,
+                            "shimcache_executed": entry.executed,
+                            "artifact_time_utc": entry.last_modified_utc,
+                            "structured_source": true,
+                        });
+                        source_metadata(&mut metadata, candidate);
+                        add_entry_category(&mut metadata, &logical_path, &entry.path, "record");
+                        derived.push(DerivedRecord {
+                            logical_path,
+                            display_name: entry.path,
+                            metadata,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    derived
 }
 
 fn derive_amcache(
@@ -959,5 +1008,43 @@ mod tests {
             "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
         ));
         assert!(!is_startup_registry_key("Software\\Vendor\\StartupStrings"));
+    }
+
+    #[test]
+    fn derive_shimcache_decodes_system_records() {
+        let candidate = HiveCandidate {
+            entry_id: 42,
+            source_job_id: 1,
+            logical_path: "/Windows/System32/config/SYSTEM".to_string(),
+            exact_path: "SYSTEM".to_string(),
+            name: "SYSTEM".to_string(),
+        };
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"10ts");
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        let path = "C:\\Windows\\System32\\cmd.exe\0";
+        let path_utf16: Vec<u8> = path.encode_utf16().flat_map(|w| w.to_le_bytes()).collect();
+        let entry_size = 14 + path_utf16.len() + 8;
+        raw.extend_from_slice(&(entry_size as u32).to_le_bytes());
+        raw.extend_from_slice(&(path_utf16.len() as u16).to_le_bytes());
+        raw.extend_from_slice(&path_utf16);
+        let ft: i64 = 133800960000000000;
+        raw.extend_from_slice(&ft.to_le_bytes());
+
+        let observation = ValueObservation {
+            key_path: "ControlSet001\\Control\\Session Manager\\AppCompatCache".to_string(),
+            key_last_write_utc: Some("2026-01-01T00:00:00Z".to_string()),
+            name: "AppCompatCache".to_string(),
+            value_type: "REG_BINARY".to_string(),
+            rendered: "<binary>".to_string(),
+            raw: Some(raw),
+        };
+
+        let records = derive_shimcache_records(&candidate, &[observation]);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].display_name, "C:\\Windows\\System32\\cmd.exe");
+        assert_eq!(records[0].metadata["artifact_kind"], "windows_shimcache_record");
+        assert_eq!(records[0].metadata["shimcache_path"], "C:\\Windows\\System32\\cmd.exe");
     }
 }
