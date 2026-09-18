@@ -7087,7 +7087,10 @@ fn stream_document_parse_success(
             "Documents and Office",
             "The filename extension does not identify the SpreadsheetML content declared inside the package",
         ),
-        _ => unreachable!("only parsed Office kinds reach metadata commit"),
+        unsupported => bail!(
+            "OOXML package kind {} cannot be committed as a supported Office document",
+            unsupported.as_str()
+        ),
     };
     let entry_object = entry_metadata
         .as_object_mut()
