@@ -1,4 +1,4 @@
-//! Read-only WordprocessingML text extraction for DOCX evidence.
+//! Read-only Office Open XML extraction for DOCX and XLSX evidence.
 //!
 //! This module never extracts package members to the filesystem. It assumes
 //! these dependency APIs:
@@ -17,6 +17,7 @@ use quick_xml::events::{BytesRef, BytesStart, BytesText, Event};
 use quick_xml::name::{Namespace, ResolveResult};
 use quick_xml::reader::NsReader;
 use quick_xml::XmlVersion;
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
@@ -30,6 +31,9 @@ const CONTENT_TYPES_NS: &[u8] = b"http://schemas.openxmlformats.org/package/2006
 const RELATIONSHIPS_NS: &[u8] = b"http://schemas.openxmlformats.org/package/2006/relationships";
 const WORD_NS_TRANSITIONAL: &[u8] = b"http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const WORD_NS_STRICT: &[u8] = b"http://purl.oclc.org/ooxml/wordprocessingml/main";
+const SPREADSHEET_NS_TRANSITIONAL: &[u8] =
+    b"http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const SPREADSHEET_NS_STRICT: &[u8] = b"http://purl.oclc.org/ooxml/spreadsheetml/main";
 const MARKUP_COMPATIBILITY_NS: &[u8] =
     b"http://schemas.openxmlformats.org/markup-compatibility/2006";
 const CORE_PROPERTIES_NS: &[u8] =
@@ -47,6 +51,18 @@ const MAIN_DOCUMENT_CONTENT_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml";
 const MAIN_DOCUMENT_MACRO_ENABLED_CONTENT_TYPE: &str =
     "application/vnd.ms-word.document.macroEnabled.main+xml";
+const SPREADSHEET_WORKBOOK_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
+const SPREADSHEET_WORKBOOK_MACRO_ENABLED_CONTENT_TYPE: &str =
+    "application/vnd.ms-excel.sheet.macroEnabled.main+xml";
+const SPREADSHEET_WORKSHEET_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+const SPREADSHEET_SHARED_STRINGS_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml";
+const PRESENTATION_MAIN_CONTENT_TYPE: &str =
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml";
+const PRESENTATION_MACRO_ENABLED_CONTENT_TYPE: &str =
+    "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml";
 const HEADER_CONTENT_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml";
 const FOOTER_CONTENT_TYPE: &str =
@@ -115,6 +131,9 @@ pub enum OoxmlPartKind {
     ExtendedProperties,
     CustomXml,
     Relationships,
+    SpreadsheetWorkbook,
+    SpreadsheetWorksheet,
+    SpreadsheetSharedStrings,
 }
 
 /// Examiner-facing semantic role of the raw text in one homogeneous segment.
@@ -162,7 +181,7 @@ fn default_text_role(part_kind: OoxmlPartKind) -> OoxmlTextRole {
 
 /// ZIP-member provenance shared by every segment emitted from a package part.
 ///
-/// The offsets are relative to the DOCX/ZIP package. `zip_data_offset` is the
+/// The offsets are relative to the OOXML/ZIP package. `zip_data_offset` is the
 /// beginning of the member's *compressed* data. It is not an XML-text offset
 /// and, for compressed members, cannot be converted 1:1 into a logical XML or
 /// evidence-image physical offset.
@@ -192,6 +211,9 @@ impl OoxmlPartKind {
             Self::ExtendedProperties => "extended_properties",
             Self::CustomXml => "custom_xml",
             Self::Relationships => "relationships",
+            Self::SpreadsheetWorkbook => "spreadsheet_workbook",
+            Self::SpreadsheetWorksheet => "spreadsheet_worksheet",
+            Self::SpreadsheetSharedStrings => "spreadsheet_shared_strings",
         }
     }
 
@@ -208,6 +230,38 @@ impl OoxmlPartKind {
             Self::ExtendedProperties => 42,
             Self::CustomXml => 43,
             Self::Relationships => 50,
+            Self::SpreadsheetWorkbook => 0,
+            Self::SpreadsheetSharedStrings => 1,
+            Self::SpreadsheetWorksheet => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OoxmlPackageKind {
+    WordProcessing,
+    Spreadsheet,
+    Presentation,
+    OtherPackage,
+}
+
+impl OoxmlPackageKind {
+    pub fn canonical_extension(self) -> Option<&'static str> {
+        match self {
+            Self::WordProcessing => Some("docx"),
+            Self::Spreadsheet => Some("xlsx"),
+            Self::Presentation => Some("pptx"),
+            Self::OtherPackage => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WordProcessing => "word_processing",
+            Self::Spreadsheet => "spreadsheet",
+            Self::Presentation => "presentation",
+            Self::OtherPackage => "other_package",
         }
     }
 }
@@ -330,7 +384,9 @@ pub enum OoxmlErrorKind {
     MissingContentTypes,
     InvalidContentTypes,
     NotWordprocessingDocument,
+    NotSpreadsheetDocument,
     MissingMainDocument,
+    MissingWorkbook,
     UnexpectedContentType,
     MalformedXml,
     InvalidRelationship,
@@ -351,7 +407,9 @@ impl OoxmlErrorKind {
             Self::MissingContentTypes => "missing_content_types",
             Self::InvalidContentTypes => "invalid_content_types",
             Self::NotWordprocessingDocument => "not_wordprocessing_document",
+            Self::NotSpreadsheetDocument => "not_spreadsheet_document",
             Self::MissingMainDocument => "missing_main_document",
+            Self::MissingWorkbook => "missing_workbook",
             Self::UnexpectedContentType => "unexpected_content_type",
             Self::MalformedXml => "malformed_xml",
             Self::InvalidRelationship => "invalid_relationship",
@@ -998,6 +1056,50 @@ pub struct OoxmlStreamResult {
     pub relationship_scope_complete: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct SpreadsheetParseStats {
+    pub archive_entries: usize,
+    pub worksheets: usize,
+    pub cells_seen: usize,
+    pub values_emitted: usize,
+    pub formulas_emitted: usize,
+    pub shared_strings: usize,
+    pub segments_emitted: usize,
+    pub text_bytes: u64,
+    pub text_chars: u64,
+    pub unsupported_parts: usize,
+    pub unresolved_worksheets: usize,
+    pub styles_present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpreadsheetPreviewCell {
+    pub reference: String,
+    pub value: String,
+    pub formula: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpreadsheetPreviewRow {
+    pub row: u64,
+    pub cells: Vec<SpreadsheetPreviewCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpreadsheetPreviewSheet {
+    pub name: String,
+    pub rows: Vec<SpreadsheetPreviewRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpreadsheetStreamResult {
+    pub stats: SpreadsheetParseStats,
+    pub supported_scope_complete: bool,
+    pub semantic_scope_complete: bool,
+    pub relationship_scope_complete: bool,
+    pub preview: Vec<SpreadsheetPreviewSheet>,
+}
+
 /// Compatibility sink for the legacy collecting API and unit tests. The case
 /// ingestion path uses a transactional SQLite sink and never accumulates all
 /// extracted segments or unsupported-part disclosures in memory.
@@ -1418,6 +1520,9 @@ fn expected_content_type(kind: OoxmlPartKind) -> &'static str {
         OoxmlPartKind::ExtendedProperties => EXTENDED_PROPERTIES_CONTENT_TYPE,
         OoxmlPartKind::CustomXml => "application/xml",
         OoxmlPartKind::Relationships => RELATIONSHIPS_CONTENT_TYPE,
+        OoxmlPartKind::SpreadsheetWorkbook => SPREADSHEET_WORKBOOK_CONTENT_TYPE,
+        OoxmlPartKind::SpreadsheetWorksheet => SPREADSHEET_WORKSHEET_CONTENT_TYPE,
+        OoxmlPartKind::SpreadsheetSharedStrings => SPREADSHEET_SHARED_STRINGS_CONTENT_TYPE,
     }
 }
 
@@ -1869,6 +1974,1023 @@ fn utf8_prefix_len(text: &str, max_bytes: usize) -> usize {
 }
 
 // --- STREAMING API IMPLEMENTATION ---
+
+fn package_kind_from_content_types(
+    content_types: &ContentTypes,
+) -> Result<OoxmlPackageKind, OoxmlParseError> {
+    let mut detected = HashSet::new();
+    for content_type in content_types.overrides.values().map(String::as_str) {
+        if matches!(
+            content_type,
+            MAIN_DOCUMENT_CONTENT_TYPE | MAIN_DOCUMENT_MACRO_ENABLED_CONTENT_TYPE
+        ) {
+            detected.insert(OoxmlPackageKind::WordProcessing);
+        } else if matches!(
+            content_type,
+            SPREADSHEET_WORKBOOK_CONTENT_TYPE | SPREADSHEET_WORKBOOK_MACRO_ENABLED_CONTENT_TYPE
+        ) {
+            detected.insert(OoxmlPackageKind::Spreadsheet);
+        } else if matches!(
+            content_type,
+            PRESENTATION_MAIN_CONTENT_TYPE | PRESENTATION_MACRO_ENABLED_CONTENT_TYPE
+        ) {
+            detected.insert(OoxmlPackageKind::Presentation);
+        }
+    }
+    if detected.len() > 1 {
+        return Err(OoxmlParseError::package(
+            OoxmlErrorKind::UnexpectedContentType,
+            "package declares multiple incompatible Office document main content types",
+        ));
+    }
+    Ok(detected
+        .into_iter()
+        .next()
+        .unwrap_or(OoxmlPackageKind::OtherPackage))
+}
+
+fn validate_package_options(options: &OoxmlStreamOptions) -> Result<(), OoxmlParseError> {
+    if options.max_segment_bytes < 4 {
+        return Err(OoxmlParseError::package(
+            OoxmlErrorKind::InvalidOptions,
+            "max_segment_bytes must be at least four so one UTF-8 scalar always fits",
+        ));
+    }
+    if options.max_entry_uncompressed_bytes == 0
+        || options.max_compression_ratio == 0
+        || options.max_total_uncompressed_bytes == 0
+        || options.max_archive_entries == 0
+        || options.max_part_name_bytes == 0
+        || options.max_xml_token_bytes == 0
+        || options.max_content_type_rules == 0
+        || options.max_relationships == 0
+    {
+        return Err(OoxmlParseError::package(
+            OoxmlErrorKind::InvalidOptions,
+            "all OOXML protective limits must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_package_inventory_limits(
+    parts: &[ArchivePart],
+    options: &OoxmlStreamOptions,
+) -> Result<(), OoxmlParseError> {
+    let mut total_uncompressed_bytes = 0_u64;
+    for part in parts {
+        total_uncompressed_bytes = total_uncompressed_bytes
+            .checked_add(part.uncompressed_size)
+            .ok_or_else(|| {
+                OoxmlParseError::part(
+                    OoxmlErrorKind::ZipBombSuspected,
+                    &part.name,
+                    "aggregate declared uncompressed ZIP size overflows u64",
+                )
+            })?;
+        if total_uncompressed_bytes > options.max_total_uncompressed_bytes {
+            return Err(OoxmlParseError::part(
+                OoxmlErrorKind::ZipBombSuspected,
+                &part.name,
+                format!(
+                    "aggregate declared uncompressed size exceeds {} bytes",
+                    options.max_total_uncompressed_bytes
+                ),
+            ));
+        }
+        if part.uncompressed_size > options.max_entry_uncompressed_bytes {
+            return Err(OoxmlParseError::part(
+                OoxmlErrorKind::ZipBombSuspected,
+                &part.name,
+                format!(
+                    "uncompressed size exceeds {} bytes",
+                    options.max_entry_uncompressed_bytes
+                ),
+            ));
+        }
+        if part.compressed_size == 0 && part.uncompressed_size > 0 {
+            return Err(OoxmlParseError::part(
+                OoxmlErrorKind::ZipBombSuspected,
+                &part.name,
+                "non-empty ZIP member declares a zero compressed size",
+            ));
+        }
+        if part.compressed_size > 0
+            && part.uncompressed_size
+                > part
+                    .compressed_size
+                    .saturating_mul(options.max_compression_ratio)
+        {
+            return Err(OoxmlParseError::part(
+                OoxmlErrorKind::ZipBombSuspected,
+                &part.name,
+                format!(
+                    "declared uncompressed size {} exceeds compressed size {} times the ratio limit of {}",
+                    part.uncompressed_size,
+                    part.compressed_size,
+                    options.max_compression_ratio
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_package_content_types<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    parts: &[ArchivePart],
+    options: &OoxmlStreamOptions,
+) -> Result<ContentTypes, OoxmlParseError> {
+    let content_types_part = parts
+        .iter()
+        .find(|part| part.name == CONTENT_TYPES_PART)
+        .ok_or_else(|| {
+            OoxmlParseError::package(
+                OoxmlErrorKind::MissingContentTypes,
+                "package has no [Content_Types].xml part",
+            )
+        })?;
+    let file = archive
+        .by_index(content_types_part.index)
+        .map_err(|error| zip_part_access_error(CONTENT_TYPES_PART, error))?;
+    parse_content_types_with_limits(
+        file,
+        CONTENT_TYPES_PART,
+        options.max_xml_token_bytes,
+        options.max_content_type_rules,
+        options.max_part_name_bytes,
+    )
+}
+
+/// Identifies the Office Open XML family from the package content-types part,
+/// independent of the filename extension. This is the authoritative package
+/// discriminator used before selecting a document parser.
+pub fn detect_ooxml_package_kind<R: Read + Seek>(
+    mut reader: R,
+    options: OoxmlStreamOptions,
+) -> Result<OoxmlPackageKind, OoxmlParseError> {
+    validate_package_options(&options)?;
+    let mut archive = ZipArchive::new(&mut reader)
+        .map_err(|error| OoxmlParseError::package(OoxmlErrorKind::InvalidZip, error.to_string()))?;
+    let parts = inventory_archive_with_limits(
+        &mut archive,
+        options.max_archive_entries,
+        options.max_part_name_bytes,
+    )?;
+    validate_package_inventory_limits(&parts, &options)?;
+    let content_types = read_package_content_types(&mut archive, &parts, &options)?;
+    package_kind_from_content_types(&content_types)
+}
+
+#[derive(Debug, Clone)]
+struct WorkbookSheetDescriptor {
+    ordinal: usize,
+    name: String,
+    relationship_id: String,
+    state: Option<String>,
+    part_name: String,
+}
+
+fn parse_workbook_sheet_descriptors<R: Read>(
+    input: R,
+    part_name: &str,
+    max_xml_token_bytes: usize,
+    max_sheets: usize,
+) -> Result<Vec<WorkbookSheetDescriptor>, OoxmlParseError> {
+    let bounded = XmlTokenLimitReader::new(input, max_xml_token_bytes);
+    let mut reader = NsReader::from_reader(BufReader::new(bounded));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut root_seen = false;
+    let mut sheets = Vec::new();
+    let mut seen_relationships = HashSet::new();
+    loop {
+        let event = reader
+            .read_event_into(&mut buffer)
+            .map_err(|error| xml_error(part_name, error))?;
+        match event {
+            Event::Start(start) | Event::Empty(start) => {
+                let qname = start.name();
+                let (namespace, local_name) = reader.resolver().resolve_element(qname);
+                let local = local_name.as_ref();
+                if !root_seen {
+                    if local != b"workbook"
+                        || !namespace_matches(
+                            &namespace,
+                            &[SPREADSHEET_NS_TRANSITIONAL, SPREADSHEET_NS_STRICT],
+                        )
+                    {
+                        return Err(OoxmlParseError::part(
+                            OoxmlErrorKind::MalformedXml,
+                            part_name,
+                            "root element is not a SpreadsheetML workbook",
+                        ));
+                    }
+                    root_seen = true;
+                } else if local == b"sheet"
+                    && namespace_matches(
+                        &namespace,
+                        &[SPREADSHEET_NS_TRANSITIONAL, SPREADSHEET_NS_STRICT],
+                    )
+                {
+                    if sheets.len() == max_sheets {
+                        return Err(OoxmlParseError::part(
+                            OoxmlErrorKind::ZipBombSuspected,
+                            part_name,
+                            format!("worksheet count exceeds the protective limit of {max_sheets}"),
+                        ));
+                    }
+                    let name = required_attribute(&start, b"name", reader.decoder(), part_name)?;
+                    let relationship_id =
+                        required_attribute(&start, b"id", reader.decoder(), part_name)?;
+                    if name.is_empty() || relationship_id.is_empty() {
+                        return Err(OoxmlParseError::part(
+                            OoxmlErrorKind::MalformedXml,
+                            part_name,
+                            "worksheet name and relationship id must be non-empty",
+                        ));
+                    }
+                    if !seen_relationships.insert(relationship_id.clone()) {
+                        return Err(OoxmlParseError::part(
+                            OoxmlErrorKind::InvalidRelationship,
+                            part_name,
+                            format!("worksheet relationship {relationship_id:?} is repeated"),
+                        ));
+                    }
+                    sheets.push(WorkbookSheetDescriptor {
+                        ordinal: sheets.len(),
+                        name,
+                        relationship_id,
+                        state: optional_attribute(&start, b"state", reader.decoder(), part_name)?,
+                        part_name: String::new(),
+                    });
+                }
+            }
+            Event::DocType(_) => return Err(doctype_error(part_name)),
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    if !root_seen {
+        return Err(OoxmlParseError::part(
+            OoxmlErrorKind::MalformedXml,
+            part_name,
+            "SpreadsheetML workbook is empty",
+        ));
+    }
+    Ok(sheets)
+}
+
+fn parse_spreadsheet_shared_strings<R: Read>(
+    input: R,
+    part_name: &str,
+    max_xml_token_bytes: usize,
+    max_strings: usize,
+) -> Result<Vec<String>, OoxmlParseError> {
+    let bounded = XmlTokenLimitReader::new(input, max_xml_token_bytes);
+    let mut reader = NsReader::from_reader(BufReader::new(bounded));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut root_seen = false;
+    let mut in_item = false;
+    let mut text_depth = 0_usize;
+    let mut phonetic_depth = 0_usize;
+    let mut current = String::new();
+    let mut strings = Vec::new();
+    loop {
+        let event = reader
+            .read_event_into(&mut buffer)
+            .map_err(|error| xml_error(part_name, error))?;
+        match event {
+            Event::Start(start) => {
+                let qname = start.name();
+                let (namespace, local_name) = reader.resolver().resolve_element(qname);
+                let local = local_name.as_ref();
+                if !root_seen {
+                    if local != b"sst"
+                        || !namespace_matches(
+                            &namespace,
+                            &[SPREADSHEET_NS_TRANSITIONAL, SPREADSHEET_NS_STRICT],
+                        )
+                    {
+                        return Err(OoxmlParseError::part(
+                            OoxmlErrorKind::MalformedXml,
+                            part_name,
+                            "root element is not a SpreadsheetML shared-string table",
+                        ));
+                    }
+                    root_seen = true;
+                } else if local == b"si" {
+                    if in_item {
+                        return Err(OoxmlParseError::part(
+                            OoxmlErrorKind::MalformedXml,
+                            part_name,
+                            "nested shared-string items are invalid",
+                        ));
+                    }
+                    if strings.len() == max_strings {
+                        return Err(OoxmlParseError::part(
+                            OoxmlErrorKind::ZipBombSuspected,
+                            part_name,
+                            format!(
+                                "shared-string count exceeds the protective limit of {max_strings}"
+                            ),
+                        ));
+                    }
+                    in_item = true;
+                    current.clear();
+                } else if in_item && local == b"rPh" {
+                    phonetic_depth = phonetic_depth.saturating_add(1);
+                } else if in_item && local == b"t" && phonetic_depth == 0 {
+                    text_depth = text_depth.saturating_add(1);
+                }
+            }
+            Event::End(end) => {
+                let local = end.name().local_name();
+                if local.as_ref() == b"si" && in_item {
+                    strings.push(std::mem::take(&mut current));
+                    in_item = false;
+                    text_depth = 0;
+                    phonetic_depth = 0;
+                } else if local.as_ref() == b"rPh" && phonetic_depth > 0 {
+                    phonetic_depth -= 1;
+                } else if local.as_ref() == b"t" && text_depth > 0 {
+                    text_depth -= 1;
+                }
+            }
+            Event::Text(text) if in_item && text_depth > 0 && phonetic_depth == 0 => {
+                current.push_str(&decode_xml_text(&text, part_name)?);
+            }
+            Event::GeneralRef(reference) if in_item && text_depth > 0 && phonetic_depth == 0 => {
+                current.push_str(&decode_xml_reference(&reference, part_name)?);
+            }
+            Event::CData(text) if in_item && text_depth > 0 && phonetic_depth == 0 => {
+                current.push_str(&text.decode().map_err(|error| xml_error(part_name, error))?);
+            }
+            Event::DocType(_) => return Err(doctype_error(part_name)),
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    if !root_seen || in_item {
+        return Err(OoxmlParseError::part(
+            OoxmlErrorKind::MalformedXml,
+            part_name,
+            "shared-string table is empty or ended inside an item",
+        ));
+    }
+    Ok(strings)
+}
+
+#[derive(Default)]
+struct SpreadsheetCellState {
+    reference: String,
+    value_type: Option<String>,
+    style_index: Option<String>,
+    raw_value: String,
+    inline_text: String,
+    formula: String,
+    capture_value_depth: usize,
+    capture_inline_depth: usize,
+    capture_formula_depth: usize,
+}
+
+fn spreadsheet_cell_row(reference: &str, fallback: u64) -> u64 {
+    let digits = reference
+        .chars()
+        .skip_while(|character| character.is_ascii_alphabetic() || *character == '$')
+        .filter(|character| character.is_ascii_digit())
+        .collect::<String>();
+    digits
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
+
+fn spreadsheet_cell_display_value(
+    cell: &SpreadsheetCellState,
+    shared_strings: &[String],
+    part_name: &str,
+) -> Result<String, OoxmlParseError> {
+    match cell.value_type.as_deref() {
+        Some("s") => {
+            let index = cell.raw_value.trim().parse::<usize>().map_err(|_| {
+                OoxmlParseError::part(
+                    OoxmlErrorKind::MalformedXml,
+                    part_name,
+                    format!(
+                        "cell {:?} has an invalid shared-string index {:?}",
+                        cell.reference, cell.raw_value
+                    ),
+                )
+            })?;
+            shared_strings.get(index).cloned().ok_or_else(|| {
+                OoxmlParseError::part(
+                    OoxmlErrorKind::MalformedXml,
+                    part_name,
+                    format!(
+                        "cell {:?} references missing shared-string index {index}",
+                        cell.reference
+                    ),
+                )
+            })
+        }
+        Some("inlineStr") => Ok(cell.inline_text.clone()),
+        Some("b") => Ok(match cell.raw_value.trim() {
+            "0" => "FALSE".to_string(),
+            "1" => "TRUE".to_string(),
+            other => other.to_string(),
+        }),
+        Some("e") => Ok(format!("#ERROR:{}", cell.raw_value.trim())),
+        _ => Ok(cell.raw_value.clone()),
+    }
+}
+
+fn emit_spreadsheet_text<S: OoxmlSink>(
+    sink: &mut S,
+    ordinal: &mut usize,
+    part_name: &str,
+    provenance: &OoxmlPartProvenance,
+    role: OoxmlTextRole,
+    source_fields: &BTreeMap<String, String>,
+    text: &str,
+    max_segment_bytes: usize,
+) -> Result<(usize, u64, u64), OoxmlParseError> {
+    if text.is_empty() {
+        return Ok((0, 0, 0));
+    }
+    let mut remaining = text;
+    let mut count = 0_usize;
+    let mut bytes = 0_u64;
+    let mut chars = 0_u64;
+    while !remaining.is_empty() {
+        let length = utf8_prefix_len(remaining, max_segment_bytes);
+        if length == 0 {
+            return Err(OoxmlParseError::part(
+                OoxmlErrorKind::InvalidOptions,
+                part_name,
+                "spreadsheet segment bound cannot hold the next UTF-8 scalar",
+            ));
+        }
+        let chunk = &remaining[..length];
+        let segment = OoxmlTextSegment {
+            ordinal: *ordinal,
+            part_name: part_name.to_string(),
+            part_kind: OoxmlPartKind::SpreadsheetWorksheet,
+            text_role: role,
+            hidden: false,
+            in_text_box: false,
+            source_fields: source_fields.clone(),
+            part_provenance: Some(provenance.clone()),
+            text: chunk.to_string(),
+        };
+        sink.segment(&segment).map_err(|error| {
+            OoxmlParseError::part(OoxmlErrorKind::SinkFailure, part_name, error.to_string())
+        })?;
+        *ordinal = ordinal.saturating_add(1);
+        count = count.saturating_add(1);
+        bytes = bytes.saturating_add(chunk.len() as u64);
+        chars = chars.saturating_add(chunk.chars().count() as u64);
+        remaining = &remaining[length..];
+    }
+    Ok((count, bytes, chars))
+}
+
+fn parse_spreadsheet_worksheet<R: Read, S: OoxmlSink>(
+    input: R,
+    descriptor: &WorkbookSheetDescriptor,
+    provenance: &OoxmlPartProvenance,
+    shared_strings: &[String],
+    options: &OoxmlStreamOptions,
+    sink: &mut S,
+    ordinal: &mut usize,
+) -> Result<(SpreadsheetParseStats, SpreadsheetPreviewSheet), OoxmlParseError> {
+    const PREVIEW_ROWS: usize = 25;
+    const PREVIEW_CELLS_PER_ROW: usize = 20;
+    let part_name = descriptor.part_name.as_str();
+    let bounded = XmlTokenLimitReader::new(input, options.max_xml_token_bytes);
+    let mut reader = NsReader::from_reader(BufReader::new(bounded));
+    reader.config_mut().trim_text(false);
+    let mut buffer = Vec::new();
+    let mut root_seen = false;
+    let mut current_row = 0_u64;
+    let mut cell: Option<SpreadsheetCellState> = None;
+    let mut stats = SpreadsheetParseStats::default();
+    let mut preview = SpreadsheetPreviewSheet {
+        name: descriptor.name.clone(),
+        rows: Vec::new(),
+    };
+
+    loop {
+        let event = reader
+            .read_event_into(&mut buffer)
+            .map_err(|error| xml_error(part_name, error))?;
+        match event {
+            Event::Start(start) => {
+                let qname = start.name();
+                let (namespace, local_name) = reader.resolver().resolve_element(qname);
+                let local = local_name.as_ref();
+                let spreadsheet_namespace = namespace_matches(
+                    &namespace,
+                    &[SPREADSHEET_NS_TRANSITIONAL, SPREADSHEET_NS_STRICT],
+                );
+                if !root_seen {
+                    if local != b"worksheet" || !spreadsheet_namespace {
+                        return Err(OoxmlParseError::part(
+                            OoxmlErrorKind::MalformedXml,
+                            part_name,
+                            "root element is not a SpreadsheetML worksheet",
+                        ));
+                    }
+                    root_seen = true;
+                } else if spreadsheet_namespace && local == b"row" {
+                    current_row = optional_attribute(&start, b"r", reader.decoder(), part_name)?
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or_else(|| current_row.saturating_add(1));
+                } else if spreadsheet_namespace && local == b"c" {
+                    if cell.is_some() {
+                        return Err(OoxmlParseError::part(
+                            OoxmlErrorKind::MalformedXml,
+                            part_name,
+                            "nested SpreadsheetML cells are invalid",
+                        ));
+                    }
+                    let reference = optional_attribute(&start, b"r", reader.decoder(), part_name)?
+                        .unwrap_or_else(|| format!("ROW{current_row}"));
+                    cell = Some(SpreadsheetCellState {
+                        reference,
+                        value_type: optional_attribute(&start, b"t", reader.decoder(), part_name)?,
+                        style_index: optional_attribute(&start, b"s", reader.decoder(), part_name)?,
+                        ..Default::default()
+                    });
+                    stats.cells_seen = stats.cells_seen.saturating_add(1);
+                } else if let Some(cell) = cell.as_mut() {
+                    if spreadsheet_namespace && local == b"v" {
+                        cell.capture_value_depth = cell.capture_value_depth.saturating_add(1);
+                    } else if spreadsheet_namespace && local == b"f" {
+                        cell.capture_formula_depth = cell.capture_formula_depth.saturating_add(1);
+                    } else if spreadsheet_namespace && local == b"t" {
+                        cell.capture_inline_depth = cell.capture_inline_depth.saturating_add(1);
+                    }
+                }
+            }
+            Event::End(end) => {
+                let qname = end.name();
+                let local = qname.local_name();
+                match local.as_ref() {
+                    b"v" => {
+                        if let Some(cell) = cell.as_mut() {
+                            cell.capture_value_depth = cell.capture_value_depth.saturating_sub(1);
+                        }
+                    }
+                    b"f" => {
+                        if let Some(cell) = cell.as_mut() {
+                            cell.capture_formula_depth =
+                                cell.capture_formula_depth.saturating_sub(1);
+                        }
+                    }
+                    b"t" => {
+                        if let Some(cell) = cell.as_mut() {
+                            cell.capture_inline_depth = cell.capture_inline_depth.saturating_sub(1);
+                        }
+                    }
+                    b"c" => {
+                        let Some(cell) = cell.take() else {
+                            return Err(OoxmlParseError::part(
+                                OoxmlErrorKind::MalformedXml,
+                                part_name,
+                                "worksheet closed a cell that was not open",
+                            ));
+                        };
+                        let value =
+                            spreadsheet_cell_display_value(&cell, shared_strings, part_name)?;
+                        let mut source_fields = BTreeMap::new();
+                        source_fields.insert("sheet_name".to_string(), descriptor.name.clone());
+                        source_fields
+                            .insert("sheet_index".to_string(), descriptor.ordinal.to_string());
+                        source_fields.insert("cell_reference".to_string(), cell.reference.clone());
+                        if let Some(value_type) = &cell.value_type {
+                            source_fields.insert("cell_type".to_string(), value_type.clone());
+                        }
+                        if let Some(style_index) = &cell.style_index {
+                            source_fields.insert("style_index".to_string(), style_index.clone());
+                        }
+                        if let Some(state) = &descriptor.state {
+                            source_fields.insert("sheet_state".to_string(), state.clone());
+                        }
+                        if !cell.formula.is_empty() {
+                            let (segments, bytes, chars) = emit_spreadsheet_text(
+                                sink,
+                                ordinal,
+                                part_name,
+                                provenance,
+                                OoxmlTextRole::FieldInstruction,
+                                &source_fields,
+                                &cell.formula,
+                                options.max_segment_bytes,
+                            )?;
+                            stats.formulas_emitted = stats.formulas_emitted.saturating_add(1);
+                            stats.segments_emitted =
+                                stats.segments_emitted.saturating_add(segments);
+                            stats.text_bytes = stats.text_bytes.saturating_add(bytes);
+                            stats.text_chars = stats.text_chars.saturating_add(chars);
+                        }
+                        if !value.is_empty() {
+                            let (segments, bytes, chars) = emit_spreadsheet_text(
+                                sink,
+                                ordinal,
+                                part_name,
+                                provenance,
+                                OoxmlTextRole::Visible,
+                                &source_fields,
+                                &value,
+                                options.max_segment_bytes,
+                            )?;
+                            stats.values_emitted = stats.values_emitted.saturating_add(1);
+                            stats.segments_emitted =
+                                stats.segments_emitted.saturating_add(segments);
+                            stats.text_bytes = stats.text_bytes.saturating_add(bytes);
+                            stats.text_chars = stats.text_chars.saturating_add(chars);
+                        }
+                        if preview.rows.len() < PREVIEW_ROWS
+                            && (!value.is_empty() || !cell.formula.is_empty())
+                        {
+                            let row_number =
+                                spreadsheet_cell_row(&cell.reference, current_row.max(1));
+                            let needs_row =
+                                preview.rows.last().is_none_or(|row| row.row != row_number);
+                            if needs_row {
+                                preview.rows.push(SpreadsheetPreviewRow {
+                                    row: row_number,
+                                    cells: Vec::new(),
+                                });
+                            }
+                            if let Some(row) = preview.rows.last_mut() {
+                                if row.cells.len() < PREVIEW_CELLS_PER_ROW {
+                                    row.cells.push(SpreadsheetPreviewCell {
+                                        reference: cell.reference,
+                                        value,
+                                        formula: (!cell.formula.is_empty()).then_some(cell.formula),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::Text(text) => {
+                if let Some(cell) = cell.as_mut() {
+                    let decoded = decode_xml_text(&text, part_name)?;
+                    if cell.capture_formula_depth > 0 {
+                        cell.formula.push_str(&decoded);
+                    } else if cell.capture_value_depth > 0 {
+                        cell.raw_value.push_str(&decoded);
+                    } else if cell.capture_inline_depth > 0 {
+                        cell.inline_text.push_str(&decoded);
+                    }
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if let Some(cell) = cell.as_mut() {
+                    let decoded = decode_xml_reference(&reference, part_name)?;
+                    if cell.capture_formula_depth > 0 {
+                        cell.formula.push_str(&decoded);
+                    } else if cell.capture_value_depth > 0 {
+                        cell.raw_value.push_str(&decoded);
+                    } else if cell.capture_inline_depth > 0 {
+                        cell.inline_text.push_str(&decoded);
+                    }
+                }
+            }
+            Event::CData(text) => {
+                if let Some(cell) = cell.as_mut() {
+                    let decoded = text.decode().map_err(|error| xml_error(part_name, error))?;
+                    if cell.capture_formula_depth > 0 {
+                        cell.formula.push_str(&decoded);
+                    } else if cell.capture_value_depth > 0 {
+                        cell.raw_value.push_str(&decoded);
+                    } else if cell.capture_inline_depth > 0 {
+                        cell.inline_text.push_str(&decoded);
+                    }
+                }
+            }
+            Event::DocType(_) => return Err(doctype_error(part_name)),
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    if !root_seen || cell.is_some() {
+        return Err(OoxmlParseError::part(
+            OoxmlErrorKind::MalformedXml,
+            part_name,
+            "worksheet is empty or ended inside a cell",
+        ));
+    }
+    stats.worksheets = 1;
+    Ok((stats, preview))
+}
+
+fn spreadsheet_unsupported_part_disclosure(part: &ArchivePart) -> OoxmlUnsupportedPart {
+    let lower = part.name.to_ascii_lowercase();
+    let (reason, may_contain_text) =
+        if lower.contains("vbaproject") || lower.starts_with("xl/activex/") {
+            (OoxmlUnsupportedReason::MacroOrActiveContent, true)
+        } else if lower.starts_with("xl/media/") || lower.starts_with("docprops/thumbnail") {
+            (OoxmlUnsupportedReason::Media, false)
+        } else if lower.starts_with("xl/embeddings/") {
+            (OoxmlUnsupportedReason::EmbeddedObject, true)
+        } else if lower == "xl/styles.xml" || lower.starts_with("xl/theme/") {
+            (OoxmlUnsupportedReason::FormattingOrLayout, false)
+        } else if lower.starts_with("xl/drawings/") || lower.starts_with("xl/charts/") {
+            (OoxmlUnsupportedReason::PotentialTextContent, true)
+        } else if lower.starts_with("_rels/") || lower.ends_with(".rels") {
+            (OoxmlUnsupportedReason::PackageInfrastructure, false)
+        } else if lower.ends_with(".xml")
+            || lower.ends_with(".txt")
+            || lower.ends_with(".html")
+            || lower.ends_with(".htm")
+        {
+            (OoxmlUnsupportedReason::PotentialTextContent, true)
+        } else {
+            (OoxmlUnsupportedReason::UnknownPart, true)
+        };
+    OoxmlUnsupportedPart {
+        part_name: part.name.clone(),
+        reason,
+        may_contain_text,
+        compressed_size: part.compressed_size,
+        uncompressed_size: part.uncompressed_size,
+        crc32: part.crc32,
+        compression_method: part.compression_method.clone(),
+        zip_local_header_offset: part.header_start,
+        zip_data_offset: part.data_start,
+        zip_central_header_offset: part.central_header_start,
+    }
+}
+
+/// Streams formulas and resolved cell values from an XLSX/XLSM workbook. The
+/// package family comes from `[Content_Types].xml`, never the filename. Shared
+/// strings are resolved, formulas and cached values remain separate semantic
+/// roles, and every emitted value retains sheet/cell and ZIP-member provenance.
+pub fn parse_xlsx_streaming<R: Read + Seek, S: OoxmlSink>(
+    mut reader: R,
+    options: OoxmlStreamOptions,
+    sink: &mut S,
+) -> Result<SpreadsheetStreamResult, OoxmlParseError> {
+    validate_package_options(&options)?;
+    let mut archive = ZipArchive::new(&mut reader)
+        .map_err(|error| OoxmlParseError::package(OoxmlErrorKind::InvalidZip, error.to_string()))?;
+    let archive_entries = archive.len();
+    let parts = inventory_archive_with_limits(
+        &mut archive,
+        options.max_archive_entries,
+        options.max_part_name_bytes,
+    )?;
+    validate_package_inventory_limits(&parts, &options)?;
+    let content_types = read_package_content_types(&mut archive, &parts, &options)?;
+    if package_kind_from_content_types(&content_types)? != OoxmlPackageKind::Spreadsheet {
+        return Err(OoxmlParseError::package(
+            OoxmlErrorKind::NotSpreadsheetDocument,
+            "package content types do not identify a SpreadsheetML workbook",
+        ));
+    }
+
+    let workbook_part = parts
+        .iter()
+        .find(|part| {
+            matches!(
+                content_types.for_part(&part.name),
+                Some(
+                    SPREADSHEET_WORKBOOK_CONTENT_TYPE
+                        | SPREADSHEET_WORKBOOK_MACRO_ENABLED_CONTENT_TYPE
+                )
+            )
+        })
+        .ok_or_else(|| {
+            OoxmlParseError::package(
+                OoxmlErrorKind::MissingWorkbook,
+                "SpreadsheetML package has no workbook main part",
+            )
+        })?
+        .clone();
+    let workbook_relationship_part_name = relationship_part_for_source(&workbook_part.name);
+    let workbook_relationship_part = parts
+        .iter()
+        .find(|part| part.name == workbook_relationship_part_name)
+        .cloned();
+
+    let mut sheets = {
+        let file = archive
+            .by_index(workbook_part.index)
+            .map_err(|error| zip_part_access_error(&workbook_part.name, error))?;
+        parse_workbook_sheet_descriptors(
+            file,
+            &workbook_part.name,
+            options.max_xml_token_bytes,
+            options.max_archive_entries,
+        )?
+    };
+
+    let relationships = if let Some(part) = &workbook_relationship_part {
+        let file = archive
+            .by_index(part.index)
+            .map_err(|error| zip_part_access_error(&part.name, error))?;
+        parse_relationship_records(
+            file,
+            &part.name,
+            Some(&workbook_part.name),
+            options.max_xml_token_bytes,
+            options.max_relationships,
+            options.max_part_name_bytes,
+        )?
+    } else {
+        Vec::new()
+    };
+    let worksheet_targets = relationships
+        .iter()
+        .filter(|relationship| {
+            !relationship.external && relationship.relationship_type.ends_with("/worksheet")
+        })
+        .filter_map(|relationship| {
+            relationship
+                .resolved_target
+                .as_ref()
+                .map(|target| (relationship.id.as_str(), target.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+    let part_names = parts
+        .iter()
+        .map(|part| part.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut unresolved_worksheets = 0_usize;
+    for sheet in &mut sheets {
+        if let Some(target) = worksheet_targets.get(sheet.relationship_id.as_str()) {
+            if part_names.contains(*target) {
+                sheet.part_name = (*target).to_string();
+            } else {
+                unresolved_worksheets = unresolved_worksheets.saturating_add(1);
+            }
+        } else {
+            unresolved_worksheets = unresolved_worksheets.saturating_add(1);
+        }
+    }
+
+    let shared_strings_part = parts
+        .iter()
+        .find(|part| {
+            content_types.for_part(&part.name) == Some(SPREADSHEET_SHARED_STRINGS_CONTENT_TYPE)
+                || part.name.eq_ignore_ascii_case("xl/sharedStrings.xml")
+        })
+        .cloned();
+    let shared_strings = if let Some(part) = &shared_strings_part {
+        let file = archive
+            .by_index(part.index)
+            .map_err(|error| zip_part_access_error(&part.name, error))?;
+        parse_spreadsheet_shared_strings(
+            file,
+            &part.name,
+            options.max_xml_token_bytes,
+            options.max_archive_entries.saturating_mul(1024),
+        )?
+    } else {
+        Vec::new()
+    };
+
+    let content_types_index = parts
+        .iter()
+        .find(|part| part.name == CONTENT_TYPES_PART)
+        .map(|part| part.index);
+    let mut selected_indices = HashSet::new();
+    if let Some(index) = content_types_index {
+        selected_indices.insert(index);
+    }
+    selected_indices.insert(workbook_part.index);
+    if let Some(part) = &workbook_relationship_part {
+        selected_indices.insert(part.index);
+    }
+    if let Some(part) = &shared_strings_part {
+        selected_indices.insert(part.index);
+    }
+
+    let property_parts = parts
+        .iter()
+        .filter_map(|part| {
+            let kind = match content_types.for_part(&part.name) {
+                Some(CORE_PROPERTIES_CONTENT_TYPE) => OoxmlPartKind::CoreProperties,
+                Some(CUSTOM_PROPERTIES_CONTENT_TYPE) => OoxmlPartKind::CustomProperties,
+                Some(EXTENDED_PROPERTIES_CONTENT_TYPE) => OoxmlPartKind::ExtendedProperties,
+                _ => return None,
+            };
+            Some((part.clone(), kind))
+        })
+        .collect::<Vec<_>>();
+
+    let mut result = SpreadsheetStreamResult {
+        stats: SpreadsheetParseStats {
+            archive_entries,
+            shared_strings: shared_strings.len(),
+            unresolved_worksheets,
+            ..Default::default()
+        },
+        supported_scope_complete: true,
+        semantic_scope_complete: true,
+        relationship_scope_complete: workbook_relationship_part.is_some()
+            && unresolved_worksheets == 0,
+        preview: Vec::new(),
+    };
+    let mut segment_ordinal = 0_usize;
+    for (part, kind) in property_parts {
+        selected_indices.insert(part.index);
+        let file = archive
+            .by_index(part.index)
+            .map_err(|error| zip_part_access_error(&part.name, error))?;
+        let before = segment_ordinal;
+        let (bytes, chars) = parse_property_part_streaming(
+            file,
+            &part.name,
+            kind,
+            &part.provenance(),
+            options.max_segment_bytes,
+            options.max_xml_token_bytes,
+            sink,
+            &mut segment_ordinal,
+        )?;
+        result.stats.segments_emitted = result
+            .stats
+            .segments_emitted
+            .saturating_add(segment_ordinal.saturating_sub(before));
+        result.stats.text_bytes = result.stats.text_bytes.saturating_add(bytes);
+        result.stats.text_chars = result.stats.text_chars.saturating_add(chars);
+    }
+    for sheet in sheets.iter().filter(|sheet| !sheet.part_name.is_empty()) {
+        let Some(part) = parts.iter().find(|part| part.name == sheet.part_name) else {
+            continue;
+        };
+        selected_indices.insert(part.index);
+        let file = archive
+            .by_index(part.index)
+            .map_err(|error| zip_part_access_error(&part.name, error))?;
+        let (stats, preview) = parse_spreadsheet_worksheet(
+            file,
+            sheet,
+            &part.provenance(),
+            &shared_strings,
+            &options,
+            sink,
+            &mut segment_ordinal,
+        )?;
+        result.stats.worksheets = result.stats.worksheets.saturating_add(stats.worksheets);
+        result.stats.cells_seen = result.stats.cells_seen.saturating_add(stats.cells_seen);
+        result.stats.values_emitted = result
+            .stats
+            .values_emitted
+            .saturating_add(stats.values_emitted);
+        result.stats.formulas_emitted = result
+            .stats
+            .formulas_emitted
+            .saturating_add(stats.formulas_emitted);
+        result.stats.segments_emitted = result
+            .stats
+            .segments_emitted
+            .saturating_add(stats.segments_emitted);
+        result.stats.text_bytes = result.stats.text_bytes.saturating_add(stats.text_bytes);
+        result.stats.text_chars = result.stats.text_chars.saturating_add(stats.text_chars);
+        if result.preview.len() < 8 {
+            result.preview.push(preview);
+        }
+    }
+
+    // Root relationships are package infrastructure already validated by the
+    // ZIP reader and content-type parser; do not advertise them as missing
+    // spreadsheet content. Every other unparsed member is disclosed.
+    for part in parts.iter().filter(|part| {
+        !selected_indices.contains(&part.index)
+            && part.name != "_rels/.rels"
+            && !part.name.eq_ignore_ascii_case("[Content_Types].xml")
+    }) {
+        let unsupported = spreadsheet_unsupported_part_disclosure(part);
+        if unsupported.may_contain_text {
+            result.supported_scope_complete = false;
+        }
+        result.stats.unsupported_parts = result.stats.unsupported_parts.saturating_add(1);
+        sink.unsupported_part(&unsupported).map_err(|error| {
+            OoxmlParseError::part(OoxmlErrorKind::SinkFailure, &part.name, error.to_string())
+        })?;
+    }
+    // Excel serial dates and custom number formats remain exact raw cell
+    // values. Style presence is disclosed separately: it limits rendered-
+    // display fidelity but does not make the stored cell-value extraction
+    // partial or uncertain.
+    result.stats.styles_present = parts
+        .iter()
+        .any(|part| part.name.eq_ignore_ascii_case("xl/styles.xml"));
+    Ok(result)
+}
 
 pub fn parse_docx_streaming<R: Read + Seek, S: OoxmlSink>(
     mut reader: R,
@@ -2425,6 +3547,26 @@ fn parse_supported_part_streaming<R: Read, S: OoxmlSink>(
             )?;
             Ok(StreamingOutcome {
                 hyperlink_targets: targets,
+                text_bytes: bytes,
+                text_chars: chars,
+                word_semantics: WordSemanticStats::default(),
+            })
+        }
+        OoxmlPartKind::SpreadsheetWorkbook
+        | OoxmlPartKind::SpreadsheetWorksheet
+        | OoxmlPartKind::SpreadsheetSharedStrings => {
+            let (bytes, chars) = parse_generic_xml_part_streaming(
+                input,
+                part_name,
+                kind,
+                part_provenance,
+                max_segment_bytes,
+                max_xml_token_bytes,
+                sink,
+                segments_emitted,
+            )?;
+            Ok(StreamingOutcome {
+                hyperlink_targets: 0,
                 text_bytes: bytes,
                 text_chars: chars,
                 word_semantics: WordSemanticStats::default(),
@@ -3567,6 +4709,83 @@ mod tests {
             ("_rels/.rels", &relationships),
             (MAIN_DOCUMENT_PART, &document),
         ])
+    }
+
+    fn minimal_xlsx() -> Vec<u8> {
+        let types = content_types(&[
+            ("xl/workbook.xml", SPREADSHEET_WORKBOOK_CONTENT_TYPE),
+            (
+                "xl/worksheets/sheet1.xml",
+                SPREADSHEET_WORKSHEET_CONTENT_TYPE,
+            ),
+            (
+                "xl/sharedStrings.xml",
+                SPREADSHEET_SHARED_STRINGS_CONTENT_TYPE,
+            ),
+            ("docProps/core.xml", CORE_PROPERTIES_CONTENT_TYPE),
+        ]);
+        let workbook = r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Investigation" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let relationships = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#;
+        let shared_strings = r#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="2" uniqueCount="2"><si><t>Account</t></si><si><t>Contoso SharePoint</t></si></sst>"#;
+        let worksheet = r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row><row r="2"><c r="A2"><f>SUM(40,2)</f><v>42</v></c><c r="B2" t="inlineStr"><is><t>Recovered value</t></is></c></row></sheetData></worksheet>"#;
+        let core = r#"<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator>Case Analyst</dc:creator></cp:coreProperties>"#;
+        make_zip(&[
+            (CONTENT_TYPES_PART, &types),
+            ("xl/workbook.xml", workbook),
+            ("xl/_rels/workbook.xml.rels", relationships),
+            ("xl/sharedStrings.xml", shared_strings),
+            ("xl/worksheets/sheet1.xml", worksheet),
+            (
+                "xl/styles.xml",
+                r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#,
+            ),
+            ("docProps/core.xml", core),
+        ])
+    }
+
+    #[test]
+    fn identifies_and_parses_spreadsheet_values_formulas_and_preview_by_content() {
+        let package = minimal_xlsx();
+        let kind =
+            detect_ooxml_package_kind(Cursor::new(package.clone()), OoxmlStreamOptions::default())
+                .expect("identify SpreadsheetML package");
+        assert_eq!(kind, OoxmlPackageKind::Spreadsheet);
+
+        let mut sink = CollectingSink {
+            segments: Vec::new(),
+            unsupported_parts: Vec::new(),
+        };
+        let parsed = parse_xlsx_streaming(
+            Cursor::new(package),
+            OoxmlStreamOptions::default(),
+            &mut sink,
+        )
+        .expect("parse SpreadsheetML package");
+        assert_eq!(parsed.stats.worksheets, 1);
+        assert_eq!(parsed.stats.cells_seen, 4);
+        assert_eq!(parsed.stats.values_emitted, 4);
+        assert_eq!(parsed.stats.formulas_emitted, 1);
+        assert!(parsed.supported_scope_complete);
+        assert!(parsed.semantic_scope_complete);
+        assert!(parsed.relationship_scope_complete);
+        assert!(parsed.stats.styles_present);
+        assert!(sink
+            .segments
+            .iter()
+            .any(|segment| segment.text == "Contoso SharePoint"
+                && segment
+                    .source_fields
+                    .get("cell_reference")
+                    .map(String::as_str)
+                    == Some("B1")));
+        assert!(sink.segments.iter().any(|segment| {
+            segment.text == "SUM(40,2)" && segment.text_role == OoxmlTextRole::FieldInstruction
+        }));
+        assert!(sink.segments.iter().any(|segment| {
+            segment.text == "Case Analyst" && segment.text_role == OoxmlTextRole::DocumentProperty
+        }));
+        assert_eq!(parsed.preview[0].name, "Investigation");
+        assert_eq!(parsed.preview[0].rows[1].cells[1].value, "Recovered value");
     }
 
     fn text_for_kind(result: &OoxmlParseResult, kind: OoxmlPartKind) -> String {

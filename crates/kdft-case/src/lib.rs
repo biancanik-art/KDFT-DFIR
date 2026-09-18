@@ -310,7 +310,7 @@ const EVTX_PARSER_NAME: &str = "evtx 0.12.2";
 const EVTX_EVENT_SUMMARY_PREVIEW_CHARS: usize = 1200;
 const EVTX_PARSER_ERROR_LIMIT: usize = 16;
 const PST_PARSER_NAME: &str = "outlook-pst 1.2.0";
-const OOXML_PARSER_NAME: &str = "kdft-wordprocessingml 1";
+const OOXML_PARSER_NAME: &str = "kdft-office-open-xml 2";
 const ZIP_PARSER_NAME: &str = "kdft-zip 2";
 const DOCUMENT_PARSE_ERROR_DISPLAY_LIMIT: usize = 100;
 const TEMP_CLEANUP_WARNING_DISPLAY_LIMIT: usize = 32;
@@ -815,6 +815,14 @@ pub struct EntryDiskLocation {
     pub entry_id: i64,
     pub evidence_id: i64,
     pub available: bool,
+    /// Start of the containing filesystem volume in the decoded evidence
+    /// media byte stream. This is not an E01 segment/container-file offset.
+    pub partition_start_offset: Option<u64>,
+    pub partition_size_bytes: Option<u64>,
+    /// Byte offset relative to the start of the containing filesystem volume.
+    /// This is returned only when it is arithmetically consistent with the
+    /// authoritative decoded-media location.
+    pub volume_relative_offset: Option<u64>,
     pub decoded_media_offset: Option<u64>,
     pub file_relative_offset: Option<u64>,
     pub contiguous_bytes: Option<u64>,
@@ -3694,8 +3702,13 @@ pub struct DocumentParseResult {
     pub documents_supported: usize,
     pub up_to_date_documents_skipped: usize,
     pub reused_partial_documents: usize,
+    pub candidates_inspected: usize,
     pub documents_found: usize,
     pub documents_parsed: usize,
+    pub word_documents_parsed: usize,
+    pub spreadsheets_parsed: usize,
+    pub renamed_office_documents_detected: usize,
+    pub non_office_packages_skipped: usize,
     pub segments_indexed: usize,
     pub text_bytes_indexed: u64,
     pub partial_documents: usize,
@@ -5315,6 +5328,7 @@ const EMBEDDED_MAILBOX_CANDIDATE_PAGE_SIZE: usize = 32;
 struct DocumentCandidate {
     entry_id: i64,
     logical_path: String,
+    name: String,
     current_object: String,
 }
 
@@ -5329,7 +5343,9 @@ struct DocumentCandidateSnapshot {
 
 #[derive(Debug)]
 struct DocumentStreamSummary {
-    stats: ooxml::OoxmlParseStats,
+    document_kind: ooxml::OoxmlPackageKind,
+    segments_indexed: usize,
+    text_bytes_indexed: u64,
     supported_scope_complete: bool,
     semantic_scope_complete: bool,
     relationship_scope_complete: bool,
@@ -5339,6 +5355,22 @@ struct DocumentStreamSummary {
     replacement_committed: bool,
 }
 
+struct ParsedOfficeFacts {
+    segments_emitted: usize,
+    text_bytes: u64,
+    unsupported_parts: usize,
+    supported_scope_complete: bool,
+    semantic_scope_complete: bool,
+    relationship_scope_complete: bool,
+    parser_metadata: serde_json::Value,
+}
+
+#[derive(Debug)]
+enum DocumentPackageOutcome {
+    Parsed(DocumentStreamSummary),
+    NotOfficePackage,
+}
+
 /// Transaction-owned production sink. Extracted text is inserted as each
 /// bounded OOXML segment arrives; only the capped unsupported-part disclosure
 /// is retained in memory. Dropping the surrounding transaction after any
@@ -5346,6 +5378,7 @@ struct DocumentStreamSummary {
 struct SqliteOoxmlSink<'connection> {
     insert: rusqlite::Statement<'connection>,
     entry_id: i64,
+    package_kind: &'static str,
     segments_indexed: usize,
     text_bytes_indexed: u64,
     unsupported_parts_total: usize,
@@ -5354,10 +5387,15 @@ struct SqliteOoxmlSink<'connection> {
 }
 
 impl<'connection> SqliteOoxmlSink<'connection> {
-    fn new(insert: rusqlite::Statement<'connection>, entry_id: i64) -> Self {
+    fn new(
+        insert: rusqlite::Statement<'connection>,
+        entry_id: i64,
+        package_kind: &'static str,
+    ) -> Self {
         Self {
             insert,
             entry_id,
+            package_kind,
             segments_indexed: 0,
             text_bytes_indexed: 0,
             unsupported_parts_total: 0,
@@ -5397,7 +5435,7 @@ impl ooxml::OoxmlSink for SqliteOoxmlSink<'_> {
             "source_fields": segment.source_fields,
             "zip_member": zip_member,
             "coordinate_system": {
-                "offset_basis": "docx_zip_package_relative",
+                "offset_basis": format!("{}_zip_package_relative", self.package_kind),
                 "zip_data_offset_meaning": "start_of_compressed_member_data",
                 "xml_text_offset_available": false,
                 "evidence_physical_offset_available": false,
@@ -5438,7 +5476,7 @@ impl ooxml::OoxmlSink for SqliteOoxmlSink<'_> {
                 "zip_local_header_offset": part.zip_local_header_offset,
                 "zip_data_offset": part.zip_data_offset,
                 "zip_central_header_offset": part.zip_central_header_offset,
-                "offset_basis": "docx_zip_package_relative",
+                "offset_basis": format!("{}_zip_package_relative", self.package_kind),
                 "physical_offset_available": false,
             }));
         }
@@ -6265,14 +6303,28 @@ fn document_candidate_snapshot(
     let supported_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM filesystem_entries
          WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
-           AND lower(name) LIKE '%.docx'",
+           AND (
+               lower(name) LIKE '%.docx'
+               OR lower(name) LIKE '%.xlsx'
+               OR lower(name) LIKE '%.xlsm'
+               OR json_extract(metadata_json, '$.detected_signature') =
+                  'ZIP / Office Open XML / OpenDocument'
+               OR substr(content_head, 1, 2) = X'504B'
+           )",
         params![case_id, evidence_id],
         |row| row.get(0),
     )?;
     let reused_partial_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM filesystem_entries
          WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
-           AND lower(name) LIKE '%.docx'
+           AND (
+               lower(name) LIKE '%.docx'
+               OR lower(name) LIKE '%.xlsx'
+               OR lower(name) LIKE '%.xlsm'
+               OR json_extract(metadata_json, '$.detected_signature') =
+                  'ZIP / Office Open XML / OpenDocument'
+               OR substr(content_head, 1, 2) = X'504B'
+           )
            AND json_extract(metadata_json, '$.document_parser.parser_name') = ?3
            AND json_extract(metadata_json, '$.document_parser.status') = 'partial'",
         params![case_id, evidence_id, OOXML_PARSER_NAME],
@@ -6287,12 +6339,19 @@ fn document_candidate_snapshot(
         "SELECT COUNT(*), MAX(id)
          FROM filesystem_entries
          WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
-           AND lower(name) LIKE '%.docx'
+           AND (
+               lower(name) LIKE '%.docx'
+               OR lower(name) LIKE '%.xlsx'
+               OR lower(name) LIKE '%.xlsm'
+               OR json_extract(metadata_json, '$.detected_signature') =
+                  'ZIP / Office Open XML / OpenDocument'
+               OR substr(content_head, 1, 2) = X'504B'
+           )
            AND NOT (
                ?3 <> 0
                AND COALESCE(json_extract(metadata_json, '$.document_parser.parser_name'), '') = ?4
                AND COALESCE(json_extract(metadata_json, '$.document_parser.status'), '')
-                   IN ('parsed', 'partial')
+                   IN ('parsed', 'partial', 'not_applicable', 'unsupported')
            )",
         params![
             case_id,
@@ -6302,15 +6361,15 @@ fn document_candidate_snapshot(
         ],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let count = usize::try_from(count).context("DOCX candidate count exceeds usize")?;
+    let count = usize::try_from(count).context("Office package candidate count exceeds usize")?;
     if (count == 0) != max_entry_id.is_none() {
-        bail!("DOCX candidate count and maximum entry id are inconsistent");
+        bail!("Office package candidate count and maximum entry id are inconsistent");
     }
     Ok(DocumentCandidateSnapshot {
         supported_count: usize::try_from(supported_count)
-            .context("DOCX supported source count exceeds usize")?,
+            .context("Office package supported source count exceeds usize")?,
         reused_partial_count: usize::try_from(reused_partial_count)
-            .context("DOCX reused partial source count exceeds usize")?,
+            .context("Office package reused partial source count exceeds usize")?,
         reuse_committed,
         count,
         max_entry_id,
@@ -6327,7 +6386,7 @@ fn document_candidate_page(
     let conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     let mut stmt = conn.prepare(
-        "SELECT id, logical_path,
+        "SELECT id, logical_path, name,
                 COALESCE(
                     NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''),
                     NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''),
@@ -6337,12 +6396,19 @@ fn document_candidate_page(
                 )
          FROM filesystem_entries
          WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
-           AND lower(name) LIKE '%.docx'
+           AND (
+               lower(name) LIKE '%.docx'
+               OR lower(name) LIKE '%.xlsx'
+               OR lower(name) LIKE '%.xlsm'
+               OR json_extract(metadata_json, '$.detected_signature') =
+                  'ZIP / Office Open XML / OpenDocument'
+               OR substr(content_head, 1, 2) = X'504B'
+           )
            AND NOT (
                ?6 <> 0
                AND COALESCE(json_extract(metadata_json, '$.document_parser.parser_name'), '') = ?7
                AND COALESCE(json_extract(metadata_json, '$.document_parser.status'), '')
-                   IN ('parsed', 'partial')
+                   IN ('parsed', 'partial', 'not_applicable', 'unsupported')
            )
            AND id > ?3 AND id <= ?4
          ORDER BY id
@@ -6362,18 +6428,20 @@ fn document_candidate_page(
             Ok(DocumentCandidate {
                 entry_id: row.get(0)?,
                 logical_path: row.get(1)?,
-                current_object: row.get(2)?,
+                name: row.get(2)?,
+                current_object: row.get(3)?,
             })
         },
     )?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// Parses every indexed DOCX package for one evidence source and stores its
-/// complete extracted text in ordered, provenance-linked segments. Candidate
-/// count is captured once as the genuine progress denominator, then candidates
-/// are keyset-paged in bounded batches. Exactly one package is recovered and
-/// staged at a time. Canonical filesystem values are never changed.
+/// Identifies indexed OOXML packages by their internal content declarations,
+/// independent of the source extension, and stores Word or spreadsheet data
+/// in ordered, provenance-linked segments. Candidate count is captured once
+/// as the genuine progress denominator, then candidates are keyset-paged in
+/// bounded batches. Exactly one package is recovered and staged at a time.
+/// Canonical filesystem values are never changed.
 pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<DocumentParseResult> {
     let snapshot = document_candidate_snapshot(case_path, evidence_id)?;
 
@@ -6384,8 +6452,13 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
         documents_supported: snapshot.supported_count,
         up_to_date_documents_skipped: snapshot.supported_count.saturating_sub(snapshot.count),
         reused_partial_documents: snapshot.reused_partial_count,
-        documents_found: snapshot.count,
+        candidates_inspected: 0,
+        documents_found: 0,
         documents_parsed: 0,
+        word_documents_parsed: 0,
+        spreadsheets_parsed: 0,
+        renamed_office_documents_detected: 0,
+        non_office_packages_skipped: 0,
         segments_indexed: 0,
         text_bytes_indexed: 0,
         partial_documents: 0,
@@ -6407,7 +6480,7 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
         progress::progress_diagnostic(
             progress::JobDiagnosticKind::ParserDiagnostic,
             format!(
-            "{} previously committed partial DOCX result(s) were reused; re-index the filesystem to force a complete parser rerun",
+            "{} previously committed partial Office document result(s) were reused; re-index the filesystem to force a complete parser rerun",
             snapshot.reused_partial_count
             ),
         );
@@ -6427,42 +6500,85 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
             for candidate in &candidates {
                 after_entry_id = candidate.entry_id;
                 candidates_seen = candidates_seen.saturating_add(1);
+                result.candidates_inspected = result.candidates_inspected.saturating_add(1);
                 progress::progress_current(candidate.current_object.clone());
                 match parse_one_document_artifact(case_path, &mut read_session, candidate) {
                     Ok(outcome) => {
-                        let parsed = outcome.parsed;
-                        result.documents_parsed = result.documents_parsed.saturating_add(1);
-                        if parsed.replacement_committed {
-                            result.segments_indexed = result
-                                .segments_indexed
-                                .saturating_add(parsed.stats.segments_emitted);
-                            result.text_bytes_indexed = result
-                                .text_bytes_indexed
-                                .saturating_add(parsed.stats.text_bytes);
+                        let StagedParseOutcome {
+                            parsed,
+                            cleanup_warning,
+                        } = outcome;
+                        match parsed {
+                            DocumentPackageOutcome::NotOfficePackage => {
+                                result.non_office_packages_skipped =
+                                    result.non_office_packages_skipped.saturating_add(1);
+                            }
+                            DocumentPackageOutcome::Parsed(parsed) => {
+                                result.documents_found = result.documents_found.saturating_add(1);
+                                result.documents_parsed = result.documents_parsed.saturating_add(1);
+                                match parsed.document_kind {
+                                    ooxml::OoxmlPackageKind::WordProcessing => {
+                                        result.word_documents_parsed =
+                                            result.word_documents_parsed.saturating_add(1);
+                                    }
+                                    ooxml::OoxmlPackageKind::Spreadsheet => {
+                                        result.spreadsheets_parsed =
+                                            result.spreadsheets_parsed.saturating_add(1);
+                                    }
+                                    _ => {}
+                                }
+                                let declared_extension = file_extension_of(&candidate.logical_path);
+                                let extension_matches = match parsed.document_kind {
+                                    ooxml::OoxmlPackageKind::WordProcessing => declared_extension
+                                        .as_deref()
+                                        .is_some_and(|value| matches!(value, "docx" | "docm")),
+                                    ooxml::OoxmlPackageKind::Spreadsheet => declared_extension
+                                        .as_deref()
+                                        .is_some_and(|value| matches!(value, "xlsx" | "xlsm")),
+                                    ooxml::OoxmlPackageKind::Presentation => declared_extension
+                                        .as_deref()
+                                        .is_some_and(|value| matches!(value, "pptx" | "pptm")),
+                                    ooxml::OoxmlPackageKind::OtherPackage => true,
+                                };
+                                if !extension_matches {
+                                    result.renamed_office_documents_detected =
+                                        result.renamed_office_documents_detected.saturating_add(1);
+                                }
+                                if parsed.replacement_committed {
+                                    result.segments_indexed = result
+                                        .segments_indexed
+                                        .saturating_add(parsed.segments_indexed);
+                                    result.text_bytes_indexed = result
+                                        .text_bytes_indexed
+                                        .saturating_add(parsed.text_bytes_indexed);
+                                }
+                                if !parsed.supported_scope_complete
+                                    || !parsed.semantic_scope_complete
+                                    || !parsed.relationship_scope_complete
+                                {
+                                    result.partial_documents =
+                                        result.partial_documents.saturating_add(1);
+                                    result.partial_artifact_coverage = true;
+                                    result.completed_with_diagnostics = true;
+                                    progress::progress_diagnostic(
+                                        progress::JobDiagnosticKind::ParserDiagnostic,
+                                        format!(
+                                            "{} entry {} has incomplete coverage (supported parts={}, semantic interpretation={}, OPC relationships={}); {} unsupported package part(s) may contain text ({} total unsupported, {} disclosure(s) omitted); replacement committed={}",
+                                            parsed.document_kind.as_str(),
+                                            candidate.entry_id,
+                                            parsed.supported_scope_complete,
+                                            parsed.semantic_scope_complete,
+                                            parsed.relationship_scope_complete,
+                                            parsed.unsupported_may_contain_text_count,
+                                            parsed.unsupported_parts_total,
+                                            parsed.unsupported_parts_omitted,
+                                            parsed.replacement_committed,
+                                        ),
+                                    );
+                                }
+                            }
                         }
-                        if !parsed.supported_scope_complete
-                            || !parsed.semantic_scope_complete
-                            || !parsed.relationship_scope_complete
-                        {
-                            result.partial_documents = result.partial_documents.saturating_add(1);
-                            result.partial_artifact_coverage = true;
-                            result.completed_with_diagnostics = true;
-                            progress::progress_diagnostic(
-                                progress::JobDiagnosticKind::ParserDiagnostic,
-                                format!(
-                                    "DOCX entry {} has incomplete coverage (supported parts={}, semantic roles={}, OPC relationships={}); {} unsupported package part(s) may contain text ({} total unsupported, {} disclosure(s) omitted); replacement committed={}",
-                                    candidate.entry_id,
-                                    parsed.supported_scope_complete,
-                                    parsed.semantic_scope_complete,
-                                    parsed.relationship_scope_complete,
-                                    parsed.unsupported_may_contain_text_count,
-                                    parsed.unsupported_parts_total,
-                                    parsed.unsupported_parts_omitted,
-                                    parsed.replacement_committed,
-                                ),
-                            );
-                        }
-                        if let Some(warning) = outcome.cleanup_warning {
+                        if let Some(warning) = cleanup_warning {
                             if let Err(record_error) = record_artifact_cleanup_warning(
                                 case_path,
                                 evidence_id,
@@ -6472,7 +6588,7 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
                                 &warning,
                             ) {
                                 eprintln!(
-                                    "warning: could not persist DOCX cleanup warning for entry {}: {record_error:#}",
+                                    "warning: could not persist Office package cleanup warning for entry {}: {record_error:#}",
                                     candidate.entry_id
                                 );
                             }
@@ -6504,7 +6620,7 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
                         progress::progress_diagnostic(
                             progress::JobDiagnosticKind::ParserDiagnostic,
                             format!(
-                                "DOCX entry {} could not be parsed: {error:#}",
+                                "Office package entry {} could not be parsed: {error:#}",
                                 candidate.entry_id
                             ),
                         );
@@ -6517,7 +6633,7 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
 
     if candidates_seen != snapshot.count {
         let message = format!(
-            "DOCX candidate snapshot contained {} item(s), but keyset paging observed {}; the evidence index changed during parsing",
+            "Office package candidate snapshot contained {} item(s), but keyset paging observed {}; the evidence index changed during parsing",
             snapshot.count, candidates_seen
         );
         result.parse_error_count = result.parse_error_count.saturating_add(1);
@@ -6553,7 +6669,11 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
                              'cleanup_warnings_omitted', ?11,
                              'partial_artifact_coverage', ?12,
                              'completed_with_diagnostics', ?13,
-                             'status', ?14))",
+                             'status', ?14,
+                             'word_documents_parsed', ?15,
+                             'spreadsheets_parsed', ?16,
+                             'renamed_office_documents_detected', ?17,
+                             'non_office_packages_skipped', ?18))",
         params![
             case_id,
             actor,
@@ -6568,7 +6688,11 @@ pub fn parse_document_artifacts(case_path: &Path, evidence_id: i64) -> Result<Do
             i64::try_from(result.cleanup_warnings_omitted).unwrap_or(i64::MAX),
             i64::from(result.partial_artifact_coverage),
             i64::from(result.completed_with_diagnostics),
-            result.status
+            result.status,
+            i64::try_from(result.word_documents_parsed).unwrap_or(i64::MAX),
+            i64::try_from(result.spreadsheets_parsed).unwrap_or(i64::MAX),
+            i64::try_from(result.renamed_office_documents_detected).unwrap_or(i64::MAX),
+            i64::try_from(result.non_office_packages_skipped).unwrap_or(i64::MAX),
         ],
     )?;
     Ok(result)
@@ -6578,17 +6702,17 @@ fn parse_one_document_artifact(
     case_path: &Path,
     read_session: &mut EvidenceReadSession,
     candidate: &DocumentCandidate,
-) -> Result<StagedParseOutcome<DocumentStreamSummary>> {
+) -> Result<StagedParseOutcome<DocumentPackageOutcome>> {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let staging_path = std::env::temp_dir().join(format!(
-        "kdft-docx-{}-{}-{nonce}.docx",
+        "kdft-ooxml-{}-{}-{nonce}.package",
         std::process::id(),
         candidate.entry_id
     ));
-    let parsed = (|| -> Result<DocumentStreamSummary> {
+    let parsed = (|| -> Result<DocumentPackageOutcome> {
         recover_filesystem_entry_in_session(
             read_session,
             RecoverEntryOptions {
@@ -6596,24 +6720,66 @@ fn parse_one_document_artifact(
                 output_path: staging_path.clone(),
             },
         )
-        .with_context(|| format!("recovering DOCX source {}", candidate.logical_path))?;
-        let file = fs::File::open(&staging_path)
-            .with_context(|| format!("opening staged DOCX {}", candidate.logical_path))?;
-        stream_document_parse_success(case_path, candidate, file)
+        .with_context(|| {
+            format!(
+                "recovering Office package source {}",
+                candidate.logical_path
+            )
+        })?;
+        let mut file = fs::File::open(&staging_path)
+            .with_context(|| format!("opening staged Office package {}", candidate.logical_path))?;
+        let package_kind =
+            match ooxml::detect_ooxml_package_kind(&mut file, ooxml::OoxmlStreamOptions::default())
+            {
+                Ok(package_kind) => package_kind,
+                Err(error)
+                    if error.kind == ooxml::OoxmlErrorKind::MissingContentTypes
+                        && !matches!(
+                            file_extension_of(&candidate.name).as_deref(),
+                            Some("docx" | "docm" | "xlsx" | "xlsm" | "pptx" | "pptm")
+                        ) =>
+                {
+                    store_document_not_applicable(
+                        case_path,
+                        candidate,
+                        ooxml::OoxmlPackageKind::OtherPackage,
+                    )?;
+                    return Ok(DocumentPackageOutcome::NotOfficePackage);
+                }
+                Err(error) => return Err(anyhow::Error::new(error)),
+            };
+        file.seek(SeekFrom::Start(0)).with_context(|| {
+            format!("rewinding staged Office package {}", candidate.logical_path)
+        })?;
+        match package_kind {
+            ooxml::OoxmlPackageKind::WordProcessing | ooxml::OoxmlPackageKind::Spreadsheet => {
+                stream_document_parse_success(case_path, candidate, file, package_kind)
+                    .map(DocumentPackageOutcome::Parsed)
+            }
+            ooxml::OoxmlPackageKind::Presentation | ooxml::OoxmlPackageKind::OtherPackage => {
+                store_document_not_applicable(case_path, candidate, package_kind)?;
+                Ok(DocumentPackageOutcome::NotOfficePackage)
+            }
+        }
     })();
     let cleanup = if staging_path.exists() {
-        fs::remove_file(&staging_path)
-            .with_context(|| format!("removing temporary DOCX {}", staging_path.display()))
+        fs::remove_file(&staging_path).with_context(|| {
+            format!(
+                "removing temporary Office package {}",
+                staging_path.display()
+            )
+        })
     } else {
         Ok(())
     };
-    combine_staged_parse_and_cleanup(parsed, cleanup, "DOCX")
+    combine_staged_parse_and_cleanup(parsed, cleanup, "Office package")
 }
 
 fn stream_document_parse_success(
     case_path: &Path,
     candidate: &DocumentCandidate,
     file: fs::File,
+    package_kind: ooxml::OoxmlPackageKind,
 ) -> Result<DocumentStreamSummary> {
     let mut conn = open_existing_case(case_path)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -6642,28 +6808,100 @@ fn stream_document_parse_success(
              segment_kind, provenance_json)
          VALUES (?1, ?2, ?3, ?4, ?5, 'utf-8', ?6, ?7)",
     )?;
-    let mut sink = SqliteOoxmlSink::new(insert, candidate.entry_id);
-    let parsed = ooxml::parse_docx_streaming(file, ooxml::OoxmlStreamOptions::default(), &mut sink)
-        .map_err(anyhow::Error::new)?;
+    let mut sink = SqliteOoxmlSink::new(
+        insert,
+        candidate.entry_id,
+        package_kind.canonical_extension().unwrap_or("ooxml"),
+    );
+    let parsed = match package_kind {
+        ooxml::OoxmlPackageKind::WordProcessing => {
+            let parsed =
+                ooxml::parse_docx_streaming(file, ooxml::OoxmlStreamOptions::default(), &mut sink)
+                    .map_err(anyhow::Error::new)?;
+            ParsedOfficeFacts {
+                segments_emitted: parsed.stats.segments_emitted,
+                text_bytes: parsed.stats.text_bytes,
+                unsupported_parts: parsed.stats.unsupported_parts,
+                supported_scope_complete: parsed.supported_scope_complete,
+                semantic_scope_complete: parsed.semantic_scope_complete,
+                relationship_scope_complete: parsed.relationship_scope_complete,
+                parser_metadata: serde_json::json!({
+                    "document_kind": package_kind.as_str(),
+                    "canonical_extension": package_kind.canonical_extension(),
+                    "text_chars_indexed": parsed.stats.text_chars,
+                    "archive_entries": parsed.stats.archive_entries,
+                    "text_parts_parsed": parsed.stats.text_parts_parsed,
+                    "hyperlink_targets": parsed.stats.hyperlink_targets,
+                    "visible_text_chars": parsed.stats.visible_text_chars,
+                    "deleted_text_chars": parsed.stats.deleted_text_chars,
+                    "field_instruction_chars": parsed.stats.field_instruction_chars,
+                    "directly_hidden_text_chars": parsed.stats.directly_hidden_text_chars,
+                    "text_box_chars": parsed.stats.text_box_chars,
+                    "run_or_paragraph_style_references": parsed.stats.run_or_paragraph_style_references,
+                    "alternate_content_blocks": parsed.stats.alternate_content_blocks,
+                    "non_text_control_elements": parsed.stats.non_text_control_elements,
+                    "internal_relationships": parsed.stats.internal_relationships,
+                    "external_relationships": parsed.stats.external_relationships,
+                    "dangling_internal_relationships": parsed.stats.dangling_internal_relationships,
+                    "relationship_cycles": parsed.stats.relationship_cycles,
+                    "unreferenced_story_parts": parsed.stats.unreferenced_story_parts,
+                    "opc_start_relationship_present": parsed.stats.opc_start_relationship_present,
+                    "orphan_relationship_parts": parsed.stats.orphan_relationship_parts,
+                }),
+            }
+        }
+        ooxml::OoxmlPackageKind::Spreadsheet => {
+            let parsed =
+                ooxml::parse_xlsx_streaming(file, ooxml::OoxmlStreamOptions::default(), &mut sink)
+                    .map_err(anyhow::Error::new)?;
+            ParsedOfficeFacts {
+                segments_emitted: parsed.stats.segments_emitted,
+                text_bytes: parsed.stats.text_bytes,
+                unsupported_parts: parsed.stats.unsupported_parts,
+                supported_scope_complete: parsed.supported_scope_complete,
+                semantic_scope_complete: parsed.semantic_scope_complete,
+                relationship_scope_complete: parsed.relationship_scope_complete,
+                parser_metadata: serde_json::json!({
+                    "document_kind": package_kind.as_str(),
+                    "canonical_extension": package_kind.canonical_extension(),
+                    "text_chars_indexed": parsed.stats.text_chars,
+                    "archive_entries": parsed.stats.archive_entries,
+                    "worksheets_parsed": parsed.stats.worksheets,
+                    "cells_seen": parsed.stats.cells_seen,
+                    "cell_values_indexed": parsed.stats.values_emitted,
+                    "formulas_indexed": parsed.stats.formulas_emitted,
+                    "shared_strings_resolved": parsed.stats.shared_strings,
+                    "unresolved_worksheets": parsed.stats.unresolved_worksheets,
+                    "styles_present": parsed.stats.styles_present,
+                    "spreadsheet_preview": parsed.preview,
+                    "display_value_policy": "Exact stored cell values are retained. Formula expressions and cached results remain separate; locale-specific Excel rendering is not synthesized.",
+                }),
+            }
+        }
+        _ => bail!(
+            "unsupported Office package kind {} reached the text parser",
+            package_kind.as_str()
+        ),
+    };
 
-    if parsed.stats.segments_emitted != sink.segments_indexed {
+    if parsed.segments_emitted != sink.segments_indexed {
         bail!(
             "OOXML parser reported {} segment(s), but the SQLite sink inserted {}",
-            parsed.stats.segments_emitted,
+            parsed.segments_emitted,
             sink.segments_indexed
         );
     }
-    if parsed.stats.text_bytes != sink.text_bytes_indexed {
+    if parsed.text_bytes != sink.text_bytes_indexed {
         bail!(
             "OOXML parser reported {} text byte(s), but the SQLite sink inserted {}",
-            parsed.stats.text_bytes,
+            parsed.text_bytes,
             sink.text_bytes_indexed
         );
     }
-    if parsed.stats.unsupported_parts != sink.unsupported_parts_total {
+    if parsed.unsupported_parts != sink.unsupported_parts_total {
         bail!(
             "OOXML parser reported {} unsupported part(s), but the SQLite sink observed {}",
-            parsed.stats.unsupported_parts,
+            parsed.unsupported_parts,
             sink.unsupported_parts_total
         );
     }
@@ -6683,45 +6921,87 @@ fn stream_document_parse_success(
     let coverage_complete = parsed.supported_scope_complete
         && parsed.semantic_scope_complete
         && parsed.relationship_scope_complete;
-    let metadata = serde_json::json!({
-        "parser_name": OOXML_PARSER_NAME,
-        "status": if coverage_complete { "parsed" } else { "partial" },
-        "segments_indexed": segments_indexed,
-        "text_bytes_indexed": parsed.stats.text_bytes,
-        "text_chars_indexed": parsed.stats.text_chars,
-        "archive_entries": parsed.stats.archive_entries,
-        "text_parts_parsed": parsed.stats.text_parts_parsed,
-        "hyperlink_targets": parsed.stats.hyperlink_targets,
-        "supported_scope_complete": parsed.supported_scope_complete,
-        "semantic_scope_complete": parsed.semantic_scope_complete,
-        "relationship_scope_complete": parsed.relationship_scope_complete,
-        "visible_text_chars": parsed.stats.visible_text_chars,
-        "deleted_text_chars": parsed.stats.deleted_text_chars,
-        "field_instruction_chars": parsed.stats.field_instruction_chars,
-        "directly_hidden_text_chars": parsed.stats.directly_hidden_text_chars,
-        "text_box_chars": parsed.stats.text_box_chars,
-        "run_or_paragraph_style_references": parsed.stats.run_or_paragraph_style_references,
-        "alternate_content_blocks": parsed.stats.alternate_content_blocks,
-        "non_text_control_elements": parsed.stats.non_text_control_elements,
-        "internal_relationships": parsed.stats.internal_relationships,
-        "external_relationships": parsed.stats.external_relationships,
-        "dangling_internal_relationships": parsed.stats.dangling_internal_relationships,
-        "relationship_cycles": parsed.stats.relationship_cycles,
-        "unreferenced_story_parts": parsed.stats.unreferenced_story_parts,
-        "opc_start_relationship_present": parsed.stats.opc_start_relationship_present,
-        "orphan_relationship_parts": parsed.stats.orphan_relationship_parts,
-        "text_segment_offset_basis": "DOCX ZIP package-relative member metadata only; extracted XML text has no source-byte or evidence-physical offset",
-        "unsupported_parts": unsupported_parts,
-        "unsupported_parts_total": unsupported_total,
-        "unsupported_parts_omitted": unsupported_parts_omitted,
-        "unsupported_may_contain_text_count": unsupported_may_contain_text_count,
-        "replacement_committed": true,
-        "replacement_rolled_back": false,
-        "previous_segments_preserved": false,
-        "previous_segments_replaced": previous_segments,
-        "retained_segment_count": segments_indexed,
-        "canonical_generation_preserved": false,
-    });
+    let mut metadata = parsed.parser_metadata;
+    let metadata_object = metadata
+        .as_object_mut()
+        .context("Office parser metadata must be a JSON object")?;
+    metadata_object.insert(
+        "parser_name".to_string(),
+        serde_json::json!(OOXML_PARSER_NAME),
+    );
+    metadata_object.insert(
+        "status".to_string(),
+        serde_json::json!(if coverage_complete {
+            "parsed"
+        } else {
+            "partial"
+        }),
+    );
+    metadata_object.insert(
+        "segments_indexed".to_string(),
+        serde_json::json!(segments_indexed),
+    );
+    metadata_object.insert(
+        "text_bytes_indexed".to_string(),
+        serde_json::json!(parsed.text_bytes),
+    );
+    metadata_object.insert(
+        "supported_scope_complete".to_string(),
+        serde_json::json!(parsed.supported_scope_complete),
+    );
+    metadata_object.insert(
+        "semantic_scope_complete".to_string(),
+        serde_json::json!(parsed.semantic_scope_complete),
+    );
+    metadata_object.insert(
+        "relationship_scope_complete".to_string(),
+        serde_json::json!(parsed.relationship_scope_complete),
+    );
+    metadata_object.insert(
+        "type_detection_basis".to_string(),
+        serde_json::json!("OOXML [Content_Types].xml package declarations"),
+    );
+    metadata_object.insert(
+        "text_segment_offset_basis".to_string(),
+        serde_json::json!("OOXML ZIP package-relative member metadata only; extracted XML text has no source-byte or evidence-physical offset"),
+    );
+    metadata_object.insert(
+        "unsupported_parts".to_string(),
+        serde_json::json!(unsupported_parts),
+    );
+    metadata_object.insert(
+        "unsupported_parts_total".to_string(),
+        serde_json::json!(unsupported_total),
+    );
+    metadata_object.insert(
+        "unsupported_parts_omitted".to_string(),
+        serde_json::json!(unsupported_parts_omitted),
+    );
+    metadata_object.insert(
+        "unsupported_may_contain_text_count".to_string(),
+        serde_json::json!(unsupported_may_contain_text_count),
+    );
+    metadata_object.insert("replacement_committed".to_string(), serde_json::json!(true));
+    metadata_object.insert(
+        "replacement_rolled_back".to_string(),
+        serde_json::json!(false),
+    );
+    metadata_object.insert(
+        "previous_segments_preserved".to_string(),
+        serde_json::json!(false),
+    );
+    metadata_object.insert(
+        "previous_segments_replaced".to_string(),
+        serde_json::json!(previous_segments),
+    );
+    metadata_object.insert(
+        "retained_segment_count".to_string(),
+        serde_json::json!(segments_indexed),
+    );
+    metadata_object.insert(
+        "canonical_generation_preserved".to_string(),
+        serde_json::json!(false),
+    );
     if preserve_prior_generation && !coverage_complete {
         tx.execute_batch(
             "ROLLBACK TO SAVEPOINT kdft_ooxml_reprocess;
@@ -6751,7 +7031,9 @@ fn stream_document_parse_success(
         }
         tx.commit()?;
         return Ok(DocumentStreamSummary {
-            stats: parsed.stats,
+            document_kind: package_kind,
+            segments_indexed,
+            text_bytes_indexed: parsed.text_bytes,
             supported_scope_complete: parsed.supported_scope_complete,
             semantic_scope_complete: parsed.semantic_scope_complete,
             relationship_scope_complete: parsed.relationship_scope_complete,
@@ -6764,7 +7046,185 @@ fn stream_document_parse_success(
     if preserve_prior_generation {
         tx.execute_batch("RELEASE SAVEPOINT kdft_ooxml_reprocess")?;
     }
+    let metadata_json: String = tx.query_row(
+        "SELECT metadata_json FROM filesystem_entries WHERE id = ?1",
+        params![candidate.entry_id],
+        |row| row.get(0),
+    )?;
+    let mut entry_metadata = serde_json::from_str::<serde_json::Value>(&metadata_json)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if !entry_metadata.is_object() {
+        entry_metadata = serde_json::json!({});
+    }
+    let declared_extension = file_extension_of(&candidate.name);
+    let extension_matches = match package_kind {
+        ooxml::OoxmlPackageKind::WordProcessing => declared_extension
+            .as_deref()
+            .is_some_and(|value| matches!(value, "docx" | "docm")),
+        ooxml::OoxmlPackageKind::Spreadsheet => declared_extension
+            .as_deref()
+            .is_some_and(|value| matches!(value, "xlsx" | "xlsm")),
+        _ => false,
+    };
+    let (
+        artifact_kind,
+        detected_signature,
+        signature_description,
+        signature_category,
+        mismatch_reason,
+    ) = match package_kind {
+        ooxml::OoxmlPackageKind::WordProcessing => (
+            "word_processing_document",
+            "Microsoft Word OOXML Document",
+            "Office Open XML word-processing package identified from its content-type declarations",
+            "Documents and Office",
+            "The filename extension does not identify the WordprocessingML content declared inside the package",
+        ),
+        ooxml::OoxmlPackageKind::Spreadsheet => (
+            "spreadsheet_document",
+            "Microsoft Excel OOXML Spreadsheet",
+            "Office Open XML spreadsheet package identified from its workbook and content-type declarations",
+            "Documents and Office",
+            "The filename extension does not identify the SpreadsheetML content declared inside the package",
+        ),
+        _ => unreachable!("only parsed Office kinds reach metadata commit"),
+    };
+    let entry_object = entry_metadata
+        .as_object_mut()
+        .context("filesystem entry metadata must be a JSON object")?;
+    entry_object.insert(
+        "artifact_kind".to_string(),
+        serde_json::json!(artifact_kind),
+    );
+    entry_object.insert(
+        "detected_office_document_type".to_string(),
+        serde_json::json!(package_kind.as_str()),
+    );
+    entry_object.insert(
+        "detected_file_extension".to_string(),
+        serde_json::json!(package_kind.canonical_extension()),
+    );
+    entry_object.insert(
+        "document_type_detection_basis".to_string(),
+        serde_json::json!("OOXML [Content_Types].xml package declarations"),
+    );
+    entry_object.insert(
+        "declared_file_extension".to_string(),
+        serde_json::json!(declared_extension),
+    );
+    entry_object.insert(
+        "detected_signature".to_string(),
+        serde_json::json!(detected_signature),
+    );
+    entry_object.insert(
+        "signature_description".to_string(),
+        serde_json::json!(signature_description),
+    );
+    entry_object.insert(
+        "signature_category".to_string(),
+        serde_json::json!(signature_category),
+    );
+    entry_object.insert(
+        "signature_detection_basis".to_string(),
+        serde_json::json!("OOXML content-type declarations"),
+    );
+    entry_object.insert(
+        "signature_status".to_string(),
+        serde_json::json!(if declared_extension.is_none() {
+            "no_extension"
+        } else if extension_matches {
+            "match"
+        } else {
+            "mismatch"
+        }),
+    );
+    if extension_matches {
+        entry_object.remove("signature_reason");
+        entry_object.remove("signature_mismatch_basis");
+    } else if declared_extension.is_none() {
+        entry_object.insert(
+            "signature_reason".to_string(),
+            serde_json::json!("The source has no filename extension; its Office type was identified from internal OOXML declarations"),
+        );
+        entry_object.insert(
+            "signature_mismatch_basis".to_string(),
+            serde_json::json!("missing filename extension versus OOXML package content type"),
+        );
+    } else {
+        entry_object.insert(
+            "signature_reason".to_string(),
+            serde_json::json!(mismatch_reason),
+        );
+        entry_object.insert(
+            "signature_mismatch_basis".to_string(),
+            serde_json::json!("declared filename extension versus OOXML package content type"),
+        );
+    }
+    entry_object.insert("document_parser".to_string(), metadata.clone());
+    entry_object.insert("document_parser_last_attempt".to_string(), metadata);
+    add_entry_category(
+        &mut entry_metadata,
+        &candidate.logical_path,
+        &candidate.name,
+        "file",
+    );
     let updated = tx.execute(
+        "UPDATE filesystem_entries
+         SET metadata_json = ?2
+         WHERE id = ?1",
+        params![candidate.entry_id, entry_metadata.to_string()],
+    )?;
+    if updated != 1 {
+        bail!(
+            "Office source entry {} disappeared before parser metadata could be committed",
+            candidate.entry_id
+        );
+    }
+    tx.commit()?;
+    Ok(DocumentStreamSummary {
+        document_kind: package_kind,
+        segments_indexed,
+        text_bytes_indexed: parsed.text_bytes,
+        supported_scope_complete: parsed.supported_scope_complete,
+        semantic_scope_complete: parsed.semantic_scope_complete,
+        relationship_scope_complete: parsed.relationship_scope_complete,
+        unsupported_parts_total: unsupported_total,
+        unsupported_parts_omitted,
+        unsupported_may_contain_text_count,
+        replacement_committed: true,
+    })
+}
+
+fn store_document_not_applicable(
+    case_path: &Path,
+    candidate: &DocumentCandidate,
+    package_kind: ooxml::OoxmlPackageKind,
+) -> Result<()> {
+    let conn = open_existing_case(case_path)?;
+    let status = if package_kind == ooxml::OoxmlPackageKind::Presentation {
+        "unsupported"
+    } else {
+        "not_applicable"
+    };
+    let metadata = serde_json::json!({
+        "parser_name": OOXML_PARSER_NAME,
+        "status": status,
+        "document_kind": package_kind.as_str(),
+        "canonical_extension": package_kind.canonical_extension(),
+        "type_detection_basis": if package_kind == ooxml::OoxmlPackageKind::OtherPackage {
+            "No OOXML Office main content type was declared"
+        } else {
+            "OOXML [Content_Types].xml package declarations"
+        },
+        "segments_indexed": 0,
+        "replacement_committed": false,
+        "reason": if package_kind == ooxml::OoxmlPackageKind::Presentation {
+            "PresentationML package recognized; presentation text extraction is not implemented by this parser generation"
+        } else {
+            "ZIP package is not a supported Office Open XML document"
+        },
+    });
+    let updated = conn.execute(
         "UPDATE filesystem_entries
          SET metadata_json = json_set(
              COALESCE(metadata_json, '{}'),
@@ -6776,21 +7236,11 @@ fn stream_document_parse_success(
     )?;
     if updated != 1 {
         bail!(
-            "DOCX source entry {} disappeared before parser metadata could be committed",
+            "Office source entry {} disappeared before parser applicability metadata could be committed",
             candidate.entry_id
         );
     }
-    tx.commit()?;
-    Ok(DocumentStreamSummary {
-        stats: parsed.stats,
-        supported_scope_complete: parsed.supported_scope_complete,
-        semantic_scope_complete: parsed.semantic_scope_complete,
-        relationship_scope_complete: parsed.relationship_scope_complete,
-        unsupported_parts_total: unsupported_total,
-        unsupported_parts_omitted,
-        unsupported_may_contain_text_count,
-        replacement_committed: true,
-    })
+    Ok(())
 }
 
 fn store_document_parse_error(
@@ -6849,7 +7299,7 @@ fn store_document_parse_error(
     };
     if updated != 1 {
         bail!(
-            "DOCX source entry {} disappeared before parser-attempt metadata could be committed",
+            "Office source entry {} disappeared before parser-attempt metadata could be committed",
             candidate.entry_id
         );
     }
@@ -15906,6 +16356,9 @@ fn unavailable_entry_disk_location(
         entry_id: entry.entry_id,
         evidence_id: entry.evidence_id,
         available: false,
+        partition_start_offset: metadata_u64_or_i64(&entry.metadata_json, "partition_start_offset"),
+        partition_size_bytes: metadata_u64_or_i64(&entry.metadata_json, "partition_size_bytes"),
+        volume_relative_offset: None,
         decoded_media_offset: None,
         file_relative_offset: None,
         contiguous_bytes: None,
@@ -16018,6 +16471,9 @@ pub fn filesystem_entry_disk_location(
                     entry_id: entry.entry_id,
                     evidence_id: entry.evidence_id,
                     available: true,
+                    partition_start_offset: Some(partition_start),
+                    partition_size_bytes: Some(partition_size),
+                    volume_relative_offset: Some(location.filesystem_offset),
                     decoded_media_offset: Some(decoded_media_offset),
                     file_relative_offset: Some(location.file_offset),
                     contiguous_bytes: Some(contiguous_bytes),
@@ -16068,6 +16524,10 @@ pub fn filesystem_entry_disk_location(
     let parser = entry.metadata_json["filesystem_parser"]
         .as_str()
         .unwrap_or("");
+    let partition_start_offset =
+        metadata_u64_or_i64(&entry.metadata_json, "partition_start_offset");
+    let partition_size_bytes = metadata_u64_or_i64(&entry.metadata_json, "partition_size_bytes");
+    let mut volume_relative_offset = None;
     let opened = open_disk_image(Path::new(&entry.source_path))?;
     if decoded_media_offset >= opened.decoded_size {
         return Ok(unavailable_entry_disk_location(
@@ -16079,15 +16539,13 @@ pub fn filesystem_entry_disk_location(
         ));
     }
     if matches!(parser, "ntfs" | "fatfs") {
-        let Some(partition_start) = entry.metadata_json["partition_start_offset"].as_u64() else {
+        let Some(partition_start) = partition_start_offset else {
             return Ok(unavailable_entry_disk_location(
                 &entry,
                 "filesystem entry has no authoritative partition start offset",
             ));
         };
-        let Some(partition_size) =
-            metadata_u64_or_i64(&entry.metadata_json, "partition_size_bytes")
-        else {
+        let Some(partition_size) = partition_size_bytes else {
             return Ok(unavailable_entry_disk_location(
                 &entry,
                 "filesystem entry has no authoritative partition size",
@@ -16125,6 +16583,16 @@ pub fn filesystem_entry_disk_location(
                 "recorded contiguous file-data range exceeds its partition",
             ));
         }
+        let relative = decoded_media_offset - partition_start;
+        if metadata_u64_or_i64(&entry.metadata_json, "file_data_logical_offset")
+            .is_some_and(|recorded| recorded != relative)
+        {
+            return Ok(unavailable_entry_disk_location(
+                &entry,
+                "recorded file-data volume and decoded-media offsets are inconsistent",
+            ));
+        }
+        volume_relative_offset = Some(relative);
     } else if contiguous_bytes.is_some_and(|length| {
         decoded_media_offset
             .checked_add(length)
@@ -16154,6 +16622,9 @@ pub fn filesystem_entry_disk_location(
         entry_id: entry.entry_id,
         evidence_id: entry.evidence_id,
         available: true,
+        partition_start_offset,
+        partition_size_bytes,
+        volume_relative_offset,
         decoded_media_offset: Some(decoded_media_offset),
         file_relative_offset: Some(file_relative_offset),
         contiguous_bytes,
@@ -23476,6 +23947,24 @@ fn classify_entry(
         .and_then(|value| value.as_str())
         .unwrap_or("");
     match artifact_kind {
+        "word_processing_document" => {
+            return category(
+                "Documents and Office",
+                "Word processing",
+                "Word-processing document identified from its internal package structure",
+                "high",
+                &["documents", "office", "content-identified"],
+            );
+        }
+        "spreadsheet_document" => {
+            return category(
+                "Documents and Office",
+                "Spreadsheets",
+                "Spreadsheet identified from its internal workbook package structure",
+                "high",
+                &["documents", "spreadsheet", "content-identified"],
+            );
+        }
         "browser_history_visit" => {
             return category(
                 "Web Activity",
@@ -23733,6 +24222,42 @@ fn classify_entry(
                 "Structured Windows ShellBag folder-usage record",
                 "medium",
                 &["windows", "shellbags", "folders", "parsed"],
+            );
+        }
+        "windows_recent_docs_record" => {
+            return category(
+                "User Activity",
+                "Recent files",
+                "Recent document recovered from the exact Explorer RecentDocs MRU schema",
+                "high",
+                &["windows", "registry", "recent-docs", "mru", "parsed"],
+            );
+        }
+        "windows_run_mru_record" => {
+            return category(
+                "User Activity",
+                "Run commands",
+                "Command recovered from the exact Explorer RunMRU schema",
+                "high",
+                &["windows", "registry", "run-mru", "command", "parsed"],
+            );
+        }
+        "windows_typed_path_record" => {
+            return category(
+                "User Activity",
+                "Typed paths",
+                "Path recovered from the exact Explorer TypedPaths schema",
+                "high",
+                &["windows", "registry", "typed-path", "parsed"],
+            );
+        }
+        "windows_search_query_record" => {
+            return category(
+                "User Activity",
+                "Windows searches",
+                "Search text recovered from the exact Explorer WordWheelQuery schema",
+                "high",
+                &["windows", "registry", "search", "wordwheelquery", "parsed"],
             );
         }
         "windows_srum_record" => {
@@ -26309,7 +26834,11 @@ impl RegistryImportCollector {
         let structured_key = key_path.to_ascii_lowercase();
         let retain_raw_value = structured_key.contains("\\userassist\\")
             || structured_key.contains("\\bagmru")
-            || structured_key.contains("\\appcompatcache");
+            || structured_key.contains("\\appcompatcache")
+            || structured_key.contains("\\explorer\\recentdocs")
+            || structured_key.contains("\\explorer\\wordwheelquery")
+            || structured_key.contains("\\explorer\\opensavepidlmru")
+            || structured_key.contains("\\explorer\\lastvisitedpidlmru");
         let raw_value_bytes = retain_raw_value
             .then_some(value_bytes.as_ref())
             .flatten()
@@ -47461,7 +47990,7 @@ fn render_forensic_context_details_html(
     push_activity_detail(
         html,
         item_ref,
-        "Volume Start Offset",
+        "Decoded-media Volume Start",
         &["volume_start_offset", "partition_start_offset"],
     );
     push_activity_detail(
@@ -47509,21 +48038,48 @@ fn render_forensic_context_details_html(
     push_dec_hex_detail(
         html,
         item_ref,
-        "Byte Offset",
+        "File-relative Offset",
         &[
-            "byte_offset",
-            "offset",
-            "selection_physical_offset_start",
+            "selection_file_offset_start",
             "selection_logical_offset_start",
         ],
     );
     push_dec_hex_detail(
         html,
         item_ref,
-        "Byte Offset End",
+        "File-relative Offset End",
+        &["selection_file_offset_end", "selection_logical_offset_end"],
+    );
+    push_dec_hex_detail(
+        html,
+        item_ref,
+        "Volume-relative Offset",
+        &["selection_volume_offset_start"],
+    );
+    push_dec_hex_detail(
+        html,
+        item_ref,
+        "Volume-relative Offset End",
+        &["selection_volume_offset_end"],
+    );
+    push_dec_hex_detail(
+        html,
+        item_ref,
+        "Decoded-media Offset",
         &[
+            "selection_decoded_media_offset_start",
+            "selection_physical_offset_start",
+            "byte_offset",
+            "offset",
+        ],
+    );
+    push_dec_hex_detail(
+        html,
+        item_ref,
+        "Decoded-media Offset End",
+        &[
+            "selection_decoded_media_offset_end",
             "selection_physical_offset_end",
-            "selection_logical_offset_end",
         ],
     );
     push_activity_detail(
@@ -47542,32 +48098,32 @@ fn render_forensic_context_details_html(
     push_activity_detail(
         html,
         item_ref,
-        "Physical Offset Basis",
+        "Decoded-media Offset Basis",
         &["physical_offset_basis"],
     );
     push_activity_detail(html, item_ref, "Storage Area", &["storage_area"]);
     push_activity_detail(
         html,
         item_ref,
-        "MFT Record Logical Offset",
+        "Volume-relative MFT Record Offset",
         &["mft_record_logical_offset"],
     );
     push_activity_detail(
         html,
         item_ref,
-        "MFT Record Physical Offset",
+        "Decoded-media MFT Record Offset",
         &["mft_record_physical_offset"],
     );
     push_activity_detail(
         html,
         item_ref,
-        "File Data Logical Offset",
+        "Volume-relative File Data Offset",
         &["file_data_logical_offset"],
     );
     push_activity_detail(
         html,
         item_ref,
-        "File Data Physical Offset",
+        "Decoded-media File Data Offset",
         &["file_data_physical_offset"],
     );
     push_activity_detail(html, item_ref, "In File Slack", &["is_file_slack"]);
@@ -49533,6 +50089,34 @@ mod tests {
         Ok(())
     }
 
+    fn write_test_xlsx(path: &Path) -> Result<()> {
+        let file = fs::File::create(path)?;
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file("[Content_Types].xml", options)?;
+        writer.write_all(
+            br#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+</Types>"#,
+        )?;
+        writer.start_file("xl/workbook.xml", options)?;
+        writer.write_all(br#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Evidence Ledger" sheetId="1" r:id="rId1"/></sheets></workbook>"#)?;
+        writer.start_file("xl/_rels/workbook.xml.rels", options)?;
+        writer.write_all(br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#)?;
+        writer.start_file("xl/sharedStrings.xml", options)?;
+        writer.write_all(br#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Vendor</t></si><si><t>Northwind Forensic Marker</t></si></sst>"#)?;
+        writer.start_file("xl/worksheets/sheet1.xml", options)?;
+        writer.write_all(br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Recovered workbook value</t></is></c><c r="B2"><f>SUM(20,22)</f><v>42</v></c></row></sheetData></worksheet>"#)?;
+        writer.finish()?;
+        Ok(())
+    }
+
     #[test]
     fn text_segment_schema_migration_preserves_legacy_content_and_adds_safe_defaults() -> Result<()>
     {
@@ -49742,6 +50326,125 @@ mod tests {
                 && hit.match_kind == "parsed_content"
                 && hit.source_path_exact.as_deref() == Some("Finance/wire_transfer_pending.txt")
         }));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn renamed_xlsx_is_identified_by_content_recategorized_and_searchable() -> Result<()> {
+        let case_path = unique_case_path("renamed-xlsx-content-detection");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("renamed-xlsx-content-detection-source");
+        let source_path = evidence_dir.join("quarterly-notes.bin");
+        write_test_xlsx(&source_path)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        let source_before = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .find(|entry| entry.name == "quarterly-notes.bin")
+            .context("renamed XLSX source was not indexed")?;
+
+        let parsed = parse_document_artifacts(&case_path, evidence_id)?;
+        assert_eq!(parsed.status, "completed");
+        assert_eq!(parsed.documents_found, 1);
+        assert_eq!(parsed.documents_parsed, 1);
+        assert_eq!(parsed.spreadsheets_parsed, 1);
+        assert_eq!(parsed.word_documents_parsed, 0);
+        assert_eq!(parsed.renamed_office_documents_detected, 1);
+        assert_eq!(parsed.parse_error_count, 0);
+
+        let source_after = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .find(|entry| entry.id == source_before.id)
+            .context("renamed XLSX source disappeared")?;
+        assert_eq!(source_after.name, "quarterly-notes.bin");
+        assert_eq!(source_after.logical_path, source_before.logical_path);
+        assert_eq!(
+            source_after.metadata_json["artifact_kind"].as_str(),
+            Some("spreadsheet_document")
+        );
+        assert_eq!(
+            source_after.metadata_json["category_main"].as_str(),
+            Some("Documents and Office")
+        );
+        assert_eq!(
+            source_after.metadata_json["category_sub"].as_str(),
+            Some("Spreadsheets")
+        );
+        assert_eq!(
+            source_after.metadata_json["detected_file_extension"].as_str(),
+            Some("xlsx")
+        );
+        assert_eq!(
+            source_after.metadata_json["declared_file_extension"].as_str(),
+            Some("bin")
+        );
+        assert_eq!(
+            source_after.metadata_json["signature_status"].as_str(),
+            Some("mismatch")
+        );
+        assert_eq!(
+            source_after.metadata_json["document_parser"]["spreadsheet_preview"][0]["name"]
+                .as_str(),
+            Some("Evidence Ledger")
+        );
+
+        let hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                query: "Northwind".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: true,
+                max_results: 10,
+                max_file_bytes: CONTENT_INDEX_BYTES as u64,
+                category: None,
+                file_types: None,
+            },
+        )?;
+        let hit = hits
+            .iter()
+            .find(|hit| hit.entry_id == source_before.id)
+            .context("renamed spreadsheet cell value was not searchable")?;
+        assert!(matches!(
+            hit.match_kind.as_str(),
+            "metadata" | "parsed_content"
+        ));
+        let conn = open_existing_case(&case_path)?;
+        let (segment_kind, provenance): (String, String) = conn.query_row(
+            "SELECT segment_kind, provenance_json
+             FROM filesystem_entry_text_segments
+             WHERE entry_id = ?1 AND parser_name = ?2 AND CAST(content AS TEXT) = ?3",
+            params![
+                source_before.id,
+                OOXML_PARSER_NAME,
+                "Northwind Forensic Marker"
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(segment_kind, "visible_text");
+        let provenance: serde_json::Value = serde_json::from_str(&provenance)?;
+        assert_eq!(
+            provenance["source_fields"]["cell_reference"].as_str(),
+            Some("B1")
+        );
+        drop(conn);
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
@@ -56927,6 +57630,8 @@ mod tests {
         assert!(location.available && location.exact_start);
         assert_eq!(location.file_relative_offset, Some(0));
         assert_eq!(location.contiguous_bytes, Some(payload.len() as u64));
+        assert_eq!(location.partition_start_offset, Some(0));
+        assert_eq!(location.volume_relative_offset, Some(8 * 1024));
         assert_eq!(location.decoded_media_offset, Some(8 * 1024));
         let image = fs::read(&image_path)?;
         let physical_start = location.decoded_media_offset.expect("physical offset") as usize;
@@ -56964,6 +57669,10 @@ mod tests {
         );
         assert_eq!(link_location.file_relative_offset, Some(0));
         assert_eq!(link_location.contiguous_bytes, Some(9));
+        assert_eq!(
+            link_location.volume_relative_offset,
+            link_location.decoded_media_offset
+        );
         let link_physical = link_location
             .decoded_media_offset
             .expect("inline symlink physical offset") as usize;
@@ -57246,6 +57955,8 @@ mod tests {
         assert_eq!(bytes.bytes, jpeg);
         assert!(bytes.eof);
         let location = filesystem_entry_disk_location(&case_path, jpg.id)?;
+        assert_eq!(location.partition_start_offset, None);
+        assert_eq!(location.volume_relative_offset, None);
         assert_eq!(location.decoded_media_offset, Some(jpeg_offset as u64));
         assert_eq!(location.contiguous_bytes, Some(jpeg.len() as u64));
         assert!(location
@@ -66505,8 +67216,8 @@ mod tests {
         assert!(html.contains("<dt>Deleted</dt><dd>true</dd>"));
         assert!(html.contains("<dt>Storage Area</dt><dd>deleted_filesystem_record</dd>"));
         assert!(html.contains("<dt>Finding Offset</dt><dd>16</dd>"));
-        assert!(html.contains("<dt>MFT Record Physical Offset</dt><dd>1050624</dd>"));
-        assert!(html.contains("<dt>File Data Physical Offset</dt><dd>1052672</dd>"));
+        assert!(html.contains("<dt>Decoded-media MFT Record Offset</dt><dd>1050624</dd>"));
+        assert!(html.contains("<dt>Decoded-media File Data Offset</dt><dd>1052672</dd>"));
         assert!(html.contains("<dt>Created</dt><dd>2026-06-30T20:00:00Z</dd>"));
         assert!(html.contains("<dt>MFT Modified</dt><dd>2026-06-30T20:03:00Z</dd>"));
 
@@ -66706,11 +67417,11 @@ mod tests {
             "<dt>SHA-256 (evidence file) (current evidence value, not captured with this finding)</dt><dd>{}</dd>",
             hash.sha256_hex
         )));
-        assert!(html.contains("<dt>Byte Offset</dt><dd>510 (0x1FE)</dd>"));
+        assert!(html.contains("<dt>Decoded-media Offset</dt><dd>510 (0x1FE)</dd>"));
         assert!(html.contains("<dt>Sector</dt><dd>0</dd>"));
         assert!(html.contains("<dt>Sector Size</dt><dd>512</dd>"));
         assert!(html.contains("<dt>Volume</dt><dd>001-system</dd>"));
-        assert!(html.contains("<dt>Volume Start Offset</dt><dd>512</dd>"));
+        assert!(html.contains("<dt>Decoded-media Volume Start</dt><dd>512</dd>"));
         assert!(html.contains("<dt>Region</dt><dd>in-partition</dd>"));
         assert!(html.contains("<dt>Encoding</dt><dd>hex</dd>"));
         assert!(html.contains("<dt>Selection Length</dt><dd>2</dd>"));
@@ -66871,10 +67582,10 @@ mod tests {
         assert!(html.contains("<dt>Size</dt><dd>42</dd>"));
         assert!(html.contains("<dt>Deleted</dt><dd>false</dd>"));
         assert!(html.contains("<dt>NTFS File Record</dt><dd>123</dd>"));
-        assert!(html.contains("<dt>MFT Record Logical Offset</dt><dd>6291456</dd>"));
-        assert!(html.contains("<dt>MFT Record Physical Offset</dt><dd>7340032</dd>"));
-        assert!(html.contains("<dt>File Data Logical Offset</dt><dd>8192</dd>"));
-        assert!(html.contains("<dt>File Data Physical Offset</dt><dd>1056768</dd>"));
+        assert!(html.contains("<dt>Volume-relative MFT Record Offset</dt><dd>6291456</dd>"));
+        assert!(html.contains("<dt>Decoded-media MFT Record Offset</dt><dd>7340032</dd>"));
+        assert!(html.contains("<dt>Volume-relative File Data Offset</dt><dd>8192</dd>"));
+        assert!(html.contains("<dt>Decoded-media File Data Offset</dt><dd>1056768</dd>"));
         assert!(html.contains("<dt>Created</dt><dd>2026-07-07T04:00:00Z</dd>"));
         assert!(html.contains("<dt>Modified</dt><dd>2026-07-07T05:00:00Z</dd>"));
         assert!(html.contains("<dt>Accessed</dt><dd>2026-07-07T06:00:00Z</dd>"));

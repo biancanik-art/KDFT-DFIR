@@ -6135,6 +6135,19 @@ mod tests {
     }
 
     #[test]
+    fn structured_windows_artifacts_surface_decoded_fields_and_parser_coverage() {
+        assert!(INDEX_HTML
+            .contains("function windowsArtifactRows(metadata, includeProvenance = false)"));
+        assert!(INDEX_HTML.contains("[\"Decoded value\", metadata.user_activity_value]"));
+        assert!(INDEX_HTML.contains("[\"Application\", srumReferenceText(record.app)]"));
+        assert!(INDEX_HTML.contains("[\"User / SID\", srumReferenceText(record.user)]"));
+        assert!(INDEX_HTML.contains("[\"Registry hive-file offset\""));
+        assert!(INDEX_HTML.contains("metadata.srum_parser_coverage"));
+        assert!(INDEX_HTML
+            .contains("[\"Application resource rows\", counts.application_resource_usage]"));
+    }
+
+    #[test]
     fn restored_tabs_refresh_local_auth_and_tolerate_missing_optional_controls() {
         assert!(INDEX_HTML.contains("async function fetchWithLocalAuthRetry(request)"));
         assert!(INDEX_HTML.contains("if (response.status !== 403)"));
@@ -6467,6 +6480,27 @@ mod tests {
         assert!(INDEX_HTML.contains("indexedDirectoryNavigationRows(selPath)"));
         assert!(!INDEX_HTML.contains("This folder is empty."));
         assert!(!INDEX_HTML.contains("This folder has no direct children."));
+    }
+
+    #[test]
+    fn examiner_status_bar_keeps_offset_coordinate_systems_explicit() {
+        assert!(INDEX_HTML.contains("id=\"examinerStatusBar\""));
+        assert!(INDEX_HTML.contains("function examinerCoordinateModel()"));
+        assert!(INDEX_HTML.contains("function renderExaminerStatusBar()"));
+        assert!(INDEX_HTML.contains("Logical byte offset in the selected file/data stream."));
+        assert!(INDEX_HTML.contains("Byte offset relative to the containing filesystem volume."));
+        assert!(INDEX_HTML.contains(
+            "Absolute byte offset in the decoded evidence-media stream; for E01 this is not an E01 segment/container-file offset."
+        ));
+        assert!(INDEX_HTML.contains("location.volume_relative_offset"));
+        assert!(INDEX_HTML.contains("location.partition_start_offset"));
+        assert!(INDEX_HTML.contains("location.partition_size_bytes"));
+        assert!(INDEX_HTML.contains("Volume-relative File Data Offset"));
+        assert!(INDEX_HTML.contains("Decoded-media File Data Offset"));
+        assert!(INDEX_HTML.contains(
+            "const offsetLabel = isFilesystemByteContext() ? \"Media offset\" : \"File offset\""
+        ));
+        assert!(!INDEX_HTML.contains("<strong>Current offset</strong>"));
     }
 
     #[test]
@@ -8052,11 +8086,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       --warn: #b7791f;
       --bad: #b42318;
       --shadow: 0 18px 48px rgba(27, 38, 38, 0.10);
+      --examiner-status-height: 30px;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       min-height: 100vh;
+      padding-bottom: var(--examiner-status-height);
       font-family: "Segoe UI", Arial, sans-serif;
       background: var(--bg);
       color: var(--text);
@@ -8269,7 +8305,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .app {
       display: grid;
       grid-template-columns: minmax(300px, 360px) 1fr;
-      min-height: 100vh;
+      min-height: calc(100vh - var(--examiner-status-height));
     }
     .app.sidebar-collapsed {
       grid-template-columns: 0 1fr;
@@ -9797,6 +9833,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .entry-row {
       cursor: pointer;
     }
+    .entry-row.deleted td {
+      background: #fff1f1;
+    }
+    .entry-row.deleted td:first-child {
+      box-shadow: inset 3px 0 0 #bf3030;
+    }
+    .entry-row.deleted:hover td {
+      background: #ffe6e6;
+    }
     .entry-row.selected td {
       background: #e8f3f0;
     }
@@ -9805,6 +9850,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     .entry-row.selected.multi-selected td {
       background: #dcefe9;
+    }
+    .entry-row.deleted.selected td,
+    .entry-row.deleted.multi-selected td,
+    .entry-row.deleted.selected.multi-selected td {
+      background: #ffe4e4;
     }
     .browser-viewer-head {
       display: grid;
@@ -9904,6 +9954,47 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .hex-current button.ghost {
       border-color: rgba(143,213,200,.45);
       color: #8fd5c8;
+    }
+    .examiner-status-bar {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 1050;
+      height: var(--examiner-status-height);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 4px 10px;
+      border-top: 1px solid #2f4440;
+      background: #101918;
+      color: #dce9e6;
+      font: 11px/1.2 Consolas, "Cascadia Mono", monospace;
+      box-shadow: 0 -3px 12px rgba(0,0,0,.12);
+    }
+    .examiner-status-path {
+      min-width: 100px;
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #f3f8f7;
+    }
+    .examiner-status-coordinates {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      white-space: nowrap;
+    }
+    .examiner-coordinate strong {
+      margin-right: 4px;
+      color: #73cdbd;
+      font-size: 10px;
+      letter-spacing: .035em;
+    }
+    .examiner-coordinate.unavailable {
+      color: #82908d;
     }
     .hex-grid {
       min-width: max-content;
@@ -10137,7 +10228,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     body.viewer-fullscreen #browserViewer {
       position: fixed;
-      inset: 0;
+      inset: 0 0 var(--examiner-status-height) 0;
       z-index: 1000;
       border: 0;
       border-radius: 0;
@@ -10241,6 +10332,45 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .preview-url {
       color: var(--accent);
       overflow-wrap: anywhere;
+    }
+    .spreadsheet-preview {
+      display: grid;
+      gap: 10px;
+      max-height: 360px;
+      overflow: auto;
+    }
+    .spreadsheet-preview-sheet {
+      display: grid;
+      gap: 5px;
+    }
+    .spreadsheet-preview-sheet h4 {
+      margin: 0;
+      font-size: 13px;
+    }
+    .spreadsheet-preview table {
+      width: max-content;
+      min-width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      font-size: 12px;
+    }
+    .spreadsheet-preview th,
+    .spreadsheet-preview td {
+      min-width: 90px;
+      max-width: 260px;
+      padding: 5px 7px;
+      border: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .spreadsheet-preview th {
+      position: sticky;
+      top: 0;
+      background: var(--surface-2);
+      color: var(--muted);
+      font-weight: 800;
     }
     .metadata-grid {
       display: grid;
@@ -10363,7 +10493,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     body.analysis-fullscreen .app {
       grid-template-columns: 1fr;
-      min-height: 100vh;
+      min-height: calc(100vh - var(--examiner-status-height));
     }
     body.analysis-fullscreen .sidebar,
     body.analysis-fullscreen .topbar,
@@ -10373,21 +10503,21 @@ const INDEX_HTML: &str = r###"<!doctype html>
     body.analysis-fullscreen main {
       padding: 8px;
       gap: 0;
-      min-height: 100vh;
+      min-height: calc(100vh - var(--examiner-status-height));
     }
     body.analysis-fullscreen .view.active {
       gap: 0;
     }
     body.analysis-fullscreen .view.analyze-view.active,
     body.analysis-fullscreen .browser-panel {
-      min-height: calc(100vh - 16px);
+      min-height: calc(100vh - var(--examiner-status-height) - 16px);
     }
     body.analysis-fullscreen .browser-panel {
       border-radius: 0;
       box-shadow: none;
     }
     body.analysis-fullscreen .browser-panel .panel-body {
-      height: calc(100vh - 72px);
+      height: calc(100vh - var(--examiner-status-height) - 72px);
       min-height: 560px;
       padding: 8px;
     }
@@ -10434,6 +10564,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       tr { border-bottom: 1px solid var(--line); padding: 8px 0; }
       td { border: 0; padding: 6px 0; }
       .hex-decode-grid { grid-template-columns: 1fr; }
+      .examiner-status-bar { gap: 6px; padding-inline: 6px; }
+      .examiner-status-coordinates { gap: 6px; }
+      .examiner-coordinate strong { display: none; }
     }
   </style>
 </head>
@@ -10574,7 +10707,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                   <label class="check-option" title="Detect browser profiles among the indexed entries (Chromium History, Firefox places.sqlite, Safari History.db) and parse their visit/download/login records into the case."><input type="checkbox" id="optRunBrowserParse" checked> Browser artifacts</label>
                   <label class="check-option" title="Extract local accounts, SID-to-profile mappings, browser accounts, host/network configuration, IP/DNS/gateway values, and Wi-Fi profiles; recognize known credential stores and sensitive values only at exact structured fields. Ordinary metadata stores the source locator, material state, byte length, and SHA-256 while withholding the value. Protected material is never presented as plaintext."><input type="checkbox" id="optParseIdentities" checked> Identities, accounts, networks and secrets</label>
                   <label class="check-option" title="Recover each indexed ZIP candidate and parse its members into provenance-linked records. Exact package names, CRC, sizes, compression, and complete textual-member segments are retained."><input type="checkbox" id="optParseArchives" checked> ZIP archive members</label>
-                  <label class="check-option" title="Recover each indexed DOCX package and extract supported WordprocessingML text parts into complete ordered searchable segments. Unsupported text-bearing parts are disclosed as partial coverage."><input type="checkbox" id="optParseDocuments" checked> DOCX document text</label>
+                  <label class="check-option" title="Identify Office Open XML packages from their internal content declarations, regardless of filename extension, then extract Word document text and spreadsheet cells/formulas into searchable segments and previews."><input type="checkbox" id="optParseDocuments" checked> Office documents and spreadsheets</label>
                   <label class="check-option" title="Recover and parse supported Windows artifact sources: LNK shortcuts, automatic/custom Jump Lists, Prefetch, EVTX event records, NTFS USN Journal streams, scheduled-task XML, Amcache, UserAssist, ShellBags, and exact Run/RunOnce Registry values. Unsupported Shimcache/SRUM decoding remains explicitly disclosed."><input type="checkbox" id="optParseWindowsArtifacts" checked> Windows artifacts (activity, execution, Registry)</label>
                 </div>
                 <p class="muted tiny">Scope note: generic legacy OLE documents, structured Unix syslog records, and picture-content analysis do not yet have dedicated parsers. Deep Search already uses captured file content and extracted parser text, so a second misleading “keyword index” switch is not needed.</p>
@@ -10666,7 +10799,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                       <label>Display<select id="viewerMode"><option value="hex">Hex + ASCII</option><option value="text">Text</option><option value="metadata">Details</option></select></label>
                       <label>Bytes/row<select id="bytesPerRow"><option value="16">16</option><option value="8">8</option><option value="32">32</option></select></label>
                       <label>Offset base<select id="offsetBase"><option value="hex">hex</option><option value="decimal">decimal</option></select></label>
-                      <label>Offset<input id="hexOffset" spellcheck="false" value="0"></label>
+                      <label><span id="hexOffsetLabel">File offset</span><input id="hexOffset" spellcheck="false" value="0"></label>
                       <label>Length<input id="hexLength" type="number" min="16" value="512"></label>
                       <button id="showEntryDetails" class="ghost">Details</button>
                       <button id="hexPrev" class="ghost">Prev</button>
@@ -10805,6 +10938,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
       </section>
     </main>
   </div>
+
+  <footer id="examinerStatusBar" class="examiner-status-bar" aria-label="Selected evidence coordinates">
+    <span id="examinerStatusPath" class="examiner-status-path" title="No item selected">No item selected</span>
+    <span id="examinerStatusCoordinates" class="examiner-status-coordinates">
+      <span class="examiner-coordinate unavailable"><strong>FILE</strong>&mdash;</span>
+      <span class="examiner-coordinate unavailable"><strong>VOLUME</strong>&mdash;</span>
+      <span class="examiner-coordinate unavailable"><strong>MEDIA</strong>&mdash;</span>
+    </span>
+  </footer>
 
   <div id="ctxMenu" class="ctx-menu" hidden></div>
   <div id="timelineDetailOverlay" class="timeline-detail-overlay" hidden onclick="if (event.target === this) closeTimelineDetail()">
@@ -12461,6 +12603,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
           : "documents: " + Number(dp.documents_parsed || 0).toLocaleString() + " / "
             + Number(dp.documents_found || 0).toLocaleString() + " parsed, "
             + Number(dp.segments_indexed || 0).toLocaleString() + " text segment(s)"
+            + " (" + Number(dp.word_documents_parsed || 0).toLocaleString() + " Word, "
+            + Number(dp.spreadsheets_parsed || 0).toLocaleString() + " spreadsheet)"
+            + (Number(dp.renamed_office_documents_detected || 0) ? ", " + Number(dp.renamed_office_documents_detected).toLocaleString() + " renamed/mislabelled Office file(s) identified by content" : "")
             + (Number(dp.up_to_date_documents_skipped || 0) ? ", " + Number(dp.up_to_date_documents_skipped).toLocaleString() + " committed checkpoint(s) reused" : "")
             + (Number(dp.reused_partial_documents || 0) ? " (including " + Number(dp.reused_partial_documents).toLocaleString() + " previously disclosed partial)" : "")
             + (Number(dp.partial_documents || 0) ? ", " + Number(dp.partial_documents).toLocaleString() + " partial" : "")
@@ -13428,7 +13573,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       const header = ["Name", "Logical path", "Evidence", "Category", "Type", "Size (bytes)",
-        "Created", "Accessed", "Modified", "Deleted", "Flags", "Offset"];
+        "Created", "Accessed", "Modified", "Deleted", "Flags", "Decoded media offset"];
       const evidenceNames = new Map((state.data.evidence || []).map((item) => [item.id, item.display_name]));
       const lines = [header.join(",")];
       entries.forEach((entry) => {
@@ -13495,7 +13640,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         { label: "Modified UTC", value: (entry) => filesystemModifiedTime(entry) },
         { label: "Artifact time UTC", value: (entry, metadata) => metadata.artifact_time_utc || "" },
         { label: "Flags", value: (entry) => entryFlagsText(entry) },
-        { label: "Offset", value: (entry) => entryPrimaryOffset(entry) },
+        { label: "Decoded media offset", value: (entry) => entryPrimaryOffset(entry) },
         { label: "Source artifact path", value: (entry, metadata) => metadata.source_artifact_path || metadata.source_path_exact || "" },
         { label: "Derived from entry ID", value: (entry, metadata) => metadata.derived_from_entry_id || metadata.source_entry_id || "" }
       ];
@@ -13670,11 +13815,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       entry.metadata_json = entry.metadata_json || {};
       entry.metadata_json.resolved_decoded_media_offset = location.decoded_media_offset;
+      entry.metadata_json.resolved_volume_relative_offset = location.volume_relative_offset;
       entry.metadata_json.resolved_offset_basis = location.basis;
       document.querySelectorAll(`.entry-row[data-entry-id="${entryId}"] .entry-offset`).forEach((cell) => {
         const label = entryPrimaryOffset(entry);
         cell.textContent = label;
-        cell.title = label + " | " + location.basis;
+        cell.title = "Decoded evidence-media offset " + label + " | " + location.basis;
       });
     }
 
@@ -13811,6 +13957,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const indexedFile = Boolean(entry && entry.id && entry.entry_kind === "file");
       const fileActive = !raw && state.hex.byteContext !== "filesystem";
       const filesystemActive = raw || state.hex.byteContext === "filesystem";
+      const offsetLabel = $("hexOffsetLabel");
+      if (offsetLabel) {
+        offsetLabel.textContent = filesystemActive ? "Media offset" : "File offset";
+      }
       fileButton.classList.toggle("active", fileActive);
       fileButton.setAttribute("aria-pressed", String(fileActive));
       fileButton.disabled = raw || (!indexedFile && !live);
@@ -17053,11 +17203,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const escChild = escapeAttr(escapeJs(row.item.path));
       const escName = escapeAttr(escapeJs(entry.name));
       const isChecked = state.live.selected.has(row.key);
-      const rowClasses = "entry-row" + (isChecked ? " multi-selected" : "") + (row.viewed ? " selected" : "");
+      const rowClasses = "entry-row" + (entry.is_deleted ? " deleted" : "") + (isChecked ? " multi-selected" : "") + (row.viewed ? " selected" : "");
       const rowArgs = `event, ${row.item.volume}, '${escChild}', '${escName}', ${entry.is_dir}, ${entry.symlink ? "true" : "false"}`;
-      const recoveryFlag = entry.is_deleted
-        ? '<span class="pill bad">deleted</span>'
-        : (entry.provenance === "allocated_orphan" ? '<span class="pill warn">orphan path</span>' : '');
+      const recoveryFlag = entry.provenance === "allocated_orphan"
+        ? '<span class="pill warn">orphan path</span>'
+        : '';
       return `<tr class="${rowClasses}" onclick="handleLiveRowClick(${rowArgs})" oncontextmenu="showLiveContextMenu(${rowArgs})">
           <td><input type="checkbox"${isChecked ? " checked" : ""} onclick="event.stopPropagation(); toggleLiveSelection(${row.item.volume}, '${escChild}', '${escName}', ${entry.is_dir}, this.checked, event)"></td>
           <td><span class="entry-name">${escapeHtml(entry.name)}</span>${recoveryFlag}</td>
@@ -17617,7 +17767,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
         ? `<input type="checkbox"${isChecked ? " checked" : ""} onclick="event.stopPropagation(); toggleEntrySelection(${child.entry_id}, this.checked, event)">`
         : "";
       const nameCell = `<span class="entry-name">${escapeHtml(child.name)}</span>`;
-      const flags = child.is_deleted ? '<span class="pill bad">deleted</span>' : "";
       // No in-lane buttons: rows are worked via selection + right-click.
       const rowClick = child.is_dir
         ? ` style="cursor:pointer" onclick="idxSelectDir('${escapeAttr(escapeJs(child.logical_path))}')"`
@@ -17625,9 +17774,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const ctxAttr = child.is_dir
         ? ` data-idx-dir="${escapeAttr(child.logical_path)}"`
         : (selectable ? ` data-entry-id="${child.entry_id}"` : "");
-      return `<tr class="entry-row${isChecked ? " multi-selected" : ""}"${rowClick}${ctxAttr}>
+      return `<tr class="entry-row${child.is_deleted ? " deleted" : ""}${isChecked ? " multi-selected" : ""}"${rowClick}${ctxAttr}>
           <td>${checkbox}</td>
-          <td>${nameCell} ${flags}</td>
+          <td>${nameCell}</td>
           <td class="entry-kind">${escapeHtml(row.values.type)}</td>
           <td class="entry-ext">${escapeHtml(row.values.ext)}</td>
           <td class="entry-size">${row.values.size}</td>
@@ -18342,7 +18491,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         { key: "ext", label: "Extension", sortable: true, filterable: true, sortType: "text" },
         { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
         { key: "flags", label: "Flags", sortable: true, filterable: true, sortType: "text" },
-        { key: "offset", label: "Offset", sortable: true, filterable: true, sortType: "number" },
+        { key: "offset", label: "Media offset", sortable: true, filterable: true, sortType: "number" },
         { key: "artifactTime", label: "Artifact time", sortable: true, filterable: true, sortType: "time" },
         { key: "created", label: "Created", sortable: true, filterable: true, sortType: "time" },
         { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" },
@@ -18401,8 +18550,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const isChecked = state.selectedEntryIds.has(entry.id);
       const checked = isChecked ? " checked" : "";
       const multiSelected = isChecked ? " multi-selected" : "";
+      const deletedRow = isDeletedRecoveryEntry(entry) ? " deleted" : "";
       return `
-          <tr class="entry-row${selectedRow}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">
+          <tr class="entry-row${deletedRow}${selectedRow}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">
             <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleEntrySelection(${entry.id}, this.checked, event)"></td>
             <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span><span class="entry-path">${escapeHtml(displayPath(entry.logical_path))}</span></td>
             <td title="${escapeAttr(entryCategoryLabel(entry) + " | " + entryCategoryDetail(entry))}">${categoryIconHtml(entryCategory(entry).main)}<span class="entry-category">${escapeHtml(entryCategoryLabel(entry))}</span></td>
@@ -18715,12 +18865,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const metadata = entry.metadata_json || {};
       const value = firstDefined(
         metadata.resolved_decoded_media_offset,
+        metadata.file_data_decoded_media_offset,
         metadata.file_data_physical_offset,
         metadata.mft_record_physical_offset,
-        metadata.physical_offset,
-        metadata.file_data_logical_offset,
-        metadata.mft_record_logical_offset,
-        metadata.logical_offset,
+        metadata.physical_offset
       );
       return formatOffsetValue(value);
     }
@@ -18808,6 +18956,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (name.includes(":") && !/^[a-zA-Z]:[\\/]/.test(name)) {
         return "ads";
       }
+      const metadata = entry.metadata_json || {};
+      if (metadata.artifact_kind === "spreadsheet_document" || metadata.detected_office_document_type === "spreadsheet") {
+        return "spreadsheet";
+      }
+      if (metadata.artifact_kind === "word_processing_document" || metadata.detected_office_document_type === "word_processing") {
+        return "document";
+      }
       const ext = filesystemFileExtension(entry);
       const pathText = (String(entry.logical_path || "") + "/" + name).toLowerCase();
       if (ext === "img" && /\/tencent\/|\/qq_games\/|\/qqgames\//.test(pathText.replaceAll("\\\\", "/"))) {
@@ -18851,7 +19006,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return "";
       }
       const metadata = entry.metadata_json || {};
-      return firstText(metadata.file_extension, fileExtension(entry.name || entry.logical_path));
+      return firstText(metadata.detected_file_extension, metadata.file_extension, fileExtension(entry.name || entry.logical_path));
     }
 
     function browserArtifactDisplayTime(metadata, role) {
@@ -19056,8 +19211,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const isChecked = state.selectedEntryIds.has(entry.id);
       const checked = isChecked ? " checked" : "";
       const multiSelected = isChecked ? " multi-selected" : "";
+      const deletedRow = isDeletedRecoveryEntry(entry) ? " deleted" : "";
       return `
-          <tr class="entry-row${selected}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">
+          <tr class="entry-row${deletedRow}${selected}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">
             <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleEntrySelection(${entry.id}, this.checked, event)"></td>
             <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span></td>
             <td class="entry-kind">${escapeHtml(filesystemTypeLabel(entry))}</td>
@@ -19507,6 +19663,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (["windows_amcache_record", "windows_userassist_record", "windows_shimcache_record"].includes(artifact)) return { main: "Program Execution", sub: "Execution artifacts" };
       if (["windows_scheduled_task", "windows_startup_record"].includes(artifact)) return { main: "Program Execution", sub: "Startup and scheduled tasks" };
       if (artifact === "windows_shellbag_record") return { main: "User Activity", sub: "Shellbags" };
+      if (artifact === "windows_recent_docs_record") return { main: "User Activity", sub: "Recent files" };
+      if (artifact === "windows_run_mru_record") return { main: "User Activity", sub: "Run commands" };
+      if (artifact === "windows_typed_path_record") return { main: "User Activity", sub: "Typed paths" };
+      if (artifact === "windows_search_query_record") return { main: "User Activity", sub: "Windows searches" };
+      if (artifact === "windows_srum_record") return { main: "Network and Connectivity", sub: "SRUM activity" };
       if (artifact === "email_message") return { main: "Email and Communications", sub: "Email messages" };
       if (artifact === "email_store") return { main: "Email and Communications", sub: "Email stores" };
       if (artifact === "deleted_file_record" || metadata.recovery_source === "ntfs_deleted_mft" || entry.is_deleted) return { main: "Recovery", sub: "Deleted files" };
@@ -21160,6 +21321,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const liveEntry = isLive ? (liveEntryByPath(metadata.volume, metadata.image_path) || {}) : {};
       const containerStartOffset = isRaw ? (Number(metadata.start_offset) || 0) : null;
       const fileDataPhysicalOffset = firstDefined(isLive ? liveEntry.file_data_physical_offset : metadata.file_data_physical_offset);
+      const fileDataLogicalOffset = firstDefined(isLive ? liveEntry.file_data_logical_offset : metadata.file_data_logical_offset);
       const fileDataFileOffset = Number(firstDefined(isLive ? liveEntry.file_data_file_offset : metadata.file_data_file_offset) || 0);
       const fileDataContiguousBytes = Number(firstDefined(isLive ? liveEntry.file_data_contiguous_bytes : metadata.file_data_contiguous_bytes));
       const fileDataDirectMapping = firstDefined(isLive ? liveEntry.file_data_direct_logical_mapping : metadata.file_data_direct_logical_mapping);
@@ -21170,6 +21332,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       let selectionFileEnd = range.end;
       let selectionDecodedStart = null;
       let selectionDecodedEnd = null;
+      let selectionVolumeStart = null;
+      let selectionVolumeEnd = null;
       let physicalBasis = "unknown - offset within source could not be resolved";
       if (filesystemContext) {
         selectionDecodedStart = range.start;
@@ -21178,12 +21342,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ? "direct decoded-media offsets in raw view"
           : "direct decoded-media offsets in file-system view";
         if (isRaw) {
-          selectionFileStart = range.start - containerStartOffset;
-          selectionFileEnd = range.end - containerStartOffset;
+          selectionFileStart = null;
+          selectionFileEnd = null;
+          if (offsetWithinExtent(range.start, metadata.partition_start_offset, metadata.partition_size_bytes)
+              && offsetWithinExtent(range.end, metadata.partition_start_offset, metadata.partition_size_bytes)) {
+            selectionVolumeStart = range.start - Number(metadata.partition_start_offset);
+            selectionVolumeEnd = range.end - Number(metadata.partition_start_offset);
+          }
         } else if (diskLocation && decodedRangeWithinDiskLocation(diskLocation, range.start, range.end)) {
           selectionFileStart = Number(diskLocation.file_relative_offset || 0)
             + range.start - Number(diskLocation.decoded_media_offset);
           selectionFileEnd = selectionFileStart + selectionLength - 1;
+          if (offsetWithinExtent(range.start, diskLocation.partition_start_offset, diskLocation.partition_size_bytes)
+              && offsetWithinExtent(range.end, diskLocation.partition_start_offset, diskLocation.partition_size_bytes)) {
+            selectionVolumeStart = range.start - Number(diskLocation.partition_start_offset);
+            selectionVolumeEnd = range.end - Number(diskLocation.partition_start_offset);
+          }
           physicalBasis = diskLocation.basis + " (verified contiguous mapping)";
         } else {
           selectionFileStart = null;
@@ -21193,6 +21367,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
         selectionDecodedStart = Number(diskLocation.decoded_media_offset)
           + range.start - Number(diskLocation.file_relative_offset || 0);
         selectionDecodedEnd = selectionDecodedStart + selectionLength - 1;
+        if (diskLocation.volume_relative_offset != null) {
+          selectionVolumeStart = Number(diskLocation.volume_relative_offset)
+            + range.start - Number(diskLocation.file_relative_offset || 0);
+          selectionVolumeEnd = selectionVolumeStart + selectionLength - 1;
+        }
         physicalBasis = diskLocation.basis + " (verified contiguous mapping)";
       } else if (fileDataPhysicalOffset != null) {
         const delta = range.start - fileDataFileOffset;
@@ -21201,6 +21380,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         if (rangeIsVerified || (fileDataDirectMapping !== false && delta === 0 && selectionLength === 1)) {
           selectionDecodedStart = Number(fileDataPhysicalOffset) + delta;
           selectionDecodedEnd = selectionDecodedStart + selectionLength - 1;
+          if (fileDataLogicalOffset != null) {
+            selectionVolumeStart = Number(fileDataLogicalOffset) + delta;
+            selectionVolumeEnd = selectionVolumeStart + selectionLength - 1;
+          }
           physicalBasis = rangeIsVerified
             ? (fileDataPhysicalBasis || "parser-recorded file-data range") + " (verified contiguous mapping)"
             : (fileDataPhysicalBasis || "parser-recorded exact file-data start");
@@ -21218,7 +21401,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         relative_path: isLive ? metadata.image_path : entry.logical_path,
         display_name: entry.name || logicalName(entry.logical_path),
         evidence_source: evidence.display_name || evidence.source_path || "",
-        source: isRaw ? "raw_image_container" : (isLive ? "live_browse_unindexed" : "indexed_case_entry"),
+        source: isRaw ? "raw_decoded_evidence_media" : (isLive ? "live_browse_unindexed" : "indexed_case_entry"),
         volume: metadata.volume == null ? null : metadata.volume,
         size_bytes: isLive ? (liveEntry.size_bytes == null ? null : liveEntry.size_bytes) : entry.size_bytes,
         is_deleted: Boolean(entry.is_deleted),
@@ -21233,7 +21416,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         mft_record_physical_offset: isLive ? liveEntry.mft_record_physical_offset : metadata.mft_record_physical_offset,
         file_data_logical_offset: isLive ? liveEntry.file_data_logical_offset : metadata.file_data_logical_offset,
         file_data_physical_offset: fileDataPhysicalOffset,
+        partition_start_offset: firstDefined(metadata.partition_start_offset, isLive ? null : diskLocation?.partition_start_offset),
         container_start_offset: containerStartOffset,
+        raw_view_start_offset: containerStartOffset,
         byte_context: filesystemContext ? "filesystem" : "file",
         selection_view_offset_start: range.start,
         selection_view_offset_end: range.end,
@@ -21242,8 +21427,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
         selection_logical_offset_start: selectionFileStart,
         selection_logical_offset_end: selectionFileEnd,
         selection_length_bytes: selectionLength,
+        selection_volume_offset_start: selectionVolumeStart,
+        selection_volume_offset_end: selectionVolumeEnd,
         selection_decoded_media_offset_start: selectionDecodedStart,
         selection_decoded_media_offset_end: selectionDecodedEnd,
+        selection_offset_coordinate_system: "file_relative / volume_relative / decoded_evidence_media",
         selection_physical_offset_start: selectionDecodedStart,
         selection_physical_offset_end: selectionDecodedEnd,
         physical_offset_basis: physicalBasis,
@@ -21334,6 +21522,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function currentHexEntry() {
       if (state.hex.raw) {
+        const rawVolume = state.hex.raw.volume == null ? null : (state.live.volumes || []).find(
+          (item) => Number(item.index) === Number(state.hex.raw.volume)
+        );
         return {
           id: null,
           entry_kind: "file",
@@ -21345,7 +21536,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
           metadata_json: {
             source: "raw_image",
             start_offset: state.hex.raw.startOffset,
-            volume: state.hex.raw.volume == null ? null : state.hex.raw.volume
+            volume: state.hex.raw.volume == null ? null : state.hex.raw.volume,
+            partition_start_offset: rawVolume ? rawVolume.start_offset : null,
+            partition_size_bytes: rawVolume ? rawVolume.size_bytes : null,
+            offset_coordinate_system: "decoded_evidence_media_byte_offset"
           }
         };
       }
@@ -21353,9 +21547,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       // viewer renders instead of falling back to "No item selected".
       if (state.hex.live) {
         const liveEntry = state.hex.live.entry || liveEntryByPath(state.hex.live.volume, state.hex.live.path) || {};
+        const liveVolume = (state.live.volumes || []).find(
+          (item) => Number(item.index) === Number(state.hex.live.volume)
+        ) || {};
         const metadata = {
           source: "live_browse",
           volume: state.hex.live.volume,
+          partition_start_offset: liveVolume.start_offset,
+          partition_size_bytes: liveVolume.size_bytes,
           image_path: state.hex.live.path,
           recovery_source: liveEntry.provenance || "",
           recovery_status: liveEntry.recovery_status || "",
@@ -21576,6 +21775,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const entry = currentHexEntry();
       const mode = $("viewerMode").value;
       updateEntryRowHighlight();
+      renderExaminerStatusBar();
       if (error) {
         setInspectorState("detail");
         $("hexStatus").textContent = error;
@@ -21664,9 +21864,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function hexCurrentBar(decode) {
       const byteLabel = decode.count === 1 ? "1 byte" : decode.count + " bytes";
       const disabled = decode.selected ? "" : " disabled";
+      const offsetLabel = isFilesystemByteContext() ? "Media offset" : "File offset";
       return `
         <div class="hex-current">
-          <span class="hex-current-item"><strong>Current offset</strong>${escapeHtml(formatOffsetPair(decode.start))}</span>
+          <span class="hex-current-item"><strong>${offsetLabel}</strong>${escapeHtml(formatOffsetPair(decode.start))}</span>
           <span class="hex-current-item"><strong>Current selection</strong>${escapeHtml(byteLabel)}</span>
           <span class="hex-current-spacer"></span>
           <button id="copyHexSelection" class="ghost"${disabled}>COPY SELECTION</button>
@@ -22100,6 +22301,138 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return `${offset} (0x${offset.toString(16).toUpperCase().padStart(8, "0")})`;
     }
 
+    function safeOffset(value) {
+      if (value === null || value === undefined || value === "") {
+        return null;
+      }
+      const offset = Number(value);
+      return Number.isSafeInteger(offset) && offset >= 0 ? offset : null;
+    }
+
+    function compactOffset(value) {
+      const offset = safeOffset(value);
+      return offset == null ? "\u2014" : "0x" + offset.toString(16).toUpperCase().padStart(8, "0");
+    }
+
+    function offsetWithinExtent(offset, start, length) {
+      const value = safeOffset(offset);
+      const extentStart = safeOffset(start);
+      const extentLength = safeOffset(length);
+      return value != null && extentStart != null && extentLength != null && extentLength > 0
+        && value >= extentStart && value - extentStart < extentLength;
+    }
+
+    function offsetStatusToken(label, value, description) {
+      const offset = safeOffset(value);
+      const unavailable = offset == null ? " unavailable" : "";
+      const title = offset == null
+        ? description + " Unavailable for the current selection."
+        : description + " " + formatOffsetPair(offset) + ".";
+      return `<span class="examiner-coordinate${unavailable}" title="${escapeAttr(title)}"><strong>${label}</strong>${escapeHtml(compactOffset(offset))}</span>`;
+    }
+
+    function examinerCoordinateModel() {
+      const entry = currentHexEntry();
+      if (!entry) {
+        return { path: "No item selected", file: null, volume: null, media: null, basis: "" };
+      }
+      const metadata = entry.metadata_json || {};
+      const data = state.hex && state.hex.data;
+      const cursor = data ? safeOffset(currentHexDecode(data).start) : null;
+      let file = null;
+      let volume = null;
+      let media = null;
+      let basis = "";
+
+      if (state.hex.raw) {
+        media = cursor == null ? safeOffset(state.hex.offset) : cursor;
+        const volumeInfo = state.hex.raw.volume == null ? null : (state.live.volumes || []).find(
+          (item) => Number(item.index) === Number(state.hex.raw.volume)
+        );
+        const volumeStart = firstDefined(volumeInfo && volumeInfo.start_offset, metadata.partition_start_offset);
+        const volumeSize = firstDefined(volumeInfo && volumeInfo.size_bytes, metadata.partition_size_bytes);
+        if (offsetWithinExtent(media, volumeStart, volumeSize)) {
+          volume = media - Number(volumeStart);
+        }
+        basis = "Raw decoded evidence-media view";
+      } else if (state.hex.live) {
+        const liveEntry = state.hex.live.entry
+          || liveEntryByPath(state.hex.live.volume, state.hex.live.path)
+          || {};
+        file = cursor == null ? 0 : cursor;
+        const mappedFileStart = safeOffset(liveEntry.file_data_file_offset) ?? 0;
+        const mappedMediaStart = safeOffset(liveEntry.file_data_physical_offset);
+        const mappedVolumeStart = safeOffset(liveEntry.file_data_logical_offset);
+        const mappedLength = safeOffset(liveEntry.file_data_contiguous_bytes) ?? 1;
+        const directlyMapped = liveEntry.file_data_direct_logical_mapping !== false
+          && offsetWithinExtent(file, mappedFileStart, mappedLength);
+        if (directlyMapped) {
+          const delta = file - mappedFileStart;
+          media = mappedMediaStart == null ? null : mappedMediaStart + delta;
+          volume = mappedVolumeStart == null ? null : mappedVolumeStart + delta;
+        }
+        basis = firstText(liveEntry.physical_offset_basis, "Live filesystem parser");
+      } else if (state.hex.entryId) {
+        const location = resolvedDiskLocation();
+        const filesystemContext = state.hex.byteContext === "filesystem";
+        if (filesystemContext) {
+          media = cursor == null
+            ? safeOffset(location && location.decoded_media_offset)
+            : cursor;
+          if (location && offsetWithinExtent(
+            media,
+            location.partition_start_offset,
+            location.partition_size_bytes
+          )) {
+            volume = media - Number(location.partition_start_offset);
+          }
+          if (location && decodedRangeWithinDiskLocation(location, media, media)) {
+            file = Number(location.file_relative_offset || 0)
+              + media - Number(location.decoded_media_offset);
+          }
+        } else if (entry.entry_kind === "file") {
+          file = cursor == null
+            ? safeOffset(location && location.file_relative_offset) ?? 0
+            : cursor;
+          if (location && fileRangeWithinDiskLocation(location, file, file)) {
+            const delta = file - Number(location.file_relative_offset || 0);
+            media = Number(location.decoded_media_offset) + delta;
+            const volumeStart = safeOffset(location.volume_relative_offset);
+            volume = volumeStart == null ? null : volumeStart + delta;
+          }
+        }
+        basis = location ? location.basis : "";
+      }
+
+      return {
+        path: String(entry.logical_path || entry.name || "Selected item"),
+        file,
+        volume,
+        media,
+        basis
+      };
+    }
+
+    function renderExaminerStatusBar() {
+      const pathNode = $("examinerStatusPath");
+      const coordinateNode = $("examinerStatusCoordinates");
+      if (!pathNode || !coordinateNode) {
+        return;
+      }
+      const model = examinerCoordinateModel();
+      pathNode.textContent = model.path;
+      pathNode.title = model.path + (model.basis ? " | " + model.basis : "");
+      coordinateNode.innerHTML = [
+        offsetStatusToken("FILE", model.file, "Logical byte offset in the selected file/data stream."),
+        offsetStatusToken("VOLUME", model.volume, "Byte offset relative to the containing filesystem volume."),
+        offsetStatusToken(
+          "MEDIA",
+          model.media,
+          "Absolute byte offset in the decoded evidence-media stream; for E01 this is not an E01 segment/container-file offset."
+        )
+      ].join("");
+    }
+
     function formatRawFindOffset(value) {
       const offset = Number(value) || 0;
       return "0x" + offset.toString(16).toUpperCase().padStart(8, "0") + " / dec " + offset;
@@ -22449,14 +22782,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Storage Area", raw.storage_area],
           ["Recovery Source", raw.recovery_source],
           ["Recovery Status", raw.recovery_status],
-          ["Logical Offset", formatOffsetValue(raw.logical_offset || raw.finding_logical_offset || raw.start_offset)],
-          ["Physical Offset", formatOffsetValue(raw.physical_offset)],
-          ["MFT Record Logical Offset", formatOffsetValue(raw.mft_record_logical_offset)],
-          ["MFT Record Physical Offset", formatOffsetValue(raw.mft_record_physical_offset)],
-          ["File Data Logical Offset", formatOffsetValue(raw.file_data_logical_offset)],
-          ["File Data Physical Offset", formatOffsetValue(raw.file_data_physical_offset)],
-          ["Partition Start", formatOffsetValue(raw.partition_start_offset || raw.start_offset)],
-          ["Partition Size", formatByteCountValue(raw.partition_size_bytes || raw.size_bytes)],
+          ["File / Finding-relative Offset", formatOffsetValue(firstDefined(raw.logical_offset, raw.finding_logical_offset, raw.start_offset))],
+          ["Decoded-media Offset", formatOffsetValue(raw.physical_offset)],
+          ["Volume-relative MFT Record Offset", formatOffsetValue(raw.mft_record_logical_offset)],
+          ["Decoded-media MFT Record Offset", formatOffsetValue(raw.mft_record_physical_offset)],
+          ["Volume-relative File Data Offset", formatOffsetValue(raw.file_data_logical_offset)],
+          ["Decoded-media File Data Offset", formatOffsetValue(firstDefined(raw.file_data_decoded_media_offset, raw.file_data_physical_offset))],
+          ["Decoded-media Volume Start", formatOffsetValue(firstDefined(raw.partition_start_offset, raw.start_offset))],
+          ["Partition Size", formatByteCountValue(firstDefined(raw.partition_size_bytes, raw.size_bytes))],
+          ["Offset Coordinate System", raw.offset_coordinate_system],
+          ["Offset Basis", raw.physical_offset_basis],
           ["In File Slack", raw.is_file_slack ? "yes" : ""],
           ["In Unallocated Space", raw.is_unallocated ? "yes" : ""]
         ]),
@@ -22495,8 +22830,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Artifact Kind", raw.artifact_kind],
           ["Filesystem Parser", raw.filesystem_parser],
           ["Filesystem", raw.filesystem],
-          ["Partition Start", formatOffsetValue(raw.partition_start_offset || raw.start_offset)],
-          ["Partition Size", formatByteCountValue(raw.partition_size_bytes || raw.size_bytes)],
+          ["Decoded-media Volume Start", formatOffsetValue(firstDefined(raw.partition_start_offset, raw.start_offset))],
+          ["Partition Size", formatByteCountValue(firstDefined(raw.partition_size_bytes, raw.size_bytes))],
           ["MFT Record", raw.mft_file_record_number || raw.ntfs_file_record_number],
           ["MFT Sequence", raw.mft_sequence_number],
           ["NTFS Path", raw.ntfs_path],
@@ -22512,11 +22847,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function previewSection(entry) {
       const metadata = entry.metadata_json || {};
+      if (metadata.artifact_kind === "spreadsheet_document" || metadata.document_parser?.document_kind === "spreadsheet") {
+        return spreadsheetPreviewSection(entry, metadata);
+      }
       if (metadata.artifact_kind === "email_message") {
         return emailPreviewSection(entry, metadata);
       }
       if (metadata.artifact_kind === "browser_history_visit" || metadata.artifact_kind === "browser_bookmark" || metadata.artifact_kind === "browser_preference") {
         return browserPreviewSection(entry, metadata);
+      }
+      if (isWindowsStructuredArtifact(metadata)) {
+        return windowsArtifactPreviewSection(entry, metadata);
       }
       if (entry.entry_kind === "record") {
         return genericRecordPreviewSection(entry, metadata);
@@ -22525,6 +22866,42 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return imagePreviewSection(entry);
       }
       return "";
+    }
+
+    function spreadsheetPreviewSection(entry, metadata) {
+      const parser = metadata.document_parser || {};
+      const sheets = Array.isArray(parser.spreadsheet_preview) ? parser.spreadsheet_preview : [];
+      const sheetHtml = sheets.map((sheet) => {
+        const rows = Array.isArray(sheet.rows) ? sheet.rows : [];
+        const references = [];
+        const seen = new Set();
+        rows.forEach((row) => (Array.isArray(row.cells) ? row.cells : []).forEach((cell) => {
+          const reference = String(cell.reference || "");
+          if (reference && !seen.has(reference.replace(/\d+$/, ""))) {
+            seen.add(reference.replace(/\d+$/, ""));
+            references.push(reference.replace(/\d+$/, ""));
+          }
+        }));
+        references.sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+        const body = rows.map((row) => {
+          const cells = new Map((Array.isArray(row.cells) ? row.cells : []).map((cell) => [String(cell.reference || "").replace(/\d+$/, ""), cell]));
+          return `<tr><th>${escapeHtml(row.row == null ? "" : row.row)}</th>${references.map((column) => {
+            const cell = cells.get(column);
+            if (!cell) return "<td></td>";
+            const formula = cell.formula ? `\nFormula: ${cell.formula}` : "";
+            return `<td title="${escapeAttr(String(cell.reference || ""))}">${escapeHtml(String(cell.value ?? "") + formula)}</td>`;
+          }).join("")}</tr>`;
+        }).join("");
+        return `<div class="spreadsheet-preview-sheet">
+          <h4>${escapeHtml(sheet.name || "Worksheet")}</h4>
+          <table><thead><tr><th>Row</th>${references.map((column) => `<th>${escapeHtml(column)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>
+        </div>`;
+      }).join("");
+      const summary = `${Number(parser.worksheets_parsed || sheets.length).toLocaleString()} worksheet(s), ${Number(parser.cells_seen || 0).toLocaleString()} cell(s)`;
+      return `<section class="metadata-section"><h3>Spreadsheet Preview</h3><div class="preview-card">
+        <div class="preview-meta"><span>${escapeHtml(summary)}</span><span>Values are source values; formulas are shown separately.</span></div>
+        <div class="spreadsheet-preview">${sheetHtml || `<span class="muted">No non-empty cells were available for the bounded preview.</span>`}</div>
+      </div></section>`;
     }
 
     function imagePreviewSection(entry) {
@@ -22573,6 +22950,158 @@ const INDEX_HTML: &str = r###"<!doctype html>
         <h4 class="preview-title">${escapeHtml(entry.name || logicalName(entry.logical_path))}</h4>
         <div class="preview-meta"><span>${escapeHtml(entry.logical_path)}</span></div>
         <div class="preview-body">${escapeHtml(body)}</div>
+      </div></section>`;
+    }
+
+    function isWindowsStructuredArtifact(metadata) {
+      const kind = String(metadata.artifact_kind || "");
+      return kind.startsWith("windows_")
+        || Boolean(metadata.srum_parser_coverage)
+        || ["network_configuration", "wifi_profile", "host_identity"].includes(kind);
+    }
+
+    function artifactKindLabel(kind) {
+      return String(kind || "Windows artifact")
+        .replace(/^windows_/, "")
+        .replace(/_record$/, "")
+        .replaceAll("_", " ")
+        .replace(/\b\w/g, (character) => character.toUpperCase());
+    }
+
+    function srumReferenceText(reference) {
+      if (!reference || typeof reference !== "object") return "";
+      return firstText(
+        reference.decoded_value,
+        reference.raw_value_hex ? "raw: " + reference.raw_value_hex : "",
+        reference.id_index == null ? "" : "unresolved identifier " + reference.id_index
+      );
+    }
+
+    function windowsArtifactRows(metadata, includeProvenance = false) {
+      const kind = String(metadata.artifact_kind || "");
+      const rows = [["Artifact", metadata.srum_parser_coverage ? "SRUM source" : artifactKindLabel(kind)]];
+      if (metadata.srum_parser_coverage) {
+        const coverage = metadata.srum_parser_coverage || {};
+        const counts = coverage.live_row_counts || {};
+        rows.push(
+          ["Parser status", firstText(metadata.srum_parser_status, coverage.status)],
+          ["Decoded records", firstDefined(metadata.srum_records_indexed, coverage.records_indexed)],
+          ["IdMap rows", counts.id_map],
+          ["Network usage rows", counts.network_usage],
+          ["Application resource rows", counts.application_resource_usage],
+          ["Connectivity rows", counts.connectivity],
+          ["Coverage", coverage.coverage],
+          ["Limitation", coverage.limitation]
+        );
+      } else if (["windows_recent_docs_record", "windows_run_mru_record", "windows_typed_path_record", "windows_search_query_record"].includes(kind)) {
+        rows.push(
+          ["Decoded value", metadata.user_activity_value],
+          ["MRU position", metadata.mru_position == null ? "" : Number(metadata.mru_position) + 1],
+          ["Registry key last write", metadata.registry_key_last_write_utc]
+        );
+      } else if (kind === "windows_userassist_record") {
+        rows.push(
+          ["Decoded program", metadata.userassist_decoded_name],
+          ["Run count", metadata.userassist_run_count],
+          ["Focus count", metadata.userassist_focus_count],
+          ["Focus time", metadata.userassist_focus_time_ms == null ? "" : metadata.userassist_focus_time_ms + " ms"],
+          ["Last execution", metadata.userassist_last_execution_utc],
+          ["Binary layout", metadata.userassist_binary_layout]
+        );
+      } else if (kind === "windows_shellbag_record") {
+        rows.push(
+          ["Resolved path", metadata.shellbag_resolved_path],
+          ["Item name", metadata.shellbag_item_name],
+          ["MRU position", metadata.shellbag_mru_position == null ? "" : Number(metadata.shellbag_mru_position) + 1],
+          ["Key last write", metadata.shellbag_key_last_write_utc],
+          ["Decode confidence", metadata.shellbag_decode_confidence],
+          ["Decode method", metadata.shellbag_name_decode_method]
+        );
+      } else if (kind === "windows_amcache_record") {
+        rows.push(
+          ["Program path", metadata.amcache_path],
+          ["Program", metadata.amcache_name || metadata.amcache_product_name],
+          ["Publisher", metadata.amcache_publisher],
+          ["Version", metadata.amcache_version],
+          ["SHA-1", metadata.amcache_sha1],
+          ["Link date", metadata.amcache_link_date]
+        );
+      } else if (kind === "windows_shimcache_record") {
+        rows.push(
+          ["Cached path", metadata.shimcache_path],
+          ["Cached file modified", metadata.shimcache_file_last_modified_utc],
+          ["Time semantics", metadata.shimcache_time_semantics],
+          ["Execution flag", metadata.shimcache_execution_flag],
+          ["Layout", metadata.shimcache_layout_label]
+        );
+      } else if (kind === "windows_startup_record") {
+        rows.push(
+          ["Name", metadata.startup_value_name],
+          ["Command", metadata.startup_command],
+          ["Scope", metadata.startup_scope],
+          ["Key last write", metadata.startup_key_last_write_utc]
+        );
+      } else if (kind === "windows_srum_record") {
+        const record = metadata.srum_record || {};
+        rows.push(
+          ["SRUM table", String(metadata.srum_record_kind || "").replaceAll("_", " ")],
+          ["Timestamp", firstText(record.connect_start_utc, record.timestamp_utc, metadata.artifact_time_utc)],
+          ["Application", srumReferenceText(record.app)],
+          ["User / SID", srumReferenceText(record.user)],
+          ["Bytes sent", record.bytes_sent],
+          ["Bytes received", record.bytes_received],
+          ["Connected time", record.connected_time_seconds == null ? "" : record.connected_time_seconds + " seconds"],
+          ["Foreground bytes read", record.foreground_bytes_read],
+          ["Foreground bytes written", record.foreground_bytes_written],
+          ["Background bytes read", record.background_bytes_read],
+          ["Background bytes written", record.background_bytes_written],
+          ["Interface LUID", record.interface_luid],
+          ["Network profile ID", record.l2_profile_id]
+        );
+      } else if (kind === "network_configuration" || kind === "host_identity") {
+        rows.push(
+          ["Finding type", String(metadata.lead_type || "").replaceAll("_", " ")],
+          ["Decoded value", metadata.value],
+          ["Observed", metadata.artifact_time_utc]
+        );
+      } else if (kind === "wifi_profile") {
+        rows.push(
+          ["Profile", metadata.profile_name],
+          ["SSID", metadata.ssid],
+          ["Authentication", metadata.authentication],
+          ["Encryption", metadata.encryption],
+          ["Key type", metadata.key_type],
+          ["Key material state", metadata.wifi_key_material_state],
+          ["Protected", metadata.key_material_protected],
+          ["Key SHA-256", metadata.wifi_key_value_sha256]
+        );
+      } else {
+        rows.push(
+          ["Time", metadata.artifact_time_utc],
+          ["Summary", firstText(metadata.summary, metadata.description, metadata.command, metadata.path)]
+        );
+      }
+      if (includeProvenance) {
+        rows.push(
+          ["Registry key", firstText(metadata.registry_key_path, metadata.userassist_registry_key, metadata.shellbag_registry_key, metadata.shimcache_registry_key, metadata.startup_registry_key, metadata.amcache_key_path)],
+          ["Registry value", firstText(metadata.registry_value_name, metadata.shimcache_registry_value, metadata.source_value_name)],
+          ["Registry value type", firstText(metadata.registry_value_type, metadata.shimcache_registry_value_type)],
+          ["Registry value size", formatByteCountValue(firstDefined(metadata.registry_value_size_bytes, metadata.shimcache_registry_value_size, metadata.source_value_size_bytes))],
+          ["Registry hive-file offset", formatOffsetValue(firstDefined(metadata.registry_value_file_relative_offset, metadata.source_value_file_relative_offset))],
+          ["Offset basis", firstText(metadata.registry_value_offset_basis, metadata.coordinate_space, metadata.shimcache_offset_basis)],
+          ["Source hive", metadata.source_hive_name],
+          ["Source path", firstText(metadata.source_path_exact, metadata.source_artifact_path, metadata.source_logical_path)],
+          ["Parser", firstText(metadata.parser, metadata.identity_parser)]
+        );
+      }
+      return rows;
+    }
+
+    function windowsArtifactPreviewSection(entry, metadata) {
+      const body = detailRows(windowsArtifactRows(metadata, false));
+      return `<section class="metadata-section"><h3>Decoded Artifact</h3><div class="preview-card">
+        <h4 class="preview-title">${escapeHtml(entry.name || logicalName(entry.logical_path))}</h4>
+        <dl class="metadata-grid">${body}</dl>
       </div></section>`;
     }
 
@@ -22751,6 +23280,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Source Artifact", metadata.source_artifact],
           ["Source Path", metadata.source_artifact_path_exact || metadata.source_artifact_path]
         ]);
+      }
+      if (isWindowsStructuredArtifact(metadata)) {
+        return detailSection("Decoded Windows Artifact", windowsArtifactRows(metadata, true));
       }
       return "";
     }
@@ -23704,12 +24236,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const hit = row.hit;
         const index = row.index;
         const checked = (state.selectedSearchKeys || new Set()).has(row.key) ? " checked" : "";
-        const deleted = row.entry && row.entry.is_deleted ? ' <span class="pill bad">deleted</span>' : "";
+        const deletedRow = row.entry && row.entry.is_deleted ? " deleted" : "";
         return `
-        <tr class="entry-row" onclick="goToSearchResult(${index})" data-entry-id="${hit.entry_id}" data-search-index="${index}">
+        <tr class="entry-row${deletedRow}" onclick="goToSearchResult(${index})" data-entry-id="${hit.entry_id}" data-search-index="${index}">
           <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleSearchResultSelection(${index}, this.checked)"></td>
           <td title="${escapeAttr(row.values.entry)}"><strong>${escapeHtml(hit.display_name)}</strong><br><span class="muted tiny">${escapeHtml(hit.logical_path)}</span></td>
-          <td><span class="pill ${hit.match_kind === "content" ? "good" : ""}">${escapeHtml(hit.match_kind)}</span>${hit.parsed_segment_kind ? ' <span class="pill">' + escapeHtml(hit.parsed_segment_kind) + '</span>' : ''}${deleted}</td>
+          <td><span class="pill ${hit.match_kind === "content" ? "good" : ""}">${escapeHtml(hit.match_kind)}</span>${hit.parsed_segment_kind ? ' <span class="pill">' + escapeHtml(hit.parsed_segment_kind) + '</span>' : ''}</td>
           <td title="${escapeAttr(row.values.host)}">${escapeHtml(row.values.host)}</td>
           <td title="${escapeAttr(row.values.referrer)}">${escapeHtml(row.values.referrer)}</td>
           <td class="entry-time" title="${escapeAttr(row.values.time)}">${escapeHtml(row.values.time)}</td>

@@ -39,6 +39,10 @@ pub struct WindowsRegistryArtifactParseResult {
     pub amcache_records_indexed: usize,
     pub userassist_records_indexed: usize,
     pub shellbag_records_indexed: usize,
+    pub recent_docs_records_indexed: usize,
+    pub run_mru_records_indexed: usize,
+    pub typed_paths_records_indexed: usize,
+    pub search_query_records_indexed: usize,
     pub startup_records_indexed: usize,
     pub shimcache_sources_seen: usize,
     pub shimcache_sources_completed: usize,
@@ -141,6 +145,7 @@ struct ValueObservation {
     value_type: String,
     rendered: String,
     value_size: Option<usize>,
+    value_file_relative_offset: Option<u64>,
     raw: Option<Vec<u8>>,
 }
 
@@ -149,6 +154,10 @@ struct DerivedCounts {
     amcache: usize,
     userassist: usize,
     shellbags: usize,
+    recent_docs: usize,
+    run_mru: usize,
+    typed_paths: usize,
+    search_queries: usize,
     startup: usize,
     shimcache_sources: usize,
     shimcache_completed: usize,
@@ -196,6 +205,18 @@ pub fn parse_windows_registry_artifacts(
                 result.shellbag_records_indexed = result
                     .shellbag_records_indexed
                     .saturating_add(counts.shellbags);
+                result.recent_docs_records_indexed = result
+                    .recent_docs_records_indexed
+                    .saturating_add(counts.recent_docs);
+                result.run_mru_records_indexed = result
+                    .run_mru_records_indexed
+                    .saturating_add(counts.run_mru);
+                result.typed_paths_records_indexed = result
+                    .typed_paths_records_indexed
+                    .saturating_add(counts.typed_paths);
+                result.search_query_records_indexed = result
+                    .search_query_records_indexed
+                    .saturating_add(counts.search_queries);
                 result.startup_records_indexed = result
                     .startup_records_indexed
                     .saturating_add(counts.startup);
@@ -359,6 +380,13 @@ pub fn parse_windows_registry_artifacts(
                 super::progress::progress_error(Some(candidate.exact_path.clone()));
                 super::progress::progress_skip(Some(candidate.exact_path.clone()));
             }
+        }
+        if let Some(coverage) = result
+            .srum_source_coverage
+            .last()
+            .filter(|coverage| coverage.source_entry_id == candidate.entry_id)
+        {
+            annotate_srum_source(case_path, evidence_id, coverage)?;
         }
         super::progress::progress_advance(candidate.exact_path.clone());
     }
@@ -821,6 +849,44 @@ fn replace_srum_source_records(
     Ok(())
 }
 
+/// Keep the parse outcome on SRUDB.dat itself. This makes a zero-record result
+/// distinguishable in the examiner UI from a parser that was never run, while
+/// leaving the evidence source classified as a file rather than inventing a
+/// decoded artifact record.
+fn annotate_srum_source(
+    case_path: &Path,
+    evidence_id: i64,
+    coverage: &SrumSourceCoverage,
+) -> Result<()> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let metadata_text: String = conn.query_row(
+        "SELECT metadata_json FROM filesystem_entries
+         WHERE case_id = ?1 AND evidence_id = ?2 AND id = ?3",
+        params![case_id, evidence_id, coverage.source_entry_id],
+        |row| row.get(0),
+    )?;
+    let mut metadata = serde_json::from_str::<serde_json::Value>(&metadata_text)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if !metadata.is_object() {
+        metadata = serde_json::json!({});
+    }
+    metadata["srum_parser_status"] = serde_json::json!(coverage.status);
+    metadata["srum_records_indexed"] = serde_json::json!(coverage.records_indexed);
+    metadata["srum_parser_coverage"] = serde_json::to_value(coverage)?;
+    conn.execute(
+        "UPDATE filesystem_entries SET metadata_json = ?1
+         WHERE case_id = ?2 AND evidence_id = ?3 AND id = ?4",
+        params![
+            metadata.to_string(),
+            case_id,
+            evidence_id,
+            coverage.source_entry_id
+        ],
+    )?;
+    Ok(())
+}
+
 fn parse_one_hive(
     case_path: &Path,
     read_session: &mut EvidenceReadSession,
@@ -910,6 +976,23 @@ fn derive_hive_records(
         let derived = derive_shellbags(candidate, &observations);
         counts.shellbags = derived.len();
         records.extend(derived);
+        let derived = derive_user_registry_activity(candidate, &observations);
+        for record in &derived {
+            match record.metadata["artifact_kind"].as_str() {
+                Some("windows_recent_docs_record") => {
+                    counts.recent_docs = counts.recent_docs.saturating_add(1)
+                }
+                Some("windows_run_mru_record") => counts.run_mru = counts.run_mru.saturating_add(1),
+                Some("windows_typed_path_record") => {
+                    counts.typed_paths = counts.typed_paths.saturating_add(1)
+                }
+                Some("windows_search_query_record") => {
+                    counts.search_queries = counts.search_queries.saturating_add(1)
+                }
+                _ => {}
+            }
+        }
+        records.extend(derived);
     }
     if hive == "ntuser.dat" || hive == "software" {
         let derived = derive_startup_records(candidate, &observations);
@@ -959,6 +1042,7 @@ fn value_observation(entry: &RegistryImportEntry) -> Option<ValueObservation> {
         value_size: entry.metadata["registry_value_data_size"]
             .as_u64()
             .and_then(|size| usize::try_from(size).ok()),
+        value_file_relative_offset: entry.metadata["registry_value_offset"].as_u64(),
         raw: entry.raw_value_bytes.clone(),
     })
 }
@@ -1222,6 +1306,172 @@ fn derive_userassist(
             DerivedRecord { logical_path, display_name: decoded_name, metadata }
         })
         .collect()
+}
+
+/// Derives examiner-facing user-activity records from exact Explorer schemas.
+/// The generic Registry import remains the source of truth; these records make
+/// the fields an examiner normally needs visible without treating arbitrary
+/// strings elsewhere in the hive as activity.
+fn derive_user_registry_activity(
+    candidate: &HiveCandidate,
+    observations: &[ValueObservation],
+) -> Vec<DerivedRecord> {
+    let mut numeric_mru_positions = HashMap::<(String, String), usize>::new();
+    let mut run_mru_positions = HashMap::<(String, String), usize>::new();
+    for observation in observations {
+        let key = normalized_registry_key(&observation.key_path);
+        if observation.name.eq_ignore_ascii_case("MRUListEx") {
+            if let Some(raw) = observation.raw.as_deref() {
+                for (position, value) in parse_mru_list_ex(raw).into_iter().enumerate() {
+                    numeric_mru_positions.insert((key.clone(), value.to_string()), position);
+                }
+            }
+        } else if observation.name.eq_ignore_ascii_case("MRUList")
+            && key.ends_with("/software/microsoft/windows/currentversion/explorer/runmru")
+        {
+            for (position, name) in observation.rendered.chars().enumerate() {
+                if !name.is_control() && !name.is_whitespace() {
+                    run_mru_positions.insert((key.clone(), name.to_string()), position);
+                }
+            }
+        }
+    }
+
+    let mut records = Vec::new();
+    for observation in observations {
+        let key = normalized_registry_key(&observation.key_path);
+        let value_name = observation.name.trim();
+        if value_name.is_empty()
+            || value_name.eq_ignore_ascii_case("(default)")
+            || value_name.eq_ignore_ascii_case("MRUList")
+            || value_name.eq_ignore_ascii_case("MRUListEx")
+        {
+            continue;
+        }
+
+        let (artifact_kind, family, value, mru_position) = if key
+            .ends_with("/software/microsoft/windows/currentversion/explorer/runmru")
+        {
+            let value = observation.rendered.trim().to_string();
+            if value.is_empty() {
+                continue;
+            }
+            (
+                "windows_run_mru_record",
+                "run-mru",
+                value,
+                run_mru_positions
+                    .get(&(key.clone(), value_name.to_string()))
+                    .copied(),
+            )
+        } else if key.ends_with("/software/microsoft/windows/currentversion/explorer/typedpaths")
+            && value_name.to_ascii_lowercase().starts_with("url")
+        {
+            let value = observation.rendered.trim().to_string();
+            if value.is_empty() {
+                continue;
+            }
+            ("windows_typed_path_record", "typed-paths", value, None)
+        } else if key
+            .ends_with("/software/microsoft/windows/currentversion/explorer/wordwheelquery")
+            && value_name.parse::<u32>().is_ok()
+        {
+            let Some(value) = observation.raw.as_deref().and_then(decode_utf16le_prefix) else {
+                continue;
+            };
+            let position = numeric_mru_positions
+                .get(&(key.clone(), value_name.to_string()))
+                .copied();
+            (
+                "windows_search_query_record",
+                "word-wheel-query",
+                value,
+                position,
+            )
+        } else if key.contains("/software/microsoft/windows/currentversion/explorer/recentdocs")
+            && value_name.parse::<u32>().is_ok()
+        {
+            let Some(value) = observation.raw.as_deref().and_then(decode_utf16le_prefix) else {
+                continue;
+            };
+            let position = numeric_mru_positions
+                .get(&(key.clone(), value_name.to_string()))
+                .copied();
+            ("windows_recent_docs_record", "recent-docs", value, position)
+        } else {
+            continue;
+        };
+
+        let ordinal = records.len();
+        let display_name = match artifact_kind {
+            "windows_run_mru_record" => format!("Run command: {value}"),
+            "windows_typed_path_record" => format!("Typed path: {value}"),
+            "windows_search_query_record" => format!("Windows search: {value}"),
+            "windows_recent_docs_record" => format!("Recent document: {value}"),
+            _ => value.clone(),
+        };
+        let logical_path = format!(
+            "/Windows Artifacts/Registry/{}/user-activity/{family}/{ordinal:020}-{}.record",
+            candidate.entry_id,
+            sanitize_logical_segment(&value)
+        );
+        let mut metadata = serde_json::json!({
+            "artifact_kind": artifact_kind,
+            "parser": PARSER_NAME,
+            "user_activity_value": value,
+            "mru_position": mru_position,
+            "registry_key_path": observation.key_path,
+            "registry_key_last_write_utc": observation.key_last_write_utc,
+            "registry_value_name": observation.name,
+            "registry_value_type": observation.value_type,
+            "registry_value_size_bytes": observation.value_size,
+            "registry_value_file_relative_offset": observation.value_file_relative_offset,
+            "registry_value_offset_basis": "byte offset within the recovered Registry hive file; not a decoded-media or acquisition-container physical offset",
+            "artifact_time_utc": observation.key_last_write_utc,
+            "structured_source": true,
+        });
+        source_metadata(&mut metadata, candidate);
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(DerivedRecord {
+            logical_path,
+            display_name,
+            metadata,
+        });
+    }
+    records
+}
+
+fn normalized_registry_key(path: &str) -> String {
+    format!(
+        "/{}",
+        path.replace('\\', "/")
+            .trim_start_matches('/')
+            .to_ascii_lowercase()
+    )
+}
+
+fn decode_utf16le_prefix(bytes: &[u8]) -> Option<String> {
+    let mut units = Vec::new();
+    for chunk in bytes.chunks_exact(2).take(16_384) {
+        let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    if units.is_empty() {
+        return None;
+    }
+    let value = String::from_utf16(&units).ok()?.trim().to_string();
+    if value.is_empty()
+        || value.chars().any(|character| {
+            character == '\0' || (character.is_control() && !character.is_whitespace())
+        })
+    {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1541,11 +1791,13 @@ fn parse_mru_list_ex(bytes: &[u8]) -> Vec<u32> {
 
 fn extract_shell_item_name(bytes: &[u8]) -> Option<String> {
     let mut candidates = Vec::<String>::new();
-    let mut offset = 0;
-    while offset + 1 < bytes.len() {
-        let start = offset;
+    // Shell-item strings are not guaranteed to begin on an even offset within
+    // the Registry value. Scan both byte alignments, but keep every candidate
+    // bounded and require readable path/name content before presenting it.
+    for start in 0..bytes.len().saturating_sub(1) {
+        let mut offset = start;
         let mut units = Vec::new();
-        while offset + 1 < bytes.len() {
+        while offset + 1 < bytes.len() && units.len() < 1_024 {
             let unit = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
             if unit == 0 {
                 break;
@@ -1562,7 +1814,6 @@ fn extract_shell_item_name(bytes: &[u8]) -> Option<String> {
                 candidates.push(value);
             }
         }
-        offset = start.saturating_add(2);
     }
     let mut ascii = String::new();
     for byte in bytes {
@@ -1581,10 +1832,81 @@ fn extract_shell_item_name(bytes: &[u8]) -> Option<String> {
     candidates
         .into_iter()
         .map(|value| value.trim_matches('\0').trim().to_string())
-        .filter(|value| {
-            value.len() >= 3 && !value.chars().all(|character| character.is_ascii_hexdigit())
+        .map(trim_isolated_shell_item_edge)
+        .filter_map(|value| shell_item_name_score(&value).map(|score| (score, value)))
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, value)| value)
+}
+
+fn trim_isolated_shell_item_edge(value: String) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    let leading_non_ascii = characters
+        .iter()
+        .take_while(|character| !character.is_ascii())
+        .count();
+    if (1..=2).contains(&leading_non_ascii)
+        && characters[leading_non_ascii..]
+            .iter()
+            .all(|character| character.is_ascii())
+    {
+        return characters[leading_non_ascii..].iter().collect();
+    }
+    let trailing_non_ascii = characters
+        .iter()
+        .rev()
+        .take_while(|character| !character.is_ascii())
+        .count();
+    if (1..=2).contains(&trailing_non_ascii)
+        && characters[..characters.len() - trailing_non_ascii]
+            .iter()
+            .all(|character| character.is_ascii())
+    {
+        return characters[..characters.len() - trailing_non_ascii]
+            .iter()
+            .collect();
+    }
+    value
+}
+
+fn shell_item_name_score(value: &str) -> Option<usize> {
+    let count = value.chars().count();
+    if !(3..=1_024).contains(&count)
+        || value.chars().all(|character| character.is_ascii_hexdigit())
+        || value.chars().any(|character| {
+            character == '\u{fffd}'
+                || character == '\0'
+                || (character.is_control() && !character.is_whitespace())
         })
-        .max_by_key(|value| value.chars().count())
+    {
+        return None;
+    }
+    let useful = value
+        .chars()
+        .filter(|character| {
+            character.is_alphanumeric()
+                || matches!(
+                    character,
+                    ' ' | '.' | '_' | '-' | '\\' | '/' | ':' | '(' | ')' | '[' | ']' | '@'
+                )
+        })
+        .count();
+    if useful.saturating_mul(100) < count.saturating_mul(75)
+        || !value.chars().any(char::is_alphanumeric)
+    {
+        return None;
+    }
+    let path_bonus = value
+        .chars()
+        .filter(|character| matches!(character, '.' | '\\' | '/' | ':'))
+        .count()
+        .saturating_mul(8);
+    let readability = useful.saturating_mul(1_000) / count;
+    Some(
+        readability
+            .saturating_mul(10_000)
+            .saturating_add(count)
+            .saturating_add(path_bonus),
+    )
 }
 
 fn shellbag_parent_path(key_path: &str, decoded_nodes: &HashMap<String, String>) -> String {
@@ -1619,6 +1941,47 @@ fn shellbag_parent_path(key_path: &str, decoded_nodes: &HashMap<String, String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_candidate(name: &str) -> HiveCandidate {
+        HiveCandidate {
+            entry_id: 42,
+            source_job_id: 7,
+            logical_path: format!("/C/Users/Alice/{name}"),
+            exact_path: format!("C/Users/Alice/{name}"),
+            name: name.to_string(),
+        }
+    }
+
+    fn observation(
+        key_path: &str,
+        name: &str,
+        rendered: &str,
+        raw: Option<Vec<u8>>,
+    ) -> ValueObservation {
+        ValueObservation {
+            key_path: key_path.to_string(),
+            key_last_write_utc: Some("2026-09-18T10:00:00+00:00".to_string()),
+            name: name.to_string(),
+            value_type: if raw.is_some() {
+                "REG_BINARY"
+            } else {
+                "REG_SZ"
+            }
+            .to_string(),
+            rendered: rendered.to_string(),
+            value_size: raw.as_ref().map(Vec::len),
+            value_file_relative_offset: Some(4096),
+            raw,
+        }
+    }
+
+    fn utf16le(value: &str) -> Vec<u8> {
+        value
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
 
     #[test]
     fn registry_staging_directory_is_exclusive_and_private() {
@@ -1675,6 +2038,89 @@ mod tests {
             "Amcache.hve",
             r"Windows\WinSxS\component\Windows\appcompat\Programs\Amcache.hve"
         ));
+    }
+
+    #[test]
+    fn exact_explorer_schemas_emit_examiner_ready_user_activity() {
+        let recent_key = r"ROOT\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs\.pdf";
+        let search_key = r"ROOT\Software\Microsoft\Windows\CurrentVersion\Explorer\WordWheelQuery";
+        let run_key = r"ROOT\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU";
+        let typed_key = r"ROOT\Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths";
+        let observations = vec![
+            observation(
+                recent_key,
+                "MRUListEx",
+                "",
+                Some(
+                    [0_u32, u32::MAX]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect(),
+                ),
+            ),
+            observation(recent_key, "0", "binary", Some(utf16le("invoice.pdf"))),
+            observation(
+                search_key,
+                "MRUListEx",
+                "",
+                Some(
+                    [2_u32, u32::MAX]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect(),
+                ),
+            ),
+            observation(search_key, "2", "binary", Some(utf16le("quarterly report"))),
+            observation(run_key, "MRUList", "a", None),
+            observation(run_key, "a", "cmd.exe /c whoami", None),
+            observation(typed_key, "url1", r"C:\Evidence\Exports", None),
+            observation(
+                r"ROOT\Software\Unrelated",
+                "0",
+                "must not be promoted",
+                Some(utf16le("noise")),
+            ),
+        ];
+        let records = derive_user_registry_activity(&test_candidate("NTUSER.DAT"), &observations);
+        assert_eq!(records.len(), 4);
+        let by_kind = records
+            .iter()
+            .map(|record| {
+                (
+                    record.metadata["artifact_kind"].as_str().unwrap(),
+                    record.metadata["user_activity_value"].as_str().unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_kind["windows_recent_docs_record"], "invoice.pdf");
+        assert_eq!(by_kind["windows_search_query_record"], "quarterly report");
+        assert_eq!(by_kind["windows_run_mru_record"], "cmd.exe /c whoami");
+        assert_eq!(by_kind["windows_typed_path_record"], r"C:\Evidence\Exports");
+        assert!(records.iter().all(|record| {
+            record.metadata["registry_value_file_relative_offset"] == serde_json::json!(4096)
+        }));
+    }
+
+    #[test]
+    fn utf16_prefix_decoder_rejects_empty_and_malformed_text() {
+        assert_eq!(
+            decode_utf16le_prefix(&utf16le("report.docx")),
+            Some("report.docx".to_string())
+        );
+        assert_eq!(decode_utf16le_prefix(&[0, 0]), None);
+        assert_eq!(decode_utf16le_prefix(&[0x00, 0xD8, 0, 0]), None);
+    }
+
+    #[test]
+    fn shell_item_name_recovers_odd_aligned_unicode_without_promoting_binary_noise() {
+        let mut value = vec![0x31, 0x00, 0xff, 0x7a, 0x13];
+        value.extend(utf16le("Project Evidence"));
+        value.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            extract_shell_item_name(&value).as_deref(),
+            Some("Project Evidence")
+        );
+        assert_eq!(extract_shell_item_name(&[0xff, 0x01, 0xaa, 0x02]), None);
     }
 
     #[test]
@@ -1771,6 +2217,7 @@ mod tests {
                 value_type: "REG_BINARY".to_string(),
                 rendered: "binary".to_string(),
                 value_size: Some(raw.len()),
+                value_file_relative_offset: Some(4096),
                 raw: Some(raw),
             },
             ValueObservation {
@@ -1780,6 +2227,7 @@ mod tests {
                 value_type: "REG_BINARY".to_string(),
                 rendered: "binary".to_string(),
                 value_size: Some(4),
+                value_file_relative_offset: Some(8192),
                 raw: Some(vec![0x34, 0, 0, 0]),
             },
         ];
@@ -1824,6 +2272,7 @@ mod tests {
             value_type: "REG_BINARY".to_string(),
             rendered: "binary".to_string(),
             value_size: Some(33 * 1024 * 1024),
+            value_file_relative_offset: Some(4096),
             raw: None,
         }];
         let candidate = HiveCandidate {
