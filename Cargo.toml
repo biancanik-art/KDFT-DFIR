@@ -5,6 +5,7 @@ members = [
     "crates/ext4-vendored",
     "crates/ewf-vendored",
     "crates/outlook-pst-vendored",
+    "crates/vhdx-vendored",
     "crates/kdft-case",
     "crates/kdft-cli",
     "crates/kdft-ui",
@@ -67,3 +68,8 @@ ewf = { path = "crates/ewf-vendored" }
 # payloads with unbounded read_to_end calls. The vendored patch imposes a
 # documented per-property bound before KDFT receives the value.
 outlook-pst = { path = "crates/outlook-pst-vendored" }
+# vhdx-core 0.2.1 materializes the complete container with std::fs::read.
+# The vendored bounded-reader backport keeps only metadata/BAT/log state in
+# memory and fetches payload blocks on demand, so multi-GB VHDX evidence does
+# not terminate the workbench on ordinary examiner hardware.
+vhdx-core = { path = "crates/vhdx-vendored" }

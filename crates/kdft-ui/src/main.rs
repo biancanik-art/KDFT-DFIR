@@ -6062,6 +6062,20 @@ mod tests {
     }
 
     #[test]
+    fn case_refresh_preserves_loaded_state_when_backend_is_unreachable() {
+        let refresh = INDEX_HTML
+            .split_once("async function refresh() {")
+            .expect("refresh function")
+            .1
+            .split_once("function suggestedNewCasePath()")
+            .expect("end of refresh function")
+            .0;
+        assert!(refresh.contains("if (state.data && state.loadedCasePath === casePath)"));
+        assert!(refresh.contains("KDFT backend is unreachable"));
+        assert!(refresh.contains("The last loaded case remains displayed"));
+    }
+
+    #[test]
     fn case_open_blocks_duplicate_input_with_visible_progress() {
         let refresh = INDEX_HTML
             .split_once("async function refresh() {")
@@ -12016,6 +12030,24 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return true;
       } catch (err) {
         if (!refreshRequestIsCurrent(casePath, generation)) {
+          return false;
+        }
+        // A browser tab survives when the local KDFT process is terminated by
+        // the OS (for example after memory exhaustion). Do not replace an
+        // already loaded case with the misleading "No case loaded" screen just
+        // because this refresh could not reach the backend. Preserve the last
+        // confirmed case/evidence state and tell the examiner what actually
+        // failed. Once the server is restarted, Refresh rehydrates the same
+        // case from its database path.
+        if (state.data && state.loadedCasePath === casePath) {
+          const networkFailure = err instanceof TypeError
+            && /failed to fetch|network/i.test(String(err.message || err));
+          setNotice(
+            networkFailure
+              ? "KDFT backend is unreachable. The last loaded case remains displayed; restart KDFT, then Refresh or reopen this case database."
+              : "Case refresh failed; the last loaded case remains displayed. " + (err.message || String(err)),
+            true
+          );
           return false;
         }
         state.data = null;
