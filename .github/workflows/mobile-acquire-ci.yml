@@ -1,0 +1,28 @@
+name: Mobile Acquire CI
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/kdft-mobile-acquire/**"
+      - ".github/workflows/mobile-acquire-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check mobile acquisition crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install quality components
+        run: rustup component add rustfmt clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Compile
+        run: cargo check -p kdft-mobile-acquire
+      - name: Clippy
+        run: cargo clippy -p kdft-mobile-acquire --all-targets -- -D warnings

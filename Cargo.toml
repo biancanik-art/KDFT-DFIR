@@ -7,6 +7,7 @@ members = [
     "crates/outlook-pst-vendored",
     "crates/kdft-case",
     "crates/kdft-cli",
+    "crates/kdft-mobile-acquire",
     "crates/kdft-ui",
 ]
 
