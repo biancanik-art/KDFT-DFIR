@@ -13,9 +13,10 @@ use rayon::prelude::*;
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::ErrorKind;
-use std::io::{BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -37,6 +38,9 @@ use super::{
 
 const WINDOWS_ARTIFACT_PARSER_NAME: &str = "kdft-windows-artifacts-v2";
 const WINDOWS_ARTIFACT_TEXT_PARSER_NAME: &str = "kdft-windows-artifacts-v2";
+const EVTXECMD_TEXT_PARSER_NAME: &str = "EvtxECmd examiner-supplied adapter";
+const EVTXECMD_JSON_FILE_NAME: &str = "kdft-evtxecmd-full.json";
+const EVTXECMD_MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const CANDIDATE_PAGE_SIZE: i64 = 128;
 const DIAGNOSTIC_SAMPLE_LIMIT: usize = 32;
 const DIAGNOSTIC_TEXT_BYTES: usize = 2_048;
@@ -320,6 +324,64 @@ struct SourceParseSummary {
     text_segments: u64,
     diagnostics: DiagnosticAccumulator,
     details: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct EvtxEcmdAdapterDetails {
+    configured: bool,
+    status: String,
+    configuration: String,
+    executable_path: Option<String>,
+    executable_sha256: Option<String>,
+    arguments: Vec<String>,
+    exit_code: Option<i32>,
+    elapsed_ms: Option<u128>,
+    output_file_bytes: u64,
+    records_seen: u64,
+    records_matched_to_native: u64,
+    external_only_records_added: u64,
+    records_without_id: u64,
+    ambiguous_record_ids: u64,
+    malformed_records: u64,
+    oversized_records: u64,
+    fields_indexed: u64,
+    stdout_excerpt: String,
+    stderr_excerpt: String,
+    maps_policy: String,
+}
+
+impl EvtxEcmdAdapterDetails {
+    fn not_configured() -> Self {
+        Self {
+            configured: false,
+            status: "not_configured".to_string(),
+            configuration: "Set KDFT_EVTXECMD_PATH to an examiner-supplied EvtxECmd executable, place EvtxECmd.exe next to KDFT, or place it in KDFT/tools.".to_string(),
+            executable_path: None,
+            executable_sha256: None,
+            arguments: Vec::new(),
+            exit_code: None,
+            elapsed_ms: None,
+            output_file_bytes: 0,
+            records_seen: 0,
+            records_matched_to_native: 0,
+            external_only_records_added: 0,
+            records_without_id: 0,
+            ambiguous_record_ids: 0,
+            malformed_records: 0,
+            oversized_records: 0,
+            fields_indexed: 0,
+            stdout_excerpt: String::new(),
+            stderr_excerpt: String::new(),
+            maps_policy: "KDFT never invokes EvtxECmd --sync. Any Maps directory beside the examiner-supplied executable is used as supplied and its provenance remains the examiner's responsibility.".to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EvtxEcmdAdapterOutcome {
+    details: EvtxEcmdAdapterDetails,
+    derived_entries: u64,
+    text_segments: u64,
 }
 
 #[derive(Debug)]
@@ -1819,6 +1881,9 @@ fn parse_evtx_source(
             ),
         ));
     }
+    let adapter = apply_evtxecmd_adapter(tx, candidate, staging_path, &mut diagnostics)?;
+    derived_entries = derived_entries.saturating_add(adapter.derived_entries);
+    text_segments = text_segments.saturating_add(adapter.text_segments);
     let partial = partial_records > 0 || failed_records > 0;
     Ok(SourceParseSummary {
         partial,
@@ -1833,8 +1898,440 @@ fn parse_evtx_source(
             "evtx_failed_records": failed_records,
             "evtx_empty_valid_log": records_seen == 0,
             "evtx_record_count_cap": null,
+            "evtxecmd_adapter": adapter.details,
         }),
     })
+}
+
+fn apply_evtxecmd_adapter(
+    tx: &Transaction<'_>,
+    candidate: &WindowsArtifactCandidate,
+    staging_path: &Path,
+    diagnostics: &mut DiagnosticAccumulator,
+) -> Result<EvtxEcmdAdapterOutcome> {
+    let Some(tool_path) = super::external_tools::configured_tool(
+        "KDFT_EVTXECMD_PATH",
+        &["EvtxECmd.exe", "EvtxECmd", "evtxecmd"],
+    ) else {
+        return Ok(EvtxEcmdAdapterOutcome {
+            details: EvtxEcmdAdapterDetails::not_configured(),
+            derived_entries: 0,
+            text_segments: 0,
+        });
+    };
+
+    let mut details = EvtxEcmdAdapterDetails::not_configured();
+    details.configured = true;
+    details.status = "starting".to_string();
+    details.executable_path = Some(tool_path.display().to_string());
+    details.executable_sha256 = super::external_tools::sha256_file(&tool_path).ok();
+    let parent = staging_path.parent().unwrap_or_else(|| Path::new("."));
+    let adapter_directory = parent.join("evtxecmd-adapter");
+    let output_directory = adapter_directory.join("json");
+    fs::create_dir_all(&output_directory).with_context(|| {
+        format!(
+            "creating EvtxECmd adapter output directory {}",
+            output_directory.display()
+        )
+    })?;
+    let arguments = [
+        OsString::from("-f"),
+        staging_path.as_os_str().to_os_string(),
+        OsString::from("--json"),
+        output_directory.as_os_str().to_os_string(),
+        OsString::from("--jsonf"),
+        OsString::from(EVTXECMD_JSON_FILE_NAME),
+        OsString::from("--fj"),
+        OsString::from("true"),
+    ];
+    details.arguments = arguments
+        .iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect();
+
+    let run = match super::external_tools::run_bounded(
+        &tool_path,
+        arguments.iter(),
+        &adapter_directory,
+    ) {
+        Ok(run) => run,
+        Err(error) => {
+            details.status = "launch_failed".to_string();
+            details.stderr_excerpt = bounded_text(&format!("{error:#}"), DIAGNOSTIC_TEXT_BYTES);
+            diagnostics.push(source_diagnostic(
+                candidate.entry_id,
+                candidate.kind,
+                &candidate.source_path_exact,
+                format!("optional EvtxECmd adapter could not start: {error:#}"),
+            ));
+            return Ok(EvtxEcmdAdapterOutcome {
+                details,
+                derived_entries: 0,
+                text_segments: 0,
+            });
+        }
+    };
+    details.executable_path = Some(run.tool_path.clone());
+    details.executable_sha256 = Some(run.tool_sha256.clone());
+    details.arguments = run.arguments.clone();
+    details.exit_code = run.exit_code;
+    details.elapsed_ms = Some(run.elapsed_ms);
+    details.stdout_excerpt = bounded_text(&run.stdout, DIAGNOSTIC_TEXT_BYTES);
+    details.stderr_excerpt = bounded_text(&run.stderr, DIAGNOSTIC_TEXT_BYTES);
+    if run.status != "completed" || run.exit_code != Some(0) {
+        details.status = run.status.clone();
+        diagnostics.push(source_diagnostic(
+            candidate.entry_id,
+            candidate.kind,
+            &candidate.source_path_exact,
+            format!(
+                "optional EvtxECmd adapter ended with status {} and exit code {:?}; native EVTX records remain authoritative",
+                run.status, run.exit_code
+            ),
+        ));
+        return Ok(EvtxEcmdAdapterOutcome {
+            details,
+            derived_entries: 0,
+            text_segments: 0,
+        });
+    }
+
+    let output_path = output_directory.join(EVTXECMD_JSON_FILE_NAME);
+    if !output_path.is_file() {
+        details.status = "output_missing".to_string();
+        diagnostics.push(source_diagnostic(
+            candidate.entry_id,
+            candidate.kind,
+            &candidate.source_path_exact,
+            format!(
+                "EvtxECmd completed but did not create {}",
+                output_path.display()
+            ),
+        ));
+        return Ok(EvtxEcmdAdapterOutcome {
+            details,
+            derived_entries: 0,
+            text_segments: 0,
+        });
+    }
+    details.output_file_bytes = fs::metadata(&output_path)
+        .with_context(|| format!("reading EvtxECmd output metadata {}", output_path.display()))?
+        .len();
+    let file = File::open(&output_path)
+        .with_context(|| format!("opening EvtxECmd JSON output {}", output_path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut derived_entries = 0_u64;
+    let mut text_segments = 0_u64;
+    let mut ordinal = 0_u64;
+    let mut first_line = true;
+    while let Some((mut line, oversized)) =
+        read_bounded_json_line(&mut reader, EVTXECMD_MAX_RECORD_BYTES)?
+    {
+        if first_line {
+            first_line = false;
+            if line.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                line.drain(..3);
+            }
+        }
+        if oversized {
+            details.oversized_records = details.oversized_records.saturating_add(1);
+            continue;
+        }
+        let line = trim_ascii_whitespace(&line);
+        if line.is_empty() {
+            continue;
+        }
+        let parsed = match serde_json::from_slice::<serde_json::Value>(line) {
+            Ok(value) => value,
+            Err(error) => {
+                details.malformed_records = details.malformed_records.saturating_add(1);
+                if details.malformed_records <= DIAGNOSTIC_SAMPLE_LIMIT as u64 {
+                    diagnostics.push(source_diagnostic(
+                        candidate.entry_id,
+                        candidate.kind,
+                        &candidate.source_path_exact,
+                        format!("EvtxECmd JSON record could not be decoded: {error}"),
+                    ));
+                }
+                continue;
+            }
+        };
+        match parsed {
+            serde_json::Value::Array(records) => {
+                for record in records {
+                    ordinal = ordinal.saturating_add(1);
+                    persist_evtxecmd_record(
+                        tx,
+                        candidate,
+                        &record,
+                        ordinal,
+                        &mut details,
+                        &mut derived_entries,
+                        &mut text_segments,
+                    )?;
+                }
+            }
+            record => {
+                ordinal = ordinal.saturating_add(1);
+                persist_evtxecmd_record(
+                    tx,
+                    candidate,
+                    &record,
+                    ordinal,
+                    &mut details,
+                    &mut derived_entries,
+                    &mut text_segments,
+                )?;
+            }
+        }
+    }
+    details.status = if details.malformed_records > 0 || details.oversized_records > 0 {
+        "completed_with_record_errors"
+    } else {
+        "completed"
+    }
+    .to_string();
+    if details.oversized_records > 0 {
+        diagnostics.push(source_diagnostic(
+            candidate.entry_id,
+            candidate.kind,
+            &candidate.source_path_exact,
+            format!(
+                "{} EvtxECmd JSON record(s) exceeded the {} byte per-record safety bound and were not imported",
+                details.oversized_records, EVTXECMD_MAX_RECORD_BYTES
+            ),
+        ));
+    }
+    Ok(EvtxEcmdAdapterOutcome {
+        details,
+        derived_entries,
+        text_segments,
+    })
+}
+
+fn persist_evtxecmd_record(
+    tx: &Transaction<'_>,
+    candidate: &WindowsArtifactCandidate,
+    record: &serde_json::Value,
+    ordinal: u64,
+    details: &mut EvtxEcmdAdapterDetails,
+    derived_entries: &mut u64,
+    text_segments: &mut u64,
+) -> Result<()> {
+    details.records_seen = details.records_seen.saturating_add(1);
+    let raw_json = serde_json::to_string(record).context("serializing EvtxECmd JSON record")?;
+    let record_id = evtxecmd_record_id(record);
+    let fields = super::evtx_named_payload_fields(record);
+    details.fields_indexed = details
+        .fields_indexed
+        .saturating_add(u64::try_from(fields.len()).unwrap_or(u64::MAX));
+    let matches = if let Some(record_id) = record_id {
+        let mut statement = tx.prepare_cached(
+            "SELECT id, metadata_json
+             FROM filesystem_entries
+             WHERE json_extract(metadata_json, '$.windows_artifact_derived') = 1
+               AND json_extract(metadata_json, '$.windows_artifact_source_entry_id') = ?1
+               AND CAST(json_extract(metadata_json, '$.evtx_record_id') AS INTEGER) = ?2
+             ORDER BY id
+             LIMIT 2",
+        )?;
+        let mut rows = statement.query(params![candidate.entry_id, record_id])?;
+        let mut found = Vec::<(i64, String)>::new();
+        while let Some(row) = rows.next()? {
+            found.push((row.get(0)?, row.get(1)?));
+        }
+        found
+    } else {
+        details.records_without_id = details.records_without_id.saturating_add(1);
+        Vec::new()
+    };
+
+    if matches.len() == 1 {
+        let (entry_id, metadata_json) = &matches[0];
+        let mut metadata = serde_json::from_str::<serde_json::Value>(metadata_json)
+            .context("decoding native EVTX metadata for EvtxECmd enrichment")?;
+        let object = metadata
+            .as_object_mut()
+            .context("native EVTX metadata is not a JSON object")?;
+        object.insert(
+            "evtxecmd_adapter".to_string(),
+            serde_json::json!({
+                "status": "matched_to_native_record",
+                "executable_path": details.executable_path,
+                "executable_sha256": details.executable_sha256,
+                "full_json": true,
+                "maps_auto_sync": false,
+            }),
+        );
+        object.insert(
+            "evtxecmd_fields".to_string(),
+            serde_json::to_value(&fields).context("serializing EvtxECmd named fields")?,
+        );
+        object.insert(
+            "evtxecmd_field_count".to_string(),
+            serde_json::json!(fields.len()),
+        );
+        object.insert(
+            "evtxecmd_rendered_json_storage".to_string(),
+            serde_json::json!(
+                "filesystem_entry_text_segments: EvtxECmd examiner-supplied adapter/full-json"
+            ),
+        );
+        tx.execute(
+            "UPDATE filesystem_entries SET metadata_json = ?1 WHERE id = ?2",
+            params![metadata.to_string(), entry_id],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO filesystem_entry_text_segments(
+                 entry_id, parser_name, segment_index, part_name, content, content_encoding
+             ) VALUES (?1, ?2, 0, 'full-json', ?3, 'utf-8')",
+            params![entry_id, EVTXECMD_TEXT_PARSER_NAME, raw_json.as_bytes()],
+        )?;
+        details.records_matched_to_native = details.records_matched_to_native.saturating_add(1);
+        *text_segments = text_segments.saturating_add(1);
+        return Ok(());
+    }
+
+    if matches.len() > 1 {
+        details.ambiguous_record_ids = details.ambiguous_record_ids.saturating_add(1);
+    }
+    let record_id_label = record_id
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| format!("ordinal-{ordinal}"));
+    let event_id = record
+        .get("Event")
+        .and_then(|event| event.get("System"))
+        .and_then(|system| super::evtx_json_path_u64(system, &["EventID"]));
+    let logical_path = format!(
+        "/Windows Artifacts/{}/evtx-external/{ordinal:020}-{}.record",
+        candidate.entry_id,
+        sanitize_logical_segment(&record_id_label)
+    );
+    let display_name = event_id
+        .map(|event_id| format!("EvtxECmd event {event_id} (record {record_id_label})"))
+        .unwrap_or_else(|| format!("EvtxECmd record {record_id_label}"));
+    let metadata = serde_json::json!({
+        "artifact_kind": "evtx_external_record",
+        "evtx_parser": EVTXECMD_TEXT_PARSER_NAME,
+        "evtx_parser_status": "external_only",
+        "evtx_record_id": record_id,
+        "evtx_event_id": event_id,
+        "evtxecmd_fields": fields,
+        "evtxecmd_field_count": fields.len(),
+        "evtxecmd_adapter": {
+            "status": if matches.len() > 1 { "ambiguous_native_match" } else { "native_record_not_found" },
+            "executable_path": details.executable_path,
+            "executable_sha256": details.executable_sha256,
+            "full_json": true,
+            "maps_auto_sync": false,
+        },
+        "evtxecmd_rendered_json_storage": "filesystem_entry_text_segments: EvtxECmd examiner-supplied adapter/full-json",
+        "supported_scope_complete": false,
+    });
+    insert_derived_entry_with_parser(
+        tx,
+        candidate,
+        &logical_path,
+        &display_name,
+        "artifact",
+        metadata,
+        &raw_json,
+        EVTXECMD_TEXT_PARSER_NAME,
+        "full-json",
+    )?;
+    details.external_only_records_added = details.external_only_records_added.saturating_add(1);
+    *derived_entries = derived_entries.saturating_add(1);
+    *text_segments = text_segments.saturating_add(1);
+    Ok(())
+}
+
+fn evtxecmd_record_id(record: &serde_json::Value) -> Option<u64> {
+    record
+        .get("Event")
+        .and_then(|event| event.get("System"))
+        .and_then(|system| super::evtx_json_path_u64(system, &["EventRecordID"]))
+        .or_else(|| evtxecmd_find_named_u64(record, "eventrecordid"))
+        .or_else(|| evtxecmd_find_named_u64(record, "recordnumber"))
+}
+
+fn evtxecmd_find_named_u64(value: &serde_json::Value, wanted: &str) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(object) => {
+            for (key, child) in object {
+                let normalized = key
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                if normalized == wanted {
+                    if let Some(value) = super::evtx_json_path_u64(child, &[]) {
+                        return Some(value);
+                    }
+                }
+            }
+            object
+                .values()
+                .find_map(|child| evtxecmd_find_named_u64(child, wanted))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|child| evtxecmd_find_named_u64(child, wanted)),
+        _ => None,
+    }
+}
+
+fn read_bounded_json_line<R: BufRead>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<(Vec<u8>, bool)>> {
+    let mut output = Vec::<u8>::new();
+    let mut exceeded = false;
+    let mut saw_bytes = false;
+    loop {
+        let (consume, line_complete) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return if saw_bytes {
+                    Ok(Some((output, exceeded)))
+                } else {
+                    Ok(None)
+                };
+            }
+            saw_bytes = true;
+            let mut line_complete = false;
+            let consume = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|position| {
+                    line_complete = true;
+                    position.saturating_add(1)
+                })
+                .unwrap_or(available.len());
+            if !exceeded {
+                let remaining = limit.saturating_sub(output.len());
+                let retain = consume.min(remaining);
+                output.extend_from_slice(&available[..retain]);
+                if retain < consume || output.len() >= limit && !line_complete {
+                    exceeded = true;
+                }
+            }
+            (consume, line_complete)
+        };
+        reader.consume(consume);
+        if line_complete {
+            return Ok(Some((output, exceeded)));
+        }
+    }
+}
+
+fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len().saturating_sub(1)];
+    }
+    value
 }
 
 struct SqliteUsnSink<'connection, 'transaction> {
@@ -2388,8 +2885,33 @@ fn insert_derived_entry(
     logical_path: &str,
     display_name: &str,
     entry_kind: &str,
+    metadata: serde_json::Value,
+    search_text: &str,
+) -> Result<i64> {
+    insert_derived_entry_with_parser(
+        tx,
+        candidate,
+        logical_path,
+        display_name,
+        entry_kind,
+        metadata,
+        search_text,
+        WINDOWS_ARTIFACT_TEXT_PARSER_NAME,
+        "record",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_derived_entry_with_parser(
+    tx: &Transaction<'_>,
+    candidate: &WindowsArtifactCandidate,
+    logical_path: &str,
+    display_name: &str,
+    entry_kind: &str,
     mut metadata: serde_json::Value,
     search_text: &str,
+    parser_name: &str,
+    part_name: &str,
 ) -> Result<i64> {
     let object = metadata
         .as_object_mut()
@@ -2446,11 +2968,12 @@ fn insert_derived_entry(
     tx.prepare_cached(
         "INSERT INTO filesystem_entry_text_segments(
              entry_id, parser_name, segment_index, part_name, content, content_encoding
-         ) VALUES (?1, ?2, 0, 'record', ?3, 'utf-8')",
+          ) VALUES (?1, ?2, 0, ?3, ?4, 'utf-8')",
     )?
     .execute(params![
         entry_id,
-        WINDOWS_ARTIFACT_TEXT_PARSER_NAME,
+        parser_name,
+        part_name,
         search_text.as_bytes()
     ])?;
     Ok(entry_id)
@@ -2965,6 +3488,141 @@ mod tests {
             is_deleted: false,
             kind,
         }
+    }
+
+    #[test]
+    fn evtxecmd_record_id_accepts_full_json_and_flat_record_number() {
+        let full = serde_json::json!({
+            "Event": {
+                "System": {
+                    "EventRecordID": {"#text": "4242"}
+                }
+            }
+        });
+        let flat = serde_json::json!({"RecordNumber": 99});
+        assert_eq!(evtxecmd_record_id(&full), Some(4242));
+        assert_eq!(evtxecmd_record_id(&flat), Some(99));
+    }
+
+    #[test]
+    fn bounded_external_json_reader_drains_oversized_records() -> Result<()> {
+        let mut input = vec![b'x'; 12];
+        input.extend_from_slice(b"\n{}\n");
+        let mut reader = BufReader::new(std::io::Cursor::new(input));
+        let (first, first_oversized) =
+            read_bounded_json_line(&mut reader, 8)?.context("expected oversized first line")?;
+        assert!(first_oversized);
+        assert_eq!(first.len(), 8);
+        let (second, second_oversized) =
+            read_bounded_json_line(&mut reader, 8)?.context("expected second line")?;
+        assert!(!second_oversized);
+        assert_eq!(trim_ascii_whitespace(&second), b"{}");
+        assert!(read_bounded_json_line(&mut reader, 8)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn evtxecmd_records_enrich_native_rows_and_preserve_unmatched_rows() -> Result<()> {
+        let mut conn = test_connection()?;
+        insert_source(
+            &conn,
+            10,
+            "/image/Security.evtx",
+            "Security.evtx",
+            serde_json::json!({"source_path_exact": "Windows/System32/winevt/Logs/Security.evtx"}),
+        )?;
+        let candidate = candidate(
+            10,
+            "/image/Security.evtx",
+            "Security.evtx",
+            "Windows/System32/winevt/Logs/Security.evtx",
+            WindowsArtifactKind::Evtx,
+        );
+        let tx = conn.transaction()?;
+        let native_id = insert_derived_entry(
+            &tx,
+            &candidate,
+            "/Windows Artifacts/10/evtx/00000000000000000001-42.record",
+            "Event 4624 (record 42)",
+            "artifact",
+            serde_json::json!({
+                "artifact_kind": "evtx_event_record",
+                "evtx_record_id": 42,
+                "evtx_fields": {"TargetUserName": "alice"}
+            }),
+            "native-json",
+        )?;
+        let mut details = EvtxEcmdAdapterDetails::not_configured();
+        details.configured = true;
+        details.executable_path = Some("EvtxECmd.exe".to_string());
+        details.executable_sha256 = Some("abcd".to_string());
+        let mut derived_entries = 0_u64;
+        let mut text_segments = 0_u64;
+        let matching = serde_json::json!({
+            "Event": {
+                "System": {
+                    "EventID": {"#text": "4624"},
+                    "EventRecordID": {"#text": "42"}
+                },
+                "EventData": {
+                    "Data": {"#attributes": {"Name": "IpAddress"}, "#text": "10.0.0.5"}
+                }
+            }
+        });
+        persist_evtxecmd_record(
+            &tx,
+            &candidate,
+            &matching,
+            1,
+            &mut details,
+            &mut derived_entries,
+            &mut text_segments,
+        )?;
+        assert_eq!(details.records_matched_to_native, 1);
+        assert_eq!(derived_entries, 0);
+        assert_eq!(text_segments, 1);
+        let metadata_text: String = tx.query_row(
+            "SELECT metadata_json FROM filesystem_entries WHERE id = ?1",
+            [native_id],
+            |row| row.get(0),
+        )?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata_text)?;
+        assert_eq!(metadata["evtxecmd_fields"]["IpAddress"], "10.0.0.5");
+        let segment_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM filesystem_entry_text_segments WHERE entry_id = ?1",
+            [native_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(segment_count, 2);
+
+        let unmatched = serde_json::json!({
+            "Event": {
+                "System": {
+                    "EventID": {"#text": "1116"},
+                    "EventRecordID": {"#text": "99"}
+                }
+            }
+        });
+        persist_evtxecmd_record(
+            &tx,
+            &candidate,
+            &unmatched,
+            2,
+            &mut details,
+            &mut derived_entries,
+            &mut text_segments,
+        )?;
+        assert_eq!(details.external_only_records_added, 1);
+        assert_eq!(derived_entries, 1);
+        assert_eq!(text_segments, 2);
+        let external_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries WHERE json_extract(metadata_json, '$.artifact_kind') = 'evtx_external_record'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(external_count, 1);
+        tx.commit()?;
+        Ok(())
     }
 
     #[test]

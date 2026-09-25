@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS evidence_sources (
     attached_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     indexed_at TEXT,
     notes TEXT,
+    display_timezone TEXT NOT NULL DEFAULT 'UTC',
     sha256_hex TEXT,
     hashed_at TEXT,
     UNIQUE(case_id, source_path)

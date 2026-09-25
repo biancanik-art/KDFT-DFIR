@@ -43,6 +43,16 @@ pub struct WindowsRegistryArtifactParseResult {
     pub run_mru_records_indexed: usize,
     pub typed_paths_records_indexed: usize,
     pub search_query_records_indexed: usize,
+    pub network_drive_records_indexed: usize,
+    pub mount_point_records_indexed: usize,
+    pub muicache_records_indexed: usize,
+    pub first_logon_records_indexed: usize,
+    pub regripper_sources_attempted: usize,
+    pub regripper_sources_completed: usize,
+    pub regripper_sources_failed: usize,
+    pub regripper_lines_indexed: usize,
+    pub regripper_adapter_status: String,
+    pub regripper_configuration: String,
     pub startup_records_indexed: usize,
     pub shimcache_sources_seen: usize,
     pub shimcache_sources_completed: usize,
@@ -158,6 +168,14 @@ struct DerivedCounts {
     run_mru: usize,
     typed_paths: usize,
     search_queries: usize,
+    network_drives: usize,
+    mount_points: usize,
+    muicache: usize,
+    first_logon: usize,
+    regripper_attempted: usize,
+    regripper_completed: usize,
+    regripper_failed: usize,
+    regripper_lines: usize,
     startup: usize,
     shimcache_sources: usize,
     shimcache_completed: usize,
@@ -186,6 +204,17 @@ pub fn parse_windows_registry_artifacts(
         limitations: vec![
             "ShellBag item names use bounded shell-item string recovery when a complete typed-shell-item decoder is unavailable; the raw Registry value and decode method remain explicit.".to_string(),
         ],
+        regripper_adapter_status: if super::external_tools::configured_tool(
+            "KDFT_REGRIPPER_PATH",
+            &["rip.exe", "rip"],
+        )
+        .is_some()
+        {
+            "configured".to_string()
+        } else {
+            "not_configured".to_string()
+        },
+        regripper_configuration: "Set KDFT_REGRIPPER_PATH to an examiner-supplied rip.exe, place rip.exe next to KDFT, or place it in KDFT/tools. KDFT does not redistribute RegRipper 4.".to_string(),
         status: "completed".to_string(),
         ..WindowsRegistryArtifactParseResult::default()
     };
@@ -217,6 +246,30 @@ pub fn parse_windows_registry_artifacts(
                 result.search_query_records_indexed = result
                     .search_query_records_indexed
                     .saturating_add(counts.search_queries);
+                result.network_drive_records_indexed = result
+                    .network_drive_records_indexed
+                    .saturating_add(counts.network_drives);
+                result.mount_point_records_indexed = result
+                    .mount_point_records_indexed
+                    .saturating_add(counts.mount_points);
+                result.muicache_records_indexed = result
+                    .muicache_records_indexed
+                    .saturating_add(counts.muicache);
+                result.first_logon_records_indexed = result
+                    .first_logon_records_indexed
+                    .saturating_add(counts.first_logon);
+                result.regripper_sources_attempted = result
+                    .regripper_sources_attempted
+                    .saturating_add(counts.regripper_attempted);
+                result.regripper_sources_completed = result
+                    .regripper_sources_completed
+                    .saturating_add(counts.regripper_completed);
+                result.regripper_sources_failed = result
+                    .regripper_sources_failed
+                    .saturating_add(counts.regripper_failed);
+                result.regripper_lines_indexed = result
+                    .regripper_lines_indexed
+                    .saturating_add(counts.regripper_lines);
                 result.startup_records_indexed = result
                     .startup_records_indexed
                     .saturating_add(counts.startup);
@@ -395,7 +448,21 @@ pub fn parse_windows_registry_artifacts(
         || result.srum_sources_failed > 0
         || result.shimcache_sources_partial > 0
         || result.shimcache_sources_unsupported > 0
-        || result.shimcache_sources_failed > 0;
+        || result.shimcache_sources_failed > 0
+        || result.regripper_sources_failed > 0;
+    result.regripper_adapter_status = if result.regripper_sources_failed > 0 {
+        "failed".to_string()
+    } else if result.regripper_sources_completed > 0 {
+        "completed".to_string()
+    } else {
+        result.regripper_adapter_status.clone()
+    };
+    if result.regripper_sources_failed > 0 {
+        result.limitations.push(format!(
+            "{} examiner-supplied RegRipper invocation(s) failed; KDFT's native Registry tree and structured parsers remain available and the adapter failure record retains diagnostics.",
+            result.regripper_sources_failed
+        ));
+    }
     if result.srum_sources_recognized_unsupported > 0 {
         result.limitations.push(format!(
             "{} validated SRUDB.dat source(s) use an ESE version or revision outside this decoder's audited profile; exact coverage is retained and no unsupported rows were claimed.",
@@ -906,20 +973,209 @@ fn parse_one_hive(
         .with_context(|| format!("recovering Registry hive {}", candidate.exact_path))?;
         let import = collect_registry_hive_import(&staging_path, &candidate.name, usize::MAX)
             .with_context(|| format!("parsing Registry hive {}", candidate.exact_path))?;
-        Ok(derive_hive_records(candidate, &import))
+        let (mut records, mut counts) = derive_hive_records(candidate, &import);
+        if let Some(tool_path) =
+            super::external_tools::configured_tool("KDFT_REGRIPPER_PATH", &["rip.exe", "rip"])
+        {
+            counts.regripper_attempted = 1;
+            let adapter_directory = directory.join("regripper-adapter");
+            match derive_regripper_records(candidate, &staging_path, &tool_path, &adapter_directory)
+            {
+                Ok(mut external) => {
+                    counts.regripper_completed = usize::from(external.completed);
+                    counts.regripper_failed = usize::from(!external.completed);
+                    counts.regripper_lines = external.line_count;
+                    records.append(&mut external.records);
+                }
+                Err(error) => {
+                    counts.regripper_failed = 1;
+                    records.push(regripper_failure_record(candidate, &tool_path, &error));
+                }
+            }
+        }
+        Ok((records, counts))
     })();
     let file_cleanup = if staging_path.exists() {
         fs::remove_file(&staging_path)
     } else {
         Ok(())
     };
-    let directory_cleanup = fs::remove_dir(&directory);
+    let directory_cleanup = fs::remove_dir_all(&directory);
     let (records, counts) = parsed?;
     file_cleanup.with_context(|| format!("removing staged hive {}", staging_path.display()))?;
     directory_cleanup
         .with_context(|| format!("removing staged hive directory {}", directory.display()))?;
     replace_source_records(case_path, evidence_id, candidate, &records)?;
     Ok(counts)
+}
+
+const REGRIPPER_LINE_LIMIT: usize = 200_000;
+
+struct RegRipperDerivedRecords {
+    records: Vec<DerivedRecord>,
+    line_count: usize,
+    completed: bool,
+}
+
+fn derive_regripper_records(
+    candidate: &HiveCandidate,
+    staged_hive: &Path,
+    tool_path: &Path,
+    working_directory: &Path,
+) -> Result<RegRipperDerivedRecords> {
+    let run = super::external_tools::run_bounded(
+        tool_path,
+        [
+            std::ffi::OsString::from("-r"),
+            staged_hive.as_os_str().to_os_string(),
+            std::ffi::OsString::from("-a"),
+        ],
+        working_directory,
+    )?;
+    let completed = run.status == "completed";
+    let mut records = Vec::new();
+    let status_path = format!(
+        "/Windows Artifacts/Registry/{}/external/regripper/run.record",
+        candidate.entry_id
+    );
+    let status_name = format!("RegRipper adapter — {}", run.status);
+    let mut status_metadata = serde_json::json!({
+        "artifact_kind": "external_registry_parser_run",
+        "parser": "RegRipper examiner-supplied adapter",
+        "external_parser_name": "RegRipper",
+        "external_parser_status": run.status,
+        "external_parser_exit_code": run.exit_code,
+        "external_parser_elapsed_ms": run.elapsed_ms,
+        "external_parser_executable": run.tool_path,
+        "external_parser_executable_sha256": run.tool_sha256,
+        "external_parser_arguments": run.arguments,
+        "external_parser_stderr": run.stderr,
+        "external_parser_stdout_truncated": run.stdout_truncated,
+        "external_parser_stderr_truncated": run.stderr_truncated,
+        "external_parser_redistribution": "not bundled by KDFT; examiner supplied",
+        "registry_transaction_log_replay": "not performed by the RegRipper adapter; native hive state and adapter output must be interpreted accordingly",
+        "structured_source": true,
+    });
+    source_metadata(&mut status_metadata, candidate);
+    add_entry_category(&mut status_metadata, &status_path, &status_name, "record");
+    records.push(DerivedRecord {
+        logical_path: status_path,
+        display_name: status_name,
+        metadata: status_metadata,
+    });
+
+    let mut current_plugin = String::new();
+    let mut line_count = 0_usize;
+    let mut omitted = 0_usize;
+    for (line_index, line) in run.stdout.lines().enumerate() {
+        let raw_line = line.trim_end_matches('\r');
+        if raw_line.trim().is_empty() {
+            continue;
+        }
+        if let Some(plugin) = regripper_plugin_heading(raw_line) {
+            current_plugin = plugin;
+        }
+        if line_count >= REGRIPPER_LINE_LIMIT {
+            omitted = omitted.saturating_add(1);
+            continue;
+        }
+        let logical_path = format!(
+            "/Windows Artifacts/Registry/{}/external/regripper/lines/{line_index:020}.record",
+            candidate.entry_id
+        );
+        let preview = raw_line.chars().take(160).collect::<String>();
+        let display_name = if current_plugin.is_empty() {
+            format!("RegRipper line {}: {preview}", line_index + 1)
+        } else {
+            format!("{}: {preview}", current_plugin)
+        };
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "external_registry_parser_line",
+            "parser": "RegRipper examiner-supplied adapter",
+            "external_parser_name": "RegRipper",
+            "external_parser_status": run.status,
+            "external_parser_executable_sha256": run.tool_sha256,
+            "external_parser_plugin": current_plugin,
+            "external_parser_line_number": line_index + 1,
+            "raw_line": raw_line,
+            "registry_transaction_log_replay": false,
+            "structured_source": false,
+        });
+        source_metadata(&mut metadata, candidate);
+        add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+        records.push(DerivedRecord {
+            logical_path,
+            display_name,
+            metadata,
+        });
+        line_count = line_count.saturating_add(1);
+    }
+    if omitted > 0 {
+        if let Some(metadata) = records
+            .first_mut()
+            .and_then(|record| record.metadata.as_object_mut())
+        {
+            metadata.insert(
+                "external_parser_lines_omitted".to_string(),
+                serde_json::json!(omitted),
+            );
+            metadata.insert(
+                "external_parser_output_partial".to_string(),
+                serde_json::json!(true),
+            );
+        }
+    }
+    Ok(RegRipperDerivedRecords {
+        records,
+        line_count,
+        completed,
+    })
+}
+
+fn regripper_plugin_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.len() > 160 || trimmed.starts_with('[') || trimmed.contains('=') {
+        return None;
+    }
+    let (name, _) = trimmed
+        .split_once(" v.")
+        .or_else(|| trimmed.split_once(" v"))?;
+    let name = name.trim();
+    (!name.is_empty()
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | ' ')
+        }))
+    .then(|| name.to_string())
+}
+
+fn regripper_failure_record(
+    candidate: &HiveCandidate,
+    tool_path: &Path,
+    error: &anyhow::Error,
+) -> DerivedRecord {
+    let logical_path = format!(
+        "/Windows Artifacts/Registry/{}/external/regripper/run.record",
+        candidate.entry_id
+    );
+    let display_name = "RegRipper adapter — failed".to_string();
+    let mut metadata = serde_json::json!({
+        "artifact_kind": "external_registry_parser_run",
+        "parser": "RegRipper examiner-supplied adapter",
+        "external_parser_name": "RegRipper",
+        "external_parser_status": "failed",
+        "external_parser_executable": tool_path.display().to_string(),
+        "external_parser_error": format!("{error:#}"),
+        "external_parser_redistribution": "not bundled by KDFT; examiner supplied",
+        "registry_transaction_log_replay": "not performed",
+        "structured_source": true,
+    });
+    source_metadata(&mut metadata, candidate);
+    add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+    DerivedRecord {
+        logical_path,
+        display_name,
+        metadata,
+    }
 }
 
 fn reserve_staging_destination(entry_id: i64, name: &str) -> Result<(PathBuf, PathBuf)> {
@@ -989,9 +1245,21 @@ fn derive_hive_records(
                 Some("windows_search_query_record") => {
                     counts.search_queries = counts.search_queries.saturating_add(1)
                 }
+                Some("windows_network_drive_mru_record") => {
+                    counts.network_drives = counts.network_drives.saturating_add(1)
+                }
+                Some("windows_muicache_record") => {
+                    counts.muicache = counts.muicache.saturating_add(1)
+                }
+                Some("windows_first_logon_record") => {
+                    counts.first_logon = counts.first_logon.saturating_add(1)
+                }
                 _ => {}
             }
         }
+        records.extend(derived);
+        let derived = derive_mount_point_records(candidate, import);
+        counts.mount_points = derived.len();
         records.extend(derived);
     }
     if hive == "ntuser.dat" || hive == "software" {
@@ -1327,7 +1595,10 @@ fn derive_user_registry_activity(
                 }
             }
         } else if observation.name.eq_ignore_ascii_case("MRUList")
-            && key.ends_with("/software/microsoft/windows/currentversion/explorer/runmru")
+            && (key.ends_with("/software/microsoft/windows/currentversion/explorer/runmru")
+                || key.ends_with(
+                    "/software/microsoft/windows/currentversion/explorer/map network drive mru",
+                ))
         {
             for (position, name) in observation.rendered.chars().enumerate() {
                 if !name.is_control() && !name.is_whitespace() {
@@ -1359,6 +1630,21 @@ fn derive_user_registry_activity(
             (
                 "windows_run_mru_record",
                 "run-mru",
+                value,
+                run_mru_positions
+                    .get(&(key.clone(), value_name.to_string()))
+                    .copied(),
+            )
+        } else if key
+            .ends_with("/software/microsoft/windows/currentversion/explorer/map network drive mru")
+        {
+            let value = observation.rendered.trim().to_string();
+            if value.is_empty() {
+                continue;
+            }
+            (
+                "windows_network_drive_mru_record",
+                "network-drive-mru",
                 value,
                 run_mru_positions
                     .get(&(key.clone(), value_name.to_string()))
@@ -1398,6 +1684,32 @@ fn derive_user_registry_activity(
                 .get(&(key.clone(), value_name.to_string()))
                 .copied();
             ("windows_recent_docs_record", "recent-docs", value, position)
+        } else if key.contains("/muicache") {
+            let description = observation.rendered.trim();
+            let value = if description.is_empty() {
+                value_name.to_string()
+            } else {
+                format!("{value_name} — {description}")
+            };
+            ("windows_muicache_record", "muicache", value, None)
+        } else if key.ends_with("/software/microsoft/windows/currentversion/explorer")
+            && matches!(
+                value_name.to_ascii_lowercase().as_str(),
+                "firstlogontime" | "firstlogontimeoncurrentinstallation"
+            )
+        {
+            let parsed = observation
+                .raw
+                .as_deref()
+                .and_then(|bytes| bytes.get(..8))
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u64::from_le_bytes)
+                .and_then(filetime_to_rfc3339);
+            let value = parsed.unwrap_or_else(|| observation.rendered.trim().to_string());
+            if value.is_empty() {
+                continue;
+            }
+            ("windows_first_logon_record", "first-logon", value, None)
         } else {
             continue;
         };
@@ -1408,6 +1720,9 @@ fn derive_user_registry_activity(
             "windows_typed_path_record" => format!("Typed path: {value}"),
             "windows_search_query_record" => format!("Windows search: {value}"),
             "windows_recent_docs_record" => format!("Recent document: {value}"),
+            "windows_network_drive_mru_record" => format!("Mapped network drive: {value}"),
+            "windows_muicache_record" => format!("MUICache: {value}"),
+            "windows_first_logon_record" => format!("First logon: {value}"),
             _ => value.clone(),
         };
         let logical_path = format!(
@@ -1427,9 +1742,36 @@ fn derive_user_registry_activity(
             "registry_value_size_bytes": observation.value_size,
             "registry_value_file_relative_offset": observation.value_file_relative_offset,
             "registry_value_offset_basis": "byte offset within the recovered Registry hive file; not a decoded-media or acquisition-container physical offset",
-            "artifact_time_utc": observation.key_last_write_utc,
+            "artifact_time_utc": if artifact_kind == "windows_first_logon_record" { Some(value.clone()) } else { observation.key_last_write_utc.clone() },
             "structured_source": true,
         });
+        if let Some(object) = metadata.as_object_mut() {
+            match artifact_kind {
+                "windows_network_drive_mru_record" => {
+                    object.insert("network_drive_path".to_string(), serde_json::json!(value));
+                }
+                "windows_muicache_record" => {
+                    object.insert(
+                        "muicache_executable_path".to_string(),
+                        serde_json::json!(value_name),
+                    );
+                    object.insert(
+                        "muicache_display_name".to_string(),
+                        serde_json::json!(observation.rendered),
+                    );
+                }
+                "windows_first_logon_record" => {
+                    object.insert("first_logon_utc".to_string(), serde_json::json!(value));
+                    object.insert(
+                        "first_logon_semantics".to_string(),
+                        serde_json::json!(
+                            "Registry FILETIME value; not inferred from the key LastWrite time"
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
         source_metadata(&mut metadata, candidate);
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
         records.push(DerivedRecord {
@@ -1439,6 +1781,75 @@ fn derive_user_registry_activity(
         });
     }
     records
+}
+
+fn derive_mount_point_records(
+    candidate: &HiveCandidate,
+    import: &RegistryImportData,
+) -> Vec<DerivedRecord> {
+    let mut keys = BTreeMap::<String, (String, Option<String>)>::new();
+    for entry in &import.entries {
+        if entry.metadata["artifact_kind"].as_str() != Some("registry_key") {
+            continue;
+        }
+        let Some(key_path) = entry.metadata["registry_key_path"].as_str() else {
+            continue;
+        };
+        let normalized = normalized_registry_key(key_path);
+        let marker = "/software/microsoft/windows/currentversion/explorer/mountpoints2/";
+        let Some(index) = normalized.find(marker) else {
+            continue;
+        };
+        let original_normalized =
+            format!("/{}", key_path.replace('\\', "/").trim_start_matches('/'));
+        let encoded = original_normalized
+            .get(index + marker.len()..)
+            .unwrap_or_default()
+            .trim_matches('/')
+            .to_string();
+        if encoded.is_empty() || encoded.contains('/') {
+            continue;
+        }
+        let decoded = if let Some(unc) = encoded.strip_prefix("##") {
+            format!(r"\\{}", unc.replace('#', r"\"))
+        } else {
+            encoded.clone()
+        };
+        let last_write = entry.metadata["registry_key_last_write_utc"]
+            .as_str()
+            .map(ToString::to_string);
+        keys.entry(key_path.to_string())
+            .or_insert((decoded, last_write));
+    }
+
+    keys.into_iter()
+        .enumerate()
+        .map(|(ordinal, (key_path, (target, last_write)))| {
+            let display_name = format!("Mounted path: {target}");
+            let logical_path = format!(
+                "/Windows Artifacts/Registry/{}/user-activity/mount-points/{ordinal:020}-{}.record",
+                candidate.entry_id,
+                sanitize_logical_segment(&target)
+            );
+            let mut metadata = serde_json::json!({
+                "artifact_kind": "windows_mount_point_record",
+                "parser": PARSER_NAME,
+                "mount_point_target": target,
+                "registry_key_path": key_path,
+                "registry_key_last_write_utc": last_write,
+                "artifact_time_utc": last_write,
+                "mount_point_time_semantics": "MountPoints2 subkey LastWrite time; evidence of Registry state, not proof that a volume or share was accessed at that exact instant",
+                "structured_source": true,
+            });
+            source_metadata(&mut metadata, candidate);
+            add_entry_category(&mut metadata, &logical_path, &display_name, "record");
+            DerivedRecord {
+                logical_path,
+                display_name,
+                metadata,
+            }
+        })
+        .collect()
 }
 
 fn normalized_registry_key(path: &str) -> String {
@@ -1984,6 +2395,20 @@ mod tests {
     }
 
     #[test]
+    fn regripper_plugin_headings_are_bounded_and_not_guessed_from_values() {
+        assert_eq!(
+            regripper_plugin_heading("userassist v.20240115"),
+            Some("userassist".to_string())
+        );
+        assert_eq!(
+            regripper_plugin_heading("shellbags v20230901"),
+            Some("shellbags".to_string())
+        );
+        assert_eq!(regripper_plugin_heading("Path = C:\\Windows"), None);
+        assert_eq!(regripper_plugin_heading("[plugin]"), None);
+    }
+
+    #[test]
     fn registry_staging_directory_is_exclusive_and_private() {
         let (directory, staged_file) =
             reserve_staging_destination(42, "SYSTEM").expect("reserve staging directory");
@@ -2046,6 +2471,10 @@ mod tests {
         let search_key = r"ROOT\Software\Microsoft\Windows\CurrentVersion\Explorer\WordWheelQuery";
         let run_key = r"ROOT\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU";
         let typed_key = r"ROOT\Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths";
+        let drive_key =
+            r"ROOT\Software\Microsoft\Windows\CurrentVersion\Explorer\Map Network Drive MRU";
+        let mui_key = r"ROOT\Local Settings\Software\Microsoft\Windows\Shell\MuiCache";
+        let explorer_key = r"ROOT\Software\Microsoft\Windows\CurrentVersion\Explorer";
         let observations = vec![
             observation(
                 recent_key,
@@ -2074,6 +2503,20 @@ mod tests {
             observation(run_key, "MRUList", "a", None),
             observation(run_key, "a", "cmd.exe /c whoami", None),
             observation(typed_key, "url1", r"C:\Evidence\Exports", None),
+            observation(drive_key, "MRUList", "z", None),
+            observation(
+                drive_key,
+                "z",
+                r"\\SMARTSERV.smarteyecarecenter.local\E$",
+                None,
+            ),
+            observation(mui_key, r"C:\Windows\system32\NOTEPAD.EXE", "Notepad", None),
+            observation(
+                explorer_key,
+                "FirstLogonTime",
+                "",
+                Some(132_223_104_000_000_000_u64.to_le_bytes().to_vec()),
+            ),
             observation(
                 r"ROOT\Software\Unrelated",
                 "0",
@@ -2082,7 +2525,7 @@ mod tests {
             ),
         ];
         let records = derive_user_registry_activity(&test_candidate("NTUSER.DAT"), &observations);
-        assert_eq!(records.len(), 4);
+        assert_eq!(records.len(), 7);
         let by_kind = records
             .iter()
             .map(|record| {
@@ -2096,6 +2539,12 @@ mod tests {
         assert_eq!(by_kind["windows_search_query_record"], "quarterly report");
         assert_eq!(by_kind["windows_run_mru_record"], "cmd.exe /c whoami");
         assert_eq!(by_kind["windows_typed_path_record"], r"C:\Evidence\Exports");
+        assert_eq!(
+            by_kind["windows_network_drive_mru_record"],
+            r"\\SMARTSERV.smarteyecarecenter.local\E$"
+        );
+        assert!(by_kind["windows_muicache_record"].contains("NOTEPAD.EXE"));
+        assert!(by_kind["windows_first_logon_record"].contains('T'));
         assert!(records.iter().all(|record| {
             record.metadata["registry_value_file_relative_offset"] == serde_json::json!(4096)
         }));
@@ -2109,6 +2558,39 @@ mod tests {
         );
         assert_eq!(decode_utf16le_prefix(&[0, 0]), None);
         assert_eq!(decode_utf16le_prefix(&[0x00, 0xD8, 0, 0]), None);
+    }
+
+    #[test]
+    fn mountpoints2_subkeys_become_structured_unc_records() {
+        let import = RegistryImportData {
+            entries: vec![RegistryImportEntry {
+                logical_path: "/Registry/NTUSER/MountPoints2/share".to_string(),
+                display_name: "##SMARTSERV.smarteyecarecenter.local#E$".to_string(),
+                entry_kind: "directory",
+                size_bytes: None,
+                metadata: serde_json::json!({
+                    "artifact_kind": "registry_key",
+                    "registry_key_path": r"ROOT\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2\##SMARTSERV.smarteyecarecenter.local#E$",
+                    "registry_key_last_write_utc": "2026-08-28T09:21:55Z"
+                }),
+                raw_value_bytes: None,
+            }],
+            keys_indexed: 1,
+            values_indexed: 0,
+            total_entries_seen: 1,
+            truncated: false,
+            root_logical_path: "/Registry/NTUSER".to_string(),
+        };
+        let records = derive_mount_point_records(&test_candidate("NTUSER.DAT"), &import);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].metadata["mount_point_target"],
+            r"\\SMARTSERV.smarteyecarecenter.local\E$"
+        );
+        assert_eq!(
+            records[0].metadata["artifact_time_utc"],
+            "2026-08-28T09:21:55Z"
+        );
     }
 
     #[test]

@@ -2,6 +2,7 @@
 #![allow(clippy::too_many_arguments)]
 #![forbid(unsafe_code)]
 
+mod external_tools;
 mod identity_network;
 mod ntfs_compression;
 mod wof;
@@ -390,6 +391,11 @@ pub struct EvidenceSource {
     pub attached_at: String,
     pub indexed_at: Option<String>,
     pub notes: Option<String>,
+    /// IANA timezone selected by the examiner when this source was attached.
+    /// Canonical parsed timestamps remain UTC; this records the reproducible
+    /// examiner-facing display context without inventing a zone for formats
+    /// such as FAT that store only a device-local wall clock.
+    pub display_timezone: String,
     /// Status of the most recent indexing/import job ("completed", "truncated", ...),
     /// so the UI can distinguish empty folders from not-yet-indexed ones.
     pub last_job_status: Option<String>,
@@ -1376,8 +1382,56 @@ pub fn list_installed_resources(case_path: &Path) -> Result<Vec<InstalledResourc
 }
 
 pub fn add_evidence(case_path: &Path, options: AddEvidenceOptions) -> Result<i64> {
+    add_evidence_internal(case_path, options, None)
+}
+
+/// Attach evidence and make the examiner-selected IANA timezone the case
+/// display timezone. The selection is also stamped on the evidence source so
+/// the display context survives moving the case to a different workstation.
+pub fn add_evidence_with_timezone(
+    case_path: &Path,
+    options: AddEvidenceOptions,
+    timezone: &str,
+) -> Result<i64> {
+    add_evidence_internal(case_path, options, Some(timezone))
+}
+
+fn normalized_timezone(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("timezone cannot be empty");
+    }
+    let timezone = trimmed
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| anyhow!("unsupported IANA timezone: {trimmed}"))?;
+    Ok(timezone.name().to_string())
+}
+
+fn stored_case_timezone(conn: &Connection, case_id: i64) -> Result<String> {
+    let value = conn
+        .query_row(
+            "SELECT timezone FROM case_options WHERE case_id = ?1",
+            params![case_id],
+            |row| row.get::<_, String>(0),
+        )
+        .context("reading case display timezone")?;
+    // Older case files could be edited outside KDFT. Do not let an invalid
+    // legacy value make evidence attachment impossible; restore the safe,
+    // explicit default instead.
+    Ok(normalized_timezone(&value).unwrap_or_else(|_| "UTC".to_string()))
+}
+
+fn add_evidence_internal(
+    case_path: &Path,
+    options: AddEvidenceOptions,
+    requested_timezone: Option<&str>,
+) -> Result<i64> {
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
+    let display_timezone = match requested_timezone {
+        Some(value) => normalized_timezone(value)?,
+        None => stored_case_timezone(&conn, case_id)?,
+    };
     let metadata = fs::metadata(&options.path)
         .with_context(|| format!("reading bounded metadata for {}", options.path.display()))?;
     if metadata.is_file() {
@@ -1417,8 +1471,8 @@ pub fn add_evidence(case_path: &Path, options: AddEvidenceOptions) -> Result<i64
     tx.execute(
         "INSERT INTO evidence_sources(
              case_id, source_kind, source_path, display_name, size_bytes,
-             read_file_system_requested, notes
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             read_file_system_requested, notes, display_timezone
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             case_id,
             source_kind,
@@ -1431,17 +1485,68 @@ pub fn add_evidence(case_path: &Path, options: AddEvidenceOptions) -> Result<i64
                 0
             },
             options.notes,
+            display_timezone,
         ],
     )?;
     let evidence_id = tx.last_insert_rowid();
+    if requested_timezone.is_some() {
+        tx.execute(
+            "UPDATE case_options SET timezone = ?1 WHERE case_id = ?2",
+            params![display_timezone, case_id],
+        )?;
+    }
     tx.execute(
         "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
          VALUES (?1, 'evidence.attach', ?2, 'evidence', ?3,
-                 json_object('source_kind', ?4, 'source_path', ?5, 'no_indexing', 1))",
-        params![case_id, actor, evidence_id, source_kind, source_path],
+                 json_object('source_kind', ?4, 'source_path', ?5, 'no_indexing', 1,
+                             'display_timezone', ?6))",
+        params![
+            case_id,
+            actor,
+            evidence_id,
+            source_kind,
+            source_path,
+            display_timezone
+        ],
     )?;
     tx.commit()?;
     Ok(evidence_id)
+}
+
+/// Apply a display timezone after an importer creates or reuses an evidence
+/// source (notably the browser-history importer). This is one transaction so
+/// the case-wide display setting and source provenance cannot diverge.
+pub fn set_evidence_display_timezone(
+    case_path: &Path,
+    evidence_id: i64,
+    timezone: &str,
+) -> Result<()> {
+    let display_timezone = normalized_timezone(timezone)?;
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE evidence_sources
+         SET display_timezone = ?1
+         WHERE id = ?2 AND case_id = ?3 AND attach_status <> 'superseded'",
+        params![display_timezone, evidence_id, case_id],
+    )?;
+    if changed != 1 {
+        bail!("evidence source {evidence_id} does not exist in this case");
+    }
+    tx.execute(
+        "UPDATE case_options SET timezone = ?1 WHERE case_id = ?2",
+        params![display_timezone, case_id],
+    )?;
+    let actor = audit_actor(&tx, case_id)?;
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'evidence.display_timezone', ?2, 'evidence', ?3,
+                 json_object('display_timezone', ?4, 'canonical_timestamps', 'UTC'))",
+        params![case_id, actor, evidence_id, display_timezone],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn acquisition_manifest_from_row(
@@ -1467,7 +1572,7 @@ pub fn list_evidence(case_path: &Path) -> Result<Vec<EvidenceSource>> {
     let mut stmt = conn.prepare(
         "SELECT e.id, e.case_id, e.source_kind, e.source_path, e.display_name, e.size_bytes,
                 e.read_file_system_requested, e.attach_status, e.encryption_status, e.attached_at,
-                e.indexed_at, e.notes,
+                e.indexed_at, e.notes, e.display_timezone,
                 (SELECT j.status FROM evidence_jobs j
                  WHERE j.case_id = e.case_id AND j.evidence_id = e.id
                    AND j.job_type = CASE WHEN e.source_kind = 'browser_history'
@@ -1504,12 +1609,13 @@ pub fn list_evidence(case_path: &Path) -> Result<Vec<EvidenceSource>> {
             attached_at: row.get(9)?,
             indexed_at: row.get(10)?,
             notes: row.get(11)?,
-            last_job_status: row.get(12)?,
-            sha256_hex: row.get(13)?,
-            hashed_at: row.get(14)?,
-            sha256_scope: row.get(15)?,
-            acquisition_manifest_json: acquisition_manifest_from_row(row, 16)?,
-            content_indexed: row.get::<_, Option<i64>>(17)?.map(|value| value != 0),
+            display_timezone: row.get(12)?,
+            last_job_status: row.get(13)?,
+            sha256_hex: row.get(14)?,
+            hashed_at: row.get(15)?,
+            sha256_scope: row.get(16)?,
+            acquisition_manifest_json: acquisition_manifest_from_row(row, 17)?,
+            content_indexed: row.get::<_, Option<i64>>(18)?.map(|value| value != 0),
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -24263,6 +24369,39 @@ fn classify_entry(
                 &["windows", "registry", "search", "wordwheelquery", "parsed"],
             );
         }
+        "windows_network_drive_mru_record" | "windows_mount_point_record" => {
+            return category(
+                "Network and Connectivity",
+                "Mapped drives and mounted paths",
+                "Structured Explorer Registry record for a mapped network drive or mounted path",
+                "high",
+                &[
+                    "windows",
+                    "registry",
+                    "network-drive",
+                    "mount-point",
+                    "parsed",
+                ],
+            );
+        }
+        "windows_muicache_record" => {
+            return category(
+                "Program Execution",
+                "Program evidence",
+                "Executable path and display-name association recovered from the exact MUICache schema; presence is program knowledge, not proof of execution",
+                "medium",
+                &["windows", "registry", "muicache", "program-evidence", "parsed"],
+            );
+        }
+        "windows_first_logon_record" => {
+            return category(
+                "User Activity",
+                "Logon state",
+                "First-logon FILETIME value recovered from the Explorer Registry schema",
+                "high",
+                &["windows", "registry", "logon", "parsed"],
+            );
+        }
         "windows_srum_record" => {
             return category(
                 "Network and Connectivity",
@@ -24317,7 +24456,16 @@ fn classify_entry(
                 &["windows", "registry", "hive"],
             );
         }
-        "evtx_log" | "evtx_event_record" => {
+        "external_registry_parser_run" | "external_registry_parser_line" => {
+            return category(
+                "Operating System",
+                "Registry interpreted artifacts",
+                "Examiner-supplied RegRipper adapter output retained with executable and source provenance",
+                "medium",
+                &["windows", "registry", "external-parser", "regripper"],
+            );
+        }
+        "evtx_log" | "evtx_event_record" | "evtx_external_record" => {
             return category(
                 "Operating System",
                 "Event logs",
@@ -26840,6 +26988,10 @@ impl RegistryImportCollector {
             || structured_key.contains("\\appcompatcache")
             || structured_key.contains("\\explorer\\recentdocs")
             || structured_key.contains("\\explorer\\wordwheelquery")
+            || structured_key.contains("\\explorer\\map network drive mru")
+            || structured_key.contains("\\explorer\\mountpoints2")
+            || structured_key.contains("\\muicache")
+            || structured_key.ends_with("\\software\\microsoft\\windows\\currentversion\\explorer")
             || structured_key.contains("\\explorer\\opensavepidlmru")
             || structured_key.contains("\\explorer\\lastvisitedpidlmru");
         let raw_value_bytes = retain_raw_value
@@ -27118,6 +27270,7 @@ struct EvtxImportEntry {
     entry_kind: &'static str,
     size_bytes: Option<i64>,
     metadata: serde_json::Value,
+    rendered_json: String,
 }
 
 #[derive(Debug, Default)]
@@ -27222,6 +27375,29 @@ fn process_evtx_event_log_evidence(
                     entry.size_bytes,
                     &entry.metadata.to_string(),
                     job_id,
+                )?;
+                let derived_entry_id: i64 = conn.query_row(
+                    "SELECT id FROM filesystem_entries
+                     WHERE case_id = ?1 AND evidence_id = ?2 AND logical_path = ?3",
+                    params![case_id, evidence.id, entry.logical_path],
+                    |row| row.get(0),
+                )?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO filesystem_entry_text_segments(
+                         entry_id, parser_name, segment_index, part_name, content,
+                         content_encoding, segment_kind, provenance_json
+                     ) VALUES (?1, ?2, 0, 'record', ?3, 'utf-8', 'evtx_rendered_json', ?4)",
+                    params![
+                        derived_entry_id,
+                        EVTX_PARSER_NAME,
+                        entry.rendered_json.as_bytes(),
+                        serde_json::json!({
+                            "source_artifact_path": evidence.source_path,
+                            "evtx_record_id": entry.metadata.get("evtx_record_id"),
+                            "representation": "complete JSON rendered by the evtx parser; no preview truncation",
+                        })
+                        .to_string(),
+                    ],
                 )?;
                 summary.records_indexed = summary.records_indexed.saturating_add(1);
             }
@@ -27391,6 +27567,7 @@ fn evtx_import_entry_from_record(
     let computer = system.and_then(|system| evtx_json_path_string(system, &["Computer"]));
     let user_sid = evtx_find_user_sid(&data);
     let user_name = evtx_find_user_name(&data);
+    let named_fields = evtx_named_payload_fields(&data);
     let event_data = data
         .get("Event")
         .and_then(|event| event.get("EventData"))
@@ -27407,11 +27584,29 @@ fn evtx_import_entry_from_record(
         channel.as_deref(),
         computer.as_deref(),
     );
-    let display_name = event_id_text
+    let forensic_label = evtx_forensic_event_label(
+        event_id,
+        provider.as_deref(),
+        channel.as_deref(),
+        &named_fields,
+    );
+    let display_name = forensic_label
         .as_deref()
-        .map(|event_id| format!("Event {event_id} (record {record_id})"))
+        .map(|label| {
+            format!(
+                "{label} (event {}, record {record_id})",
+                event_id_text.as_deref().unwrap_or("unknown")
+            )
+        })
+        .or_else(|| {
+            event_id_text
+                .as_deref()
+                .map(|event_id| format!("Event {event_id} (record {record_id})"))
+        })
         .unwrap_or_else(|| format!("Event record {record_id}"));
     let logical_path = evtx_record_logical_path(root_logical_path, record_id, ordinal);
+    let rendered_json =
+        serde_json::to_string(&data).context("rendering complete EVTX record JSON")?;
     let mut metadata = serde_json::json!({
         "artifact_kind": "evtx_event_record",
         "evtx_parser": EVTX_PARSER_NAME,
@@ -27423,9 +27618,13 @@ fn evtx_import_entry_from_record(
         "created_utc": logged_utc,
         "evtx_summary": summary.text,
         "evtx_summary_truncated": summary.truncated,
-        "evtx_event_id_curation": "not attempted",
+        "evtx_event_title": forensic_label,
+        "evtx_fields": named_fields,
+        "evtx_field_count": named_fields.len(),
+        "evtx_event_id_curation": "bounded forensic label only; original fields and raw rendered JSON remain authoritative",
         "evtx_event_correlation": "not attempted",
         "evtx_message_template_resolution": "evtx crate rendered JSON only; custom provider message template expansion is deferred",
+        "evtx_rendered_json_storage": "filesystem_entry_text_segments: evtx 0.12.2/record",
         "source_artifact_path": source_path,
     });
     if let Some(object) = metadata.as_object_mut() {
@@ -27444,6 +27643,45 @@ fn evtx_import_entry_from_record(
         insert_optional_string(object, "evtx_computer", computer);
         insert_optional_string(object, "evtx_user_sid", user_sid);
         insert_optional_string(object, "evtx_user", user_name);
+        if let Some(system) = system {
+            for (metadata_key, system_key) in [
+                ("evtx_version", "Version"),
+                ("evtx_task", "Task"),
+                ("evtx_opcode", "Opcode"),
+                ("evtx_keywords", "Keywords"),
+            ] {
+                insert_optional_string(
+                    object,
+                    metadata_key,
+                    evtx_json_path_string(system, &[system_key]),
+                );
+            }
+            insert_optional_string(
+                object,
+                "evtx_process_id",
+                evtx_execution_attribute(system, "ProcessID"),
+            );
+            insert_optional_string(
+                object,
+                "evtx_thread_id",
+                evtx_execution_attribute(system, "ThreadID"),
+            );
+            insert_optional_string(
+                object,
+                "evtx_activity_id",
+                evtx_correlation_attribute(system, "ActivityID"),
+            );
+            insert_optional_string(
+                object,
+                "evtx_related_activity_id",
+                evtx_correlation_attribute(system, "RelatedActivityID"),
+            );
+            insert_optional_string(
+                object,
+                "evtx_system_user_id",
+                evtx_security_attribute(system, "UserID"),
+            );
+        }
         if let Some(event_data) = event_data {
             object.insert("evtx_event_data".to_string(), event_data);
         }
@@ -27458,7 +27696,256 @@ fn evtx_import_entry_from_record(
         entry_kind: "record",
         size_bytes: None,
         metadata,
+        rendered_json,
     })
+}
+
+fn evtx_object_attribute(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Option<String> {
+    object
+        .get("#attributes")
+        .and_then(|value| value.get(name))
+        .and_then(evtx_scalar_string)
+        .or_else(|| object.get(&format!("@{name}")).and_then(evtx_scalar_string))
+        .or_else(|| {
+            (object.contains_key("#text") || object.contains_key("$text"))
+                .then(|| object.get(name).and_then(evtx_scalar_string))
+                .flatten()
+        })
+}
+
+fn evtx_object_text(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    for key in ["#text", "$text", "text", "Value"] {
+        if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
+            return Some(value.clone());
+        }
+    }
+    let mut remaining = serde_json::Map::new();
+    for (key, value) in object {
+        if !matches!(key.as_str(), "#attributes" | "Name" | "@Name") {
+            remaining.insert(key.clone(), value.clone());
+        }
+    }
+    match remaining.len() {
+        0 => None,
+        1 => remaining.into_iter().next().map(|(_, value)| value),
+        _ => Some(serde_json::Value::Object(remaining)),
+    }
+}
+
+fn evtx_push_named_field(
+    fields: &mut BTreeMap<String, Vec<serde_json::Value>>,
+    name: &str,
+    value: serde_json::Value,
+) {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || value.is_null() {
+        return;
+    }
+    fields.entry(trimmed.to_string()).or_default().push(value);
+}
+
+fn evtx_collect_payload_fields(
+    value: &serde_json::Value,
+    prefix: &str,
+    fields: &mut BTreeMap<String, Vec<serde_json::Value>>,
+) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for item in values {
+                evtx_collect_payload_fields(item, prefix, fields);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if let Some(name) = evtx_object_attribute(object, "Name") {
+                if let Some(value) = evtx_object_text(object) {
+                    evtx_push_named_field(fields, &name, value);
+                }
+                return;
+            }
+            if let Some(data) = object.get("Data") {
+                evtx_collect_payload_fields(data, prefix, fields);
+            }
+            for (key, child) in object {
+                if matches!(key.as_str(), "Data" | "#attributes" | "#text" | "$text") {
+                    continue;
+                }
+                let next = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                match child {
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                        evtx_collect_payload_fields(child, &next, fields)
+                    }
+                    _ => evtx_push_named_field(fields, &next, child.clone()),
+                }
+            }
+        }
+        _ if !prefix.is_empty() => evtx_push_named_field(fields, prefix, value.clone()),
+        _ => {}
+    }
+}
+
+fn evtx_named_payload_fields(data: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
+    let mut collected = BTreeMap::<String, Vec<serde_json::Value>>::new();
+    if let Some(event) = data.get("Event") {
+        if let Some(event_data) = event.get("EventData") {
+            evtx_collect_payload_fields(event_data, "", &mut collected);
+        }
+        if let Some(user_data) = event.get("UserData") {
+            evtx_collect_payload_fields(user_data, "UserData", &mut collected);
+        }
+    }
+    collected
+        .into_iter()
+        .map(|(name, mut values)| {
+            let value = if values.len() == 1 {
+                values.pop().unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::Value::Array(values)
+            };
+            (name, value)
+        })
+        .collect()
+}
+
+fn evtx_named_field_text(
+    fields: &BTreeMap<String, serde_json::Value>,
+    names: &[&str],
+) -> Option<String> {
+    for name in names {
+        if let Some(value) = fields.get(*name).and_then(evtx_scalar_string) {
+            return Some(value);
+        }
+        if let Some((_, value)) = fields
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        {
+            if let Some(value) = evtx_scalar_string(value) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn evtx_forensic_event_label(
+    event_id: Option<u64>,
+    provider: Option<&str>,
+    channel: Option<&str>,
+    fields: &BTreeMap<String, serde_json::Value>,
+) -> Option<String> {
+    let id = event_id?;
+    let provider_lower = provider.unwrap_or_default().to_ascii_lowercase();
+    let channel_lower = channel.unwrap_or_default().to_ascii_lowercase();
+    let security = channel_lower == "security" || provider_lower.contains("security-auditing");
+    let sysmon = provider_lower.contains("sysmon");
+    let defender = provider_lower.contains("windows defender");
+    let powershell = provider_lower.contains("powershell");
+    let system = channel_lower == "system" || provider_lower.contains("service control manager");
+    let base = if security {
+        match id {
+            4624 => "Successful logon",
+            4625 => "Failed logon",
+            4634 => "Logoff",
+            4648 => "Logon with explicit credentials",
+            4672 => "Special privileges assigned",
+            4688 => "Process created",
+            4697 => "Service installed",
+            4720 => "User account created",
+            4724 => "Password reset attempted",
+            4728 | 4732 | 4756 => "Member added to security group",
+            4768 => "Kerberos ticket-granting ticket requested",
+            4769 => "Kerberos service ticket requested",
+            4776 => "Credential validation",
+            5140 => "Network share accessed",
+            5145 => "Network share access checked",
+            1102 => "Audit log cleared",
+            _ => return None,
+        }
+    } else if sysmon {
+        match id {
+            1 => "Sysmon process creation",
+            3 => "Sysmon network connection",
+            11 => "Sysmon file creation",
+            13 => "Sysmon Registry value set",
+            22 => "Sysmon DNS query",
+            _ => return None,
+        }
+    } else if defender {
+        match id {
+            1116 => "Microsoft Defender threat detected",
+            1117 => "Microsoft Defender action taken",
+            1118 => "Microsoft Defender remediation failed",
+            1119 => "Microsoft Defender remediation succeeded",
+            5001 => "Microsoft Defender protection disabled",
+            5007 => "Microsoft Defender configuration changed",
+            _ => return None,
+        }
+    } else if powershell {
+        match id {
+            4103 => "PowerShell module logging",
+            4104 => "PowerShell script block logging",
+            _ => return None,
+        }
+    } else if system && id == 7045 {
+        "Service installed"
+    } else {
+        return None;
+    };
+    let subject = evtx_named_field_text(
+        fields,
+        &[
+            "NewProcessName",
+            "Image",
+            "TargetUserName",
+            "Threat Name",
+            "ThreatName",
+            "ServiceName",
+            "ShareName",
+            "DestinationIp",
+        ],
+    );
+    Some(match subject {
+        Some(subject) if !subject.trim().is_empty() => format!("{base}: {subject}"),
+        _ => base.to_string(),
+    })
+}
+
+fn evtx_system_object_attribute(
+    system: &serde_json::Value,
+    object_name: &str,
+    attribute: &str,
+) -> Option<String> {
+    let object = system.get(object_name)?;
+    object
+        .get("#attributes")
+        .and_then(|value| value.get(attribute))
+        .and_then(evtx_scalar_string)
+        .or_else(|| {
+            object
+                .get(format!("@{attribute}"))
+                .and_then(evtx_scalar_string)
+        })
+        .or_else(|| object.get(attribute).and_then(evtx_scalar_string))
+}
+
+fn evtx_execution_attribute(system: &serde_json::Value, attribute: &str) -> Option<String> {
+    evtx_system_object_attribute(system, "Execution", attribute)
+}
+
+fn evtx_correlation_attribute(system: &serde_json::Value, attribute: &str) -> Option<String> {
+    evtx_system_object_attribute(system, "Correlation", attribute)
+}
+
+fn evtx_security_attribute(system: &serde_json::Value, attribute: &str) -> Option<String> {
+    evtx_system_object_attribute(system, "Security", attribute)
 }
 
 fn record_evtx_parser_error(summary: &mut EvtxImportSummary, error: String) {
@@ -46974,6 +47461,14 @@ fn ensure_evidence_hash_columns(conn: &Connection) -> Result<()> {
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<Vec<_>, _>>()
         .context("collecting evidence_sources columns")?;
+    if !existing.iter().any(|name| name == "display_timezone") {
+        conn.execute(
+            "ALTER TABLE evidence_sources
+             ADD COLUMN display_timezone TEXT NOT NULL DEFAULT 'UTC'",
+            [],
+        )
+        .context("adding evidence_sources.display_timezone column")?;
+    }
     for column in [
         "sha256_hex",
         "hashed_at",
@@ -51193,6 +51688,99 @@ mod tests {
     }
 
     #[test]
+    fn evidence_timezone_is_validated_recorded_and_inherited() -> Result<()> {
+        let case_path = unique_case_path("evidence-timezone");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("evidence-timezone-source");
+        fs::create_dir_all(&evidence_dir)?;
+        let first_path = evidence_dir.join("first.txt");
+        let second_path = evidence_dir.join("second.txt");
+        fs::write(&first_path, b"first")?;
+        fs::write(&second_path, b"second")?;
+
+        let first_id = add_evidence_with_timezone(
+            &case_path,
+            AddEvidenceOptions {
+                path: first_path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: false,
+                notes: None,
+            },
+            "Europe/Bucharest",
+        )?;
+        assert_eq!(case_info(&case_path)?.timezone, "Europe/Bucharest");
+        let first = list_evidence(&case_path)?
+            .into_iter()
+            .find(|item| item.id == first_id)
+            .expect("new evidence source");
+        assert_eq!(first.display_timezone, "Europe/Bucharest");
+
+        let second_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: second_path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let second = list_evidence(&case_path)?
+            .into_iter()
+            .find(|item| item.id == second_id)
+            .expect("second evidence source");
+        assert_eq!(second.display_timezone, "Europe/Bucharest");
+
+        let invalid_path = evidence_dir.join("invalid.txt");
+        fs::write(&invalid_path, b"invalid")?;
+        let error = add_evidence_with_timezone(
+            &case_path,
+            AddEvidenceOptions {
+                path: invalid_path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: false,
+                notes: None,
+            },
+            "Not/A_Real_Timezone",
+        )
+        .expect_err("unknown IANA timezone must be rejected");
+        assert!(format!("{error:#}").contains("unsupported IANA timezone"));
+        assert_eq!(list_evidence(&case_path)?.len(), 2);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn opening_pre_timezone_case_adds_safe_evidence_default() -> Result<()> {
+        let case_path = unique_case_path("evidence-timezone-migration");
+        create_test_case(&case_path)?;
+        {
+            let conn = Connection::open(&case_path)?;
+            conn.execute(
+                "ALTER TABLE evidence_sources DROP COLUMN display_timezone",
+                [],
+            )?;
+        }
+
+        let conn = open_existing_case(&case_path)?;
+        let default_value: Option<String> = conn
+            .prepare("PRAGMA table_info(evidence_sources)")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, Option<String>>(4)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .find_map(|(name, default)| (name == "display_timezone").then_some(default))
+            .flatten();
+        assert_eq!(default_value.as_deref(), Some("'UTC'"));
+        drop(conn);
+
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
     fn create_case_never_replaces_an_existing_file() -> Result<()> {
         let case_path = unique_case_path("existing-case-preserved");
         let original = b"not a case database; preserve these bytes";
@@ -53338,6 +53926,81 @@ mod tests {
                 "Provider": {"#attributes": {"Guid": "{ABC}", "Name": "Source"}}
             })),
             Some("{ABC}".to_string())
+        );
+    }
+
+    #[test]
+    fn evtx_named_payload_fields_preserve_names_duplicates_and_user_data() {
+        let event = serde_json::json!({
+            "Event": {
+                "EventData": {
+                    "Data": [
+                        {"#attributes": {"Name": "TargetUserName"}, "#text": "alice"},
+                        {"#attributes": {"Name": "IpAddress"}, "#text": "10.0.0.5"},
+                        {"#attributes": {"Name": "IpAddress"}, "#text": "10.0.0.6"}
+                    ]
+                },
+                "UserData": {"Threat": {"Name": "Ransomware!Test", "Severity": "Severe"}}
+            }
+        });
+        let fields = evtx_named_payload_fields(&event);
+        assert_eq!(fields["TargetUserName"], "alice");
+        assert_eq!(
+            fields["IpAddress"],
+            serde_json::json!(["10.0.0.5", "10.0.0.6"])
+        );
+        assert_eq!(fields["UserData.Threat.Name"], "Ransomware!Test");
+        assert_eq!(fields["UserData.Threat.Severity"], "Severe");
+    }
+
+    #[test]
+    fn evtx_forensic_labels_are_provider_scoped_and_use_evidence_fields() {
+        let fields = BTreeMap::from([(
+            "NewProcessName".to_string(),
+            serde_json::json!(r"C:\ProgramData\hgja.exe"),
+        )]);
+        assert_eq!(
+            evtx_forensic_event_label(
+                Some(4688),
+                Some("Microsoft-Windows-Security-Auditing"),
+                Some("Security"),
+                &fields,
+            )
+            .as_deref(),
+            Some(r"Process created: C:\ProgramData\hgja.exe")
+        );
+        assert_eq!(
+            evtx_forensic_event_label(Some(4688), Some("Unrelated-Provider"), None, &fields),
+            None
+        );
+    }
+
+    #[test]
+    fn evtx_system_attributes_cover_execution_correlation_and_security() {
+        let system = serde_json::json!({
+            "Execution": {"#attributes": {"ProcessID": "123", "ThreadID": "456"}},
+            "Correlation": {"#attributes": {"ActivityID": "{A}", "RelatedActivityID": "{B}"}},
+            "Security": {"#attributes": {"UserID": "S-1-5-18"}}
+        });
+        assert_eq!(
+            evtx_execution_attribute(&system, "ProcessID").as_deref(),
+            Some("123")
+        );
+        assert_eq!(
+            evtx_execution_attribute(&system, "ThreadID").as_deref(),
+            Some("456")
+        );
+        assert_eq!(
+            evtx_correlation_attribute(&system, "ActivityID").as_deref(),
+            Some("{A}")
+        );
+        assert_eq!(
+            evtx_correlation_attribute(&system, "RelatedActivityID").as_deref(),
+            Some("{B}")
+        );
+        assert_eq!(
+            evtx_security_attribute(&system, "UserID").as_deref(),
+            Some("S-1-5-18")
         );
     }
 

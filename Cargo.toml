@@ -23,6 +23,7 @@ anyhow = "1.0"
 base64 = "=0.22.1"
 bitlocker-core = "0.3.0"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = { version = "0.10", default-features = false }
 chrome-cache-parser = "0.2.5"
 clap = { version = "4.5", features = ["derive"] }
 codepage-strings = "1"

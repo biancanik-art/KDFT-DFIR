@@ -6,11 +6,12 @@ use kdft_case::progress::{
     JobProgressState, JobProgressTracker,
 };
 use kdft_case::{
-    add_evidence, analyze_signatures, bookmark_indexed_folder_recursive,
-    bookmark_live_folder_recursive, browser_auto_import_disclosures, carve_evidence, case_info,
-    case_mutation_generation, category_entry_counts, clear_all_findings,
-    count_filesystem_entries_for_timeline, create_bookmark, create_bookmark_folder, create_case,
-    evidence_source_exists, evidence_tree_entry_count, export_image_file, export_image_tree,
+    add_evidence, add_evidence_with_timezone, analyze_signatures,
+    bookmark_indexed_folder_recursive, bookmark_live_folder_recursive,
+    browser_auto_import_disclosures, carve_evidence, case_info, case_mutation_generation,
+    category_entry_counts, clear_all_findings, count_filesystem_entries_for_timeline,
+    create_bookmark, create_bookmark_folder, create_case, evidence_source_exists,
+    evidence_tree_entry_count, export_image_file, export_image_tree,
     export_indexed_browser_profile, export_local_file, export_local_tree, filesystem_entry_by_id,
     filesystem_entry_count, filesystem_entry_disk_location, hash_evidence,
     import_browser_artifacts_into_evidence, import_browser_history,
@@ -23,11 +24,12 @@ use kdft_case::{
     record_live_tree_export_with_source_kind, record_processing_pass_failure_audit,
     record_report_export, recover_filesystem_entry, remove_bookmark, remove_bookmark_item,
     remove_evidence, render_report, report_data, report_data_with_directory_structure,
-    AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType, BrowserDatabaseDetected,
-    BrowserFamily, CarveOptions, CategoryEntryCursor, CategoryEntryFilters,
-    CreateBookmarkItemOptions, CreateBookmarkOptions, CreateCaseOptions, DeepSearchOptions,
-    EvidenceKind, ImportBrowserArtifactsIntoEvidenceOptions, ImportBrowserHistoryOptions,
-    ProcessEvidenceOptions, ReadEntryBytesOptions, RecoverEntryOptions,
+    set_evidence_display_timezone, AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType,
+    BrowserDatabaseDetected, BrowserFamily, CarveOptions, CategoryEntryCursor,
+    CategoryEntryFilters, CreateBookmarkItemOptions, CreateBookmarkOptions, CreateCaseOptions,
+    DeepSearchOptions, EvidenceKind, ImportBrowserArtifactsIntoEvidenceOptions,
+    ImportBrowserHistoryOptions, ProcessEvidenceOptions, ReadEntryBytesOptions,
+    RecoverEntryOptions,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -404,6 +406,7 @@ struct AddEvidenceRequest {
     kind: Option<String>,
     read_file_system: Option<bool>,
     notes: Option<String>,
+    timezone: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -549,6 +552,7 @@ struct ImportHistoryRequest {
     history_path: String,
     max_visits: Option<usize>,
     evidence_name: Option<String>,
+    timezone: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2663,15 +2667,17 @@ fn api_add_evidence(body: &[u8]) -> Result<serde_json::Value> {
     let case_path = request_path(&request.case_path, "case_path")?;
     let evidence_path = request_path(&request.path, "path")?;
     let kind = EvidenceKind::parse(request.kind.as_deref().unwrap_or("auto"))?;
-    let add_result = add_evidence(
-        &case_path,
-        AddEvidenceOptions {
-            path: evidence_path.clone(),
-            kind,
-            read_file_system_requested: request.read_file_system.unwrap_or(true),
-            notes: request.notes,
-        },
-    );
+    let timezone = request.timezone.clone();
+    let options = AddEvidenceOptions {
+        path: evidence_path.clone(),
+        kind,
+        read_file_system_requested: request.read_file_system.unwrap_or(true),
+        notes: request.notes,
+    };
+    let add_result = match timezone.as_deref() {
+        Some(value) => add_evidence_with_timezone(&case_path, options, value),
+        None => add_evidence(&case_path, options),
+    };
     match add_result {
         Ok(evidence_id) => Ok(json!({
             "evidence_id": evidence_id,
@@ -2686,7 +2692,12 @@ fn api_add_evidence(body: &[u8]) -> Result<serde_json::Value> {
             let Some(detected) = error.downcast_ref::<BrowserDatabaseDetected>() else {
                 return Err(error);
             };
-            import_detected_browser_database(&case_path, &evidence_path, detected.family)
+            import_detected_browser_database(
+                &case_path,
+                &evidence_path,
+                detected.family,
+                timezone.as_deref(),
+            )
         }
     }
 }
@@ -2695,6 +2706,7 @@ fn import_detected_browser_database(
     case_path: &Path,
     database_path: &Path,
     family: BrowserFamily,
+    timezone: Option<&str>,
 ) -> Result<serde_json::Value> {
     let profile_root = database_path
         .parent()
@@ -2709,6 +2721,9 @@ fn import_detected_browser_database(
             evidence_name: None,
         },
     )?;
+    if let Some(value) = timezone {
+        set_evidence_display_timezone(case_path, result.evidence_id, value)?;
+    }
     let mut response =
         serde_json::to_value(result).context("serializing detected browser import result")?;
     response
@@ -4489,14 +4504,18 @@ fn api_import_history(body: &[u8]) -> Result<kdft_case::BrowserHistoryImportResu
     let request: ImportHistoryRequest = parse_json_body(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let history_path = request_path(&request.history_path, "history_path")?;
-    import_browser_history(
+    let result = import_browser_history(
         &case_path,
         ImportBrowserHistoryOptions {
             history_path,
             max_visits: request.max_visits.unwrap_or(0),
             evidence_name: request.evidence_name,
         },
-    )
+    )?;
+    if let Some(timezone) = request.timezone.as_deref() {
+        set_evidence_display_timezone(&case_path, result.evidence_id, timezone)?;
+    }
+    Ok(result)
 }
 
 /// Browser history import (`import_browser_history`) needs several
@@ -6119,8 +6138,12 @@ mod tests {
         assert!(INDEX_HTML.contains("timeline-capable records matched"));
         assert!(INDEX_HTML
             .contains("const matchingRows = visibleGridRows(\"timeline\", columns, rows)"));
-        assert!(INDEX_HTML
-            .contains("const renderedRows = matchingRows.slice(0, TIMELINE_TABLE_RENDER_LIMIT)"));
+        assert!(INDEX_HTML.contains(
+            "const renderedRows = matchingRows.slice(rowOffset, rowOffset + TIMELINE_TABLE_RENDER_LIMIT)"
+        ));
+        assert!(INDEX_HTML.contains("function timelineTablePagerHtml("));
+        assert!(INDEX_HTML.contains("type=\"datetime-local\" step=\"60\" id=\"timelineDateFrom\""));
+        assert!(INDEX_HTML.contains("function currentTimelineBuildLimit() {\n      return 0;"));
         assert!(INDEX_HTML.contains(".timeline-bottom {\n      display: block;"));
     }
 
@@ -6474,6 +6497,8 @@ mod tests {
         ));
         assert!(INDEX_HTML.contains("liveGuidanceExpiresAt: 0"));
         assert!(INDEX_HTML.contains("state.liveGuidanceExpiresAt = Date.now() + 7000"));
+        assert!(INDEX_HTML.contains("liveState.reconstructionNoticeExpiresAt = Date.now() + 7000"));
+        assert!(INDEX_HTML.contains("forensicSummary.cached && reconstructionRemainingMs > 0"));
         assert!(INDEX_HTML.contains("const guidanceRemainingMs = Math.max(0"));
         assert!(INDEX_HTML
             .contains("$(\"treeCount\").textContent = String(state.live.volumes.length);"));
@@ -6481,6 +6506,35 @@ mod tests {
         assert!(INDEX_HTML
             .contains("direct-browse rows are intentionally not mirrored into Categories"));
         assert!(INDEX_HTML.contains("Closed source browse. Showing indexed categories."));
+    }
+
+    #[test]
+    fn evidence_timezone_is_explicit_and_timeline_never_uses_host_local_time() {
+        assert!(INDEX_HTML.contains("id=\"evidenceTimezone\""));
+        assert!(INDEX_HTML.contains("Canonical parsed timestamps remain UTC"));
+        assert!(INDEX_HTML.contains("timezone: evidenceTimezoneValue()"));
+        assert!(INDEX_HTML.contains("function caseDisplayTimezone()"));
+        assert!(INDEX_HTML.contains("timeZone: timezone"));
+        assert!(INDEX_HTML.contains("function zonedDateBoundaryMillis("));
+        assert!(INDEX_HTML.contains("timelineBucketKey(event.timestampMs, focus.unit)"));
+        assert!(!INDEX_HTML.contains("return date.toLocaleString(undefined, options);"));
+    }
+
+    #[test]
+    fn analyzed_grids_and_exports_expose_forensic_fields_and_preserve_paths() {
+        assert!(INDEX_HTML.contains("{ key: \"detectedType\", label: \"Detected type\""));
+        assert!(INDEX_HTML.contains("{ key: \"signature\", label: \"Signature\""));
+        assert!(INDEX_HTML.contains("{ key: \"offset\", label: \"Media offset\""));
+        assert!(INDEX_HTML.contains("{ key: \"sha256\", label: \"SHA-256\""));
+        assert!(INDEX_HTML.contains("function filesystemFileHashDisplay("));
+        assert!(INDEX_HTML.contains("function exportBatchDirectory("));
+        assert!(INDEX_HTML.contains("function askPreserveOriginalExportPaths("));
+        assert!(INDEX_HTML.contains("id=\"exportPathChoiceOverlay\""));
+        assert!(INDEX_HTML.contains("Preserve original paths"));
+        assert!(INDEX_HTML.contains("Flat export"));
+        assert!(INDEX_HTML.contains("await askPreserveOriginalExportPaths()"));
+        assert!(INDEX_HTML.contains("indexedExportPathParts(entry)"));
+        assert!(INDEX_HTML.contains("liveExportPathParts(item)"));
     }
 
     #[test]
@@ -6661,7 +6715,8 @@ mod tests {
             // Reproduce the Image-path UI flow that originally misclassified
             // the extensionless SQLite database as disk evidence.
             "kind": "image",
-            "read_file_system": true
+            "read_file_system": true,
+            "timezone": "Europe/Bucharest"
         })
         .to_string();
         let response = api_add_evidence(body.as_bytes())?;
@@ -6672,6 +6727,11 @@ mod tests {
         let evidence = kdft_case::list_evidence(&case_path)?;
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].source_kind, "browser_history");
+        assert_eq!(evidence[0].display_timezone, "Europe/Bucharest");
+        assert_eq!(
+            kdft_case::case_info(&case_path)?.timezone,
+            "Europe/Bucharest"
+        );
         assert!(evidence
             .iter()
             .all(|source| source.source_kind != "image" && source.source_kind != "file"));
@@ -9114,6 +9174,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
       background: var(--surface-2);
     }
     .timeline-detail-modal-head h3 { margin: 0; font-size: 14px; }
+    .export-path-choice-modal {
+      width: min(560px, calc(100vw - 48px));
+    }
+    .export-path-choice-body {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 16px;
+    }
+    .export-path-choice-body p { margin: 0; }
+    .export-path-choice-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
     .timeline-detail .timeline-detail-empty {
       color: var(--muted);
       font-size: 12px;
@@ -10729,6 +10805,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
               <div class="row" id="historyOptionsRow" hidden>
                 <label>Max visits (0 = all)<input id="historyMaxVisits" type="number" min="0" value="0"></label>
               </div>
+              <label>Evidence / case display timezone
+                <select id="evidenceTimezone"><option value="UTC">UTC</option></select>
+              </label>
+              <p class="muted tiny">Canonical parsed timestamps remain UTC. Timeline labels and examiner-facing times use this IANA timezone, and the selection is recorded with the evidence. Filesystems such as FAT that do not store a timezone remain explicitly marked as timezone-ambiguous.</p>
               <label>Notes<textarea id="evidenceNotes"></textarea></label>
               <button id="addEvidence">Add Evidence</button>
             </div>
@@ -10849,9 +10929,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
               <div class="timeline-controls">
                 <div id="timelineSummary" class="timeline-summary">No timeline built.</div>
                 <span class="tiny date-filter timeline-date-filter">
-                  <input type="date" id="timelineDateFrom" title="Show only events on or after this date">
-                  <input type="date" id="timelineDateTo" title="Show only events on or before this date">
-                  <button id="timelineDateFilterClear" class="ghost" title="Clear date filter">All dates</button>
+                  <label>From <input type="datetime-local" step="60" id="timelineDateFrom" title="Inclusive start in the case display timezone"></label>
+                  <label>To <input type="datetime-local" step="60" id="timelineDateTo" title="Exclusive end in the case display timezone"></label>
+                  <button id="timelineDateFilterClear" class="ghost" title="Clear timeline time filter">All time</button>
                 </span>
               </div>
               <div id="timelineGraph" class="timeline-graph"></div>
@@ -10972,6 +11052,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
       <aside id="timelineDetail" class="timeline-detail"></aside>
     </section>
   </div>
+  <div id="exportPathChoiceOverlay" class="timeline-detail-overlay" hidden onclick="if (event.target === this) resolveExportPathChoice(null)">
+    <section class="timeline-detail-modal export-path-choice-modal" role="dialog" aria-modal="true" aria-labelledby="exportPathChoiceTitle" aria-describedby="exportPathChoiceDescription">
+      <div class="timeline-detail-modal-head">
+        <h3 id="exportPathChoiceTitle">Export folder structure</h3>
+      </div>
+      <div class="export-path-choice-body">
+        <p id="exportPathChoiceDescription">How should KDFT arrange this export batch?</p>
+        <p class="muted tiny"><strong>Preserve original paths</strong> recreates the source hierarchy inside a new, uniquely named export folder. <strong>Flat export</strong> writes every selected file directly into that batch folder with collision-safe names.</p>
+        <div class="export-path-choice-actions">
+          <button type="button" class="ghost" onclick="resolveExportPathChoice(null)">Cancel</button>
+          <button type="button" class="secondary" onclick="resolveExportPathChoice(false)">Flat export</button>
+          <button type="button" id="preserveExportPaths" onclick="resolveExportPathChoice(true)">Preserve original paths</button>
+        </div>
+      </div>
+    </section>
+  </div>
 
   <script>
     const BOOTSTRAP = __KDFT_BOOTSTRAP__;
@@ -10995,12 +11091,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return 0;
     }
 
-    // Timeline event expansion happens in the browser and produces several
-    // events per entry. Keep one build bounded; the backend filters the full
-    // requested date range and prioritizes parsed artifact records before
-    // bulk filesystem metadata so the cap cannot erase every activity class.
+    // Zero is the public "unlimited" sentinel. The old fixed 20,000-entry cap
+    // could stop a busy Windows timeline during provisioning and hide later
+    // attack activity. Examiners can (and on large cases should) bound work by
+    // an exact From/To time window, but KDFT must never silently discard the
+    // rest of that requested window.
     function currentTimelineBuildLimit() {
-      return 20000;
+      return 0;
     }
     if (ANALYSIS_MODE) {
       document.body.classList.add("analysis-fullscreen");
@@ -11174,6 +11271,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       liveState.forensicReady.add(Number(volumeIndex));
       liveState.forensicSummary[Number(volumeIndex)] = finalStatus;
+      liveState.reconstructionNoticeExpiresAt = Date.now() + 7000;
       return true;
     }
 
@@ -11203,7 +11301,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         focusBucket: null,
         scrollToSelected: false,
         building: false,
-        buildGeneration: 0
+        buildGeneration: 0,
+        rangeFrom: "",
+        rangeTo: "",
+        tablePage: 0
       };
     }
 
@@ -12002,6 +12103,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const priorSearchRevision = state.searchScope && state.searchScope.caseRevision;
         state.data = nextData;
         state.loadedCasePath = casePath;
+        syncEvidenceTimezoneFromCase();
         const currentSearchRevision = deepSearchCaseRevision(nextData);
         const searchRevisionChanged = Boolean(
           priorSearchRevision && priorSearchRevision !== currentSearchRevision
@@ -12143,6 +12245,76 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return active ? active.dataset.type : "image";
     }
 
+    const FALLBACK_IANA_TIMEZONES = [
+      "UTC",
+      "Africa/Johannesburg",
+      "America/Chicago",
+      "America/Denver",
+      "America/Los_Angeles",
+      "America/New_York",
+      "America/Sao_Paulo",
+      "Asia/Dubai",
+      "Asia/Hong_Kong",
+      "Asia/Kolkata",
+      "Asia/Singapore",
+      "Asia/Tokyo",
+      "Australia/Sydney",
+      "Europe/Berlin",
+      "Europe/Bucharest",
+      "Europe/London",
+      "Europe/Paris",
+      "Pacific/Auckland"
+    ];
+
+    function browserSupportsTimezone(timezone) {
+      try {
+        new Intl.DateTimeFormat("en", { timeZone: timezone }).format(new Date(0));
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function populateEvidenceTimezones() {
+      const select = $("evidenceTimezone");
+      if (!select) return;
+      let zones = FALLBACK_IANA_TIMEZONES.slice();
+      if (typeof Intl.supportedValuesOf === "function") {
+        try {
+          zones = ["UTC", ...Intl.supportedValuesOf("timeZone")];
+        } catch (_) {
+          // Older embedded browsers use the curated fallback above.
+        }
+      }
+      zones = Array.from(new Set(zones.filter(browserSupportsTimezone)));
+      select.innerHTML = zones.map((zone) => `<option value="${escapeAttr(zone)}">${escapeHtml(zone)}</option>`).join("");
+      const saved = localStorage.getItem("kdft.evidenceTimezone") || "UTC";
+      setEvidenceTimezoneSelection(saved);
+    }
+
+    function setEvidenceTimezoneSelection(timezone) {
+      const select = $("evidenceTimezone");
+      if (!select) return;
+      const requested = browserSupportsTimezone(timezone) ? timezone : "UTC";
+      if (!Array.from(select.options).some((option) => option.value === requested)) {
+        select.add(new Option(requested, requested));
+      }
+      select.value = requested;
+    }
+
+    function syncEvidenceTimezoneFromCase() {
+      const timezone = state.data && state.data.case && state.data.case.timezone
+        ? String(state.data.case.timezone)
+        : "UTC";
+      setEvidenceTimezoneSelection(timezone);
+      localStorage.setItem("kdft.evidenceTimezone", timezone);
+    }
+
+    function evidenceTimezoneValue() {
+      const select = $("evidenceTimezone");
+      return select && browserSupportsTimezone(select.value) ? select.value : "UTC";
+    }
+
     const EVIDENCE_TYPE_LABELS = {
       image: { label: "Image path", placeholder: "C:\\Evidence\\image.E01", button: "Add Evidence", pick: "file", filter: "image" },
       folder: { label: "Folder path", placeholder: "C:\\Evidence\\source-folder", button: "Add Evidence", pick: "folder", filter: "any" },
@@ -12199,7 +12371,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           path: evidencePath.value,
           kind: type,
           read_file_system: processNow,
-          notes: $("evidenceNotes").value
+          notes: $("evidenceNotes").value,
+          timezone: evidenceTimezoneValue()
         });
         setNotice("");
         if (data.detected) {
@@ -12666,7 +12839,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
             + Number(wr.amcache_records_indexed || 0).toLocaleString() + " Amcache, "
             + Number(wr.userassist_records_indexed || 0).toLocaleString() + " UserAssist, "
             + Number(wr.shellbag_records_indexed || 0).toLocaleString() + " ShellBag, "
+            + Number(wr.recent_docs_records_indexed || 0).toLocaleString() + " RecentDocs, "
+            + Number(wr.network_drive_records_indexed || 0).toLocaleString() + " mapped-drive MRU, "
+            + Number(wr.mount_point_records_indexed || 0).toLocaleString() + " MountPoints2, "
+            + Number(wr.muicache_records_indexed || 0).toLocaleString() + " MUICache, "
+            + Number(wr.first_logon_records_indexed || 0).toLocaleString() + " first-logon, "
             + Number(wr.startup_records_indexed || 0).toLocaleString() + " startup record(s)"
+            + "; RegRipper adapter " + String(wr.regripper_adapter_status || "not_configured")
+            + (Number(wr.regripper_lines_indexed || 0) ? " (" + Number(wr.regripper_lines_indexed).toLocaleString() + " raw line(s) indexed)" : "")
             + (Number(wr.shimcache_sources_seen || 0) ? "; Shimcache source retained (decoder limitation disclosed)" : "")
             + (Number(wr.srum_sources_seen || 0) ? "; SRUM source retained (ESE decoder limitation disclosed)" : "")
             + (Number(wr.parse_error_count || 0) ? ", " + Number(wr.parse_error_count).toLocaleString() + " hive error(s)" : ""));
@@ -13203,7 +13383,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const data = await apiPost("/api/history/import", {
           case_path: currentCasePath(),
           history_path: historyPath.value,
-          max_visits: nonNegativeNumberValue("historyMaxVisits", 0)
+          max_visits: nonNegativeNumberValue("historyMaxVisits", 0),
+          timezone: evidenceTimezoneValue()
         });
         const message = "Imported browser activities: " + data.entries_indexed + " records (" + data.status + ").";
         setNotice("");
@@ -13459,28 +13640,32 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Select one or more visible file entries first.", true);
         return { succeeded: 0, failed: ids.length };
       }
-      const fileIds = ids.filter((entryId) => {
-        const entry = findLoadedEntry(entryId);
-        return entry && entry.entry_kind === "file";
-      });
-      if (fileIds.length === 0) {
+      const files = ids.map(findLoadedEntry).filter((entry) => entry && entry.entry_kind === "file");
+      if (files.length === 0) {
         setNotice("Selected rows are records or folders. Use Report selected to add them to the report; only file entries have bytes to export.", true);
         return { succeeded: 0, failed: ids.length };
       }
+      const preservePaths = await askPreserveOriginalExportPaths();
+      if (preservePaths === null) {
+        return { succeeded: 0, failed: 0 };
+      }
+      const batchDirectory = exportBatchDirectory(files, "indexed-files");
       let succeeded = 0;
       const failed = [];
       let lastError = "";
-      for (const entryId of fileIds) {
-        const entry = findLoadedEntry(entryId);
+      for (const entry of files) {
+        const outputParts = preservePaths
+          ? indexedExportPathParts(entry)
+          : [String(entry.id) + "-" + safeFileName(entry.name || logicalName(entry.logical_path) || "exported.bin")];
         try {
           await apiPost("/api/entry/recover", {
             case_path: currentCasePath(),
-            entry_id: entryId,
-            output_path: defaultRecoveryPath(entry)
+            entry_id: entry.id,
+            output_path: joinLocalPath(batchDirectory, outputParts)
           });
           succeeded += 1;
         } catch (err) {
-          failed.push(entryId);
+          failed.push(entry.id);
           lastError = err.message || String(err);
         }
       }
@@ -13488,14 +13673,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       restoreEntrySelection(ids);
       renderEvidenceBrowserEntries();
       renderSelectionCount();
-      const skipped = ids.length - fileIds.length;
+      const skipped = ids.length - files.length;
       if (failed.length) {
         const skippedText = skipped ? "; skipped " + skipped + " non-file item" + (skipped === 1 ? "" : "s") : "";
-        setNotice("Exported " + succeeded + " selected file" + (succeeded === 1 ? "" : "s") + skippedText + "; " + failed.length + " failed" + (lastError ? ": " + lastError : "."), true);
+        setNotice("Exported " + succeeded + " selected file" + (succeeded === 1 ? "" : "s") + " to " + batchDirectory + skippedText + "; " + failed.length + " failed" + (lastError ? ": " + lastError : "."), true);
         return { succeeded, failed: failed.length };
       }
       const skippedText = skipped ? "; skipped " + skipped + " non-file item" + (skipped === 1 ? "" : "s") : "";
-      setNotice("Exported " + succeeded + " selected file" + (succeeded === 1 ? "" : "s") + " to ui-output" + skippedText + ".");
+      setNotice("Exported " + succeeded + " selected file" + (succeeded === 1 ? "" : "s") + " to " + batchDirectory + (preservePaths ? " with original paths preserved" : " in a flat export") + skippedText + ".");
       return { succeeded, failed: 0 };
     }
 
@@ -13677,6 +13862,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         { label: "Derived from entry ID", value: (entry, metadata) => metadata.derived_from_entry_id || metadata.source_entry_id || "" }
       ];
       const metadataKeys = new Set();
+      const evtxFieldKeys = new Set();
+      const evtxEcmdFieldKeys = new Set();
       entries.forEach((entry) => {
         const metadata = entry.metadata_json && typeof entry.metadata_json === "object" ? entry.metadata_json : {};
         Object.keys(metadata).forEach((key) => {
@@ -13684,9 +13871,33 @@ const INDEX_HTML: &str = r###"<!doctype html>
             metadataKeys.add(key);
           }
         });
+        const evtxFields = metadata.evtx_fields && typeof metadata.evtx_fields === "object" && !Array.isArray(metadata.evtx_fields)
+          ? metadata.evtx_fields
+          : {};
+        Object.keys(evtxFields).forEach((key) => evtxFieldKeys.add(key));
+        const evtxEcmdFields = metadata.evtxecmd_fields && typeof metadata.evtxecmd_fields === "object" && !Array.isArray(metadata.evtxecmd_fields)
+          ? metadata.evtxecmd_fields
+          : {};
+        Object.keys(evtxEcmdFields).forEach((key) => evtxEcmdFieldKeys.add(key));
       });
       Array.from(metadataKeys).sort((left, right) => left.localeCompare(right)).forEach((key) => {
         columns.push({ label: "meta." + key, value: (entry, metadata) => metadata[key] });
+      });
+      Array.from(evtxFieldKeys).sort((left, right) => left.localeCompare(right)).forEach((key) => {
+        columns.push({
+          label: "evtx." + key,
+          value: (entry, metadata) => metadata.evtx_fields && typeof metadata.evtx_fields === "object"
+            ? metadata.evtx_fields[key]
+            : ""
+        });
+      });
+      Array.from(evtxEcmdFieldKeys).sort((left, right) => left.localeCompare(right)).forEach((key) => {
+        columns.push({
+          label: "evtxecmd." + key,
+          value: (entry, metadata) => metadata.evtxecmd_fields && typeof metadata.evtxecmd_fields === "object"
+            ? metadata.evtxecmd_fields[key]
+            : ""
+        });
       });
       return columns;
     }
@@ -15964,7 +16175,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         item,
         evidenceIndex,
         values: {
-          source: compactParts([item.display_name, item.source_path, item.sha256_hex ? "SHA-256: " + item.sha256_hex : ""]),
+          source: compactParts([item.display_name, item.source_path, "Display timezone: " + (item.display_timezone || "UTC"), item.sha256_hex ? "SHA-256: " + item.sha256_hex : ""]),
           kind: item.source_kind,
           status: compactParts([evidenceProcessingStatusText(item), item.sha256_hex ? "hashed" : ""])
         }
@@ -15975,7 +16186,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const item = row.item;
       return `
         <tr>
-          <td><strong>${escapeHtml(item.display_name)}</strong><br><span class="muted tiny">${escapeHtml(item.source_path)}</span>${item.sha256_hex ? `<br><span class="muted tiny" title="SHA-256 computed ${escapeAttr(item.hashed_at || "")}">SHA-256: ${escapeHtml(item.sha256_hex)}</span>` : ""}</td>
+          <td><strong>${escapeHtml(item.display_name)}</strong><br><span class="muted tiny">${escapeHtml(item.source_path)}</span><br><span class="muted tiny">Display timezone: ${escapeHtml(item.display_timezone || "UTC")}</span>${item.sha256_hex ? `<br><span class="muted tiny" title="SHA-256 computed ${escapeAttr(item.hashed_at || "")}">SHA-256: ${escapeHtml(item.sha256_hex)}</span>` : ""}</td>
           <td><span class="pill">${escapeHtml(item.source_kind)}</span></td>
           <td>${evidenceProcessingStatusHtml(item)}${item.sha256_hex ? ' <span class="pill good">hashed</span>' : ""}</td>
           <td class="actions">
@@ -16266,6 +16477,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
             orphan_count: Number(data.orphan_count || 0),
             diagnostic_count: Number(data.diagnostic_count || 0)
           };
+          if (!Number(liveState.reconstructionNoticeExpiresAt || 0)) {
+            liveState.reconstructionNoticeExpiresAt = Date.now() + 7000;
+          }
         }
       }
       return liveState.dirCache[key];
@@ -16738,7 +16952,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("No source items selected.", true);
         return;
       }
-      const root = BOOTSTRAP.workspaceRoot || ".";
+      const preservePaths = await askPreserveOriginalExportPaths();
+      if (preservePaths === null) return;
+      const batchDirectory = exportBatchDirectory(items, "source-items");
       let files = 0;
       let bytes = 0;
       let failures = [];
@@ -16747,10 +16963,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
         index += 1;
         setNotice("Exporting " + index + "/" + items.length + ": " + item.name + "...");
         try {
+          const outputParts = preservePaths
+            ? liveExportPathParts(item)
+            : [String(index).padStart(3, "0") + "-" + safeFileName(item.name || (item.is_dir ? "folder" : "file"))];
           if (item.is_dir) {
-            const outputDir = joinLocalPath(joinLocalPath(root, ["ui-output", "exported"]), [
-              "live-tree-" + safeFileName(item.name)
-            ]);
+            const outputDir = joinLocalPath(batchDirectory, outputParts);
             const data = await apiPost("/api/image/export-tree", {
               case_path: currentCasePath(),
               evidence_id: state.live.evidenceId,
@@ -16764,9 +16981,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
               failures.push(item.name + ": " + describeLiveTreePartial(data));
             }
           } else {
-            const outputPath = joinLocalPath(joinLocalPath(root, ["ui-output", "exported"]), [
-              "live-vol" + item.volume + "-" + safeFileName(item.name)
-            ]);
+            const outputPath = joinLocalPath(batchDirectory, outputParts);
             const data = await apiPost("/api/image/export", {
               case_path: currentCasePath(),
               evidence_id: state.live.evidenceId,
@@ -16782,15 +16997,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
         }
       }
       const problems = failures.length ? " Issues: " + failures.slice(0, 5).join(" | ") : "";
-      setNotice("Exported " + files + " file(s), " + formatBytes(bytes) + " to ui-output\\exported." + problems, failures.length > 0);
+      setNotice("Exported " + files + " file(s), " + formatBytes(bytes) + " to " + batchDirectory + (preservePaths ? " with original paths preserved." : " in a flat export.") + problems, failures.length > 0);
     }
 
     async function exportLiveTree(volume, path, name) {
       hideContextMenu();
-      const root = BOOTSTRAP.workspaceRoot || ".";
-      const outputDir = joinLocalPath(joinLocalPath(root, ["ui-output", "exported"]), [
-        "live-tree-" + safeFileName(name || "vol" + volume)
-      ]);
+      const item = { volume, path, name: name || "vol" + volume, is_dir: true };
+      const preservePaths = await askPreserveOriginalExportPaths();
+      if (preservePaths === null) return;
+      const batchDirectory = exportBatchDirectory([item], item.name);
+      const outputDir = joinLocalPath(batchDirectory, preservePaths
+        ? liveExportPathParts(item)
+        : [safeFileName(item.name)]);
       setNotice("Exporting folder " + (name || path) + " recursively...");
       try {
         const data = await apiPost("/api/image/export-tree", {
@@ -17088,10 +17306,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function exportLiveFile(volume, path, name) {
-      const root = BOOTSTRAP.workspaceRoot || ".";
-      const outputPath = joinLocalPath(joinLocalPath(root, ["ui-output", "exported"]), [
-        "live-vol" + volume + "-" + safeFileName(name)
-      ]);
+      const item = { volume, path, name, is_dir: false };
+      const preservePaths = await askPreserveOriginalExportPaths();
+      if (preservePaths === null) return;
+      const batchDirectory = exportBatchDirectory([item], name || "source-file");
+      const outputPath = joinLocalPath(batchDirectory, preservePaths
+        ? liveExportPathParts(item)
+        : [safeFileName(name || "exported.bin")]);
       const evidence = state.data && state.data.evidence.find((item) => item.id === state.live.evidenceId);
       setNotice("Exporting " + name + (evidence && evidence.source_kind === "image" ? " from the image..." : " from the attached source..."));
       try {
@@ -17355,8 +17576,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         ? `<div class="analysis-status">Direct browse reads the current disk state (not a preserved snapshot).</div>`
         : "";
       const forensicSummary = state.live.forensicSummary && state.live.forensicSummary[Number(selVolume)];
-      const reconstruction = forensicSummary && forensicSummary.cached
-        ? `<div class="analysis-status">Transient NTFS reconstruction (no case index): ${Number(forensicSummary.allocated_count || 0).toLocaleString()} allocated record${Number(forensicSummary.allocated_count || 0) === 1 ? "" : "s"}, ${Number(forensicSummary.deleted_reconstructed_count || 0).toLocaleString()} deleted path${Number(forensicSummary.deleted_reconstructed_count || 0) === 1 ? "" : "s"} reconstructed, ${Number(forensicSummary.orphan_count || 0).toLocaleString()} unresolved/orphan record${Number(forensicSummary.orphan_count || 0) === 1 ? "" : "s"}. Open <strong>$OrphanFiles</strong> for records whose original path cannot be claimed.</div>`
+      const reconstructionRemainingMs = Math.max(0, Number(state.live.reconstructionNoticeExpiresAt || 0) - Date.now());
+      const reconstruction = forensicSummary && forensicSummary.cached && reconstructionRemainingMs > 0
+        ? `<div class="analysis-status transient-guidance" role="status" style="--guidance-duration:${reconstructionRemainingMs}ms">Transient NTFS reconstruction (no case index): ${Number(forensicSummary.allocated_count || 0).toLocaleString()} allocated record${Number(forensicSummary.allocated_count || 0) === 1 ? "" : "s"}, ${Number(forensicSummary.deleted_reconstructed_count || 0).toLocaleString()} deleted path${Number(forensicSummary.deleted_reconstructed_count || 0) === 1 ? "" : "s"} reconstructed, ${Number(forensicSummary.orphan_count || 0).toLocaleString()} unresolved/orphan record${Number(forensicSummary.orphan_count || 0) === 1 ? "" : "s"}. Open <strong>$OrphanFiles</strong> for records whose original path cannot be claimed.</div>`
         : "";
       const guidanceRemainingMs = Math.max(0, Number(state.liveGuidanceExpiresAt || 0) - Date.now());
       const guidanceStyle = `style="--guidance-duration:${guidanceRemainingMs}ms"`;
@@ -17741,9 +17963,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return [
         { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
         { key: "name", label: "Name", sortable: true, filterable: true, sortType: "text" },
+        { key: "category", label: "Category", sortable: true, filterable: true, sortType: "text" },
         { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
         { key: "ext", label: "Extension", sortable: true, filterable: true, sortType: "text" },
+        { key: "detectedType", label: "Detected type", sortable: true, filterable: true, sortType: "text" },
+        { key: "signature", label: "Signature", sortable: true, filterable: true, sortType: "text" },
+        { key: "flags", label: "Flags", sortable: true, filterable: true, sortType: "text" },
         { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
+        { key: "offset", label: "Media offset", sortable: true, filterable: true, sortType: "number" },
         { key: "artifactTime", label: "Artifact time", sortable: true, filterable: true, sortType: "time" },
         { key: "created", label: "Created", sortable: true, filterable: true, sortType: "time" },
         { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" },
@@ -17763,16 +17990,21 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const modified = filesystemModifiedTime(entry);
       const accessed = filesystemAccessedTime(entry);
       const mftModified = filesystemMftModifiedTime(entry);
-      const sha256 = filesystemFileSha256(entry);
+      const sha256 = filesystemFileHashDisplay(entry);
       return {
         child,
         entry,
         selectable: !child.is_dir && child.entry_id != null,
         values: {
           name: compactParts([child.name, flags]),
+          category: entry ? entryCategoryLabel(entry) : "",
           type,
           ext: filesystemFileExtension(entry),
+          detectedType: filesystemDetectedType(entry),
+          signature: filesystemSignatureStatus(entry),
+          flags: entry ? (entryFlagsText(entry) || "-") : (child.is_deleted ? "deleted" : "-"),
           size,
+          offset: entry ? entryPrimaryOffset(entry) : "",
           artifactTime,
           created,
           modified,
@@ -17782,6 +18014,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         },
         sortValues: {
           size: child.size_bytes == null ? NaN : Number(child.size_bytes),
+          offset: entry ? gridNumericValue(entryPrimaryOffset(entry)) : NaN,
           artifactTime: Date.parse(artifactTime),
           created: Date.parse(created),
           modified: Date.parse(modified),
@@ -17793,6 +18026,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function renderIndexedGridRow(row) {
       const child = row.child;
+      const entry = row.entry;
       const selectable = row.selectable;
       const isChecked = selectable && state.selectedEntryIds.has(child.entry_id);
       const checkbox = selectable
@@ -17809,9 +18043,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return `<tr class="entry-row${child.is_deleted ? " deleted" : ""}${isChecked ? " multi-selected" : ""}"${rowClick}${ctxAttr}>
           <td>${checkbox}</td>
           <td>${nameCell}</td>
+          <td class="entry-category">${escapeHtml(row.values.category)}</td>
           <td class="entry-kind">${escapeHtml(row.values.type)}</td>
           <td class="entry-ext">${escapeHtml(row.values.ext)}</td>
+          <td title="${escapeAttr(row.values.detectedType)}">${escapeHtml(row.values.detectedType)}</td>
+          <td>${escapeHtml(row.values.signature)}</td>
+          <td class="entry-flags" title="${escapeAttr(row.values.flags)}">${entry ? entryFlagsHtml(entry) : escapeHtml(row.values.flags)}</td>
           <td class="entry-size">${row.values.size}</td>
+          <td class="entry-offset" title="${escapeAttr(row.values.offset)}">${escapeHtml(row.values.offset)}</td>
           <td class="entry-time entry-artifact-time" title="${escapeAttr(row.values.artifactTime)}">${escapeHtml(row.values.artifactTime)}</td>
           <td class="entry-time" title="${escapeAttr(row.values.created)}">${escapeHtml(row.values.created)}</td>
           <td class="entry-time" title="${escapeAttr(row.values.modified)}">${escapeHtml(row.values.modified)}</td>
@@ -18544,7 +18783,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const accessed = filesystemAccessedTime(entry);
       const mftModified = filesystemMftModifiedTime(entry);
       const flags = entryFlagsText(entry) || "-";
-      const sha256 = filesystemFileSha256(entry);
+      const sha256 = filesystemFileHashDisplay(entry);
       return {
         entry,
         values: {
@@ -18598,7 +18837,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
             <td class="entry-time" title="${escapeAttr(filesystemModifiedTime(entry))}">${escapeHtml(filesystemModifiedTime(entry))}</td>
             <td class="entry-time" title="${escapeAttr(filesystemAccessedTime(entry))}">${escapeHtml(filesystemAccessedTime(entry))}</td>
             <td class="entry-time" title="${escapeAttr(filesystemMftModifiedTime(entry))}">${escapeHtml(filesystemMftModifiedTime(entry))}</td>
-            <td class="entry-hash mono" title="${escapeAttr(filesystemFileSha256(entry))}">${escapeHtml(filesystemFileSha256(entry))}</td>
+            <td class="entry-hash mono" title="${escapeAttr(row.values.sha256)}">${escapeHtml(row.values.sha256)}</td>
           </tr>`;
     }
 
@@ -18638,20 +18877,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!dateFilterActive()) {
         return rows;
       }
-      const from = state.dateFilter.from ? Date.parse(state.dateFilter.from + "T00:00:00Z") : -Infinity;
-      const to = state.dateFilter.to ? Date.parse(state.dateFilter.to + "T23:59:59.999Z") : Infinity;
+      const bounds = evidenceDateRangeBounds();
       return rows.filter((entry) => entryTimestamps(entry).some((text) => {
         const value = Date.parse(text);
-        return Number.isFinite(value) && value >= from && value <= to;
+        return Number.isFinite(value) && value >= bounds.from && value < bounds.toExclusive;
       }));
     }
 
     function syncDateFilterInputs() {
       [
         ["dateFilterFrom", "from"],
-        ["dateFilterTo", "to"],
-        ["timelineDateFrom", "from"],
-        ["timelineDateTo", "to"]
+        ["dateFilterTo", "to"]
       ].forEach(([id, field]) => {
         const input = $(id);
         if (input && input.value !== (state.dateFilter[field] || "")) {
@@ -18674,6 +18910,52 @@ const INDEX_HTML: &str = r###"<!doctype html>
       } else {
         renderEvidenceBrowserEntries();
       }
+      renderTimeline();
+    }
+
+    function timelineRangeActive() {
+      return Boolean(state.timeline.rangeFrom || state.timeline.rangeTo);
+    }
+
+    function syncTimelineRangeInputs() {
+      [["timelineDateFrom", "rangeFrom"], ["timelineDateTo", "rangeTo"]].forEach(([id, field]) => {
+        const input = $(id);
+        if (input && input.value !== (state.timeline[field] || "")) {
+          input.value = state.timeline[field] || "";
+        }
+      });
+    }
+
+    function invalidateTimelineBuildForRangeChange() {
+      state.timeline.built = false;
+      state.timeline.entries = [];
+      state.timeline.events = [];
+      state.timeline.truncated = false;
+      state.timeline.loadedEntryCount = 0;
+      state.timeline.totalEntryCount = 0;
+      state.timeline.focusBucket = null;
+      state.timeline.tablePage = 0;
+      state.timeline.selectedEntryId = null;
+      state.timeline.selectedEventIndex = null;
+    }
+
+    function setTimelineRangeValue(field, value) {
+      const key = field === "rangeTo" ? "rangeTo" : "rangeFrom";
+      if (state.timeline[key] === value) {
+        syncTimelineRangeInputs();
+        return;
+      }
+      state.timeline[key] = value;
+      invalidateTimelineBuildForRangeChange();
+      syncTimelineRangeInputs();
+      renderTimeline();
+    }
+
+    function clearTimelineRange() {
+      state.timeline.rangeFrom = "";
+      state.timeline.rangeTo = "";
+      invalidateTimelineBuildForRangeChange();
+      syncTimelineRangeInputs();
       renderTimeline();
     }
 
@@ -19106,6 +19388,31 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return firstText(metadata.file_sha256);
     }
 
+    function filesystemFileHashDisplay(entry) {
+      const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
+      const digest = filesystemFileSha256(entry);
+      if (digest) return digest;
+      if (metadata.file_sha256_skipped) {
+        return "not hashed: " + String(metadata.file_sha256_skipped);
+      }
+      return entry && entry.entry_kind === "file" ? "not computed" : "";
+    }
+
+    function filesystemDetectedType(entry) {
+      const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
+      return firstText(
+        metadata.detected_signature,
+        metadata.detected_office_document_type,
+        metadata.signature_description
+      );
+    }
+
+    function filesystemSignatureStatus(entry) {
+      const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
+      if (!entry || entry.entry_kind !== "file") return "";
+      return firstText(metadata.signature_status, metadata.signature_analysis ? "analyzed" : "not analyzed");
+    }
+
     function hasFilesystemTimes(entry) {
       return !!entry && entry.entry_kind !== "record";
     }
@@ -19138,9 +19445,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return [
         { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
         { key: "name", label: "Name", sortable: true, filterable: true, sortType: "text" },
+        { key: "category", label: "Category", sortable: true, filterable: true, sortType: "text" },
         { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
         { key: "ext", label: "File ext", sortable: true, filterable: true, sortType: "text" },
+        { key: "detectedType", label: "Detected type", sortable: true, filterable: true, sortType: "text" },
+        { key: "signature", label: "Signature", sortable: true, filterable: true, sortType: "text" },
+        { key: "flags", label: "Flags", sortable: true, filterable: true, sortType: "text" },
         { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
+        { key: "offset", label: "Media offset", sortable: true, filterable: true, sortType: "number" },
         { key: "artifactTime", label: "Artifact time", sortable: true, filterable: true, sortType: "time" },
         { key: "created", label: "Created", sortable: true, filterable: true, sortType: "time" },
         { key: "accessed", label: "Accessed", sortable: true, filterable: true, sortType: "time" },
@@ -19164,9 +19476,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
         selectable: false,
         values: {
           name: logicalName(path),
+          category: folderEntry ? entryCategoryLabel(folderEntry) : "",
           type: "Folder",
           ext: "",
+          detectedType: "",
+          signature: "",
+          flags: folderEntry ? (entryFlagsText(folderEntry) || "-") : "-",
           size: "",
+          offset: folderEntry ? entryPrimaryOffset(folderEntry) : "",
           artifactTime: "",
           created,
           accessed,
@@ -19176,6 +19493,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         },
         sortValues: {
           size: NaN,
+          offset: folderEntry ? gridNumericValue(entryPrimaryOffset(folderEntry)) : NaN,
           artifactTime: NaN,
           created: Date.parse(created),
           accessed: Date.parse(accessed),
@@ -19191,7 +19509,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const modified = filesystemModifiedTime(entry);
       const mftModified = filesystemMftModifiedTime(entry);
       const artifactTime = artifactEventTime(entry);
-      const sha256 = filesystemFileSha256(entry);
+      const sha256 = filesystemFileHashDisplay(entry);
       const size = entry.size_bytes == null ? "" : formatBytes(entry.size_bytes);
       return {
         kind: "entry",
@@ -19199,9 +19517,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
         selectable: true,
         values: {
           name: entry.name || logicalName(entry.logical_path),
+          category: entryCategoryLabel(entry),
           type: filesystemTypeLabel(entry),
           ext: filesystemFileExtension(entry),
+          detectedType: filesystemDetectedType(entry),
+          signature: filesystemSignatureStatus(entry),
+          flags: entryFlagsText(entry) || "-",
           size,
+          offset: entryPrimaryOffset(entry),
           artifactTime,
           created,
           accessed,
@@ -19211,6 +19534,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         },
         sortValues: {
           size: entry.size_bytes == null ? NaN : Number(entry.size_bytes),
+          offset: gridNumericValue(entryPrimaryOffset(entry)),
           artifactTime: Date.parse(artifactTime),
           created: Date.parse(created),
           accessed: Date.parse(accessed),
@@ -19227,9 +19551,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
           <tr class="entry-row" onclick="selectFolder('${escapeAttr(escapeJs(row.path))}')"${folderEntry ? ` data-entry-id="${folderEntry.id}"` : ` data-folder-path="${escapeAttr(row.path)}"`}>
             <td></td>
             <td title="${escapeAttr(row.path)}">${svgIconHtml(FILE_ICON_SHAPES.folder, "file-icon file-icon-folder", "")}<span class="entry-name">${escapeHtml(logicalName(row.path))}</span></td>
+            <td class="entry-category">${escapeHtml(row.values.category)}</td>
             <td class="entry-kind" title="${row.count} ${escapeAttr(row.countKind)} item${row.count === 1 ? "" : "s"}">Folder</td>
             <td class="entry-ext"></td>
+            <td></td>
+            <td></td>
+            <td class="entry-flags">${folderEntry ? entryFlagsHtml(folderEntry) : '<span class="muted tiny">-</span>'}</td>
             <td class="entry-size"></td>
+            <td class="entry-offset" title="${escapeAttr(row.values.offset)}">${escapeHtml(row.values.offset)}</td>
             <td class="entry-time entry-artifact-time"></td>
             <td class="entry-time" title="${escapeAttr(row.values.created)}">${escapeHtml(row.values.created)}</td>
             <td class="entry-time" title="${escapeAttr(row.values.accessed)}">${escapeHtml(row.values.accessed)}</td>
@@ -19248,9 +19577,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
           <tr class="entry-row${deletedRow}${selected}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">
             <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleEntrySelection(${entry.id}, this.checked, event)"></td>
             <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span></td>
+            <td class="entry-category">${escapeHtml(row.values.category)}</td>
             <td class="entry-kind">${escapeHtml(filesystemTypeLabel(entry))}</td>
             <td class="entry-ext">${escapeHtml(filesystemFileExtension(entry))}</td>
+            <td title="${escapeAttr(row.values.detectedType)}">${escapeHtml(row.values.detectedType)}</td>
+            <td>${escapeHtml(row.values.signature)}</td>
+            <td class="entry-flags" title="${escapeAttr(row.values.flags)}">${entryFlagsHtml(entry)}</td>
             <td class="entry-size">${entry.size_bytes == null ? "" : formatBytes(entry.size_bytes)}</td>
+            <td class="entry-offset" title="${escapeAttr(row.values.offset)}">${escapeHtml(row.values.offset)}</td>
             <td class="entry-time entry-artifact-time" title="${escapeAttr(row.values.artifactTime)}">${escapeHtml(row.values.artifactTime)}</td>
             <td class="entry-time" title="${escapeAttr(row.values.created)}">${escapeHtml(row.values.created)}</td>
             <td class="entry-time" title="${escapeAttr(row.values.accessed)}">${escapeHtml(row.values.accessed)}</td>
@@ -19620,8 +19954,75 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const cleaned = String(value || "recovered.bin")
         .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
         .replace(/\s+/g, " ")
+        .replace(/[. ]+$/g, "_")
         .trim();
-      return cleaned || "recovered.bin";
+      return cleaned && cleaned !== "." && cleaned !== ".." ? cleaned : "recovered.bin";
+    }
+
+    function exportBatchDirectory(items, fallback = "evidence") {
+      const root = BOOTSTRAP.workspaceRoot || ".";
+      const names = (items || []).map((item) => item && (item.name || logicalName(item.logical_path || item.path))).filter(Boolean);
+      const first = safeFileName(names[0] || fallback).slice(0, 80);
+      const suffix = names.length > 1 ? "-and-" + (names.length - 1) + "-more" : "";
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").replace("Z", "Z");
+      return joinLocalPath(joinLocalPath(root, ["ui-output", "exported"]), [
+        first + suffix + "-export-" + stamp
+      ]);
+    }
+
+    let exportPathChoiceResolver = null;
+
+    function askPreserveOriginalExportPaths() {
+      if (exportPathChoiceResolver) {
+        return Promise.resolve(null);
+      }
+      const overlay = $("exportPathChoiceOverlay");
+      overlay.hidden = false;
+      return new Promise((resolve) => {
+        exportPathChoiceResolver = resolve;
+        window.setTimeout(() => {
+          const preferred = $("preserveExportPaths");
+          if (preferred) preferred.focus();
+        }, 0);
+      });
+    }
+
+    function resolveExportPathChoice(preservePaths) {
+      const overlay = $("exportPathChoiceOverlay");
+      if (overlay) overlay.hidden = true;
+      const resolve = exportPathChoiceResolver;
+      exportPathChoiceResolver = null;
+      if (resolve) resolve(preservePaths);
+    }
+
+    function sanitizedExportPathParts(path) {
+      let parts = String(path || "")
+        .replace(/\\/g, "/")
+        .split("/")
+        .filter((part) => part && part !== "." && part !== "..");
+      if (parts[0] === "Image Analysis" && parts[1] === "Volumes") {
+        parts = parts.slice(2);
+      }
+      return parts.map((part) => safeFileName(part));
+    }
+
+    function indexedExportPathParts(entry) {
+      const metadata = entry && entry.metadata_json ? entry.metadata_json : {};
+      const exact = firstText(metadata.source_path_exact, metadata.ntfs_path, metadata.fat_path);
+      const parts = sanitizedExportPathParts(exact || entry.logical_path);
+      if (parts.length && parts[parts.length - 1] !== safeFileName(entry.name || "")) {
+        parts.push(safeFileName(entry.name || logicalName(entry.logical_path) || "exported.bin"));
+      }
+      return parts.length ? parts : [safeFileName(entry.name || "exported.bin")];
+    }
+
+    function liveExportPathParts(item) {
+      const evidence = state.data && state.data.evidence.find((source) => Number(source.id) === Number(state.live.evidenceId));
+      const parts = sanitizedExportPathParts(item.path);
+      if (evidence && evidence.source_kind === "image") {
+        parts.unshift("volume-" + item.volume);
+      }
+      return parts.length ? parts : [safeFileName(item.name || "volume-" + item.volume)];
     }
 
     function categorizedVisibleEntries(entries) {
@@ -19774,6 +20175,150 @@ const INDEX_HTML: &str = r###"<!doctype html>
     const TIMELINE_HOUR_MS = 60 * 60 * 1000;
     const TIMELINE_DAY_MS = 24 * TIMELINE_HOUR_MS;
     const TIMELINE_TABLE_RENDER_LIMIT = 2000;
+    const timelineFormatterCache = new Map();
+
+    function caseDisplayTimezone() {
+      const value = state.data && state.data.case && state.data.case.timezone
+        ? String(state.data.case.timezone)
+        : "UTC";
+      return browserSupportsTimezone(value) ? value : "UTC";
+    }
+
+    function timelineFormatter(options) {
+      const timezone = caseDisplayTimezone();
+      const key = timezone + "|" + JSON.stringify(options);
+      if (!timelineFormatterCache.has(key)) {
+        timelineFormatterCache.set(key, new Intl.DateTimeFormat("en-GB", { ...options, timeZone: timezone }));
+      }
+      return timelineFormatterCache.get(key);
+    }
+
+    function timelineZonedParts(timestampMs) {
+      const formatter = timelineFormatter({
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hourCycle: "h23",
+        timeZoneName: "longOffset"
+      });
+      const values = {};
+      formatter.formatToParts(new Date(timestampMs)).forEach((part) => {
+        if (part.type !== "literal") values[part.type] = part.value;
+      });
+      const offsetText = values.timeZoneName || "GMT";
+      const match = /^GMT(?:([+-])(\d{1,2})(?::?(\d{2}))?)?$/.exec(offsetText);
+      const offsetMinutes = match && match[1]
+        ? (match[1] === "-" ? -1 : 1) * (Number(match[2]) * 60 + Number(match[3] || 0))
+        : 0;
+      return {
+        year: Number(values.year),
+        month: Number(values.month),
+        day: Number(values.day),
+        hour: Number(values.hour),
+        minute: Number(values.minute),
+        second: Number(values.second),
+        offsetMinutes,
+        offsetText: offsetText === "GMT" ? "UTC" : offsetText
+      };
+    }
+
+    function timelineDisplayTimestamp(timestampMs, fallback = "") {
+      if (!Number.isFinite(timestampMs)) return fallback;
+      const parts = timelineZonedParts(timestampMs);
+      const pad = (value, width = 2) => String(value).padStart(width, "0");
+      const milliseconds = new Date(timestampMs).getUTCMilliseconds();
+      return pad(parts.year, 4) + "-" + pad(parts.month) + "-" + pad(parts.day)
+        + " " + pad(parts.hour) + ":" + pad(parts.minute) + ":" + pad(parts.second)
+        + "." + pad(milliseconds, 3) + " " + parts.offsetText
+        + " [" + caseDisplayTimezone() + "]";
+    }
+
+    function zonedDateBoundaryMillis(dateText, nextDay = false) {
+      if (!dateText) return null;
+      const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateText);
+      if (!match) return null;
+      const base = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + (nextDay ? 1 : 0)));
+      const target = {
+        year: base.getUTCFullYear(),
+        month: base.getUTCMonth() + 1,
+        day: base.getUTCDate(),
+        hour: 0,
+        minute: 0,
+        second: 0
+      };
+      const targetAsUtc = Date.UTC(target.year, target.month - 1, target.day, 0, 0, 0);
+      let guess = targetAsUtc;
+      // Convert a wall-clock midnight in the selected IANA zone to an instant.
+      // Iteration handles DST/offset changes without depending on the host zone.
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const observed = timelineZonedParts(guess);
+        const observedAsUtc = Date.UTC(
+          observed.year,
+          observed.month - 1,
+          observed.day,
+          observed.hour,
+          observed.minute,
+          observed.second
+        );
+        const correction = targetAsUtc - observedAsUtc;
+        guess += correction;
+        if (correction === 0) break;
+      }
+      return guess;
+    }
+
+    function zonedDateTimeMillis(localText) {
+      if (!localText) return null;
+      const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(localText);
+      if (!match) return null;
+      const target = {
+        year: Number(match[1]),
+        month: Number(match[2]),
+        day: Number(match[3]),
+        hour: Number(match[4]),
+        minute: Number(match[5]),
+        second: Number(match[6] || 0)
+      };
+      const targetAsUtc = Date.UTC(
+        target.year,
+        target.month - 1,
+        target.day,
+        target.hour,
+        target.minute,
+        target.second
+      );
+      let guess = targetAsUtc;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const observed = timelineZonedParts(guess);
+        const observedAsUtc = Date.UTC(
+          observed.year,
+          observed.month - 1,
+          observed.day,
+          observed.hour,
+          observed.minute,
+          observed.second
+        );
+        const correction = targetAsUtc - observedAsUtc;
+        guess += correction;
+        if (correction === 0) break;
+      }
+      return guess;
+    }
+
+    function evidenceDateRangeBounds() {
+      const from = state.dateFilter.from ? zonedDateBoundaryMillis(state.dateFilter.from, false) : -Infinity;
+      const toExclusive = state.dateFilter.to ? zonedDateBoundaryMillis(state.dateFilter.to, true) : Infinity;
+      return { from, toExclusive };
+    }
+
+    function timelineRangeBounds() {
+      const from = state.timeline.rangeFrom ? zonedDateTimeMillis(state.timeline.rangeFrom) : -Infinity;
+      const toExclusive = state.timeline.rangeTo ? zonedDateTimeMillis(state.timeline.rangeTo) : Infinity;
+      return { from, toExclusive };
+    }
     const TIMELINE_METADATA_TIME_FIELDS = [
       { key: "artifact_time_utc", label: "Artifact Date/Time" },
       { key: "email_date", label: "Email Date/Time" },
@@ -19939,7 +20484,20 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       const total = Number(state.data.entry_count || 0);
-      const rangeActive = dateFilterActive();
+      const rangeActive = timelineRangeActive();
+      if (rangeActive) {
+        const bounds = timelineRangeBounds();
+        if ((state.timeline.rangeFrom && !Number.isFinite(bounds.from))
+          || (state.timeline.rangeTo && !Number.isFinite(bounds.toExclusive))) {
+          setNotice("Enter valid timeline From/To values.", true);
+          return;
+        }
+        if (Number.isFinite(bounds.from) && Number.isFinite(bounds.toExclusive)
+          && bounds.from >= bounds.toExclusive) {
+          setNotice("Timeline To must be later than From. The start is inclusive and the end is exclusive.", true);
+          return;
+        }
+      }
       // A date range set BEFORE building lets the server filter with SQL
       // (json_extract over every known timestamp field, see
       // list_filesystem_entries_for_timeline) instead of shipping every
@@ -19952,7 +20510,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const proceed = window.confirm(
           "No date range is set above, so this will scan all " + total.toLocaleString() +
           " indexed entries and can be slow or freeze the tab on large cases.\n\n" +
-          "Click Cancel, set a From/To date in the fields above, then click Build timeline again to scan only that window.\n\n" +
+           "Click Cancel, set an exact From/To date and time in the fields above, then click Build timeline again to scan only that window.\n\n" +
           "Build from all entries anyway?"
         );
         if (!proceed) {
@@ -19971,8 +20529,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       try {
         const params = { case_path: currentCasePath(), max_entries: limit };
         if (rangeActive) {
-          params.from = state.dateFilter.from ? state.dateFilter.from + "T00:00:00Z" : "0001-01-01T00:00:00Z";
-          params.to = state.dateFilter.to ? state.dateFilter.to + "T23:59:59.999Z" : "9999-12-31T23:59:59Z";
+          const bounds = timelineRangeBounds();
+          params.from = Number.isFinite(bounds.from) ? new Date(bounds.from).toISOString() : "0001-01-01T00:00:00Z";
+          params.to = Number.isFinite(bounds.toExclusive) ? new Date(bounds.toExclusive - 1).toISOString() : "9999-12-31T23:59:59Z";
         }
         const data = await apiGet("/api/timeline/entries", params);
         if (buildGeneration !== state.timeline.buildGeneration) {
@@ -19983,6 +20542,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         state.timeline.truncated = Boolean(data.truncated);
         const matchedTotal = Number(data.entry_count || total);
         state.timeline.totalEntryCount = matchedTotal;
+        state.timeline.tablePage = 0;
         rebuildTimelineEvents();
         renderTimeline();
         const scopeNote = rangeActive
@@ -20012,13 +20572,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function timelineDateFilteredEvents(events) {
-      if (!dateFilterActive()) {
+      if (!timelineRangeActive()) {
         return events;
       }
-      const from = state.dateFilter.from ? Date.parse(state.dateFilter.from + "T00:00:00Z") : -Infinity;
-      const to = state.dateFilter.to ? Date.parse(state.dateFilter.to + "T23:59:59.999Z") : Infinity;
+      const bounds = timelineRangeBounds();
       return events.filter((event) =>
-        Number.isFinite(event.timestampMs) && event.timestampMs >= from && event.timestampMs <= to
+        Number.isFinite(event.timestampMs)
+          && event.timestampMs >= bounds.from
+          && event.timestampMs < bounds.toExclusive
       );
     }
 
@@ -20027,22 +20588,36 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!focus) {
         return events;
       }
-      const startMs = Number(focus.startMs);
-      const endMs = Number(focus.endMs);
-      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) {
+      if (!focus.key || !focus.unit) {
         return events;
       }
       return events.filter((event) =>
-        Number.isFinite(event.timestampMs) && event.timestampMs >= startMs && event.timestampMs < endMs
+        Number.isFinite(event.timestampMs)
+          && timelineBucketKey(event.timestampMs, focus.unit) === focus.key
       );
     }
 
+    function timelineBucketKey(timestampMs, unit) {
+      const parts = timelineZonedParts(timestampMs);
+      const pad = (value) => String(value).padStart(2, "0");
+      const date = String(parts.year).padStart(4, "0") + "-" + pad(parts.month) + "-" + pad(parts.day);
+      // Include the offset for hours so the repeated hour at a DST fall-back
+      // remains two distinct, chronologically correct forensic buckets.
+      return unit === "hour"
+        ? date + "T" + pad(parts.hour) + "|" + String(parts.offsetMinutes)
+        : date;
+    }
+
     function timelineBucketStart(timestampMs, unit) {
-      const date = new Date(timestampMs);
+      const parts = timelineZonedParts(timestampMs);
       if (unit === "hour") {
-        return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), date.getUTCHours());
+        return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour)
+          - parts.offsetMinutes * 60 * 1000;
       }
-      return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate());
+      const date = String(parts.year).padStart(4, "0") + "-"
+        + String(parts.month).padStart(2, "0") + "-"
+        + String(parts.day).padStart(2, "0");
+      return zonedDateBoundaryMillis(date, false);
     }
 
     function timelineBucketLabel(timestampMs, unit) {
@@ -20050,7 +20625,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const options = unit === "hour"
         ? { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }
         : { month: "short", day: "numeric", year: "numeric" };
-      return date.toLocaleString(undefined, options);
+      return timelineFormatter(options).format(date);
     }
 
     function timelineAxisLabel(timestampMs, unit) {
@@ -20058,7 +20633,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const options = unit === "hour"
         ? { month: "short", day: "numeric", hour: "numeric" }
         : { month: "short", day: "numeric" };
-      return date.toLocaleString(undefined, options);
+      return timelineFormatter(options).format(date);
     }
 
     function timelineGraphData(events) {
@@ -20073,28 +20648,28 @@ const INDEX_HTML: &str = r###"<!doctype html>
         maxMs = Math.max(maxMs, event.timestampMs);
       });
       const unit = maxMs - minMs <= 3 * TIMELINE_DAY_MS ? "hour" : "day";
-      const intervalMs = unit === "hour" ? TIMELINE_HOUR_MS : TIMELINE_DAY_MS;
-      const bucketsByStart = new Map();
+      const bucketsByKey = new Map();
       validEvents.forEach((event) => {
+        const key = timelineBucketKey(event.timestampMs, unit);
         const startMs = timelineBucketStart(event.timestampMs, unit);
-        if (!bucketsByStart.has(startMs)) {
-          bucketsByStart.set(startMs, {
+        if (!bucketsByKey.has(key)) {
+          bucketsByKey.set(key, {
+            key,
             startMs,
-            endMs: startMs + intervalMs,
             unit,
             count: 0,
             firstEntryId: null,
             firstEventIndex: null
           });
         }
-        const bucket = bucketsByStart.get(startMs);
+        const bucket = bucketsByKey.get(key);
         bucket.count += 1;
         if (bucket.firstEntryId === null && event.entry && event.entry.id != null) {
           bucket.firstEntryId = event.entry.id;
           bucket.firstEventIndex = event.index;
         }
       });
-      const buckets = Array.from(bucketsByStart.values()).sort((left, right) => left.startMs - right.startMs);
+      const buckets = Array.from(bucketsByKey.values()).sort((left, right) => left.startMs - right.startMs);
       const maxCount = buckets.reduce((max, bucket) => Math.max(max, bucket.count), 0);
       return { buckets, unit, maxCount };
     }
@@ -20154,7 +20729,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         : "";
       const focus = state.timeline.focusBucket;
       const focusedPoint = focus
-        ? points.find((point) => point.bucket.startMs === focus.startMs && point.bucket.endMs === focus.endMs)
+        ? points.find((point) => point.bucket.key === focus.key && point.bucket.unit === focus.unit)
         : null;
       const tickHtml = timelineGraphTickIndexes(points.length).map((index) => {
         const point = points[index];
@@ -20237,12 +20812,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       state.timeline.focusBucket = {
+        key: bucket.key,
         startMs: bucket.startMs,
-        endMs: bucket.endMs,
         unit: bucket.unit,
         label: timelineBucketLabel(bucket.startMs, bucket.unit),
         count: bucket.count
       };
+      state.timeline.tablePage = 0;
       if (bucket.firstEntryId !== null) {
         state.timeline.selectedEntryId = bucket.firstEntryId;
         state.timeline.selectedEventIndex = bucket.firstEventIndex;
@@ -20263,6 +20839,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function clearTimelineBucketFocus() {
       state.timeline.focusBucket = null;
+      state.timeline.tablePage = 0;
       state.timeline.scrollToSelected = true;
       renderTimeline();
     }
@@ -20334,7 +20911,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const position = timelineSelectedEventPosition(events);
       const current = events[position];
       const title = timelineItemName(entry);
-      const eventTitle = current ? compactParts([current.timestamp, current.attribute]) : "";
+      const eventTitle = current
+        ? compactParts([timelineDisplayTimestamp(current.timestampMs, current.timestamp), current.attribute])
+        : "";
       const pager = events.length > 1
         ? `<div class="timeline-timestamp-pager" title="${escapeAttr(eventTitle)}">
             <button type="button" onclick="event.stopPropagation(); stepTimelineTimestamp(-1)" title="Previous timestamp">&lt;</button>
@@ -20447,13 +21026,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (kind.includes("clipboard") || /\b(copy|copied|paste|pasted|clipboard)\b/.test(intentText)) {
         return { label: "Copy/paste activity", tone: "clipboard" };
       }
-      if (["windows_shellbag_record", "windows_jumplist_lnk_record"].includes(kind)) {
+      if (["windows_shellbag_record", "windows_jumplist_lnk_record", "windows_recent_docs_record", "windows_run_mru_record", "windows_typed_path_record", "windows_search_query_record", "windows_network_drive_mru_record", "windows_mount_point_record", "windows_first_logon_record"].includes(kind)) {
         return { label: "User activity", tone: "user" };
       }
       if (["windows_prefetch_record", "windows_userassist_record"].includes(kind)) {
         return { label: "Program execution", tone: "execution" };
       }
-      if (["windows_amcache_record", "windows_shimcache_record"].includes(kind)) {
+      if (["windows_amcache_record", "windows_shimcache_record", "windows_muicache_record"].includes(kind)) {
         return { label: "Program evidence", tone: "knowledge" };
       }
       if (["windows_scheduled_task", "windows_startup_record"].includes(kind)) {
@@ -20461,6 +21040,34 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       if (kind === "windows_shell_link_record") {
         return { label: "Shortcut evidence", tone: "knowledge" };
+      }
+      if (kind === "evtx_event_record") {
+        const eventId = Number(metadata.evtx_event_id);
+        const provider = String(metadata.evtx_provider || "").toLowerCase();
+        const channel = String(metadata.evtx_channel || "").toLowerCase();
+        if ((channel === "security" || provider.includes("security-auditing"))
+          && [4624, 4625, 4634, 4648, 4672].includes(eventId)) {
+          return { label: "Authentication activity", tone: "user" };
+        }
+        if ((channel === "security" || provider.includes("security-auditing"))
+          && [4720, 4724, 4728, 4732, 4756].includes(eventId)) {
+          return { label: "Account change", tone: "user" };
+        }
+        if (provider.includes("sysmon")
+          || ((channel === "security" || provider.includes("security-auditing")) && eventId === 4688)) {
+          return { label: "Program execution", tone: "execution" };
+        }
+        if (provider.includes("windows defender")) {
+          return { label: "Security detection", tone: "system" };
+        }
+        if (provider.includes("powershell")) {
+          return { label: "PowerShell activity", tone: "execution" };
+        }
+        if ((channel === "security" || provider.includes("security-auditing"))
+          && [5140, 5145].includes(eventId)) {
+          return { label: "Network share activity", tone: "transfer" };
+        }
+        return { label: "System activity", tone: "system" };
       }
       if (["evtx_event_record", "evtx_log", "windows_srum_record", "registry_hive", "registry_key", "registry_value", "windows_local_account", "windows_user_profile", "wifi_profile"].includes(kind)) {
         return { label: "System activity", tone: "system" };
@@ -20485,7 +21092,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (isEmailEntry(entry)) {
         return emailDisplayName(entry);
       }
-      return firstText(metadata.title, metadata.file_name, metadata.registry_value_name, metadata.registry_key_name, metadata.url, entry.name, logicalName(entry.logical_path));
+      return firstText(metadata.evtx_event_title, metadata.title, metadata.file_name, metadata.registry_value_name, metadata.registry_key_name, metadata.url, entry.name, logicalName(entry.logical_path));
     }
 
     function timelineItemValue(entry) {
@@ -20500,8 +21107,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (metadata.artifact_kind === "registry_value") {
         return compactParts([metadata.registry_key_path, metadata.registry_value_data]);
       }
-      if (metadata.artifact_kind === "evtx_event_record") {
-        return compactParts([metadata.evtx_provider, metadata.evtx_summary]);
+      if (metadata.artifact_kind === "evtx_event_record" || metadata.artifact_kind === "evtx_external_record") {
+        const nativeFields = metadata.evtx_fields && typeof metadata.evtx_fields === "object" ? metadata.evtx_fields : {};
+        const externalFields = metadata.evtxecmd_fields && typeof metadata.evtxecmd_fields === "object" ? metadata.evtxecmd_fields : {};
+        const fields = Object.assign({}, externalFields, nativeFields);
+        const fieldPreview = Object.entries(fields).slice(0, 6).map(([key, value]) => key + "=" + spreadsheetSafeText(value)).join("; ");
+        return compactParts([metadata.evtx_provider, metadata.evtx_channel, fieldPreview, metadata.evtx_summary]);
       }
       if (isBrowserActivityEntry(entry)) {
         return firstText(metadata.url, metadata.target_path, metadata.tab_url, metadata.source_url, browserActivityPreview(entry));
@@ -20517,7 +21128,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return {
         event,
         values: {
-          time: event.timestamp,
+          time: timelineDisplayTimestamp(event.timestampMs, event.timestamp),
           attribute: timelineAttributeSummary(event.attribute),
           timelineCategory: timelineCategory.label,
           item,
@@ -20526,6 +21137,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         sortValues: {
           time: event.timestampMs
         },
+        canonicalTime: event.timestamp,
         timelineCategory
       };
     }
@@ -20540,7 +21152,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const tone = row.timelineCategory.tone || "knowledge";
       return `
           <tr class="entry-row${selected}" data-entry-id="${entry.id}" data-timeline-event-index="${event.index}" onclick="selectTimelineEntry(${entry.id}, ${event.index})" ondblclick="event.stopPropagation(); closeTimelineDetail(); goToEntryFolder(${entry.id})">
-            <td class="entry-time" title="${escapeAttr(row.values.time)}">${escapeHtml(row.values.time)}</td>
+            <td class="entry-time" title="Stored source/canonical value: ${escapeAttr(row.canonicalTime || "")}">${escapeHtml(row.values.time)}</td>
             <td title="${escapeAttr(event.attribute || row.values.attribute)}">${escapeHtml(row.values.attribute)}</td>
             <td><span class="timeline-badge timeline-${escapeAttr(tone)}">${escapeHtml(row.values.timelineCategory)}</span></td>
             <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="timeline-item-name">${escapeHtml(row.values.item)}</span></td>
@@ -20574,7 +21186,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return -1;
       }
       const buckets = state.timeline.graphBuckets || [];
-      return buckets.findIndex((bucket) => timestampMs >= bucket.startMs && timestampMs < bucket.endMs);
+      return buckets.findIndex((bucket) =>
+        bucket.key === timelineBucketKey(timestampMs, bucket.unit)
+      );
     }
 
     // "Jump to this timestamp on the timeline": select the exact event AND move
@@ -20607,7 +21221,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const selectedIndex = Number(state.timeline.selectedEventIndex);
       const chips = events.map((event) => {
         const active = Number(event.index) === selectedIndex ? " active" : "";
-        const stamp = escapeHtml(event.timestamp || "(no timestamp)");
+        const stamp = escapeHtml(timelineDisplayTimestamp(event.timestampMs, event.timestamp || "(no timestamp)"));
         const attr = escapeHtml(event.attribute || "Timestamp");
         return `<button type="button" class="timeline-jump${active}" title="Jump to this timestamp on the timeline"
             onclick="jumpTimelineToEvent(${entry.id}, ${event.index})">
@@ -20650,7 +21264,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const position = timelineSelectedEventPosition(events);
       const current = position >= 0 ? events[position] : null;
       const selectedLine = current
-        ? `<div class="timeline-detail-selected">${fileIconHtml(entry)}<span>${escapeHtml(current.timestamp || "(no timestamp)")}</span><span class="timeline-jump-attr">${escapeHtml(current.attribute || "")}</span></div>`
+        ? `<div class="timeline-detail-selected">${fileIconHtml(entry)}<span title="Stored source/canonical value: ${escapeAttr(current.timestamp || "")}">${escapeHtml(timelineDisplayTimestamp(current.timestampMs, current.timestamp || "(no timestamp)"))}</span><span class="timeline-jump-attr">${escapeHtml(current.attribute || "")}</span></div>`
         : `<div class="timeline-detail-selected">${fileIconHtml(entry)}<span>${escapeHtml(timelineItemName(entry))}</span></div>`;
       const head = `<div class="timeline-detail-head">${selectedLine}${timelineEventJumpChips(entry)}</div>`;
       pane.innerHTML = head + metadataView(entry);
@@ -20734,6 +21348,23 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return `<span class="timeline-scope-chip" title="The bounded build prioritizes parsed artifact records, then file metadata. Narrow the date range and rebuild to examine another window.">Coverage: ${loaded} of ${total} timeline records</span>`;
     }
 
+    function setTimelineTablePage(page) {
+      const requested = Math.max(0, Number(page) || 0);
+      state.timeline.tablePage = requested;
+      renderTimeline();
+      const table = $("timelineTable");
+      if (table) table.scrollTop = 0;
+    }
+
+    function timelineTablePagerHtml(page, pageCount, rowStart, rowEnd, total) {
+      if (pageCount <= 1) return "";
+      return `<div class="timeline-selection-nav">
+        <button type="button" class="ghost" ${page <= 0 ? "disabled" : ""} onclick="setTimelineTablePage(${page - 1})">Previous 2,000</button>
+        <span class="timeline-selection-title">Rows ${rowStart.toLocaleString()}–${rowEnd.toLocaleString()} of ${total.toLocaleString()} • page ${(page + 1).toLocaleString()} of ${pageCount.toLocaleString()}</span>
+        <button type="button" class="ghost" ${page + 1 >= pageCount ? "disabled" : ""} onclick="setTimelineTablePage(${page + 1})">Next 2,000</button>
+      </div>`;
+    }
+
     function renderTimeline() {
       const table = $("timelineTable");
       const graph = $("timelineGraph");
@@ -20748,7 +21379,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
         buildButton.disabled = Boolean(state.timeline.building);
         buildButton.textContent = state.timeline.building ? "Building..." : "Build timeline";
       }
-      syncDateFilterInputs();
+      const subtitle = $("timelineSubtitle");
+      if (subtitle) {
+        subtitle.textContent = "Timestamped events • display " + caseDisplayTimezone() + " • canonical storage UTC";
+      }
+      syncTimelineRangeInputs();
       if (!state.data) {
         count.textContent = "not built";
         summary.textContent = "No case loaded.";
@@ -20782,25 +21417,36 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const rows = tableEvents.map(timelineGridRow);
       const columns = timelineGridColumns();
       const matchingRows = visibleGridRows("timeline", columns, rows);
-      const renderedRows = matchingRows.slice(0, TIMELINE_TABLE_RENDER_LIMIT);
+      const pageCount = Math.max(1, Math.ceil(matchingRows.length / TIMELINE_TABLE_RENDER_LIMIT));
+      const page = Math.min(Math.max(0, Number(state.timeline.tablePage || 0)), pageCount - 1);
+      state.timeline.tablePage = page;
+      const rowOffset = page * TIMELINE_TABLE_RENDER_LIMIT;
+      const renderedRows = matchingRows.slice(rowOffset, rowOffset + TIMELINE_TABLE_RENDER_LIMIT);
       const tableResult = sortableGridTable("timeline", columns, renderedRows, "timeline-table", renderTimelineGridRow);
       count.textContent = matchingRows.length.toLocaleString() + " events";
-      const baseText = dateFilterActive()
-        ? "date filtered from " + allEvents.length.toLocaleString() + " total events"
+      const baseText = timelineRangeActive()
+        ? "time filtered from " + allEvents.length.toLocaleString() + " total events"
         : allEvents.length.toLocaleString() + " total events";
       const focusText = state.timeline.focusBucket
         ? "bucket " + timelineBucketLabel(state.timeline.focusBucket.startMs, state.timeline.focusBucket.unit)
         : "";
       const scopeChip = timelineScopeNoticeHtml();
       const tableWindowChip = matchingRows.length > renderedRows.length
-        ? `<span class="timeline-scope-chip" title="Narrow the date range or select a graph bucket to inspect another table window.">Table window: first ${TIMELINE_TABLE_RENDER_LIMIT.toLocaleString()}</span>`
+        ? `<span class="timeline-scope-chip" title="Use Previous/Next below or narrow the exact time range.">Table page ${(page + 1).toLocaleString()} of ${pageCount.toLocaleString()}</span>`
         : "";
       summary.innerHTML = `<span><strong>${tableResult.visibleRows.length.toLocaleString()}</strong> shown</span><span>${matchingRows.length.toLocaleString()} match current filters</span><span>${tableEvents.length.toLocaleString()} in date/bucket scope</span><span>${escapeHtml(focusText || baseText)}</span>${scopeChip}${tableWindowChip}`;
       const filterStatus = gridFilterStatusHtml("timeline", columns, matchingRows.length, rows.length, "events");
       const noRows = matchingRows.length
         ? ""
         : empty(tableEvents.length ? "No timeline events match the column filters." : "No timestamped events match the active date or bucket filter.");
-      table.innerHTML = filterStatus + tableResult.html + noRows;
+      const pager = timelineTablePagerHtml(
+        page,
+        pageCount,
+        matchingRows.length ? rowOffset + 1 : 0,
+        rowOffset + renderedRows.length,
+        matchingRows.length
+      );
+      table.innerHTML = pager + filterStatus + tableResult.html + noRows + pager;
       renderTimelineDetail();
       scrollTimelineToSelectedEvent();
     }
@@ -23965,6 +24611,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         column: columnKey,
         direction: current.column === columnKey && current.direction === "asc" ? "desc" : "asc"
       };
+      if (gridId === "timeline") {
+        state.timeline.tablePage = 0;
+      }
       if (gridId === "search") {
         state.searchSort = view.sort;
       }
@@ -23985,6 +24634,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       if (gridId === "search") {
         state.searchColumnFilters = view.filters;
+      }
+      if (gridId === "timeline") {
+        state.timeline.tablePage = 0;
       }
       const reloadCompleteCategory = gridId === "category" && serverCategoryBrowseActive();
       rerenderGrid(gridId);
@@ -24622,6 +25274,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (event.key === "Escape") {
         hideContextMenu();
         closeTimelineDetail();
+        resolveExportPathChoice(null);
       }
     });
     document.addEventListener("scroll", hideContextMenu, true);
@@ -24630,6 +25283,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
     $("casePath").value = normalizePathInput(state.casePath);
     $("evidencePath").value = normalizePathInput(localStorage.getItem("kdft.evidencePath") || BOOTSTRAP.defaultEvidencePath);
     $("reportPath").value = normalizePathInput(BOOTSTRAP.defaultReportPath);
+    populateEvidenceTimezones();
+    $("evidenceTimezone").addEventListener("change", () => {
+      localStorage.setItem("kdft.evidenceTimezone", evidenceTimezoneValue());
+    });
     // Clear any persisted processing cap from the removed "Processing limit" input.
     localStorage.removeItem("kdft.processMaxEntries");
     PROCESSING_OPTION_CHECKBOXES.forEach((id) => {
@@ -24666,16 +25323,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // needed; the value stays "" until the date is complete.
     [
       ["dateFilterFrom", "from"],
-      ["dateFilterTo", "to"],
-      ["timelineDateFrom", "from"],
-      ["timelineDateTo", "to"]
+      ["dateFilterTo", "to"]
     ].forEach(([id, field]) => {
       ["input", "change"].forEach((eventName) => {
         $(id).addEventListener(eventName, () => setDateFilterValue(field, $(id).value));
       });
     });
+    [["timelineDateFrom", "rangeFrom"], ["timelineDateTo", "rangeTo"]].forEach(([id, field]) => {
+      ["input", "change"].forEach((eventName) => {
+        $(id).addEventListener(eventName, () => setTimelineRangeValue(field, $(id).value));
+      });
+    });
     $("dateFilterClear").addEventListener("click", clearDateFilter);
-    $("timelineDateFilterClear").addEventListener("click", clearDateFilter);
+    $("timelineDateFilterClear").addEventListener("click", clearTimelineRange);
     $("buildTimeline").addEventListener("click", requestTimelineBuild);
     $("toggleInspector").addEventListener("click", toggleInspectorPane);
     $("analyzeBack").addEventListener("click", analyzeBack);
