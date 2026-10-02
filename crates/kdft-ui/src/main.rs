@@ -204,7 +204,6 @@ fn print_server_help() {
 struct ServerConfig {
     default_case_path: String,
     default_case_pinned: bool,
-    default_evidence_path: String,
     default_vhd_sample_path: String,
     default_history_path: String,
     default_report_path: String,
@@ -231,11 +230,6 @@ impl ServerConfig {
         Ok(Self {
             default_case_path: default_case_path.to_string_lossy().into_owned(),
             default_case_pinned,
-            default_evidence_path: cwd
-                .join("testdata")
-                .join("smoke-evidence")
-                .to_string_lossy()
-                .into_owned(),
             default_vhd_sample_path: output
                 .join("fat-partition-smoke.vhd")
                 .to_string_lossy()
@@ -671,6 +665,7 @@ struct UiState {
     bookmarks: Vec<kdft_case::Bookmark>,
     items: Vec<kdft_case::BookmarkItem>,
     entry_count: i64,
+    database_entry_count: i64,
     report: kdft_case::ReportData,
 }
 
@@ -706,7 +701,7 @@ struct HttpRequest {
     method: String,
     target: String,
     headers: HashMap<String, String>,
-    body: Vec<u8>,
+    body: zeroize::Zeroizing<Vec<u8>>,
 }
 
 struct HttpResponse {
@@ -756,7 +751,7 @@ fn handle_connection(mut stream: TcpStream, config: &ServerConfig) -> Result<()>
     if let Err(response) = authorize_request(&request, config, local_port) {
         return write_http_response(&mut stream, response);
     }
-    let response = route_request(&request, config);
+    let response = route_request(request, config);
     write_http_response(&mut stream, response)
 }
 
@@ -842,7 +837,7 @@ fn read_http_request_from<R: Read>(source: R) -> Result<HttpRequest> {
     if method == "GET" && content_length != 0 {
         bail!("GET requests cannot contain a body");
     }
-    let mut body = vec![0_u8; content_length];
+    let mut body = zeroize::Zeroizing::new(vec![0_u8; content_length]);
     if content_length > 0 {
         reader
             .read_exact(&mut body)
@@ -940,7 +935,7 @@ mod http_security_tests {
             method: "POST".to_string(),
             target: "/api/state".to_string(),
             headers,
-            body: Vec::new(),
+            body: Vec::new().into(),
         }
     }
 
@@ -966,7 +961,7 @@ mod http_security_tests {
         let parsed = read_http_request_from(Cursor::new(bytes)).unwrap();
         assert_eq!(parsed.method, "POST");
         assert_eq!(parsed.headers["host"], "127.0.0.1:8777");
-        assert_eq!(parsed.body, b"{}");
+        assert_eq!(parsed.body.as_slice(), b"{}");
     }
 
     #[test]
@@ -1033,7 +1028,7 @@ mod http_security_tests {
                 method: "POST".to_string(),
                 target: "/api/jobs/cancel".to_string(),
                 headers,
-                body: br#"{"progress_id":"x"}"#.to_vec(),
+                body: br#"{\"progress_id\":\"x\"}"#.to_vec().into(),
             }
         };
         assert!(authorize_request(
@@ -1057,7 +1052,7 @@ mod http_security_tests {
     }
 }
 
-fn route_request(request: &HttpRequest, config: &ServerConfig) -> HttpResponse {
+fn route_request(mut request: HttpRequest, config: &ServerConfig) -> HttpResponse {
     let (path, query) = split_target(&request.target);
     match (request.method.as_str(), path.as_str()) {
         ("GET", "/") => {
@@ -1074,23 +1069,37 @@ fn route_request(request: &HttpRequest, config: &ServerConfig) -> HttpResponse {
         ("GET", "/api/health") => json_ok(json!({ "status": "ok" })),
         ("GET", "/api/pick") => api_response(api_pick_path(&query)),
         ("GET", "/api/jobs/progress") => api_response(api_job_progress(&query, config)),
-        ("POST", "/api/jobs/cancel") => api_response(api_job_cancel(&request.body, config)),
+        ("POST", "/api/jobs/cancel") => api_response(api_job_cancel(&mut request.body, config)),
         ("GET", "/api/fs/list") => api_response(api_fs_list(&query)),
         ("GET", "/api/image/volumes") => api_response(api_image_volumes(&query)),
         ("GET", "/api/image/forensic/status") => api_response(api_image_forensic_status(&query)),
         ("POST", "/api/image/forensic/build") => {
-            api_response(api_image_forensic_build(&request.body, config))
+            api_response(api_image_forensic_build(&mut request.body, config))
         }
         ("GET", "/api/image/dir") => api_response(api_image_dir(&query)),
         ("GET", "/api/image/bytes") => api_response(api_image_bytes(&query)),
         ("GET", "/api/image/find") => api_response(api_image_find(&query)),
-        ("POST", "/api/image/export") => api_response(api_image_export(&request.body)),
-        ("POST", "/api/image/export-tree") => api_response(api_image_export_tree(&request.body)),
+        ("POST", "/api/image/export") => api_response(api_image_export(&mut request.body)),
+        ("POST", "/api/image/export-tree") => {
+            api_response(api_image_export_tree(&mut request.body))
+        }
         ("POST", "/api/image/bitlocker/unlock/list") => {
-            api_response(api_bitlocker_unlock_list(&request.body))
+            api_response(api_bitlocker_unlock_list(&mut request.body))
+        }
+        ("POST", "/api/image/bitlocker/unlock/raw") => {
+            match api_bitlocker_unlock_raw(&mut request.body) {
+                Ok((content_type, body)) => HttpResponse {
+                    status: 200,
+                    reason: "OK",
+                    content_type,
+                    body,
+                    headers: Vec::new(),
+                },
+                Err(err) => json_error(400, &format!("{err:#}")),
+            }
         }
         ("POST", "/api/image/bitlocker/unlock/bytes") => {
-            api_response(api_bitlocker_unlock_bytes(&request.body))
+            api_response(api_bitlocker_unlock_bytes(&mut request.body))
         }
         ("GET", "/api/entries/dir") => api_response(api_entries_dir(&query)),
         ("GET", "/api/entry") => api_response(api_entry_lookup(&query)),
@@ -1119,48 +1128,52 @@ fn route_request(request: &HttpRequest, config: &ServerConfig) -> HttpResponse {
             },
             Err(err) => json_error(400, &format!("{err:#}")),
         },
-        ("POST", "/api/case/create") => api_response(api_create_case(&request.body)),
-        ("POST", "/api/evidence/add") => api_response(api_add_evidence(&request.body)),
-        ("POST", "/api/evidence/remove") => api_response(api_remove_evidence(&request.body)),
-        ("POST", "/api/evidence/hash") => api_response(api_hash_evidence(&request.body)),
-        ("POST", "/api/evidence/carve") => api_response(api_carve_evidence(&request.body)),
+        ("POST", "/api/case/create") => api_response(api_create_case(&mut request.body)),
+        ("POST", "/api/evidence/add") => api_response(api_add_evidence(&mut request.body)),
+        ("POST", "/api/evidence/remove") => api_response(api_remove_evidence(&mut request.body)),
+        ("POST", "/api/evidence/hash") => api_response(api_hash_evidence(&mut request.body)),
+        ("POST", "/api/evidence/carve") => api_response(api_carve_evidence(&mut request.body)),
         ("POST", "/api/evidence/process") => {
-            api_response(api_process_evidence(&request.body, config))
+            api_response(api_process_evidence(&mut request.body, config))
         }
         ("POST", "/api/evidence/run-processors") => {
-            api_response(api_run_processors(&request.body, config))
+            api_response(api_run_processors(&mut request.body, config))
         }
-        ("POST", "/api/evidence/parse-browsers") => api_response(api_parse_browsers(&request.body)),
+        ("POST", "/api/evidence/parse-browsers") => {
+            api_response(api_parse_browsers(&mut request.body))
+        }
         ("POST", "/api/evidence/analyze-signatures") => {
-            api_response(api_analyze_signatures(&request.body))
+            api_response(api_analyze_signatures(&mut request.body))
         }
-        ("POST", "/api/entry/recover") => api_response(api_recover_entry(&request.body)),
-        ("POST", "/api/entry/open") => api_response(api_open_entry(&request.body)),
-        ("POST", "/api/history/import") => api_response(api_import_history(&request.body)),
+        ("POST", "/api/entry/recover") => api_response(api_recover_entry(&mut request.body)),
+        ("POST", "/api/entry/open") => api_response(api_open_entry(&mut request.body)),
+        ("POST", "/api/history/import") => api_response(api_import_history(&mut request.body)),
         ("POST", "/api/history/import-from-image") => {
-            api_response(api_import_history_from_image(&request.body))
+            api_response(api_import_history_from_image(&mut request.body))
         }
-        ("POST", "/api/search/deep") => api_response(api_deep_search(&request.body)),
-        ("POST", "/api/search/raw") => api_response(api_raw_search(&request.body)),
-        ("POST", "/api/bookmark/quick") => api_response(api_quick_bookmark(&request.body)),
-        ("POST", "/api/bookmark/remove") => api_response(api_remove_bookmark(&request.body)),
-        ("POST", "/api/bookmark/bulk") => api_response(api_bulk_bookmark(&request.body)),
+        ("POST", "/api/search/deep") => api_response(api_deep_search(&mut request.body)),
+        ("POST", "/api/search/raw") => api_response(api_raw_search(&mut request.body)),
+        ("POST", "/api/bookmark/quick") => api_response(api_quick_bookmark(&mut request.body)),
+        ("POST", "/api/bookmark/remove") => api_response(api_remove_bookmark(&mut request.body)),
+        ("POST", "/api/bookmark/bulk") => api_response(api_bulk_bookmark(&mut request.body)),
         ("POST", "/api/bookmark/item/remove") => {
-            api_response(api_remove_bookmark_item(&request.body))
+            api_response(api_remove_bookmark_item(&mut request.body))
         }
         ("POST", "/api/bookmark/folder/remove") => {
-            api_response(api_remove_bookmark_folder(&request.body))
+            api_response(api_remove_bookmark_folder(&mut request.body))
         }
         ("POST", "/api/bookmark/folder-recursive-indexed") => {
             api_response(api_bookmark_folder_recursive_indexed(&request.body))
         }
         ("POST", "/api/bookmark/folder-recursive-live") => {
-            api_response(api_bookmark_folder_recursive_live(&request.body))
+            api_response(api_bookmark_folder_recursive_live(&mut request.body))
         }
-        ("POST", "/api/findings/clear") => api_response(api_clear_findings(&request.body)),
-        ("POST", "/api/case/recategorize") => api_response(api_recategorize(&request.body)),
-        ("POST", "/api/report/export") => api_response(api_export_report(&request.body, config)),
-        ("POST", "/api/report/open") => api_response(api_open_report(&request.body, config)),
+        ("POST", "/api/findings/clear") => api_response(api_clear_findings(&mut request.body)),
+        ("POST", "/api/case/recategorize") => api_response(api_recategorize(&mut request.body)),
+        ("POST", "/api/report/export") => {
+            api_response(api_export_report(&mut request.body, config))
+        }
+        ("POST", "/api/report/open") => api_response(api_open_report(&mut request.body, config)),
         ("GET", "/favicon.ico") => HttpResponse {
             status: 204,
             reason: "No Content",
@@ -1207,6 +1220,7 @@ fn api_state(query: &HashMap<String, String>) -> Result<UiState> {
         bookmarks: list_bookmarks(&case_path)?,
         items: list_bookmark_items(&case_path, None)?,
         entry_count,
+        database_entry_count,
         report: report_data(&case_path)?,
     })
 }
@@ -1242,8 +1256,8 @@ struct CancelJobRequest {
     progress_id: String,
 }
 
-fn api_job_cancel(body: &[u8], config: &ServerConfig) -> Result<serde_json::Value> {
-    let request: CancelJobRequest = parse_json_body(body)?;
+fn api_job_cancel(body: &mut [u8], config: &ServerConfig) -> Result<serde_json::Value> {
+    let request: CancelJobRequest = parse_json_body(&mut body.to_vec())?;
     let accepted = config.progress.cancel(&request.progress_id)?;
     Ok(serde_json::json!({ "accepted": accepted }))
 }
@@ -1594,8 +1608,8 @@ fn api_image_forensic_status(query: &HashMap<String, String>) -> Result<serde_js
     )?)
 }
 
-fn api_image_forensic_build(body: &[u8], config: &ServerConfig) -> Result<serde_json::Value> {
-    let request: ForensicCatalogBuildRequest = parse_json_body(body)?;
+fn api_image_forensic_build(body: &mut [u8], config: &ServerConfig) -> Result<serde_json::Value> {
+    let request: ForensicCatalogBuildRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let source = live_evidence_source(&case_path, request.evidence_id)?;
     if source.source_kind != "image" {
@@ -1755,8 +1769,8 @@ struct LiveExportRequest {
     output_path: String,
 }
 
-fn api_image_export(body: &[u8]) -> Result<kdft_case::LiveExportResult> {
-    let request: LiveExportRequest = parse_json_body(body)?;
+fn api_image_export(body: &mut [u8]) -> Result<kdft_case::LiveExportResult> {
+    let request: LiveExportRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let output_path = request_path(&request.output_path, "output_path")?;
     let source = live_evidence_source(&case_path, request.evidence_id)?;
@@ -1814,8 +1828,8 @@ struct LiveTreeExportRequest {
     max_files: Option<usize>,
 }
 
-fn api_image_export_tree(body: &[u8]) -> Result<kdft_case::LiveTreeExportResult> {
-    let request: LiveTreeExportRequest = parse_json_body(body)?;
+fn api_image_export_tree(body: &mut [u8]) -> Result<kdft_case::LiveTreeExportResult> {
+    let request: LiveTreeExportRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let output_dir = request_path(&request.output_dir, "output_dir")?;
     let source = live_evidence_source(&case_path, request.evidence_id)?;
@@ -1880,7 +1894,20 @@ fn api_image_export_tree(body: &[u8]) -> Result<kdft_case::LiveTreeExportResult>
 struct BitlockerUnlockCredentialRequest {
     #[serde(rename = "type")]
     kind: String,
-    value: String,
+    value: zeroize::Zeroizing<String>,
+}
+
+impl Drop for BitlockerUnlockCredentialRequest {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.kind.zeroize();
+    }
+}
+
+#[derive(Deserialize)]
+struct UnlockOnly {
+    unlock: Option<BitlockerUnlockCredentialRequest>,
+    volume_index: Option<usize>,
 }
 
 // Builds a call-scoped BitLocker credential from the request. The recovery
@@ -1892,10 +1919,10 @@ fn bitlocker_credential_from(
 ) -> Result<kdft_case::BitLockerUnlockCredential<'_>> {
     match unlock.kind.as_str() {
         "recovery_key" => Ok(kdft_case::BitLockerUnlockCredential::RecoveryKey(
-            &unlock.value,
+            unlock.value.as_str(),
         )),
         "password" => Ok(kdft_case::BitLockerUnlockCredential::Password(
-            &unlock.value,
+            unlock.value.as_str(),
         )),
         other => bail!("unknown BitLocker unlock type '{other}' (use recovery_key or password)"),
     }
@@ -1914,15 +1941,15 @@ struct BitlockerUnlockListRequest {
     case_path: String,
     evidence_id: i64,
     volume_index: usize,
-    unlock: BitlockerUnlockCredentialRequest,
     dir_path: Option<String>,
 }
 
-fn api_bitlocker_unlock_list(body: &[u8]) -> Result<serde_json::Value> {
-    let request: BitlockerUnlockListRequest = parse_json_body(body)?;
+fn api_bitlocker_unlock_list(body: &mut [u8]) -> Result<serde_json::Value> {
+    let (request, unlock_cred) = parse_json_body_with_unlock::<BitlockerUnlockListRequest>(body)?;
+    let unlock = unlock_cred.unlock.context("missing unlock credential")?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let source = bitlocker_image_source(&case_path, request.evidence_id)?;
-    let credential = bitlocker_credential_from(&request.unlock)?;
+    let credential = bitlocker_credential_from(&unlock)?;
     let dir_path = request.dir_path.as_deref().unwrap_or("/");
     let entries = kdft_case::list_bitlocker_ntfs_directory(
         Path::new(&source.source_path),
@@ -1938,17 +1965,57 @@ struct BitlockerUnlockBytesRequest {
     case_path: String,
     evidence_id: i64,
     volume_index: usize,
-    unlock: BitlockerUnlockCredentialRequest,
     file_path: String,
     offset: Option<u64>,
     length: Option<usize>,
 }
 
-fn api_bitlocker_unlock_bytes(body: &[u8]) -> Result<serde_json::Value> {
-    let request: BitlockerUnlockBytesRequest = parse_json_body(body)?;
+#[derive(Deserialize)]
+struct BitlockerUnlockRawRequest {
+    case_path: String,
+    evidence_id: i64,
+    volume_index: usize,
+    file_path: String,
+}
+
+fn validate_bitlocker_raster_preview(bytes: &[u8], total_size: u64) -> Result<&'static str> {
+    if total_size > RAW_PREVIEW_MAX_BYTES as u64 {
+        bail!("file size {total_size} exceeds raster preview cap {RAW_PREVIEW_MAX_BYTES}");
+    }
+    if total_size != bytes.len() as u64 {
+        bail!(
+            "raster preview read was incomplete ({} of {total_size} bytes)",
+            bytes.len()
+        );
+    }
+    detect_image_content_type(bytes)
+        .context("file is not a supported JPEG, PNG, GIF, BMP, WebP, or ICO raster image")
+}
+
+fn api_bitlocker_unlock_raw(body: &mut [u8]) -> Result<(&'static str, Vec<u8>)> {
+    let (request, unlock_cred) = parse_json_body_with_unlock::<BitlockerUnlockRawRequest>(body)?;
+    let unlock = unlock_cred.unlock.context("missing unlock credential")?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let source = bitlocker_image_source(&case_path, request.evidence_id)?;
-    let credential = bitlocker_credential_from(&request.unlock)?;
+    let credential = bitlocker_credential_from(&unlock)?;
+    let (bytes, total_size) = kdft_case::read_bitlocker_ntfs_file_bytes(
+        Path::new(&source.source_path),
+        request.volume_index,
+        credential,
+        &request.file_path,
+        0,
+        RAW_PREVIEW_MAX_BYTES,
+    )?;
+    let content_type = validate_bitlocker_raster_preview(&bytes, total_size)?;
+    Ok((content_type, bytes))
+}
+
+fn api_bitlocker_unlock_bytes(body: &mut [u8]) -> Result<serde_json::Value> {
+    let (request, unlock_cred) = parse_json_body_with_unlock::<BitlockerUnlockBytesRequest>(body)?;
+    let unlock = unlock_cred.unlock.context("missing unlock credential")?;
+    let case_path = request_path(&request.case_path, "case_path")?;
+    let source = bitlocker_image_source(&case_path, request.evidence_id)?;
+    let credential = bitlocker_credential_from(&unlock)?;
     let offset = request.offset.unwrap_or(0);
     let length = request.length.unwrap_or(512);
     let (bytes, total_size) = kdft_case::read_bitlocker_ntfs_file_bytes(
@@ -2643,8 +2710,8 @@ fn default_history_path() -> String {
         .unwrap_or_default()
 }
 
-fn api_create_case(body: &[u8]) -> Result<serde_json::Value> {
-    let request: CreateCaseRequest = parse_json_body(body)?;
+fn api_create_case(body: &mut [u8]) -> Result<serde_json::Value> {
+    let request: CreateCaseRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let case_id = create_case(
         &case_path,
@@ -2662,8 +2729,8 @@ fn api_create_case(body: &[u8]) -> Result<serde_json::Value> {
     Ok(json!({ "case_id": case_id, "case": case_path }))
 }
 
-fn api_add_evidence(body: &[u8]) -> Result<serde_json::Value> {
-    let request: AddEvidenceRequest = parse_json_body(body)?;
+fn api_add_evidence(body: &mut [u8]) -> Result<serde_json::Value> {
+    let request: AddEvidenceRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let evidence_path = request_path(&request.path, "path")?;
     let kind = EvidenceKind::parse(request.kind.as_deref().unwrap_or("auto"))?;
@@ -2736,8 +2803,8 @@ fn import_detected_browser_database(
     Ok(response)
 }
 
-fn api_process_evidence(body: &[u8], config: &ServerConfig) -> Result<serde_json::Value> {
-    let request: ProcessEvidenceRequest = parse_json_body(body)?;
+fn api_process_evidence(body: &mut [u8], config: &ServerConfig) -> Result<serde_json::Value> {
+    let (request, unlock) = parse_json_body_with_unlock::<ProcessEvidenceRequest>(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let (diagnostic_log, diagnostic_start_error) =
         match StreamingDiagnosticLog::start(&case_path, request.evidence_id, "analysis") {
@@ -2764,7 +2831,7 @@ fn api_process_evidence(body: &[u8], config: &ServerConfig) -> Result<serde_json
     };
     tracker.set_evidence_id(request.evidence_id);
     let result = with_job_progress(&tracker, || {
-        api_process_evidence_tracked(&case_path, &request, &tracker)
+        api_process_evidence_tracked(&case_path, &request, unlock, &tracker)
     });
     match result {
         Ok(mut response) => {
@@ -2818,8 +2885,8 @@ fn api_process_evidence(body: &[u8], config: &ServerConfig) -> Result<serde_json
 /// Runs examiner-selected processors against the existing immutable indexed
 /// snapshot. Unlike `/api/evidence/process`, this path never calls the base
 /// file-system walker and therefore never deletes `filesystem_entries`.
-fn api_run_processors(body: &[u8], config: &ServerConfig) -> Result<serde_json::Value> {
-    let request: ProcessEvidenceRequest = parse_json_body(body)?;
+fn api_run_processors(body: &mut [u8], config: &ServerConfig) -> Result<serde_json::Value> {
+    let (request, _unlock) = parse_json_body_with_unlock::<ProcessEvidenceRequest>(body)?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let (diagnostic_log, diagnostic_start_error) =
         match StreamingDiagnosticLog::start(&case_path, request.evidence_id, "processors") {
@@ -3136,6 +3203,7 @@ fn api_run_processors_tracked(
         &mut stage_index,
         stage_count,
         true,
+        false,
     )?;
 
     // If cancellation was requested between processor stages, stop before
@@ -3229,6 +3297,7 @@ fn api_run_processors_tracked(
 fn api_process_evidence_tracked(
     case_path: &Path,
     request: &ProcessEvidenceRequest,
+    unlock: UnlockOnly,
     tracker: &JobProgressTracker,
 ) -> Result<serde_json::Value> {
     let stage_count = process_stage_count(request);
@@ -3246,7 +3315,16 @@ fn api_process_evidence_tracked(
         None,
     );
     tracker.set_auto_advance_database_entries(true);
-    let index_result = kdft_case::process_evidence_with_profile(
+    let bitlocker_credential = match unlock.unlock {
+        Some(ref u) => Some(bitlocker_credential_from(u)?),
+        None => None,
+    };
+    let bitlocker_ctx =
+        bitlocker_credential.map(|credential| kdft_case::BitLockerProcessingContext {
+            volume_index: unlock.volume_index.unwrap_or(0),
+            credential,
+        });
+    let index_result = kdft_case::process_evidence_with_profile_and_bitlocker(
         case_path,
         ProcessEvidenceOptions {
             evidence_id: request.evidence_id,
@@ -3260,6 +3338,7 @@ fn api_process_evidence_tracked(
             parse_emails: request.parse_emails.unwrap_or(true),
             parse_browsers: request.parse_browsers.unwrap_or(true),
         },
+        bitlocker_ctx,
     )?;
     tracker.set_auto_advance_database_entries(false);
 
@@ -3302,6 +3381,7 @@ fn api_process_evidence_tracked(
         return Ok(response);
     }
 
+    let is_unlocked_bitlocker = unlock.unlock.is_some();
     // Examiner-selected follow-up passes, each already an independent audited
     // job. The base index result stays at the top level so existing callers
     // keep working; per-pass results (or their failure text) are nested. A
@@ -3316,6 +3396,7 @@ fn api_process_evidence_tracked(
         &mut stage_index,
         stage_count,
         false,
+        is_unlocked_bitlocker,
     )?;
 
     // If cancellation was requested between passes, stop the pipeline before
@@ -3525,6 +3606,7 @@ enum OptionalPassesOutcome {
     Cancelled,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_optional_processing_passes(
     case_path: &Path,
     request: &ProcessEvidenceRequest,
@@ -3533,10 +3615,17 @@ fn append_optional_processing_passes(
     stage_index: &mut usize,
     stage_count: usize,
     run_content_head_backfill: bool,
+    is_unlocked_bitlocker: bool,
 ) -> Result<OptionalPassesOutcome> {
     let extras = response
         .as_object_mut()
         .context("processing result serialized to a non-object")?;
+
+    let skip_msg = serde_json::json!({
+        "status": "skipped",
+        "error": "Structured processing requires a credential-aware reader for unlocked BitLocker evidence"
+    });
+
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
     }
@@ -3548,24 +3637,28 @@ fn append_optional_processing_passes(
             "Content capture backfill",
             "entries",
         );
-        extras.insert(
-            "content_head_backfill".to_string(),
-            run_optional_processing_pass(
-                case_path,
-                request.evidence_id,
-                "content head backfill",
-                tracker,
-                || {
-                    kdft_case::backfill_content_head(
-                        case_path,
-                        kdft_case::BackfillContentHeadOptions {
-                            evidence_id: request.evidence_id,
-                            max_entries: 0,
-                        },
-                    )
-                },
-            )?,
-        );
+        if is_unlocked_bitlocker {
+            extras.insert("content_head_backfill".to_string(), skip_msg.clone());
+        } else {
+            extras.insert(
+                "content_head_backfill".to_string(),
+                run_optional_processing_pass(
+                    case_path,
+                    request.evidence_id,
+                    "content head backfill",
+                    tracker,
+                    || {
+                        kdft_case::backfill_content_head(
+                            case_path,
+                            kdft_case::BackfillContentHeadOptions {
+                                evidence_id: request.evidence_id,
+                                max_entries: 0,
+                            },
+                        )
+                    },
+                )?,
+            );
+        }
     }
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
@@ -3578,16 +3671,20 @@ fn append_optional_processing_passes(
             "Archive member parsing",
             "archives",
         );
-        extras.insert(
-            "archive_parsing".to_string(),
-            run_optional_processing_pass(
-                case_path,
-                request.evidence_id,
-                "archive parsing",
-                tracker,
-                || parse_archive_artifacts(case_path, request.evidence_id),
-            )?,
-        );
+        if is_unlocked_bitlocker {
+            extras.insert("archive_parsing".to_string(), skip_msg.clone());
+        } else {
+            extras.insert(
+                "archive_parsing".to_string(),
+                run_optional_processing_pass(
+                    case_path,
+                    request.evidence_id,
+                    "archive parsing",
+                    tracker,
+                    || parse_archive_artifacts(case_path, request.evidence_id),
+                )?,
+            );
+        }
     }
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
@@ -3600,16 +3697,20 @@ fn append_optional_processing_passes(
             "Document content parsing",
             "documents",
         );
-        extras.insert(
-            "document_parsing".to_string(),
-            run_optional_processing_pass(
-                case_path,
-                request.evidence_id,
-                "document parsing",
-                tracker,
-                || parse_document_artifacts(case_path, request.evidence_id),
-            )?,
-        );
+        if is_unlocked_bitlocker {
+            extras.insert("document_parsing".to_string(), skip_msg.clone());
+        } else {
+            extras.insert(
+                "document_parsing".to_string(),
+                run_optional_processing_pass(
+                    case_path,
+                    request.evidence_id,
+                    "document parsing",
+                    tracker,
+                    || parse_document_artifacts(case_path, request.evidence_id),
+                )?,
+            );
+        }
     }
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
@@ -3622,21 +3723,25 @@ fn append_optional_processing_passes(
             "Windows artifact parsing",
             "Windows artifact sources",
         );
-        extras.insert(
-            "windows_artifact_parsing".to_string(),
-            run_optional_processing_pass(
-                case_path,
-                request.evidence_id,
-                "Windows artifact parsing",
-                tracker,
-                || {
-                    kdft_case::windows_artifacts::parse_windows_artifacts(
-                        case_path,
-                        request.evidence_id,
-                    )
-                },
-            )?,
-        );
+        if is_unlocked_bitlocker {
+            extras.insert("windows_artifact_parsing".to_string(), skip_msg.clone());
+        } else {
+            extras.insert(
+                "windows_artifact_parsing".to_string(),
+                run_optional_processing_pass(
+                    case_path,
+                    request.evidence_id,
+                    "Windows artifact parsing",
+                    tracker,
+                    || {
+                        kdft_case::windows_artifacts::parse_windows_artifacts(
+                            case_path,
+                            request.evidence_id,
+                        )
+                    },
+                )?,
+            );
+        }
         begin_processing_stage(
             tracker,
             stage_index,
@@ -3644,21 +3749,28 @@ fn append_optional_processing_passes(
             "Windows Registry artifact parsing",
             "Registry hives",
         );
-        extras.insert(
-            "windows_registry_artifact_parsing".to_string(),
-            run_optional_processing_pass(
-                case_path,
-                request.evidence_id,
-                "Windows Registry artifact parsing",
-                tracker,
-                || {
-                    kdft_case::windows_registry_artifacts::parse_windows_registry_artifacts(
-                        case_path,
-                        request.evidence_id,
-                    )
-                },
-            )?,
-        );
+        if is_unlocked_bitlocker {
+            extras.insert(
+                "windows_registry_artifact_parsing".to_string(),
+                skip_msg.clone(),
+            );
+        } else {
+            extras.insert(
+                "windows_registry_artifact_parsing".to_string(),
+                run_optional_processing_pass(
+                    case_path,
+                    request.evidence_id,
+                    "Windows Registry artifact parsing",
+                    tracker,
+                    || {
+                        kdft_case::windows_registry_artifacts::parse_windows_registry_artifacts(
+                            case_path,
+                            request.evidence_id,
+                        )
+                    },
+                )?,
+            );
+        }
     }
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
@@ -3671,16 +3783,20 @@ fn append_optional_processing_passes(
             "Embedded mailbox parsing",
             "mailboxes",
         );
-        extras.insert(
-            "email_parsing".to_string(),
-            run_optional_processing_pass(
-                case_path,
-                request.evidence_id,
-                "embedded mailbox parsing",
-                tracker,
-                || parse_embedded_mailboxes(case_path, request.evidence_id, 0),
-            )?,
-        );
+        if is_unlocked_bitlocker {
+            extras.insert("email_parsing".to_string(), skip_msg.clone());
+        } else {
+            extras.insert(
+                "email_parsing".to_string(),
+                run_optional_processing_pass(
+                    case_path,
+                    request.evidence_id,
+                    "embedded mailbox parsing",
+                    tracker,
+                    || parse_embedded_mailboxes(case_path, request.evidence_id, 0),
+                )?,
+            );
+        }
     }
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
@@ -3695,16 +3811,20 @@ fn append_optional_processing_passes(
             "Browser artifact parsing",
             "profiles",
         );
-        extras.insert(
-            "browser_parsing".to_string(),
-            run_optional_processing_pass(
-                case_path,
-                request.evidence_id,
-                "browser parsing",
-                tracker,
-                || run_browser_parsing_pass(case_path, request.evidence_id, Some(tracker)),
-            )?,
-        );
+        if is_unlocked_bitlocker {
+            extras.insert("browser_parsing".to_string(), skip_msg.clone());
+        } else {
+            extras.insert(
+                "browser_parsing".to_string(),
+                run_optional_processing_pass(
+                    case_path,
+                    request.evidence_id,
+                    "browser parsing",
+                    tracker,
+                    || run_browser_parsing_pass(case_path, request.evidence_id, Some(tracker)),
+                )?,
+            );
+        }
     }
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
@@ -3717,16 +3837,20 @@ fn append_optional_processing_passes(
             "Identity artifact parsing",
             "hives",
         );
-        extras.insert(
-            "identity_parsing".to_string(),
-            run_optional_processing_pass(
-                case_path,
-                request.evidence_id,
-                "identity parsing",
-                tracker,
-                || parse_identity_artifacts(case_path, request.evidence_id),
-            )?,
-        );
+        if is_unlocked_bitlocker {
+            extras.insert("identity_parsing".to_string(), skip_msg.clone());
+        } else {
+            extras.insert(
+                "identity_parsing".to_string(),
+                run_optional_processing_pass(
+                    case_path,
+                    request.evidence_id,
+                    "identity parsing",
+                    tracker,
+                    || parse_identity_artifacts(case_path, request.evidence_id),
+                )?,
+            );
+        }
     }
     let outcome = append_slow_integrity_passes(
         case_path,
@@ -3735,6 +3859,7 @@ fn append_optional_processing_passes(
         tracker,
         stage_index,
         stage_count,
+        is_unlocked_bitlocker,
     )?;
     Ok(outcome)
 }
@@ -3750,7 +3875,13 @@ fn append_slow_integrity_passes(
     tracker: &JobProgressTracker,
     stage_index: &mut usize,
     stage_count: usize,
+    is_unlocked_bitlocker: bool,
 ) -> Result<OptionalPassesOutcome> {
+    let skip_msg = serde_json::json!({
+        "status": "skipped",
+        "error": "Structured processing requires a credential-aware reader for unlocked BitLocker evidence"
+    });
+
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
     }
@@ -3762,25 +3893,29 @@ fn append_slow_integrity_passes(
             "File signature analysis",
             "files",
         );
-        extras.insert(
-            "signature_analysis".to_string(),
-            run_optional_processing_pass(
-                case_path,
-                request.evidence_id,
-                "signature analysis",
-                tracker,
-                || {
-                    analyze_signatures(
-                        case_path,
-                        AnalyzeSignaturesOptions {
-                            evidence_id: Some(request.evidence_id),
-                            // Every reconstructable indexed logical file is checked.
-                            max_entries: 0,
-                        },
-                    )
-                },
-            )?,
-        );
+        if is_unlocked_bitlocker {
+            extras.insert("signature_analysis".to_string(), skip_msg.clone());
+        } else {
+            extras.insert(
+                "signature_analysis".to_string(),
+                run_optional_processing_pass(
+                    case_path,
+                    request.evidence_id,
+                    "signature analysis",
+                    tracker,
+                    || {
+                        analyze_signatures(
+                            case_path,
+                            AnalyzeSignaturesOptions {
+                                evidence_id: Some(request.evidence_id),
+                                // Every reconstructable indexed logical file is checked.
+                                max_entries: 0,
+                            },
+                        )
+                    },
+                )?,
+            );
+        }
     }
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
@@ -3793,25 +3928,29 @@ fn append_slow_integrity_passes(
             "Indexed-file hashing",
             "files",
         );
-        extras.insert(
-            "file_hash".to_string(),
-            run_optional_processing_pass(
-                case_path,
-                request.evidence_id,
-                "file hashing",
-                tracker,
-                || {
-                    kdft_case::hash_indexed_files(
-                        case_path,
-                        kdft_case::HashIndexedFilesOptions {
-                            evidence_id: request.evidence_id,
-                            max_files: 0,
-                            max_file_bytes: 0,
-                        },
-                    )
-                },
-            )?,
-        );
+        if is_unlocked_bitlocker {
+            extras.insert("file_hash".to_string(), skip_msg.clone());
+        } else {
+            extras.insert(
+                "file_hash".to_string(),
+                run_optional_processing_pass(
+                    case_path,
+                    request.evidence_id,
+                    "file hashing",
+                    tracker,
+                    || {
+                        kdft_case::hash_indexed_files(
+                            case_path,
+                            kdft_case::HashIndexedFilesOptions {
+                                evidence_id: request.evidence_id,
+                                max_files: 0,
+                                max_file_bytes: 0,
+                            },
+                        )
+                    },
+                )?,
+            );
+        }
     }
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
@@ -4248,14 +4387,14 @@ fn run_browser_parsing_pass(
     }))
 }
 
-fn api_parse_browsers(body: &[u8]) -> Result<serde_json::Value> {
-    let request: RemoveEvidenceRequest = parse_json_body(body)?;
+fn api_parse_browsers(body: &mut [u8]) -> Result<serde_json::Value> {
+    let request: RemoveEvidenceRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     run_browser_parsing_pass(&case_path, request.evidence_id, None)
 }
 
-fn api_analyze_signatures(body: &[u8]) -> Result<kdft_case::AnalyzeSignaturesResult> {
-    let request: AnalyzeSignaturesRequest = parse_json_body(body)?;
+fn api_analyze_signatures(body: &mut [u8]) -> Result<kdft_case::AnalyzeSignaturesResult> {
+    let request: AnalyzeSignaturesRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     analyze_signatures(
         &case_path,
@@ -4267,20 +4406,20 @@ fn api_analyze_signatures(body: &[u8]) -> Result<kdft_case::AnalyzeSignaturesRes
     )
 }
 
-fn api_remove_evidence(body: &[u8]) -> Result<kdft_case::RemoveEvidenceResult> {
-    let request: RemoveEvidenceRequest = parse_json_body(body)?;
+fn api_remove_evidence(body: &mut [u8]) -> Result<kdft_case::RemoveEvidenceResult> {
+    let request: RemoveEvidenceRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     remove_evidence(&case_path, request.evidence_id)
 }
 
-fn api_hash_evidence(body: &[u8]) -> Result<kdft_case::HashEvidenceResult> {
-    let request: RemoveEvidenceRequest = parse_json_body(body)?;
+fn api_hash_evidence(body: &mut [u8]) -> Result<kdft_case::HashEvidenceResult> {
+    let request: RemoveEvidenceRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     hash_evidence(&case_path, request.evidence_id)
 }
 
-fn api_carve_evidence(body: &[u8]) -> Result<kdft_case::CarveResult> {
-    let request: CarveEvidenceRequest = parse_json_body(body)?;
+fn api_carve_evidence(body: &mut [u8]) -> Result<kdft_case::CarveResult> {
+    let request: CarveEvidenceRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     carve_evidence(
         &case_path,
@@ -4292,8 +4431,8 @@ fn api_carve_evidence(body: &[u8]) -> Result<kdft_case::CarveResult> {
     )
 }
 
-fn api_recover_entry(body: &[u8]) -> Result<kdft_case::RecoverEntryResult> {
-    let request: RecoverEntryRequest = parse_json_body(body)?;
+fn api_recover_entry(body: &mut [u8]) -> Result<kdft_case::RecoverEntryResult> {
+    let request: RecoverEntryRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let output_path = request_path(&request.output_path, "output_path")?;
     recover_filesystem_entry(
@@ -4440,8 +4579,8 @@ fn unique_report_output_path(requested_path: &Path) -> PathBuf {
     candidate
 }
 
-fn api_open_entry(body: &[u8]) -> Result<serde_json::Value> {
-    let request: OpenEntryRequest = parse_json_body(body)?;
+fn api_open_entry(body: &mut [u8]) -> Result<serde_json::Value> {
+    let request: OpenEntryRequest = parse_json_body(&mut body.to_vec())?;
     if !request.acknowledge_host_app_risk {
         bail!(
             "opening untrusted evidence in a host application requires explicit examiner risk acknowledgement"
@@ -4500,8 +4639,8 @@ fn api_open_entry(body: &[u8]) -> Result<serde_json::Value> {
     }))
 }
 
-fn api_import_history(body: &[u8]) -> Result<kdft_case::BrowserHistoryImportResult> {
-    let request: ImportHistoryRequest = parse_json_body(body)?;
+fn api_import_history(body: &mut [u8]) -> Result<kdft_case::BrowserHistoryImportResult> {
+    let request: ImportHistoryRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let history_path = request_path(&request.history_path, "history_path")?;
     let result = import_browser_history(
@@ -4567,8 +4706,8 @@ fn ensure_staging_directory_not_reparse(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn api_import_history_from_image(body: &[u8]) -> Result<kdft_case::BrowserHistoryImportResult> {
-    let request: ImportHistoryFromImageRequest = parse_json_body(body)?;
+fn api_import_history_from_image(body: &mut [u8]) -> Result<kdft_case::BrowserHistoryImportResult> {
+    let request: ImportHistoryFromImageRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let source = live_evidence_source(&case_path, request.evidence_id)?;
     if source.source_kind != "image" {
@@ -4711,8 +4850,8 @@ fn stage_and_import_image_profile_into_evidence(
     )
 }
 
-fn api_deep_search(body: &[u8]) -> Result<kdft_case::DeepSearchPage> {
-    let request: DeepSearchRequest = parse_json_body(body)?;
+fn api_deep_search(body: &mut [u8]) -> Result<kdft_case::DeepSearchPage> {
+    let request: DeepSearchRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let page_size = request.max_results.unwrap_or(200);
     kdft_case::deep_search_page(
@@ -4743,8 +4882,8 @@ fn api_deep_search(body: &[u8]) -> Result<kdft_case::DeepSearchPage> {
     )
 }
 
-fn api_raw_search(body: &[u8]) -> Result<kdft_case::RawSearchResult> {
-    let request: RawSearchRequest = parse_json_body(body)?;
+fn api_raw_search(body: &mut [u8]) -> Result<kdft_case::RawSearchResult> {
+    let request: RawSearchRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     kdft_case::raw_disk_search_page(
         &case_path,
@@ -4758,8 +4897,8 @@ fn api_raw_search(body: &[u8]) -> Result<kdft_case::RawSearchResult> {
     )
 }
 
-fn api_quick_bookmark(body: &[u8]) -> Result<QuickBookmarkResponse> {
-    let request: QuickBookmarkRequest = parse_json_body(body)?;
+fn api_quick_bookmark(body: &mut [u8]) -> Result<QuickBookmarkResponse> {
+    let request: QuickBookmarkRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     // Validate the whole request BEFORE the first case write: creating the
     // destination folder first meant a rejected request (bad bookmark_type /
@@ -4845,32 +4984,32 @@ fn api_quick_bookmark(body: &[u8]) -> Result<QuickBookmarkResponse> {
     })
 }
 
-fn api_clear_findings(body: &[u8]) -> Result<kdft_case::ClearStaleFindingsResult> {
-    let request: ClearFindingsRequest = parse_json_body(body)?;
+fn api_clear_findings(body: &mut [u8]) -> Result<kdft_case::ClearStaleFindingsResult> {
+    let request: ClearFindingsRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     clear_all_findings(&case_path)
 }
 
-fn api_remove_bookmark(body: &[u8]) -> Result<kdft_case::RemoveBookmarkResult> {
-    let request: RemoveBookmarkRequest = parse_json_body(body)?;
+fn api_remove_bookmark(body: &mut [u8]) -> Result<kdft_case::RemoveBookmarkResult> {
+    let request: RemoveBookmarkRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     remove_bookmark(&case_path, request.bookmark_id)
 }
 
-fn api_remove_bookmark_item(body: &[u8]) -> Result<kdft_case::RemoveBookmarkItemResult> {
-    let request: RemoveBookmarkItemRequest = parse_json_body(body)?;
+fn api_remove_bookmark_item(body: &mut [u8]) -> Result<kdft_case::RemoveBookmarkItemResult> {
+    let request: RemoveBookmarkItemRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     remove_bookmark_item(&case_path, request.item_id)
 }
 
-fn api_remove_bookmark_folder(body: &[u8]) -> Result<kdft_case::RemoveBookmarkFolderResult> {
-    let request: RemoveBookmarkFolderRequest = parse_json_body(body)?;
+fn api_remove_bookmark_folder(body: &mut [u8]) -> Result<kdft_case::RemoveBookmarkFolderResult> {
+    let request: RemoveBookmarkFolderRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     kdft_case::remove_bookmark_folder(&case_path, request.folder_id)
 }
 
-fn api_bulk_bookmark(body: &[u8]) -> Result<kdft_case::BulkBookmarkItemsResult> {
-    let request: BulkBookmarkRequest = parse_json_body(body)?;
+fn api_bulk_bookmark(body: &mut [u8]) -> Result<kdft_case::BulkBookmarkItemsResult> {
+    let request: BulkBookmarkRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     if request.entry_ids.is_empty() {
         bail!("entry_ids must not be empty");
@@ -4913,7 +5052,7 @@ fn recursive_bookmark_folder_title(path: &str) -> String {
 fn api_bookmark_folder_recursive_indexed(
     body: &[u8],
 ) -> Result<kdft_case::RecursiveBookmarkResult> {
-    let request: BookmarkFolderRecursiveIndexedRequest = parse_json_body(body)?;
+    let request: BookmarkFolderRecursiveIndexedRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let max_entries = resolve_unlimited_max_entries(request.max_entries);
     let folder_name = request
@@ -4952,8 +5091,10 @@ fn api_bookmark_folder_recursive_indexed(
     )
 }
 
-fn api_bookmark_folder_recursive_live(body: &[u8]) -> Result<kdft_case::RecursiveBookmarkResult> {
-    let request: BookmarkFolderRecursiveLiveRequest = parse_json_body(body)?;
+fn api_bookmark_folder_recursive_live(
+    body: &mut [u8],
+) -> Result<kdft_case::RecursiveBookmarkResult> {
+    let request: BookmarkFolderRecursiveLiveRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let max_entries = resolve_unlimited_max_entries(request.max_entries);
     let source = live_evidence_source(&case_path, request.evidence_id)?;
@@ -5037,15 +5178,15 @@ const REPORT_DIRECTORY_TREE_MAX_LINES: usize = 2000;
 
 // Re-run category classification over existing indexed entries without
 // reading the evidence source again.
-fn api_recategorize(body: &[u8]) -> Result<serde_json::Value> {
-    let request: RecategorizeRequest = parse_json_body(body)?;
+fn api_recategorize(body: &mut [u8]) -> Result<serde_json::Value> {
+    let request: RecategorizeRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let updated = kdft_case::recategorize_case_entries(&case_path)?;
     Ok(serde_json::json!({ "entries_updated": updated }))
 }
 
-fn api_export_report(body: &[u8], config: &ServerConfig) -> Result<serde_json::Value> {
-    let request: ExportReportRequest = parse_json_body(body)?;
+fn api_export_report(body: &mut [u8], config: &ServerConfig) -> Result<serde_json::Value> {
+    let request: ExportReportRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let requested_output_path = request_path(&request.output_path, "output_path")?;
     let output_path = unique_report_output_path(&requested_output_path);
@@ -5088,8 +5229,8 @@ fn api_export_report(body: &[u8], config: &ServerConfig) -> Result<serde_json::V
     }))
 }
 
-fn api_open_report(body: &[u8], config: &ServerConfig) -> Result<serde_json::Value> {
-    let request: ExportReportRequest = parse_json_body(body)?;
+fn api_open_report(body: &mut [u8], config: &ServerConfig) -> Result<serde_json::Value> {
+    let request: ExportReportRequest = parse_json_body(&mut body.to_vec())?;
     let output_path = request_path(&request.output_path, "output_path")?;
     let canonical_output = output_path
         .canonicalize()
@@ -5124,11 +5265,27 @@ fn ensure_report_folder(case_path: &Path, folder_name: &str) -> Result<i64> {
     create_bookmark_folder(case_path, None, folder_name, None, true)
 }
 
-fn parse_json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
+fn parse_json_body<T: DeserializeOwned>(body: &mut [u8]) -> Result<T> {
     if body.is_empty() {
         bail!("request body is required");
     }
-    serde_json::from_slice(body).context("parsing request JSON")
+    let result = serde_json::from_slice(body).context("parsing request JSON");
+    use zeroize::Zeroize;
+    body.zeroize();
+    result
+}
+
+fn parse_json_body_with_unlock<T: DeserializeOwned>(body: &mut [u8]) -> Result<(T, UnlockOnly)> {
+    if body.is_empty() {
+        bail!("request body is required");
+    }
+    let request_result: Result<T, _> = serde_json::from_slice(body);
+    let unlock_result: Result<UnlockOnly, _> = serde_json::from_slice(body);
+    use zeroize::Zeroize;
+    body.zeroize();
+    let request = request_result.context("parsing request JSON")?;
+    let unlock = unlock_result.context("parsing unlock JSON")?;
+    Ok((request, unlock))
 }
 
 fn request_path(value: &str, field: &str) -> Result<PathBuf> {
@@ -5366,6 +5523,57 @@ fn is_separator(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_imported_browser_only_search_state_relies_on_database_entry_count() {
+        assert!(INDEX_HTML.contains("state.data.database_entry_count"));
+        assert!(!INDEX_HTML.contains("state.data.entry_count > 0"));
+        assert!(INDEX_HTML.contains("$(\"statEntries\").textContent = data.database_entry_count;"));
+    }
+
+    #[test]
+    fn ui_named_bookmark_cancellation_and_label_prompts() {
+        assert!(INDEX_HTML.contains("let groupName = prompt("));
+        assert!(INDEX_HTML.contains("if (groupName === null) {"));
+        assert!(INDEX_HTML.contains("folder_name: groupName,"));
+        assert!(INDEX_HTML.contains("title: groupName,"));
+        assert!(INDEX_HTML.contains("comment: \"\","));
+    }
+
+    #[test]
+    fn ui_browser_history_rich_report_fields_are_exposed() {
+        assert!(INDEX_HTML.contains(
+            "\"source_table\", \"source_row\", \"source_path\", \"browser_family\", \"referrer\""
+        ));
+    }
+
+    #[test]
+    fn parse_json_body_with_unlock_zeroizes_raw_body_and_owns_dummy_credential() {
+        use super::{parse_json_body_with_unlock, ProcessEvidenceRequest};
+        let payload = r#"{"case_path":"C:\\test.kdft.sqlite","evidence_id":1,"unlock":{"type":"password","value":"dummy_secret"},"volume_index":0}"#;
+        let mut body = payload.as_bytes().to_vec();
+
+        let (request, unlock) =
+            parse_json_body_with_unlock::<ProcessEvidenceRequest>(&mut body).unwrap();
+
+        // Assert the raw request body is zeroed immediately after parsing
+        assert!(body.iter().all(|&b| b == 0));
+        assert_eq!(request.case_path, "C:\\test.kdft.sqlite");
+        assert_eq!(request.evidence_id, 1);
+
+        let cred = unlock.unlock.unwrap();
+        assert_eq!(cred.kind, "password");
+        assert_eq!(cred.value.as_str(), "dummy_secret");
+    }
+
+    #[test]
+    fn parse_json_body_with_unlock_zeroizes_raw_body_on_error() {
+        use super::{parse_json_body_with_unlock, ProcessEvidenceRequest};
+        let mut body = br#"{"case_path":"C:\\test.kdft.sqlite","evidence_id":1,"unlock":{"type":"password","value":"dummy_secret"},"volume_index":0"#.to_vec();
+
+        assert!(parse_json_body_with_unlock::<ProcessEvidenceRequest>(&mut body).is_err());
+        assert!(body.iter().all(|&byte| byte == 0));
+    }
+
     use super::{
         api_add_evidence, api_carve_evidence, api_image_dir, api_job_cancel, api_job_progress,
         api_process_evidence_tracked, api_run_processors_tracked, api_state,
@@ -5375,8 +5583,8 @@ mod tests {
         inline_script_json, normalize_request_path, normalized_browser_profile_identity,
         observed_browser_profile_count, parse_archives_enabled, parse_documents_enabled,
         parse_windows_artifacts_enabled, process_stage_count, run_optional_processing_pass,
-        safe_external_preview_name, trim_balanced_path_quotes, ProcessEvidenceRequest, ServerArgs,
-        ServerConfig, StreamingDiagnosticLog, INDEX_HTML,
+        safe_external_preview_name, trim_balanced_path_quotes, validate_bitlocker_raster_preview,
+        ProcessEvidenceRequest, ServerArgs, ServerConfig, StreamingDiagnosticLog, INDEX_HTML,
     };
     use super::{DeepSearchRequest, ProgressRegistry, RawSearchRequest};
     use kdft_case::progress::{JobProgressState, JobProgressTracker};
@@ -5398,6 +5606,15 @@ mod tests {
             "kdft-ui-{label}-{}-{nonce}{suffix}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn bitlocker_status_uses_serialized_method_and_surfaces_geometry_qualification() {
+        assert!(INDEX_HTML.contains("typeof bl.encryption_method === \"string\""));
+        assert!(INDEX_HTML.contains("bl.effective_encrypted_volume_size"));
+        assert!(INDEX_HTML.contains("qualified FVE geometry"));
+        assert!(INDEX_HTML.contains("metadata inspection warning"));
+        assert!(!INDEX_HTML.contains("decrypt is limited to AES-128-CBC"));
     }
 
     #[test]
@@ -5456,6 +5673,18 @@ mod tests {
         assert!(html.contains("\"defaultCasePath\":\"\""));
         assert!(!INDEX_HTML.contains("localStorage.getItem(\"kdft.casePath\")"));
         assert!(!INDEX_HTML.contains("localStorage.setItem(\"kdft.casePath\""));
+        Ok(())
+    }
+
+    #[test]
+    fn add_evidence_path_starts_empty_and_clears_legacy_cross_case_state() -> anyhow::Result<()> {
+        let config = ServerConfig::new(None)?;
+        let html = super::index_html(&config);
+        assert!(!html.contains("\"defaultEvidencePath\""));
+        assert!(!INDEX_HTML.contains("localStorage.getItem(\"kdft.evidencePath\")"));
+        assert!(!INDEX_HTML.contains("localStorage.setItem(\"kdft.evidencePath\""));
+        assert!(INDEX_HTML.contains("localStorage.removeItem(\"kdft.evidencePath\")"));
+        assert!(INDEX_HTML.contains("$(\"evidencePath\").value = \"\""));
         Ok(())
     }
 
@@ -5556,7 +5785,15 @@ mod tests {
         };
         let tracker = JobProgressTracker::new("diagnostic-index-status", "process", None);
 
-        let response = api_process_evidence_tracked(&case_path, &request, &tracker)?;
+        let response = api_process_evidence_tracked(
+            &case_path,
+            &request,
+            super::UnlockOnly {
+                unlock: None,
+                volume_index: None,
+            },
+            &tracker,
+        )?;
 
         assert_eq!(response["status"], "completed_with_diagnostics");
         assert_eq!(response["truncated"], false);
@@ -5610,7 +5847,15 @@ mod tests {
             carve_max_files: None,
         };
         let tracker = JobProgressTracker::new("backfill-index", "process", None);
-        let index_response = api_process_evidence_tracked(&case_path, &index_request, &tracker)?;
+        let index_response = api_process_evidence_tracked(
+            &case_path,
+            &index_request,
+            super::UnlockOnly {
+                unlock: None,
+                volume_index: None,
+            },
+            &tracker,
+        )?;
         assert_eq!(index_response["status"], "completed");
 
         let entry_count_before = {
@@ -5869,7 +6114,7 @@ mod tests {
         assert!(!INDEX_HTML.contains(">Live browse</button>"));
         assert!(INDEX_HTML.contains(">Browse source</button>"));
         assert!(INDEX_HTML.contains(">Choose&hellip;</button>"));
-        assert!(INDEX_HTML.contains(">View index</button>"));
+        assert!(!INDEX_HTML.contains(">View index</button>"));
     }
 
     #[test]
@@ -6509,6 +6754,187 @@ mod tests {
     }
 
     #[test]
+    fn bitlocker_browse_uses_its_own_compact_table_and_transient_unlock_notice() {
+        assert!(INDEX_HTML.contains("function bitlockerGridColumns()"));
+        assert!(INDEX_HTML.contains("\"bitlocker-table\","));
+        assert!(!INDEX_HTML.contains("<table class=\"live-table bitlocker-table\">"));
+        assert!(INDEX_HTML.contains(".browser-table-wrap .bitlocker-table"));
+        assert!(INDEX_HTML.contains("unlockNoticeExpiresAt: Date.now() + 7000"));
+        assert!(INDEX_HTML.contains("const unlockNoticeRemainingMs = Math.max(0"));
+        assert!(INDEX_HTML.contains(
+            "analysis-status transient-guidance\" role=\"status\" style=\"--guidance-duration:${unlockNoticeRemainingMs}ms"
+        ));
+        assert!(INDEX_HTML
+            .contains("Use <strong>Lock (forget key)</strong> in the volume tree when finished."));
+    }
+
+    #[test]
+    fn live_and_bitlocker_grids_render_exact_sortable_timestamp_facets() {
+        assert!(INDEX_HTML.contains("function liveTimestampDisplay(value)"));
+        assert!(INDEX_HTML.contains("timelineDisplayTimestamp(timestampMs, text)"));
+        assert!(INDEX_HTML.contains("function liveMftModifiedTimestamp(entry)"));
+        assert!(INDEX_HTML.contains("entry && entry.ntfs_mft_record_modification_time_utc"));
+        assert!(INDEX_HTML.contains("function liveGridColumns()"));
+        assert!(INDEX_HTML.contains("function bitlockerGridColumns()"));
+        assert!(INDEX_HTML.contains(
+            "{ key: \"created\", label: \"Created\", sortable: true, filterable: true, sortType: \"time\" }"
+        ));
+        assert!(INDEX_HTML.contains(
+            "{ key: \"modified\", label: \"Modified\", sortable: true, filterable: true, sortType: \"time\" }"
+        ));
+        assert!(INDEX_HTML.contains(
+            "{ key: \"accessed\", label: \"Accessed\", sortable: true, filterable: true, sortType: \"time\" }"
+        ));
+        assert!(INDEX_HTML.contains(
+            "{ key: \"mftModified\", label: \"MFT Modified\", sortable: true, filterable: true, sortType: \"time\" }"
+        ));
+        assert!(INDEX_HTML.contains("created: Date.parse(createdRaw)"));
+        assert!(INDEX_HTML.contains("modified: Date.parse(modifiedRaw)"));
+        assert!(INDEX_HTML.contains("accessed: Date.parse(accessedRaw)"));
+        assert!(INDEX_HTML.contains("mftModified: Date.parse(mftModifiedRaw)"));
+        assert!(!INDEX_HTML.contains("entry.modified_utc || entry.created_utc"));
+        assert!(INDEX_HTML.contains("bitlockerGridColumns().length"));
+        assert!(INDEX_HTML.contains("case \"bitlocker\": return bitlockerGridColumns();"));
+    }
+
+    #[test]
+    fn bitlocker_browse_keeps_the_unlocked_volume_active_and_uses_the_inspector() {
+        assert!(INDEX_HTML.contains("state.live.selKey = liveKey(volumeIndex, initialPath)"));
+        assert!(INDEX_HTML.contains("state.live.selKey = liveKey(bl.volumeIndex, path)"));
+        assert!(INDEX_HTML.contains(
+            "async function resumeBitlockerBrowse(volumeIndex, recordNavigation = true)"
+        ));
+        assert!(INDEX_HTML.contains("onclick=\"resumeBitlockerBrowse(${volume.index})\""));
+        assert!(INDEX_HTML.contains("function attachBitlockerSessionToLiveState("));
+        assert!(INDEX_HTML.contains("const resumedBitlocker = attachBitlockerSessionToLiveState("));
+        assert!(INDEX_HTML.contains("state.hex.bitlocker = {"));
+        assert!(INDEX_HTML.contains("/api/image/bitlocker/unlock/bytes"));
+        assert!(INDEX_HTML.contains("setInspectorCollapsed(false)"));
+        assert!(INDEX_HTML.contains("source: \"bitlocker_live_browse\""));
+        assert!(INDEX_HTML
+            .contains("Decrypted BitLocker logical stream; evidence-media offset is unavailable"));
+        assert!(!INDEX_HTML.contains("const dump = bl.preview"));
+        assert!(!INDEX_HTML.contains("First bytes of ${escapeHtml(bl.preview.name)}"));
+    }
+
+    #[test]
+    fn bitlocker_credentials_are_session_only_and_scrubbed_on_context_changes() {
+        assert!(INDEX_HTML.contains("function forgetBitlockerCredential()"));
+        assert!(INDEX_HTML.contains("state.bitlocker.unlock.value = \"\""));
+        assert!(INDEX_HTML.contains("casePath: currentCasePath()"));
+        assert!(INDEX_HTML.contains("evidenceId: state.live.evidenceId"));
+        assert!(INDEX_HTML.contains("const bitlockerSession = state.bitlocker"));
+        assert!(INDEX_HTML.contains("bitlockerSessionMatchesContext("));
+        assert!(INDEX_HTML.contains("payload.unlock = {"));
+        assert!(INDEX_HTML.contains("payload.volume_index = bitlockerSession.volumeIndex"));
+        assert!(INDEX_HTML.contains("payload.unlock.value = \"\""));
+        assert!(INDEX_HTML.contains("payload.unlock = null"));
+        assert!(!INDEX_HTML.contains("localStorage.setItem(\"kdft.bitlocker"));
+        assert!(!INDEX_HTML.contains("sessionStorage.setItem(\"kdft.bitlocker"));
+    }
+
+    #[test]
+    fn bitlocker_unlock_modal_replaces_prompts_and_scrubs_credential_input() {
+        assert!(INDEX_HTML.contains("id=\"bitlockerUnlockOverlay\""));
+        assert!(INDEX_HTML.contains("class=\"timeline-detail-overlay\""));
+        assert!(INDEX_HTML.contains("class=\"timeline-detail-modal bitlocker-unlock-modal\""));
+        assert!(INDEX_HTML.contains("id=\"bitlockerCredentialType\""));
+        assert!(INDEX_HTML.contains("<option value=\"recovery_key\" selected>"));
+        assert!(INDEX_HTML.contains("<option value=\"password\">"));
+        assert!(INDEX_HTML.contains("id=\"bitlockerCredentialInput\""));
+        assert!(INDEX_HTML.contains("function promptBitlockerUnlock("));
+        assert!(INDEX_HTML.contains("function submitBitlockerUnlock()"));
+        assert!(INDEX_HTML.contains("function cancelBitlockerUnlock()"));
+        assert!(INDEX_HTML.contains("if (credInput) credInput.value = \"\";"));
+        assert!(!INDEX_HTML.contains("window.prompt(\"BitLocker unlock"));
+    }
+
+    #[test]
+    fn analyze_fullscreen_uses_one_control_and_opens_the_workbench_in_a_new_tab() {
+        assert!(INDEX_HTML.contains("function toggleAnalyzeFullscreen()"));
+        assert!(INDEX_HTML.contains("document.body.classList.toggle(\"analysis-fullscreen\")"));
+        assert!(INDEX_HTML.contains("function updateAnalyzeFullscreenButton()"));
+        assert!(INDEX_HTML.contains(
+            "btn.textContent = active ? \"Exit full screen\" : \"Open full screen in new tab\""
+        ));
+        assert!(INDEX_HTML.contains("function openAnalyzeWindow()"));
+        assert!(INDEX_HTML.contains("function bitlockerSessionForAnalyzeLocation("));
+        assert!(INDEX_HTML
+            .contains("const bitlockerSession = bitlockerSessionForAnalyzeLocation(location)"));
+        assert!(INDEX_HTML.contains("const session = bitlockerSessionForAnalyzeLocation()"));
+        assert!(INDEX_HTML.contains("const child = window.open(\"\", \"_blank\")"));
+        assert!(INDEX_HTML.contains("child.location.replace(destination)"));
+        assert_eq!(INDEX_HTML.matches("id=\"openAnalyzeWindow\"").count(), 1);
+    }
+
+    #[test]
+    fn bitlocker_tree_supports_dircache_and_recursive_rendering_with_root_browse() {
+        assert!(INDEX_HTML.contains("dirCache: { [initialPath]: data.entries || [] }"));
+        assert!(INDEX_HTML
+            .contains("expanded: new Set(treeAncestors(initialPath).concat([initialPath]))"));
+        assert!(INDEX_HTML.contains("function renderBitlockerDirRows("));
+        assert!(INDEX_HTML.contains("function bitlockerToggleDir("));
+        assert!(INDEX_HTML.contains("onclick=\"bitlockerSelectDir('/')\""));
+        assert!(INDEX_HTML.contains("bitlockerToggleDir('/')"));
+    }
+
+    #[test]
+    fn bitlocker_navigation_history_integrates_drill_resume_and_table_dots() {
+        assert!(INDEX_HTML.contains("bitlocker: isBitlocker"));
+        assert!(INDEX_HTML.contains("function bitlockerDirectoryNavigationRow("));
+        assert!(INDEX_HTML.contains("function bitlockerDirectoryNavigationRows("));
+        assert!(INDEX_HTML.contains("bitlockerDirectoryNavigationRows(current)"));
+        assert!(INDEX_HTML.contains("bitlockerDirectoryNavigationRow(\n        \".\","));
+        assert!(INDEX_HTML.contains("bitlockerDirectoryNavigationRow(\n        \"..\","));
+        assert!(INDEX_HTML.contains("if (isBitlocker && bitlockerSessionMatches)"));
+        assert!(INDEX_HTML.contains("applied = await applyAnalyzeLocation(target)"));
+        assert!(INDEX_HTML.contains("state.analyzeHistory.back.pop()"));
+        assert!(INDEX_HTML.contains("state.analyzeHistory.forward.pop()"));
+    }
+
+    #[test]
+    fn bitlocker_resume_rehydrates_live_volumes_and_lock_prunes_sensitive_history() {
+        assert!(INDEX_HTML.contains("const data = await loadLiveVolumes(bl.evidenceId)"));
+        assert!(INDEX_HTML.contains("Resumed unlocked BitLocker volume "));
+        assert!(INDEX_HTML.contains("location.bitlocker"));
+        assert!(INDEX_HTML.contains("belongsToLockedSession"));
+        assert!(INDEX_HTML.contains("state.analyzeHistory.back = state.analyzeHistory.back.filter"));
+        assert!(INDEX_HTML
+            .contains("state.analyzeHistory.forward = state.analyzeHistory.forward.filter"));
+    }
+
+    #[test]
+    fn bitlocker_async_reads_are_context_bound_and_unlock_is_single_flight() {
+        assert!(INDEX_HTML.contains("let bitlockerUnlockPromise = null"));
+        assert!(INDEX_HTML.contains("if (bitlockerUnlockPromise)"));
+        assert!(INDEX_HTML.contains("let bitlockerUnlockOperationActive = false"));
+        assert!(INDEX_HTML.contains("if (bitlockerUnlockOperationActive)"));
+        assert!(INDEX_HTML.contains("const expectedLiveState = state.live"));
+        assert!(INDEX_HTML.contains("state.live !== expectedLiveState"));
+        assert!(INDEX_HTML.contains("state.bitlocker !== bl"));
+        assert!(INDEX_HTML.contains("if (!credentialRetained)"));
+        assert!(INDEX_HTML.contains("cred.value = \"\""));
+    }
+
+    #[test]
+    fn analyze_history_pops_target_unconditionally_on_apply_to_prevent_jamming() {
+        assert!(INDEX_HTML.contains("let applied = false;"));
+        assert!(INDEX_HTML.contains("applied = await applyAnalyzeLocation(target);"));
+        assert!(INDEX_HTML.contains("} finally {"));
+        assert!(INDEX_HTML.contains("state.analyzeHistory.back.pop();"));
+        assert!(INDEX_HTML.contains("state.analyzeHistory.forward.pop();"));
+    }
+
+    #[test]
+    fn bitlocker_select_dir_uses_per_session_monotonic_generation_guard() {
+        assert!(INDEX_HTML.contains("bl.navGeneration = (bl.navGeneration || 0) + 1;"));
+        assert!(INDEX_HTML.contains("const generation = bl.navGeneration;"));
+        assert!(
+            INDEX_HTML.contains("if (state.bitlocker !== bl || generation !== bl.navGeneration")
+        );
+    }
+
+    #[test]
     fn evidence_timezone_is_explicit_and_timeline_never_uses_host_local_time() {
         assert!(INDEX_HTML.contains("id=\"evidenceTimezone\""));
         assert!(INDEX_HTML.contains("Canonical parsed timestamps remain UTC"));
@@ -6684,7 +7110,7 @@ mod tests {
             "evidence_id": evidence_id
         })
         .to_string();
-        let result = api_carve_evidence(body.as_bytes())?;
+        let result = api_carve_evidence(&mut body.as_bytes().to_vec())?;
         assert_eq!(result.carved_files, 1_001);
         assert_eq!(result.recognized_candidates, 0);
         assert_eq!(result.status, "completed");
@@ -6719,7 +7145,7 @@ mod tests {
             "timezone": "Europe/Bucharest"
         })
         .to_string();
-        let response = api_add_evidence(body.as_bytes())?;
+        let response = api_add_evidence(&mut body.as_bytes().to_vec())?;
         assert_eq!(response["detected"], "chromium_history_database");
         assert_eq!(response["visits_indexed"], 1);
         assert!(response["entries_indexed"].as_u64().unwrap_or_default() >= 2);
@@ -6961,6 +7387,7 @@ mod tests {
             &mut stage_index,
             stage_count,
             false,
+            false,
         )?;
 
         assert_eq!(response["job_id"], expected_job_id);
@@ -7098,7 +7525,7 @@ mod tests {
         })
         .to_string();
         let config = super::ServerConfig::new(None)?;
-        let response = super::api_process_evidence(body.as_bytes(), &config)?;
+        let response = super::api_process_evidence(&mut body.as_bytes().to_vec(), &config)?;
         assert_eq!(response["status"], "completed");
         assert_eq!(response["progress"]["state"], "complete");
         assert_eq!(response["progress"]["stage_count"], 6);
@@ -7288,7 +7715,7 @@ mod tests {
             "bookmark_type": "file"
         })
         .to_string();
-        let error = match super::api_quick_bookmark(body.as_bytes()) {
+        let error = match super::api_quick_bookmark(&mut body.as_bytes().to_vec()) {
             Ok(_) => panic!("invalid bookmark_type must be rejected"),
             Err(error) => error,
         };
@@ -7322,7 +7749,7 @@ mod tests {
             })
             .to_string();
             let config = super::ServerConfig::new(None)?;
-            super::api_export_report(body.as_bytes(), &config)
+            super::api_export_report(&mut body.as_bytes().to_vec(), &config)
         };
 
         let first = export_request(&output_path)?;
@@ -7383,13 +7810,14 @@ mod tests {
     #[test]
     fn search_apis_reject_oversized_pages_instead_of_clamping() {
         let deep = super::api_deep_search(
-            br#"{"case_path":"missing.kdft.sqlite","query":"needle","max_results":1001}"#,
+            &mut br#"{"case_path":"missing.kdft.sqlite","query":"needle","max_results":1001}"#
+                .to_vec(),
         )
         .expect_err("oversized indexed page must be rejected");
         assert!(deep.to_string().contains("response maximum"));
 
         let raw = super::api_raw_search(
-            br#"{"case_path":"missing.kdft.sqlite","evidence_id":1,"query":"needle","max_results":1001}"#,
+            &mut br#"{"case_path":"missing.kdft.sqlite","evidence_id":1,"query":"needle","max_results":1001}"#.to_vec(),
         )
         .expect_err("oversized raw page must be rejected");
         assert!(raw.to_string().contains("response maximum"));
@@ -7450,8 +7878,10 @@ mod tests {
 
     #[test]
     fn external_host_application_api_rejects_missing_risk_acknowledgement() {
-        let error = super::api_open_entry(br#"{"case_path":"missing.kdft.sqlite","entry_id":1}"#)
-            .expect_err("host-app open without explicit risk acknowledgement must fail");
+        let error = super::api_open_entry(
+            &mut br#"{"case_path":"missing.kdft.sqlite","entry_id":1}"#.to_vec(),
+        )
+        .expect_err("host-app open without explicit risk acknowledgement must fail");
         assert!(error
             .to_string()
             .contains("requires explicit examiner risk acknowledgement"));
@@ -7635,12 +8065,14 @@ mod tests {
             .start("cancel-api-test", "process", None, None)
             .expect("start progress operation");
         let active_body = br#"{"progress_id":"cancel-api-test"}"#;
-        let response = api_job_cancel(active_body, &config).expect("cancel active operation");
+        let response =
+            api_job_cancel(&mut active_body.to_vec(), &config).expect("cancel active operation");
         assert_eq!(response["accepted"], true);
         assert!(tracker.is_cancellation_requested());
 
         let missing_body = br#"{"progress_id":"does-not-exist"}"#;
-        let response = api_job_cancel(missing_body, &config).expect("cancel missing operation");
+        let response =
+            api_job_cancel(&mut missing_body.to_vec(), &config).expect("cancel missing operation");
         assert_eq!(response["accepted"], false);
     }
 
@@ -7684,7 +8116,15 @@ mod tests {
         let tracker = JobProgressTracker::new("base-cancel-skips-passes", "process", None);
         tracker.request_cancellation();
         let response = kdft_case::progress::with_job_progress(&tracker, || {
-            api_process_evidence_tracked(&case_path, &request, &tracker)
+            api_process_evidence_tracked(
+                &case_path,
+                &request,
+                super::UnlockOnly {
+                    unlock: None,
+                    volume_index: None,
+                },
+                &tracker,
+            )
         })?;
 
         assert_eq!(response["status"], "cancelled");
@@ -7754,7 +8194,15 @@ mod tests {
             carve_max_files: None,
         };
         let tracker = JobProgressTracker::new("run-processors-index", "process", None);
-        let index_response = api_process_evidence_tracked(&case_path, &index_request, &tracker)?;
+        let index_response = api_process_evidence_tracked(
+            &case_path,
+            &index_request,
+            super::UnlockOnly {
+                unlock: None,
+                volume_index: None,
+            },
+            &tracker,
+        )?;
         assert_eq!(index_response["status"], "completed");
 
         let processor_request = ProcessEvidenceRequest {
@@ -7851,7 +8299,15 @@ mod tests {
             carve_max_files: None,
         };
         let tracker = JobProgressTracker::new("run-processors-final-index", "process", None);
-        let index_response = api_process_evidence_tracked(&case_path, &index_request, &tracker)?;
+        let index_response = api_process_evidence_tracked(
+            &case_path,
+            &index_request,
+            super::UnlockOnly {
+                unlock: None,
+                volume_index: None,
+            },
+            &tracker,
+        )?;
         assert_eq!(index_response["status"], "completed");
 
         let processor_request = ProcessEvidenceRequest {
@@ -7913,6 +8369,147 @@ mod tests {
         cleanup_ui_test_case(&case_path);
         let _ = std::fs::remove_dir_all(source_dir);
         Ok(())
+    }
+
+    #[test]
+    fn ui_bitlocker_raster_preview_tests() {
+        assert!(INDEX_HTML.contains("/api/image/bitlocker/unlock/raw"));
+        assert!(INDEX_HTML.contains("URL.createObjectURL(blob)"));
+        assert!(INDEX_HTML.contains("URL.revokeObjectURL(preview.objectUrl)"));
+        assert!(INDEX_HTML.contains("function resetBitlockerRasterPreview()"));
+        assert!(INDEX_HTML.contains("function bitlockerRasterPreviewIsCurrent("));
+        assert!(INDEX_HTML
+            .contains("window.addEventListener(\"pagehide\", resetBitlockerRasterPreview)"));
+        assert!(INDEX_HTML.contains("BITLOCKER_RASTER_PREVIEW_EXTENSIONS"));
+        assert!(INDEX_HTML.contains(
+            "\"jpg\", \"jpeg\", \"jpe\", \"jfif\", \"png\", \"gif\", \"bmp\", \"webp\", \"ico\""
+        ));
+        let extension_allowlist = INDEX_HTML
+            .split_once("const BITLOCKER_RASTER_PREVIEW_EXTENSIONS")
+            .unwrap()
+            .1
+            .split_once("]);")
+            .unwrap()
+            .0;
+        assert!(!extension_allowlist.contains("svg"));
+        assert!(!extension_allowlist.contains("tif"));
+        assert!(INDEX_HTML.contains(
+            "\"image/jpeg\", \"image/png\", \"image/gif\", \"image/bmp\", \"image/webp\", \"image/x-icon\""
+        ));
+        assert!(INDEX_HTML.contains(
+            "function forgetBitlockerCredential() {\n      resetBitlockerRasterPreview();"
+        ));
+        assert!(INDEX_HTML.contains("async function bitlockerSelectDir("));
+        assert!(INDEX_HTML.contains(
+            "async function fetchEntryBytes() {\n      reconcileBitlockerRasterPreviewSelection();"
+        ));
+        assert!(!INDEX_HTML.contains("URL.createObjectURL ="));
+        assert!(!INDEX_HTML.contains("_bitlockerUrl"));
+        assert!(!INDEX_HTML.contains("_bitlockerError"));
+        assert!(!INDEX_HTML.contains("blPreviewController"));
+    }
+
+    #[test]
+    fn bitlocker_raster_preview_validation_accepts_only_safe_signature_types() {
+        let samples: &[(&[u8], &str)] = &[
+            (&[0xff, 0xd8, 0xff], "image/jpeg"),
+            (
+                &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+                "image/png",
+            ),
+            (b"GIF89a", "image/gif"),
+            (b"BM", "image/bmp"),
+            (b"RIFF\0\0\0\0WEBP", "image/webp"),
+            (&[0x00, 0x00, 0x01, 0x00], "image/x-icon"),
+        ];
+        for (bytes, expected) in samples {
+            assert_eq!(
+                validate_bitlocker_raster_preview(bytes, bytes.len() as u64).unwrap(),
+                *expected
+            );
+        }
+
+        let svg = b"<svg xmlns='http://www.w3.org/2000/svg'></svg>";
+        assert!(validate_bitlocker_raster_preview(svg, svg.len() as u64).is_err());
+        assert!(validate_bitlocker_raster_preview(b"BM", 3).is_err());
+        assert!(validate_bitlocker_raster_preview(b"BM", (8 * 1024 * 1024 + 1) as u64).is_err());
+    }
+
+    #[test]
+    fn ui_repurpose_open_fullscreen_tests() {
+        assert!(INDEX_HTML.contains("function openAnalyzeWindow()"));
+        assert!(INDEX_HTML.contains("const destination = analysisWindowUrl()"));
+        assert!(INDEX_HTML.contains("const child = window.open(\"\", \"_blank\")"));
+        assert!(INDEX_HTML.contains("child.location.replace(destination)"));
+        assert!(INDEX_HTML.contains("MessageChannel"));
+        assert!(INDEX_HTML.contains("crypto.getRandomValues"));
+        assert!(INDEX_HTML.contains("event.origin !== window.location.origin"));
+        assert!(INDEX_HTML.contains("event.source !== expected.child"));
+        assert!(INDEX_HTML.contains("expected.consumed = true"));
+        assert!(INDEX_HTML.contains("const BITLOCKER_HANDOFF_PROTOCOL"));
+        assert!(INDEX_HTML.contains("detachAnalysisOpener()"));
+        assert!(INDEX_HTML.contains("The browser blocked the full-screen tab."));
+        assert!(INDEX_HTML.contains("params.set(\"bl_marker\", \"1\")"));
+        assert!(INDEX_HTML.contains("params.set(\"viewer_target\", \"bitlocker\")"));
+        assert!(INDEX_HTML.contains("Number(evidence.id) !== handoffEvidenceId"));
+        assert!(INDEX_HTML.contains("let bitlockerPreviewRestore = null"));
+        assert!(INDEX_HTML.contains("await Promise.all([bytesRequest, previewRequest])"));
+        assert!(!INDEX_HTML.contains("params.set(\"bl_credential\","));
+        assert!(!INDEX_HTML.contains("state.bitlocker = e.data.session"));
+        assert!(!INDEX_HTML.contains("session: bl"));
+        assert!(!INDEX_HTML.contains("openBitlocker(evId"));
+        let bitlocker_branch = INDEX_HTML
+            .find("if (pending.blMarker)")
+            .expect("BitLocker restore branch");
+        let generic_live_branch = INDEX_HTML[bitlocker_branch..]
+            .find("else if (pending.treeMode === \"live\")")
+            .expect("generic live restore branch");
+        assert!(
+            generic_live_branch > 0,
+            "BitLocker must restore before generic live browse"
+        );
+    }
+
+    #[test]
+    fn compact_analyze_routes_selection_actions_through_existing_handlers() {
+        assert!(!INDEX_HTML.contains("id=\"selectVisibleRows\""));
+        assert!(!INDEX_HTML.contains("id=\"bookmarkReportSelected\""));
+        assert!(!INDEX_HTML.contains("$(\"selectVisibleRows\")"));
+        assert!(!INDEX_HTML.contains("$(\"bookmarkReportSelected\")"));
+        assert!(!INDEX_HTML.contains("selectVisibleRows()"));
+        assert!(INDEX_HTML.contains("<option value=\"select_visible\">Select visible</option>"));
+        assert!(INDEX_HTML.contains("<option value=\"bookmark_report\">Report selected</option>"));
+        assert!(INDEX_HTML
+            .contains("if (action === \"select_visible\") {\n        selectVisibleEntries();"));
+        assert!(INDEX_HTML.contains(
+            "if (action === \"bookmark_report\") {\n        await bookmarkSelectionAndExportReport();"
+        ));
+    }
+
+    #[test]
+    fn compact_analyze_panes_leave_accessible_reopen_rails() {
+        assert!(INDEX_HTML.contains("navigationCollapsed: false"));
+        assert!(INDEX_HTML.contains("function setNavigationCollapsed(collapsed)"));
+        assert!(INDEX_HTML.contains("setNavigationCollapsed(!state.navigationCollapsed)"));
+        assert!(INDEX_HTML.contains("aria-controls=\"navigationPane\" aria-expanded=\"true\""));
+        assert!(INDEX_HTML.contains("aria-controls=\"browserViewer\" aria-expanded=\"true\""));
+        assert!(INDEX_HTML.contains("button.setAttribute(\"aria-expanded\""));
+        assert!(INDEX_HTML.contains(".browser-workspace.inspector-collapsed .browser-viewer {"));
+        assert!(!INDEX_HTML.contains(
+            ".browser-workspace.inspector-collapsed .browser-viewer {\n      display: none;"
+        ));
+        assert!(INDEX_HTML.contains("@media (max-width: 980px)"));
+        assert!(INDEX_HTML.contains("--left-width: minmax(180px, 230px)"));
+    }
+    #[test]
+    fn ui_evidence_and_category_layout_improvements() {
+        assert!(!INDEX_HTML.contains("indexedBrowseButtonHtml("));
+        assert!(INDEX_HTML.contains("Add Evidence / Analyze image"));
+        assert!(INDEX_HTML.contains("updateAddEvidenceButton()"));
+        assert!(INDEX_HTML.contains("class=\"column-chooser\""));
+        assert!(INDEX_HTML.contains("CATEGORY_OPTIONAL_COLUMNS"));
+        assert!(INDEX_HTML.contains("min-width: max-content;"));
+        assert!(!INDEX_HTML.contains("min-width: 2480px;"));
     }
 }
 
@@ -8064,7 +8661,7 @@ fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> Result
     // from different executable versions.
     write!(
         stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n",
         response.status,
         response.reason,
         response.content_type,
@@ -8114,7 +8711,6 @@ fn index_html(config: &ServerConfig) -> String {
     let bootstrap = json!({
         "defaultCasePath": config.default_case_path,
         "defaultCasePinned": config.default_case_pinned,
-        "defaultEvidencePath": config.default_evidence_path,
         "defaultVhdSamplePath": config.default_vhd_sample_path,
         "defaultHistoryPath": config.default_history_path,
         "defaultReportPath": config.default_report_path,
@@ -8876,18 +9472,82 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .browser-workspace {
       display: grid;
       --inspector-width: 520px;
-      grid-template-columns: minmax(230px, 300px) minmax(360px, 1fr) 12px minmax(320px, var(--inspector-width));
+      --left-width: minmax(230px, 300px);
+      grid-template-columns: var(--left-width) minmax(360px, 1fr) 12px minmax(320px, var(--inspector-width));
       grid-template-rows: minmax(0, 1fr);
       gap: 10px;
       height: 100%;
       min-height: 0;
     }
     .browser-workspace.inspector-collapsed {
-      grid-template-columns: minmax(230px, 300px) minmax(0, 1fr);
+      grid-template-columns: var(--left-width) minmax(0, 1fr) 36px;
     }
-    .browser-workspace.inspector-collapsed .pane-resizer,
-    .browser-workspace.inspector-collapsed .browser-viewer {
+    .browser-workspace.inspector-collapsed .pane-resizer {
       display: none;
+    }
+    .browser-workspace.left-collapsed {
+      --left-width: 36px;
+    }
+    .browser-workspace.left-collapsed .tree-mode,
+    .browser-workspace.left-collapsed .tree-list,
+    .browser-workspace.left-collapsed .left-pane-text {
+      display: none;
+    }
+    .browser-workspace.left-collapsed .browser-tree {
+      grid-template-rows: minmax(0, 1fr);
+    }
+    .browser-workspace.left-collapsed .browser-tree .pane-title {
+      align-items: flex-start;
+      justify-content: center;
+      padding: 6px 0;
+      border-bottom: 0;
+    }
+    .browser-workspace.inspector-collapsed .browser-viewer {
+      display: grid;
+      grid-template-rows: minmax(0, 1fr) 0;
+    }
+    .browser-workspace.inspector-collapsed .browser-viewer-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 6px 0;
+      border-bottom: 0;
+    }
+    .browser-workspace.inspector-collapsed .hex-meta,
+    .browser-workspace.inspector-collapsed .inspector-title-text,
+    .browser-workspace.inspector-collapsed #hexStatus,
+    .browser-workspace.inspector-collapsed #hexView {
+      display: none;
+    }
+    .browser-workspace.inspector-collapsed .browser-viewer-head > div:first-child,
+    .browser-workspace.inspector-collapsed .browser-viewer-head .pane-title {
+      width: 100%;
+    }
+    .browser-workspace.inspector-collapsed .browser-viewer-head .pane-title {
+      justify-content: center;
+    }
+    .edge-control {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 28px;
+      width: 28px;
+      min-width: 28px;
+      min-height: 28px;
+      padding: 0;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 20px;
+      line-height: 1;
+    }
+    .edge-control:hover,
+    .edge-control:focus-visible {
+      border-color: var(--line);
+      background: #fff;
+      color: var(--accent);
     }
     .pane-resizer {
       min-width: 12px;
@@ -9042,7 +9702,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     .browser-table-wrap .category-table {
       table-layout: fixed;
-      min-width: 2480px;
+      min-width: max-content;
     }
     .browser-table-wrap .folder-table {
       table-layout: fixed;
@@ -9065,11 +9725,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .browser-table-wrap .idx-table td:nth-child(5) {
       width: 176px;
     }
-    /* Live browse table: checkbox / Name / Type / Size / Modified. Row click
-       opens, right-click acts - no per-row buttons, so it fits the pane. */
+    /* Live browse table: exact source timestamps stay in separate forensic
+       facets. Horizontal scrolling preserves readable timestamp columns. */
     .browser-table-wrap .live-table {
       table-layout: fixed;
-      min-width: 100%;
+      min-width: 1320px;
     }
     .browser-table-wrap .live-table th:nth-child(1),
     .browser-table-wrap .live-table td:nth-child(1) {
@@ -9086,6 +9746,39 @@ const INDEX_HTML: &str = r###"<!doctype html>
     .browser-table-wrap .live-table th:nth-child(5),
     .browser-table-wrap .live-table td:nth-child(5) {
       width: 170px;
+    }
+    /* The unlocked BitLocker browser has no selection-checkbox column, so its
+       Name/Type/Size widths are independent from the ordinary live grid. */
+    .browser-table-wrap .bitlocker-table {
+      table-layout: fixed;
+      min-width: 1160px;
+    }
+    .browser-table-wrap .bitlocker-table th:nth-child(2),
+    .browser-table-wrap .bitlocker-table td:nth-child(2) {
+      width: 88px;
+    }
+    .browser-table-wrap .bitlocker-table th:nth-child(3),
+    .browser-table-wrap .bitlocker-table td:nth-child(3) {
+      width: 112px;
+    }
+    .browser-table-wrap .bitlocker-table td {
+      padding-top: 8px;
+      padding-bottom: 8px;
+      vertical-align: middle;
+    }
+    .browser-table-wrap .bitlocker-table .entry-name {
+      display: block;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .browser-table-wrap .bitlocker-table .entry-row:hover td {
+      background: var(--surface-2);
+    }
+    .browser-table-wrap .bitlocker-table .entry-row.selected td,
+    .browser-table-wrap .bitlocker-table .entry-row.selected:hover td {
+      background: #e8f3f0;
     }
     .browser-table-wrap .directory-nav-row td {
       background: var(--surface-2);
@@ -9185,6 +9878,26 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     .export-path-choice-body p { margin: 0; }
     .export-path-choice-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .bitlocker-unlock-modal {
+      width: min(520px, calc(100vw - 48px));
+    }
+    .bitlocker-unlock-body {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 16px;
+    }
+    .bitlocker-unlock-body label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+    .bitlocker-unlock-actions {
       display: flex;
       justify-content: flex-end;
       gap: 8px;
@@ -10613,13 +11326,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
     body.analysis-fullscreen .browser-workspace {
       --inspector-width: 540px;
-      grid-template-columns: minmax(260px, 340px) minmax(420px, 1fr) 12px minmax(340px, var(--inspector-width));
+      --left-width: minmax(260px, 340px);
+      grid-template-columns: var(--left-width) minmax(420px, 1fr) 12px minmax(340px, var(--inspector-width));
       grid-template-rows: minmax(0, 1fr);
       height: 100%;
       min-height: 0;
     }
     body.analysis-fullscreen .browser-workspace.inspector-collapsed {
-      grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+      grid-template-columns: var(--left-width) minmax(0, 1fr) 36px;
+    }
+    body.analysis-fullscreen .browser-workspace.left-collapsed {
+      --left-width: 36px;
     }
     pre {
       white-space: pre-wrap;
@@ -10637,6 +11354,24 @@ const INDEX_HTML: &str = r###"<!doctype html>
       .sidebar { border-right: 0; border-bottom: 1px solid var(--line); }
       .topbar, .grid-2, .dashboard-grid { grid-template-columns: 1fr; }
       .stats { min-width: 0; grid-template-columns: repeat(2, 1fr); }
+      .browser-panel .panel-body {
+        padding: 6px;
+      }
+      .browser-workspace,
+      body.analysis-fullscreen .browser-workspace {
+        --left-width: minmax(180px, 230px);
+        --inspector-width: 320px;
+        grid-template-columns: var(--left-width) minmax(260px, 1fr) 8px minmax(280px, var(--inspector-width));
+        gap: 6px;
+      }
+      .browser-workspace.inspector-collapsed,
+      body.analysis-fullscreen .browser-workspace.inspector-collapsed {
+        grid-template-columns: var(--left-width) minmax(0, 1fr) 36px;
+      }
+      .browser-workspace.left-collapsed,
+      body.analysis-fullscreen .browser-workspace.left-collapsed {
+        --left-width: 36px;
+      }
     }
     @media (max-width: 620px) {
       main, .sidebar { padding: 12px; }
@@ -10644,7 +11379,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
       .dashboard-category-row { grid-template-columns: 1fr auto; }
       .dashboard-category-bar { grid-column: 1 / -1; }
       .browser-panel .panel-body { height: auto; min-height: 0; }
-      .browser-workspace { grid-template-columns: 1fr; grid-template-rows: auto minmax(260px, 40vh) minmax(340px, 1fr); }
+      .browser-workspace,
+      .browser-workspace.inspector-collapsed,
+      body.analysis-fullscreen .browser-workspace,
+      body.analysis-fullscreen .browser-workspace.inspector-collapsed {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto minmax(260px, 40vh) minmax(340px, 1fr);
+      }
+      .browser-workspace.inspector-collapsed,
+      body.analysis-fullscreen .browser-workspace.inspector-collapsed {
+        grid-template-rows: auto minmax(260px, 40vh) 40px;
+      }
       .pane-resizer { display: none; }
       .browser-tree { max-height: 260px; }
       .browser-viewer-head { grid-template-columns: 1fr; }
@@ -10844,8 +11589,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
             </div>
             <div class="panel-body">
               <div class="browser-workspace">
-                <div class="browser-tree">
-                  <div class="pane-title"><span id="treeTitle">Entries</span><span id="treeCount" class="tiny">0</span></div>
+                <div id="navigationPane" class="browser-tree">
+                  <div class="pane-title"><button id="toggleLeftPane" class="edge-control" type="button" aria-controls="navigationPane" aria-expanded="true" aria-label="Collapse Evidence and Volumes pane" title="Collapse Evidence and Volumes pane">&lsaquo;</button><span id="treeTitle" class="left-pane-text">Entries</span><span id="treeCount" class="tiny left-pane-text">0</span></div>
                   <div class="tree-mode">
                     <button id="treeModeFilesystem" class="active">Entries</button>
                     <button id="treeModeCategories">Categories</button>
@@ -10863,17 +11608,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
                         <button id="dateFilterClear" class="ghost" title="Clear date filter">All dates</button>
                       </span>
                       <span id="selectedCount" class="tiny">0 selected</span>
-                      <button id="selectVisibleRows" class="ghost">Select visible</button>
-                      <button id="bookmarkReportSelected" class="ghost" disabled>Report selected</button>
                       <select id="selectedAction" class="toolbar-select" title="Selected actions">
                         <option value="" disabled selected hidden>Selected actions</option>
                         <option value="bookmark">Bookmark selected</option>
-                        <option value="bookmark_report">Bookmark + export report</option>
+                        <option value="select_visible">Select visible</option>
+                        <option value="bookmark_report">Report selected</option>
                         <option value="export_files">Export selected file bytes</option>
                         <option value="export_csv">Export selected as CSV</option>
                         <option value="clear">Clear selection</option>
                       </select>
-                      <button id="toggleInspector" class="ghost">Hide inspector</button>
                     </span>
                   </div>
                   <div id="entryTable" class="browser-table-wrap"></div>
@@ -10882,7 +11625,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                 <div id="browserViewer" class="browser-viewer viewer-idle">
                   <div class="browser-viewer-head">
                     <div>
-                      <div class="pane-title" style="border:0;padding:0;background:transparent;min-height:0"><span>Inspector</span></div>
+                      <div class="pane-title" style="border:0;padding:0;background:transparent;min-height:0"><span class="inspector-title-text">Inspector</span><button id="toggleInspector" class="edge-control" type="button" aria-controls="browserViewer" aria-expanded="true" aria-label="Collapse Inspector pane" title="Collapse Inspector pane">&rsaquo;</button></div>
                       <div id="hexStatus" class="muted tiny">Select an item for preview, details, and bytes.</div>
                     </div>
                     <div class="hex-meta">
@@ -11068,6 +11811,27 @@ const INDEX_HTML: &str = r###"<!doctype html>
       </div>
     </section>
   </div>
+  <div id="bitlockerUnlockOverlay" class="timeline-detail-overlay" hidden onclick="if (event.target === this) cancelBitlockerUnlock()">
+    <section class="timeline-detail-modal bitlocker-unlock-modal" role="dialog" aria-modal="true" aria-labelledby="bitlockerUnlockTitle">
+      <div class="timeline-detail-modal-head">
+        <h3 id="bitlockerUnlockTitle">Unlock BitLocker volume</h3>
+        <button type="button" class="ghost" onclick="cancelBitlockerUnlock()">Close</button>
+      </div>
+      <form id="bitlockerUnlockForm" class="bitlocker-unlock-body" onsubmit="event.preventDefault(); submitBitlockerUnlock();">
+        <label for="bitlockerCredentialType">Credential type</label>
+        <select id="bitlockerCredentialType">
+          <option value="recovery_key" selected>Recovery key (48-digit)</option>
+          <option value="password">Password</option>
+        </select>
+        <label for="bitlockerCredentialInput">Credential</label>
+        <input id="bitlockerCredentialInput" type="password" autocomplete="off" placeholder="Enter recovery key or password" />
+        <div class="bitlocker-unlock-actions">
+          <button type="button" class="ghost" onclick="cancelBitlockerUnlock()">Cancel</button>
+          <button type="submit" id="bitlockerUnlockSubmit">Unlock</button>
+        </div>
+      </form>
+    </section>
+  </div>
 
   <script>
     const BOOTSTRAP = __KDFT_BOOTSTRAP__;
@@ -11116,6 +11880,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         selStart: null,
         selEnd: null,
         live: null,
+        bitlocker: null,
         raw: null,
         find: { query: "", kind: "text", status: "", continuation: null, nextStart: null, active: false, lastMatch: null, matchLength: null }
       };
@@ -11162,6 +11927,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       cat: { evidenceId: null, key: null, entries: [], total: null, categoryTotal: null, nextCursor: null, loading: false, error: "", pageSize: 1000 },
       expandedTreePaths: new Map(),
       collapsedCategoryMains: new Set(),
+      navigationCollapsed: false,
       inspectorCollapsed: false,
       viewerFullscreen: false,
       viewerFullscreenHistoryPending: false,
@@ -11172,10 +11938,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
       dateFilter: { from: "", to: "" },
       timeline: newTimelineState(),
       hex: makeHexState(),
+      bitlocker: null,
+      bitlockerPreview: newBitlockerPreviewState(),
       lastReportPath: BOOTSTRAP.defaultReportPath,
       pendingAnalysisSelection: ANALYSIS_MODE ? {
         evidenceId: Number.isFinite(REQUESTED_EVIDENCE_ID) && REQUESTED_EVIDENCE_ID > 0 ? REQUESTED_EVIDENCE_ID : null,
         selectedPath: PAGE_PARAMS.get("selected_path") || null,
+        blMarker: PAGE_PARAMS.get("bl_marker") === "1",
+        blEvidenceId: PAGE_PARAMS.get("bl_evidence_id") || "",
+        blVolume: PAGE_PARAMS.get("bl_volume") || "",
+        blPath: PAGE_PARAMS.get("bl_path") || "",
         treeMode: PAGE_PARAMS.get("tree_mode") === "live"
           ? "live"
           : (PAGE_PARAMS.get("tree_mode") === "categories" || PAGE_PARAMS.has("selected_category") || PAGE_PARAMS.has("category") ? "categories" : "filesystem"),
@@ -11567,13 +12339,115 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return sameEvidenceIdentity(selectedEvidenceSource(), expected);
     }
 
+    const BITLOCKER_RASTER_PREVIEW_EXTENSIONS = new Set([
+      "jpg", "jpeg", "jpe", "jfif", "png", "gif", "bmp", "webp", "ico"
+    ]);
+    const BITLOCKER_RASTER_PREVIEW_MIME_TYPES = new Set([
+      "image/jpeg", "image/png", "image/gif", "image/bmp", "image/webp", "image/x-icon"
+    ]);
+
+    function newBitlockerPreviewState(generation = 0) {
+      return {
+        generation,
+        controller: null,
+        objectUrl: "",
+        selectionKey: "",
+        status: "idle",
+        error: ""
+      };
+    }
+
+    function bitlockerPreviewSelectionKey(session, selection) {
+      if (!session || !selection) {
+        return "";
+      }
+      return [
+        session.casePath,
+        Number(selection.evidenceId),
+        Number(selection.volume),
+        normalizeLogicalPath(selection.path || "/")
+      ].join("|");
+    }
+
+    function resetBitlockerRasterPreview() {
+      const preview = state.bitlockerPreview;
+      const generation = Number(preview && preview.generation || 0) + 1;
+      if (preview && preview.controller) {
+        preview.controller.abort();
+      }
+      if (preview && preview.objectUrl) {
+        URL.revokeObjectURL(preview.objectUrl);
+      }
+      state.bitlockerPreview = newBitlockerPreviewState(generation);
+    }
+
+    function bitlockerRasterPreviewIsCurrent(preview, session, selectionKey) {
+      return state.bitlockerPreview === preview
+        && state.bitlocker === session
+        && Boolean(session && session.active)
+        && session.casePath === state.casePath
+        && state.loadedCasePath === session.casePath
+        && bitlockerPreviewSelectionKey(session, state.hex && state.hex.bitlocker) === selectionKey;
+    }
+
+    function reconcileBitlockerRasterPreviewSelection() {
+      const preview = state.bitlockerPreview;
+      if (preview && preview.selectionKey
+          && preview.selectionKey !== bitlockerPreviewSelectionKey(state.bitlocker, state.hex && state.hex.bitlocker)) {
+        resetBitlockerRasterPreview();
+      }
+    }
+
+    function isBitlockerRasterPreviewEntry(entry) {
+      return Boolean(entry && entry.entry_kind === "file")
+        && BITLOCKER_RASTER_PREVIEW_EXTENSIONS.has(fileExtension(entry.name || entry.logical_path));
+    }
+
+    function forgetBitlockerCredential() {
+      resetBitlockerRasterPreview();
+      if (bitlockerUnlockResolver) {
+        cancelBitlockerUnlock();
+      }
+      if (state.bitlocker) {
+        if (state.bitlocker.unlock) {
+          state.bitlocker.unlock.value = "";
+        }
+        state.bitlocker = null;
+      }
+      if (state.hex && state.hex.bitlocker) {
+        state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
+        renderHexViewer();
+      }
+    }
+
+    function bitlockerSessionMatchesContext(session, evidenceId = null, volumeIndex = null) {
+      if (!session || !session.active || session.casePath !== currentCasePath()) {
+        return false;
+      }
+      if (evidenceId != null && Number(session.evidenceId) !== Number(evidenceId)) {
+        return false;
+      }
+      if (volumeIndex != null && Number(session.volumeIndex) !== Number(volumeIndex)) {
+        return false;
+      }
+      return Boolean(
+        state.data
+        && state.data.evidence.some((item) => Number(item.id) === Number(session.evidenceId))
+        && Number(state.browserState.evidenceId) === Number(session.evidenceId)
+      );
+    }
+
     function clearRemovedEvidenceViewState(evidenceId) {
+      resetBitlockerRasterPreview();
       const id = Number(evidenceId);
       if (state.browserState.evidenceId === id) {
         state.browserState = { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" };
       }
       if (state.live.evidenceId === id) {
         state.live = newLiveBrowseState();
+      }
+      if (state.bitlocker && Number(state.bitlocker.evidenceId) === id) {
+        forgetBitlockerCredential();
       }
       if (state.idx.evidenceId === id) {
         state.idx = newIndexedBrowseState();
@@ -11613,8 +12487,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.timeline.casePath = state.casePath;
       updateAnalyzeNavButtons();
       // Analyze evidence/path selection is carried in state and URL params.
-      // No localStorage key persists it; kdft.evidencePath is only the Add
-      // Evidence input and intentionally remains untouched.
+      // The Add Evidence path is a form-local value and is never restored from
+      // another case or an earlier browser session.
     }
 
     function reconcileAnalyzeEvidenceState() {
@@ -11648,9 +12522,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       const hexEvidenceId = state.hex && state.hex.live
         ? Number(state.hex.live.evidenceId)
-        : (state.hex && state.hex.raw ? Number(state.hex.raw.evidenceId) : null);
+        : (state.hex && state.hex.bitlocker
+          ? Number(state.hex.bitlocker.evidenceId)
+          : (state.hex && state.hex.raw ? Number(state.hex.raw.evidenceId) : null));
       if (hexEvidenceId != null && !validIds.has(hexEvidenceId)) {
         state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
+      }
+      if (state.bitlocker && (
+          state.bitlocker.casePath !== currentCasePath()
+          || !validIds.has(Number(state.bitlocker.evidenceId))
+          || Number(state.bitlocker.evidenceId) !== selectedId
+        )) {
+        forgetBitlockerCredential();
       }
     }
 
@@ -11770,13 +12653,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function apiPost(path, body) {
-      const encodedBody = JSON.stringify(body);
-      const response = await fetchWithLocalAuthRetry(() => fetch(path, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "same-origin",
-          body: encodedBody
-        }));
+      const payloadStr = JSON.stringify(body);
+      const encodedBody = new TextEncoder().encode(payloadStr);
+      let response;
+      try {
+        response = await fetchWithLocalAuthRetry(() => fetch(path, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "same-origin",
+            body: encodedBody
+          }));
+      } finally {
+        encodedBody.fill(0);
+      }
       return readApiResponse(response);
     }
 
@@ -11823,6 +12712,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!state.loadedCasePath || state.loadedCasePath === casePath) {
         return;
       }
+      resetBitlockerRasterPreview();
       state.data = null;
       state.loadedCasePath = null;
       state.searchResults = [];
@@ -11844,6 +12734,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.searchSessionRestoredCasePath = null;
       state.lookupEntries = new Map();
       state.live = newLiveBrowseState();
+      if (state.bitlocker) {
+        forgetBitlockerCredential();
+      }
       state.idx = newIndexedBrowseState();
       state.cat = newCategoryCache();
       state.analyzeHistory = { back: [], forward: [], applying: false };
@@ -11861,7 +12754,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function currentEvidencePathDetails() {
       const result = normalizePathInputDetails($("evidencePath").value);
       $("evidencePath").value = result.value;
-      localStorage.setItem("kdft.evidencePath", result.value);
       return result;
     }
 
@@ -12004,6 +12896,27 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return pathResult && pathResult.corrected ? pathCorrectionNotice(pathResult) + ". " + message : message;
     }
 
+    function bitlockerSessionForAnalyzeLocation(location = currentAnalyzeLocation()) {
+      const session = state.bitlocker;
+      if (!session || !bitlockerSessionMatchesContext(session, session.evidenceId, session.volumeIndex)) {
+        return null;
+      }
+      const locationMatches = Boolean(
+        location
+        && location.treeMode === "live"
+        && location.bitlocker
+        && Number(location.evidenceId) === Number(session.evidenceId)
+        && Number(location.liveVolume) === Number(session.volumeIndex)
+      );
+      const viewerMatches = Boolean(
+        state.hex
+        && state.hex.bitlocker
+        && Number(state.hex.bitlocker.evidenceId) === Number(session.evidenceId)
+        && Number(state.hex.bitlocker.volume) === Number(session.volumeIndex)
+      );
+      return locationMatches || viewerMatches ? session : null;
+    }
+
     function analysisWindowUrl() {
       const params = new URLSearchParams();
       params.set("mode", "analysis");
@@ -12026,7 +12939,20 @@ const INDEX_HTML: &str = r###"<!doctype html>
         ? Number(state.hex.data.offset)
         : Number(state.hex && state.hex.offset);
       const viewerLength = Number(state.hex && state.hex.length);
-      if (state.hex && state.hex.live) {
+      const bitlockerSession = bitlockerSessionForAnalyzeLocation(location);
+      if (bitlockerSession) {
+        params.set("bl_marker", "1");
+        params.set("bl_evidence_id", String(bitlockerSession.evidenceId));
+        params.set("bl_volume", String(bitlockerSession.volumeIndex));
+        params.set("bl_path", bitlockerSession.path || "/");
+      }
+      if (state.hex && state.hex.bitlocker) {
+        params.set("viewer_target", "bitlocker");
+        params.set("evidence_id", String(state.hex.bitlocker.evidenceId));
+        params.set("viewer_volume", String(state.hex.bitlocker.volume));
+        params.set("viewer_path", state.hex.bitlocker.path || "/");
+        params.set("viewer_name", state.hex.bitlocker.name || logicalName(state.hex.bitlocker.path) || "file");
+      } else if (state.hex && state.hex.live) {
         params.set("viewer_target", "live");
         params.set("evidence_id", String(state.hex.live.evidenceId));
         params.set("viewer_volume", String(state.hex.live.volume));
@@ -12060,8 +12986,121 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return window.location.origin + window.location.pathname + "?" + params.toString();
     }
 
+    function toggleAnalyzeFullscreen() {
+      const active = document.body.classList.toggle("analysis-fullscreen");
+      updateAnalyzeFullscreenButton();
+      return active;
+    }
+
+    function updateAnalyzeFullscreenButton() {
+      const btn = $("openAnalyzeWindow");
+      if (btn) {
+        const active = document.body.classList.contains("analysis-fullscreen");
+        btn.textContent = active ? "Exit full screen" : "Open full screen in new tab";
+      }
+    }
+
+    const BITLOCKER_HANDOFF_PROTOCOL = "kdft-bitlocker-handoff-v1";
+
+    function randomHandoffNonce() {
+      return Array.from(crypto.getRandomValues(new Uint8Array(16)))
+        .map((value) => value.toString(16).padStart(2, "0"))
+        .join("");
+    }
+
     function openAnalyzeWindow() {
-      window.open(analysisWindowUrl(), "_blank", "noopener");
+      if (ANALYSIS_MODE) {
+        toggleAnalyzeFullscreen();
+        return;
+      }
+
+      const destination = analysisWindowUrl();
+      const child = window.open("", "_blank");
+      if (!child) {
+        setNotice("The browser blocked the full-screen tab. Allow pop-ups for this local KDFT page and try again.", true);
+        return;
+      }
+
+      const session = bitlockerSessionForAnalyzeLocation();
+      const transferBitlocker = Boolean(
+        session
+        && bitlockerSessionMatchesContext(session, session.evidenceId, session.volumeIndex)
+        && session.unlock
+        && session.unlock.value
+      );
+      if (!transferBitlocker) {
+        child.opener = null;
+        child.location.replace(destination);
+        return;
+      }
+
+      const expected = {
+        child,
+        session,
+        casePath: currentCasePath(),
+        evidenceId: Number(session.evidenceId),
+        volumeIndex: Number(session.volumeIndex),
+        expiresAt: Date.now() + 60000,
+        consumed: false
+      };
+      let timeoutId = null;
+      const cleanup = () => {
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+        window.removeEventListener("message", onReady);
+      };
+      const onReady = (event) => {
+        const message = event.data || {};
+        if (event.origin !== window.location.origin
+          || event.source !== expected.child
+          || message.protocol !== BITLOCKER_HANDOFF_PROTOCOL
+          || message.type !== "ready"
+          || typeof message.nonce !== "string"
+          || !/^[0-9a-f]{32}$/.test(message.nonce)
+          || !event.ports
+          || event.ports.length !== 1) {
+          return;
+        }
+        const port = event.ports[0];
+        const currentSession = state.bitlocker;
+        const contextStillMatches = !expected.consumed
+          && Date.now() <= expected.expiresAt
+          && currentCasePath() === expected.casePath
+          && currentSession === expected.session
+          && bitlockerSessionMatchesContext(currentSession, expected.evidenceId, expected.volumeIndex)
+          && Number(message.evidenceId) === expected.evidenceId
+          && Number(message.volumeIndex) === expected.volumeIndex
+          && currentSession.unlock
+          && Boolean(currentSession.unlock.value);
+        expected.consumed = true;
+        cleanup();
+        if (!contextStillMatches) {
+          port.postMessage({
+            protocol: BITLOCKER_HANDOFF_PROTOCOL,
+            type: "unavailable",
+            nonce: message.nonce
+          });
+          port.close();
+          return;
+        }
+        port.postMessage({
+          protocol: BITLOCKER_HANDOFF_PROTOCOL,
+          type: "credential",
+          nonce: message.nonce,
+          evidenceId: expected.evidenceId,
+          volumeIndex: expected.volumeIndex,
+          unlock: {
+            type: currentSession.unlock.type,
+            value: currentSession.unlock.value
+          }
+        });
+        port.close();
+      };
+      window.addEventListener("message", onReady);
+      timeoutId = window.setTimeout(cleanup, 60000);
+      child.location.replace(destination);
     }
 
     async function refresh() {
@@ -12322,6 +13361,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
       browser_history: { label: "History DB file", placeholder: "C:\\Users\\me\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\History", button: "Import Browser History", pick: "file", filter: "browser_history" }
     };
 
+    function updateAddEvidenceButton() {
+      const type = document.querySelector("#evidenceTypeRow .evidence-type.active")?.dataset.type || "image";
+      const spec = EVIDENCE_TYPE_LABELS[type] || EVIDENCE_TYPE_LABELS.image;
+      if (type === "image" && $("readFileSystem")?.value === "true") {
+        $("addEvidence").textContent = "Add Evidence / Analyze image";
+      } else {
+        $("addEvidence").textContent = spec.button;
+      }
+    }
+
     function setEvidenceType(type) {
       document.querySelectorAll("#evidenceTypeRow .evidence-type").forEach((button) => {
         button.classList.toggle("active", button.dataset.type === type);
@@ -12330,7 +13379,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const label = $("evidencePathLabel");
       label.childNodes[0].textContent = spec.label;
       $("evidencePath").placeholder = spec.placeholder;
-      $("addEvidence").textContent = spec.button;
+      updateAddEvidenceButton();
       const fsOptions = $("fsOptionsRow");
       const historyOptions = $("historyOptionsRow");
       if (fsOptions) {
@@ -12459,7 +13508,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
         });
         if (data.path) {
           $("evidencePath").value = data.path;
-          localStorage.setItem("kdft.evidencePath", data.path);
           setNotice("Selected " + data.path + ".");
         } else {
           setNotice("Browse cancelled.");
@@ -12944,16 +13992,33 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const progressId = newJobProgressId();
       const options = processingOptionsPayload();
       const hasExistingIndex = evidenceIndexedEntryCount(id) > 0;
-      const additive = hasExistingIndex && !options.reindex_filesystem;
+      let additive = hasExistingIndex && !options.reindex_filesystem;
+
+      let payload = {
+        case_path: currentCasePath(),
+        evidence_id: id,
+        max_entries: currentProcessMaxEntries(),
+        progress_id: progressId,
+        ...options
+      };
+
+      const bitlockerSession = state.bitlocker;
+      if (bitlockerSessionMatchesContext(
+            bitlockerSession,
+            id,
+            bitlockerSession && bitlockerSession.volumeIndex
+          ) && bitlockerSession.unlock) {
+        payload.unlock = {
+          type: bitlockerSession.unlock.type,
+          value: bitlockerSession.unlock.value
+        };
+        payload.volume_index = bitlockerSession.volumeIndex;
+        additive = false;
+      }
+
       await runAnalyze(label, async () => {
         try {
-          const data = await apiPost(additive ? "/api/evidence/run-processors" : "/api/evidence/process", {
-            case_path: currentCasePath(),
-            evidence_id: id,
-            max_entries: currentProcessMaxEntries(),
-            progress_id: progressId,
-            ...options
-          });
+          const data = await apiPost(additive ? "/api/evidence/run-processors" : "/api/evidence/process", payload);
           if (state.analyzing) {
             state.analyzing.telemetry = data.progress || state.analyzing.telemetry;
             state.analyzing.telemetryReceivedAt = Date.now();
@@ -12992,6 +14057,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
           } else {
             setNotice(err.message, true);
           }
+        } finally {
+          if (payload.unlock && payload.unlock.value) {
+            payload.unlock.value = "";
+          }
+          payload.unlock = null;
         }
       }, { progressId });
     }
@@ -13109,12 +14179,36 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       const button = $("toggleInspector");
       if (button) {
-        button.textContent = state.inspectorCollapsed ? "Show inspector" : "Hide inspector";
+        const action = state.inspectorCollapsed ? "Expand" : "Collapse";
+        button.textContent = state.inspectorCollapsed ? "\u2039" : "\u203a";
+        button.setAttribute("aria-expanded", String(!state.inspectorCollapsed));
+        button.setAttribute("aria-label", action + " Inspector pane");
+        button.title = action + " Inspector pane";
       }
     }
 
     function toggleInspectorPane() {
       setInspectorCollapsed(!state.inspectorCollapsed);
+    }
+
+    function setNavigationCollapsed(collapsed) {
+      state.navigationCollapsed = Boolean(collapsed);
+      const workspace = document.querySelector(".browser-workspace");
+      if (workspace) {
+        workspace.classList.toggle("left-collapsed", state.navigationCollapsed);
+      }
+      const button = $("toggleLeftPane");
+      if (button) {
+        const action = state.navigationCollapsed ? "Expand" : "Collapse";
+        button.textContent = state.navigationCollapsed ? "\u203a" : "\u2039";
+        button.setAttribute("aria-expanded", String(!state.navigationCollapsed));
+        button.setAttribute("aria-label", action + " Evidence and Volumes pane");
+        button.title = action + " Evidence and Volumes pane";
+      }
+    }
+
+    function toggleNavigationPane() {
+      setNavigationCollapsed(!state.navigationCollapsed);
     }
 
     function currentAnalyzeLocation() {
@@ -13126,12 +14220,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const separator = state.live.selKey.indexOf("|");
         const volume = separator === -1 ? state.live.selKey : state.live.selKey.slice(0, separator);
         const path = separator === -1 ? "/" : state.live.selKey.slice(separator + 1);
+        const isBitlocker = Boolean(
+          state.bitlocker && state.bitlocker.active && Number(state.bitlocker.volumeIndex) === Number(volume)
+        );
         return {
           evidenceId: state.live.evidenceId,
           treeMode: "live",
           selectedPath: normalizeLogicalPath(path || "/"),
           selectedCategory: "",
-          liveVolume: volume
+          liveVolume: volume,
+          bitlocker: isBitlocker
         };
       }
       const browserState = state.browserState || {};
@@ -13156,7 +14254,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         location.treeMode || "filesystem",
         normalizeLogicalPath(location.selectedPath || "/"),
         location.selectedCategory || "",
-        location.treeMode === "live" ? (location.liveVolume || "") : ""
+        location.treeMode === "live" ? (location.liveVolume || "") : "",
+        location.bitlocker ? "bl" : ""
       ].join("|");
     }
 
@@ -13184,23 +14283,24 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const back = $("analyzeBack");
       const forward = $("analyzeForward");
       if (back) {
-        back.disabled = state.analyzeHistory.back.length === 0;
+        back.disabled = state.analyzeHistory.applying || state.analyzeHistory.back.length === 0;
       }
       if (forward) {
-        forward.disabled = state.analyzeHistory.forward.length === 0;
+        forward.disabled = state.analyzeHistory.applying || state.analyzeHistory.forward.length === 0;
       }
     }
 
     async function applyAnalyzeLocation(location) {
       if (!location) {
-        return;
+        return false;
       }
       state.analyzeHistory.applying = true;
+      updateAnalyzeNavButtons();
       try {
         if (location.treeMode === "live") {
           const expectedEvidence = state.data && state.data.evidence.find((item) => item.id === location.evidenceId);
           if (!expectedEvidence) {
-            return;
+            return false;
           }
           let openedLiveForLocation = false;
           state.browserState = {
@@ -13215,28 +14315,61 @@ const INDEX_HTML: &str = r###"<!doctype html>
             if (state.live !== initialLiveState
               || Number(state.browserState.evidenceId) !== Number(location.evidenceId)
               || !selectedEvidenceIdentityMatches(expectedEvidence)) {
-              return;
+              return false;
             }
             state.live = { active: true, evidenceId: location.evidenceId, volumes: data.volumes || [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
             openedLiveForLocation = true;
           }
           const liveState = state.live;
           const path = normalizeLogicalPath(location.selectedPath || "/");
-          try {
-            const entries = await liveLoadDir(location.liveVolume, path);
-            if (entries === null || state.live !== liveState) {
-              return;
+          const bitlockerSession = state.bitlocker;
+          const bitlockerSessionMatches = bitlockerSessionMatchesContext(
+            bitlockerSession,
+            location.evidenceId,
+            location.liveVolume
+          );
+          const isBitlocker = Boolean(location.bitlocker || bitlockerSessionMatches);
+          if (location.bitlocker && !bitlockerSessionMatches) {
+            setNotice("That BitLocker browse session is locked. Unlock the volume again to revisit it.", true);
+            return false;
+          }
+          if (isBitlocker && bitlockerSessionMatches) {
+            try {
+              const entries = await bitlockerLoadDir(path);
+              if (entries === null || state.bitlocker !== bitlockerSession || state.live !== liveState) {
+                return false;
+              }
+              bitlockerSession.path = path;
+              bitlockerSession.entries = entries;
+              bitlockerSession.expanded = bitlockerSession.expanded || new Set(["/"]);
+              treeAncestors(path).forEach((ancestor) => bitlockerSession.expanded.add(ancestor));
+              bitlockerSession.expanded.add(path);
+              state.live.selKey = liveKey(bitlockerSession.volumeIndex, path);
+            } catch (err) {
+              if (state.bitlocker !== bitlockerSession || state.live !== liveState) {
+                return false;
+              }
+              setNotice("BitLocker browse failed: " + err.message, true);
+              return false;
             }
-            state.live.selKey = liveKey(location.liveVolume, path);
-            state.live.expanded.add(state.live.selKey);
-            if (openedLiveForLocation) {
-              state.liveGuidanceExpiresAt = Date.now() + 7000;
+          } else {
+            try {
+              const entries = await liveLoadDir(location.liveVolume, path);
+              if (entries === null || state.live !== liveState) {
+                return false;
+              }
+              state.live.selKey = liveKey(location.liveVolume, path);
+              state.live.expanded.add(state.live.selKey);
+              if (openedLiveForLocation) {
+                state.liveGuidanceExpiresAt = Date.now() + 7000;
+              }
+            } catch (err) {
+              if (state.live !== liveState) {
+                return false;
+              }
+              setNotice(err.message, true);
+              return false;
             }
-          } catch (err) {
-            if (state.live !== liveState) {
-              return;
-            }
-            setNotice(err.message, true);
           }
         } else {
           if (state.live.active) {
@@ -13267,32 +14400,45 @@ const INDEX_HTML: &str = r###"<!doctype html>
         state.analyzeHistory.applying = false;
         updateAnalyzeNavButtons();
       }
+      return true;
     }
 
     async function analyzeBack() {
-      const target = state.analyzeHistory.back.pop();
+      const target = state.analyzeHistory.back[state.analyzeHistory.back.length - 1];
       if (!target) {
         updateAnalyzeNavButtons();
         return;
       }
       const current = currentAnalyzeLocation();
-      if (current && !sameAnalyzeLocation(current, target)) {
-        state.analyzeHistory.forward.push(current);
+      let applied = false;
+      try {
+        applied = await applyAnalyzeLocation(target);
+      } finally {
+        state.analyzeHistory.back.pop();
+        if (applied && current && !sameAnalyzeLocation(current, target)) {
+          state.analyzeHistory.forward.push(current);
+        }
+        updateAnalyzeNavButtons();
       }
-      await applyAnalyzeLocation(target);
     }
 
     async function analyzeForward() {
-      const target = state.analyzeHistory.forward.pop();
+      const target = state.analyzeHistory.forward[state.analyzeHistory.forward.length - 1];
       if (!target) {
         updateAnalyzeNavButtons();
         return;
       }
       const current = currentAnalyzeLocation();
-      if (current && !sameAnalyzeLocation(current, target)) {
-        state.analyzeHistory.back.push(current);
+      let applied = false;
+      try {
+        applied = await applyAnalyzeLocation(target);
+      } finally {
+        state.analyzeHistory.forward.pop();
+        if (applied && current && !sameAnalyzeLocation(current, target)) {
+          state.analyzeHistory.back.push(current);
+        }
+        updateAnalyzeNavButtons();
       }
-      await applyAnalyzeLocation(target);
     }
 
     async function analyzeDiskImageEntry(entryId) {
@@ -13402,9 +14548,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function selectEvidenceSource(id, selectedPath = "/", treeMode = null, recordNavigation = true) {
       const previous = currentAnalyzeLocation();
+      resetBitlockerRasterPreview();
       if (state.live.active && state.live.evidenceId !== id) {
         state.live = newLiveBrowseState();
         setCurrentLiveGrid("", []);
+      }
+      if (state.bitlocker && Number(state.bitlocker.evidenceId) !== Number(id)) {
+        forgetBitlockerCredential();
       }
       state.browserState = {
         evidenceId: id,
@@ -13600,19 +14750,27 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Select one or more visible entries first.", true);
         return { succeeded: 0, failed: ids.length };
       }
-      // One request for the whole selection (bulk_add_bookmark_items runs every insert in a
-      // single server-side transaction) instead of one HTTP round-trip per entry - the old
-      // per-entry loop measured ~17ms/item, so a real ~23k-entry "All Categories" selection
-      // took nearly 7 minutes with no progress feedback, which read as a hung/crashed tab.
+      let groupName = prompt("Enter a name for this bookmark group:");
+      if (groupName === null) {
+        return { succeeded: 0, failed: 0 };
+      }
+      groupName = groupName.trim();
+      if (!groupName) {
+        setNotice("Bookmark group name cannot be empty.", true);
+        return { succeeded: 0, failed: 0 };
+      }
+      if (groupName.length > 255) {
+        groupName = groupName.substring(0, 255);
+      }
       if (ids.length > 500) {
         setNotice("Bookmarking " + ids.length.toLocaleString() + " selected entries...");
       }
       try {
         const result = await apiPost("/api/bookmark/bulk", {
           case_path: currentCasePath(),
-          folder_name: "Findings",
-          title: "Bulk bookmark (" + ids.length + " entries)",
-          comment: "Bookmarked via Selected actions on " + new Date().toISOString() + ".",
+          folder_name: groupName,
+          title: groupName,
+          comment: "",
           bookmark_type: "file_group",
           entry_ids: ids
         });
@@ -13691,12 +14849,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!action) {
         return;
       }
+      if (action === "select_visible") {
+        selectVisibleEntries();
+        return;
+      }
+      if (action === "bookmark_report") {
+        await bookmarkSelectionAndExportReport();
+        return;
+      }
       if (state.live.active) {
         if (action === "bookmark") {
           await bookmarkSelectedLive();
-        } else if (action === "bookmark_report") {
-          await bookmarkSelectedLive();
-          await exportReport();
         } else if (action === "export_files") {
           await exportSelectedLive();
         } else if (action === "clear") {
@@ -13708,13 +14871,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       if (action === "bookmark") {
         await bookmarkSelectedEntries();
-        return;
-      }
-      if (action === "bookmark_report") {
-        const result = await bookmarkSelectedEntries();
-        if (result && result.succeeded > 0) {
-          await exportReport();
-        }
         return;
       }
       if (action === "export_files") {
@@ -14102,7 +15258,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function setByteContext(context) {
-      if (!state.hex || state.hex.live || state.hex.raw || !state.hex.entryId) {
+      if (!state.hex || state.hex.live || state.hex.bitlocker || state.hex.raw || !state.hex.entryId) {
         return;
       }
       const currentOffset = Number(state.hex.data ? state.hex.data.offset : state.hex.offset) || 0;
@@ -14197,6 +15353,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const entry = currentHexEntry();
       const raw = Boolean(state.hex && state.hex.raw);
       const live = Boolean(state.hex && state.hex.live);
+      const bitlocker = Boolean(state.hex && state.hex.bitlocker);
       const indexedFile = Boolean(entry && entry.id && entry.entry_kind === "file");
       const fileActive = !raw && state.hex.byteContext !== "filesystem";
       const filesystemActive = raw || state.hex.byteContext === "filesystem";
@@ -14206,7 +15363,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       fileButton.classList.toggle("active", fileActive);
       fileButton.setAttribute("aria-pressed", String(fileActive));
-      fileButton.disabled = raw || (!indexedFile && !live);
+      fileButton.disabled = raw || (!indexedFile && !live && !bitlocker);
       filesystemButton.classList.toggle("active", filesystemActive);
       filesystemButton.setAttribute("aria-pressed", String(filesystemActive));
       const location = resolvedDiskLocation();
@@ -14229,34 +15386,55 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function fetchEntryBytes() {
-      if (!state.hex.entryId && !state.hex.live && !state.hex.raw) {
+      reconcileBitlockerRasterPreviewSelection();
+      if (!state.hex.entryId && !state.hex.live && !state.hex.bitlocker && !state.hex.raw) {
         renderHexViewer();
         return;
       }
       if (state.hex.fetching) {
         return;
       }
-      state.hex.fetching = true;
+      const requestState = state.hex;
+      requestState.fetching = true;
       try {
         let data;
         const filesystemContext = isFilesystemByteContext();
-        if (state.hex.raw) {
+        if (requestState.raw) {
           data = await apiGet("/api/image/bytes", {
               case_path: currentCasePath(),
-              evidence_id: state.hex.raw.evidenceId,
+              evidence_id: requestState.raw.evidenceId,
               raw: true,
-              offset: state.hex.offset,
-              length: state.hex.length
+              offset: requestState.offset,
+              length: requestState.length
             });
           data.byte_context = "filesystem";
-        } else if (state.hex.live) {
+        } else if (requestState.bitlocker) {
+          const session = state.bitlocker;
+          if (!session || !session.active
+              || session.casePath !== currentCasePath()
+              || Number(session.evidenceId) !== Number(requestState.bitlocker.evidenceId)
+              || Number(session.volumeIndex) !== Number(requestState.bitlocker.volume)) {
+            throw new Error("The BitLocker session is no longer unlocked.");
+          }
+          data = await apiPost("/api/image/bitlocker/unlock/bytes", {
+            case_path: currentCasePath(),
+            evidence_id: requestState.bitlocker.evidenceId,
+            volume_index: requestState.bitlocker.volume,
+            unlock: session.unlock,
+            file_path: requestState.bitlocker.path,
+            offset: requestState.offset,
+            length: requestState.length
+          });
+          data.byte_context = "file";
+          data.file_relative_offset = Number(data.offset || 0);
+        } else if (requestState.live) {
           data = await apiGet("/api/image/bytes", {
               case_path: currentCasePath(),
-              evidence_id: state.hex.live.evidenceId,
-              volume: state.hex.live.volume,
-              path: state.hex.live.path,
-              offset: state.hex.offset,
-              length: state.hex.length
+              evidence_id: requestState.live.evidenceId,
+              volume: requestState.live.volume,
+              path: requestState.live.path,
+              offset: requestState.offset,
+              length: requestState.length
             });
         } else if (filesystemContext) {
           const location = resolvedDiskLocation();
@@ -14267,37 +15445,45 @@ const INDEX_HTML: &str = r###"<!doctype html>
             case_path: currentCasePath(),
             evidence_id: location.evidence_id,
             raw: true,
-            offset: state.hex.offset,
-            length: state.hex.length
+            offset: requestState.offset,
+            length: requestState.length
           });
           data.byte_context = "filesystem";
-          data.entry_id = state.hex.entryId;
+          data.entry_id = requestState.entryId;
           data.disk_location = location;
           data.file_relative_offset = Number(location.file_relative_offset || 0)
             + Number(data.offset) - Number(location.decoded_media_offset);
         } else {
           data = await apiGet("/api/entry/bytes", {
               case_path: currentCasePath(),
-              entry_id: state.hex.entryId,
-              offset: state.hex.offset,
-              length: state.hex.length
+              entry_id: requestState.entryId,
+              offset: requestState.offset,
+              length: requestState.length
             });
           data.byte_context = "file";
           data.file_relative_offset = Number(data.offset);
         }
+        if (state.hex !== requestState) {
+          requestState.fetching = false;
+          return;
+        }
         clearHexSelection();
-        state.hex.data = data;
+        requestState.data = data;
         $("hexOffset").value = String(data.offset);
         $("hexLength").value = String(data.requested_length);
-        state.hex.fetching = false;
+        requestState.fetching = false;
         renderHexViewer();
         setNotice(filesystemContext
           ? "Opened file-system bytes at decoded-media offset " + data.offset + "."
           : "Opened file bytes at file-relative offset " + data.offset + ".");
       } catch (err) {
+        if (state.hex !== requestState) {
+          requestState.fetching = false;
+          return;
+        }
         clearHexSelection();
-        state.hex.data = null;
-        state.hex.fetching = false;
+        requestState.data = null;
+        requestState.fetching = false;
         renderHexViewer(err.message);
         setNotice(err.message, true);
       }
@@ -15745,7 +16931,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         recategorizeButton.hidden = !staleCategories;
       }
       $("statEvidence").textContent = data.evidence.length;
-      $("statEntries").textContent = data.entry_count;
+      $("statEntries").textContent = data.database_entry_count;
       $("statBookmarks").textContent = data.bookmarks.length;
       $("statReport").textContent = data.report.folders.length;
       if (!data.evidence.some((item) => item.id === state.browserState.evidenceId)) {
@@ -15788,13 +16974,202 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return Math.min(maximum, Math.max(minimum, parsed));
     }
 
+    function detachAnalysisOpener() {
+      try {
+        window.opener = null;
+      } catch (ignored) {
+        // The analysis tab must remain usable even if a hardened browser makes
+        // the opener property read-only.
+      }
+    }
+
+    async function receiveBitlockerHandoff(pending) {
+      const parent = window.opener;
+      if (!parent || !pending || !pending.blMarker) {
+        detachAnalysisOpener();
+        return null;
+      }
+      const evidenceId = pendingViewerInteger(
+        pending.blEvidenceId || pending.evidenceId,
+        0,
+        1,
+        Number.MAX_SAFE_INTEGER
+      );
+      const volumeIndex = pendingViewerInteger(
+        pending.blVolume,
+        -1,
+        0,
+        Number.MAX_SAFE_INTEGER
+      );
+      if (!evidenceId || volumeIndex < 0) {
+        detachAnalysisOpener();
+        return null;
+      }
+      const nonce = randomHandoffNonce();
+      const channel = new MessageChannel();
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = (credential) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearTimeout(timeoutId);
+          channel.port1.onmessage = null;
+          channel.port1.close();
+          detachAnalysisOpener();
+          resolve(credential);
+        };
+        const timeoutId = window.setTimeout(() => finish(null), 8000);
+        channel.port1.onmessage = (event) => {
+          const message = event.data || {};
+          const valid = message.protocol === BITLOCKER_HANDOFF_PROTOCOL
+            && message.type === "credential"
+            && message.nonce === nonce
+            && Number(message.evidenceId) === evidenceId
+            && Number(message.volumeIndex) === volumeIndex
+            && message.unlock
+            && typeof message.unlock.type === "string"
+            && typeof message.unlock.value === "string"
+            && Boolean(message.unlock.value);
+          if (!valid) {
+            finish(null);
+            return;
+          }
+          finish({ type: message.unlock.type, value: message.unlock.value });
+        };
+        channel.port1.start();
+        try {
+          parent.postMessage({
+            protocol: BITLOCKER_HANDOFF_PROTOCOL,
+            type: "ready",
+            nonce,
+            evidenceId,
+            volumeIndex
+          }, window.location.origin, [channel.port2]);
+        } catch (ignored) {
+          finish(null);
+        }
+      });
+    }
+
+    async function openPendingBitlocker(pending, evidence) {
+      const handoffEvidenceId = pendingViewerInteger(
+        pending.blEvidenceId,
+        -1,
+        1,
+        Number.MAX_SAFE_INTEGER
+      );
+      const volumeIndex = pendingViewerInteger(
+        pending.blVolume,
+        -1,
+        0,
+        Number.MAX_SAFE_INTEGER
+      );
+      if (!evidence || handoffEvidenceId < 1
+        || Number(evidence.id) !== handoffEvidenceId
+        || volumeIndex < 0) {
+        detachAnalysisOpener();
+        return false;
+      }
+      const expectedCasePath = currentCasePath();
+      state.browserState = {
+        evidenceId: evidence.id,
+        selectedPath: "/",
+        treeMode: "filesystem",
+        selectedCategory: ""
+      };
+      const credential = await receiveBitlockerHandoff(pending);
+      const initialLiveState = state.live;
+      let data;
+      try {
+        data = await loadLiveVolumes(evidence.id);
+      } catch (err) {
+        if (credential) {
+          credential.value = "";
+        }
+        setNotice("Could not inspect the BitLocker evidence source: " + err.message, true);
+        return false;
+      }
+      if (currentCasePath() !== expectedCasePath
+        || state.live !== initialLiveState
+        || !selectedEvidenceIdentityMatches(evidence)) {
+        if (credential) {
+          credential.value = "";
+        }
+        return false;
+      }
+      state.live = {
+        active: true,
+        evidenceId: evidence.id,
+        volumes: data.volumes || [],
+        dirCache: {},
+        expanded: new Set(),
+        selKey: liveKey(volumeIndex, "/"),
+        selected: new Map(),
+        lastKey: null
+      };
+      try {
+        return await unlockBitlockerVolume(volumeIndex, {
+          credential,
+          initialPath: pending.blPath || "/",
+          recordNavigation: false
+        });
+      } finally {
+        if (credential) {
+          credential.value = "";
+        }
+      }
+    }
+
     async function restorePendingViewerTarget(pending, evidence) {
       if (!pending || !pending.viewerTarget || !evidence) {
         return;
       }
       const offset = pendingViewerInteger(pending.viewerOffset, 0, 0, Number.MAX_SAFE_INTEGER);
       const length = pendingViewerInteger(pending.viewerLength, 512, 16, 8 * 1024 * 1024);
-      if (pending.viewerTarget === "live") {
+      let bitlockerPreviewRestore = null;
+      if (pending.viewerTarget === "bitlocker") {
+        const session = state.bitlocker;
+        const volume = pendingViewerInteger(
+          pending.viewerVolume || pending.blVolume,
+          -1,
+          0,
+          Number.MAX_SAFE_INTEGER
+        );
+        const path = normalizeLogicalPath(pending.viewerPath || "");
+        if (!path
+          || !bitlockerSessionMatchesContext(session, evidence.id, volume)
+          || Number(session.volumeIndex) !== volume) {
+          return;
+        }
+        const parentPath = parentLogicalPath(path);
+        if (!session.dirCache[parentPath]) {
+          const entries = await bitlockerLoadDir(parentPath);
+          if (entries === null || state.bitlocker !== session) {
+            return;
+          }
+          session.dirCache[parentPath] = entries;
+        }
+        const name = pending.viewerName || logicalName(path) || "file";
+        const entry = (session.dirCache[parentPath] || []).find(
+          (item) => !item.is_dir && (item.name === name || liveChildPath(parentPath, item.name) === path)
+        ) || null;
+        state.hex = makeHexState(null, offset, length);
+        state.hex.bitlocker = {
+          evidenceId: evidence.id,
+          volume,
+          path,
+          name,
+          entry,
+          sizeBytes: entry && entry.size_bytes != null ? entry.size_bytes : null
+        };
+        bitlockerPreviewRestore = {
+          session,
+          selection: state.hex.bitlocker,
+          entry: currentHexEntry()
+        };
+      } else if (pending.viewerTarget === "live") {
         if (!state.live.active || Number(state.live.evidenceId) !== Number(evidence.id)) {
           return;
         }
@@ -15857,7 +17232,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
       $("viewerMode").value = viewerMode;
       $("hexOffset").value = String(offset);
       $("hexLength").value = String(length);
-      await fetchEntryBytes();
+      const bytesRequest = fetchEntryBytes();
+      const previewRequest = bitlockerPreviewRestore
+        && isBitlockerRasterPreviewEntry(bitlockerPreviewRestore.entry)
+        ? loadBitlockerRasterPreview(
+            bitlockerPreviewRestore.session,
+            bitlockerPreviewRestore.selection,
+            bitlockerPreviewRestore.entry
+          )
+        : Promise.resolve();
+      await Promise.all([bytesRequest, previewRequest]);
       const selectionStart = pendingViewerInteger(
         pending.viewerSelectionStart,
         -1,
@@ -15883,14 +17267,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!pending || pending.applied || pending.applying || !state.data) {
         return;
       }
-      const requested = pending.evidenceId;
+      const requested = pending.blMarker
+        ? pendingViewerInteger(pending.blEvidenceId, 0, 1, Number.MAX_SAFE_INTEGER)
+        : pending.evidenceId;
       const evidence = state.data.evidence.find((item) => item.id === requested)
         || state.data.evidence.find((item) => item.id === state.browserState.evidenceId)
         || state.data.evidence[0];
       pending.applying = true;
       try {
         if (evidence) {
-          if (pending.treeMode === "live") {
+          if (pending.blMarker) {
+            await openPendingBitlocker(pending, evidence);
+          } else if (pending.treeMode === "live") {
             await applyAnalyzeLocation({
               evidenceId: evidence.id,
               treeMode: "live",
@@ -16191,12 +17579,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
           <td>${evidenceProcessingStatusHtml(item)}${item.sha256_hex ? ' <span class="pill good">hashed</span>' : ""}</td>
           <td class="actions">
             <div class="toolbar">
-              ${indexedBrowseButtonHtml(item)}
               ${liveBrowseButtonHtml(item)}
               ${processActionHtml(item)}
               ${item.source_kind === "folder" || item.source_kind === "browser_history" ? "" : `<button class="ghost" onclick="hashEvidence(${item.id})">${item.sha256_hex ? "Re-hash" : "Hash"}</button>`}
               ${item.source_kind === "image" ? `<button class="ghost" onclick="carveEvidence(${item.id})">Carve</button>` : ""}
-              <button class="ghost" onclick="bookmarkEvidence(${row.evidenceIndex})">Bookmark</button>
               <button class="ghost danger" onclick="removeEvidence(${item.id})">Remove</button>
             </div>
           </td>
@@ -16285,12 +17671,6 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return `<button class="ghost" onclick="processEvidence(${item.id})">Process</button>`;
     }
 
-    function indexedBrowseButtonHtml(item) {
-      if (evidenceIndexedEntryCount(item.id) === 0) {
-        return "";
-      }
-      return `<button class="secondary" onclick="selectEvidenceSource(${item.id}, preferredAnalysisPath(${item.id}))" title="Open the processed filesystem index and derived categories for this evidence.">View index</button>`;
-    }
 
     function supportsLiveBrowseEvidence(item) {
       return !!item && (item.source_kind === "image" || item.source_kind === "folder" || item.source_kind === "file");
@@ -16414,21 +17794,26 @@ const INDEX_HTML: &str = r###"<!doctype html>
         }
         openedLiveState = { active: true, evidenceId: evidence.id, volumes: data.volumes || [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null };
         state.live = openedLiveState;
-        const first = openedLiveState.volumes.find((volume) => volume.browsable);
-        if (first) {
-          const entries = await liveLoadDir(first.index, "/");
-          if (entries === null || state.live !== openedLiveState) {
-            return;
+        const resumedBitlocker = attachBitlockerSessionToLiveState(state.bitlocker, openedLiveState);
+        if (!resumedBitlocker) {
+          const first = openedLiveState.volumes.find((volume) => volume.browsable);
+          if (first) {
+            const entries = await liveLoadDir(first.index, "/");
+            if (entries === null || state.live !== openedLiveState) {
+              return;
+            }
+            openedLiveState.expanded.add(liveKey(first.index, "/"));
+            openedLiveState.selKey = liveKey(first.index, "/");
           }
-          openedLiveState.expanded.add(liveKey(first.index, "/"));
-          openedLiveState.selKey = liveKey(first.index, "/");
         }
         state.liveGuidanceExpiresAt = Date.now() + 7000;
         renderEvidenceBrowserEntries();
         if (state.live !== openedLiveState || !selectedEvidenceIdentityMatches(evidence)) {
           return;
         }
-        setNotice(liveBrowseReadyNotice(evidence));
+        setNotice(resumedBitlocker
+          ? "Resumed unlocked BitLocker volume " + state.bitlocker.volumeIndex + " at " + displayPath(state.bitlocker.path || "/") + "."
+          : liveBrowseReadyNotice(evidence));
         commitAnalyzeNavigation(previous);
       } catch (err) {
         if (!selectedEvidenceIdentityMatches(evidence)
@@ -17383,8 +18768,27 @@ const INDEX_HTML: &str = r###"<!doctype html>
         { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
         { key: "status", label: "Status", sortable: true, filterable: true, sortType: "text" },
         { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
-        { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" }
+        { key: "created", label: "Created", sortable: true, filterable: true, sortType: "time" },
+        { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" },
+        { key: "accessed", label: "Accessed", sortable: true, filterable: true, sortType: "time" },
+        { key: "mftModified", label: "MFT Modified", sortable: true, filterable: true, sortType: "time" }
       ];
+    }
+
+    function liveTimestampDisplay(value) {
+      const text = firstText(value);
+      if (!text) return "";
+      const timestampMs = Date.parse(text);
+      return Number.isFinite(timestampMs)
+        ? timelineDisplayTimestamp(timestampMs, text)
+        : text;
+    }
+
+    function liveMftModifiedTimestamp(entry) {
+      return firstText(
+        entry && entry.ntfs_mft_record_modification_time_utc,
+        entry && entry.mft_record_modification_time_utc
+      );
     }
 
     function directoryNavigationRow(name, targetPath, onOpen, columnCount) {
@@ -17425,7 +18829,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
             ? (entry.provenance === "deleted_reconstructed" ? "Deleted · path reconstructed" : "Deleted · orphan")
             : (entry.provenance === "allocated_orphan" ? "Allocated · orphan path" : "Allocated")));
       const size = entry.size_bytes == null ? "" : formatBytes(entry.size_bytes);
-      const modified = entry.modified_utc || entry.created_utc || "";
+      const createdRaw = firstText(entry.created_utc);
+      const modifiedRaw = firstText(entry.modified_utc);
+      const accessedRaw = firstText(entry.accessed_utc);
+      const mftModifiedRaw = liveMftModifiedTimestamp(entry);
       return {
         entry,
         item: {
@@ -17442,11 +18849,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
           type,
           status,
           size,
-          modified
+          created: liveTimestampDisplay(createdRaw),
+          modified: liveTimestampDisplay(modifiedRaw),
+          accessed: liveTimestampDisplay(accessedRaw),
+          mftModified: liveTimestampDisplay(mftModifiedRaw)
         },
         sortValues: {
           size: entry.size_bytes == null ? NaN : Number(entry.size_bytes),
-          modified: Date.parse(modified)
+          created: Date.parse(createdRaw),
+          modified: Date.parse(modifiedRaw),
+          accessed: Date.parse(accessedRaw),
+          mftModified: Date.parse(mftModifiedRaw)
         }
       };
     }
@@ -17467,7 +18880,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
           <td class="entry-kind">${escapeHtml(row.values.type)}</td>
           <td class="entry-flags">${escapeHtml(row.values.status)}</td>
           <td class="entry-size">${row.values.size}</td>
-          <td class="entry-time">${escapeHtml(row.values.modified)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.created)}">${escapeHtml(row.values.created)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.modified)}">${escapeHtml(row.values.modified)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.accessed)}">${escapeHtml(row.values.accessed)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.mftModified)}">${escapeHtml(row.values.mftModified)}</td>
         </tr>`;
     }
 
@@ -17526,11 +18942,23 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.live.volumes.forEach((volume) => {
         const key = liveKey(volume.index, "/");
         const expanded = state.live.expanded.has(key);
-        const active = (state.live.selKey === key || (state.hex.raw && Number(state.hex.raw.volume) === Number(volume.index))) ? " active" : "";
-        const toggle = volume.browsable
-          ? `<span class="tree-toggle can-toggle" onclick="event.stopPropagation(); liveToggleDir(${volume.index}, '/')">${expanded ? "-" : "+"}</span>`
-          : `<span class="tree-toggle"></span>`;
-        const click = volume.browsable ? `onclick="liveSelectDir(${volume.index}, '/')"` : "";
+        const isBitlockerUnlocked = Boolean(
+          state.bitlocker && state.bitlocker.active && Number(state.bitlocker.volumeIndex) === Number(volume.index)
+        );
+        const selVolume = state.live.selKey ? Number(state.live.selKey.split("|")[0]) : null;
+        const isBitlockerActive = isBitlockerUnlocked && selVolume === Number(volume.index);
+        const isBitlockerRootActive = isBitlockerUnlocked && state.live.selKey === key;
+        const isNormalActive = !isBitlockerActive && state.live.selKey === key;
+        const isRawActive = state.hex.raw && Number(state.hex.raw.volume) === Number(volume.index);
+        const active = (isBitlockerRootActive || isNormalActive || isRawActive) ? " active" : "";
+        const toggle = isBitlockerUnlocked
+          ? `<span class="tree-toggle can-toggle" onclick="event.stopPropagation(); bitlockerToggleDir('/')">${state.bitlocker.expanded && state.bitlocker.expanded.has("/") ? "-" : "+"}</span>`
+          : (volume.browsable
+            ? `<span class="tree-toggle can-toggle" onclick="event.stopPropagation(); liveToggleDir(${volume.index}, '/')">${expanded ? "-" : "+"}</span>`
+            : `<span class="tree-toggle"></span>`);
+        const click = isBitlockerUnlocked
+          ? `onclick="bitlockerSelectDir('/')"`
+          : (volume.browsable ? `onclick="liveSelectDir(${volume.index}, '/')"` : "");
         rows.push(`<button class="tree-row${active}" style="--depth:0" ${click} title="${escapeAttr(volume.filesystem + " " + formatBytes(volume.size_bytes))}">
           ${toggle}
           <span class="tree-label">${escapeHtml(volume.name)} <span class="muted tiny">${escapeHtml(volume.filesystem)}</span></span>
@@ -17541,6 +18969,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         }
         if (volume.browsable && expanded) {
           renderLiveDirRows(volume.index, "/", 1, rows);
+        } else if (isBitlockerUnlocked && state.bitlocker.expanded && state.bitlocker.expanded.has("/")) {
+          renderBitlockerDirRows("/", 1, rows);
         }
       });
       // Count filesystem volumes only. The separate raw-image byte stream is
@@ -17558,6 +18988,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         $("entryTable").innerHTML = empty("Select a volume or folder on the left to browse it.");
         setCurrentLiveGrid("live", []);
         renderSelectionCount();
+        return;
+      }
+      if (state.bitlocker && state.bitlocker.active && selVolume === Number(state.bitlocker.volumeIndex)) {
+        renderBitlockerEntries();
         return;
       }
       const viewedPath = state.hex.live && state.hex.live.volume === selVolume ? state.hex.live.path : null;
@@ -17613,92 +19047,477 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // never written to localStorage, the case DB, notices, or logs.
     function bitlockerStatusRow(volume) {
       const bl = volume.bitlocker || {};
-      const method = bl.encryption_method ? (bl.encryption_method.description || bl.encryption_method.raw || "") : "";
+      const method = typeof bl.encryption_method === "string"
+        ? bl.encryption_method
+        : (bl.encryption_method ? (bl.encryption_method.description || bl.encryption_method.raw || "") : "");
       const protectors = Array.isArray(bl.protectors)
         ? bl.protectors.map((p) => (p && (p.kind || p.label || p.raw)) || "").filter(Boolean).join(", ")
         : "";
       const hasCredentialProtector = bl.can_unlock_with_recovery_key || bl.can_unlock_with_password;
       // decrypt_supported === false means the cipher was identified but this
-      // build's decrypt layer refuses it (only AES-128-CBC with/without the
-      // Elephant diffuser is validated); a credential cannot help until then,
-      // so say that honestly instead of offering a doomed unlock.
+      // build's decrypt layer refuses it; a credential cannot help until then,
+      // so say that honestly instead of offering a doomed unlock. Do not list
+      // algorithms here because the wrapped decrypt core is the authority.
       const cipherUnsupported = bl.decrypt_supported === false;
-      const canUnlock = hasCredentialProtector && !cipherUnsupported;
+      const inspectionFailed = bl.metadata_state === "inspection-warning";
+      const canUnlock = hasCredentialProtector && !cipherUnsupported && !inspectionFailed;
       const unlocked = state.bitlocker && state.bitlocker.active && Number(state.bitlocker.volumeIndex) === Number(volume.index);
+      const declaredEncryptedSize = Number(bl.encrypted_volume_size || 0);
+      const effectiveEncryptedSize = Number(bl.effective_encrypted_volume_size || 0);
+      const boundedExtent = declaredEncryptedSize > 0 && effectiveEncryptedSize > 0 && declaredEncryptedSize !== effectiveEncryptedSize
+        ? ` - encrypted extent bounded to ${effectiveEncryptedSize.toLocaleString()} bytes (FVE declared ${declaredEncryptedSize.toLocaleString()})`
+        : "";
+      const inspectionQualification = bl.inspection_warning
+        ? `<span class="muted tiny" title="${escapeAttr(String(bl.inspection_warning))}"> - ${inspectionFailed ? "metadata inspection warning" : "qualified FVE geometry"}</span>`
+        : "";
       const action = unlocked
         ? `<button class="ghost tiny" onclick="event.stopPropagation(); lockBitlockerVolume()">Lock (forget key)</button>`
         : (canUnlock
           ? `<button class="ghost tiny" onclick="event.stopPropagation(); unlockBitlockerVolume(${volume.index})">Unlock &amp; browse</button>`
-          : (cipherUnsupported
-            ? `<span class="muted tiny">Detected, but this build cannot decrypt ${escapeHtml(String(method || "this cipher"))} yet (decrypt is limited to AES-128-CBC &plusmn; diffuser); a recovery key/password will not help until then</span>`
-            : `<span class="muted tiny">Cannot decrypt (no recovery-key/password protector${bl.tpm_only ? "; TPM-only" : ""})</span>`));
-      return `<div class="tree-row bitlocker-info" style="--depth:1">
+          : (inspectionFailed
+            ? `<span class="muted tiny">Unlock unavailable because FVE metadata inspection did not complete</span>`
+            : (cipherUnsupported
+              ? `<span class="muted tiny">Detected, but this build cannot decrypt ${escapeHtml(String(method || "this cipher"))}; a recovery key/password will not help until the decrypt core supports it</span>`
+              : `<span class="muted tiny">Cannot decrypt (no recovery-key/password protector${bl.tpm_only ? "; TPM-only" : ""})</span>`)));
+      const statusClick = unlocked ? ` onclick="resumeBitlockerBrowse(${volume.index})"` : "";
+      const statusStyle = unlocked ? ' style="--depth:1; cursor:pointer"' : ' style="--depth:1"';
+      return `<div class="tree-row bitlocker-info"${statusStyle}${statusClick}>
         <span class="tree-toggle"></span>
-        <span class="tree-label"><span class="muted tiny">${escapeHtml(bl.status || "BitLocker volume")}${method ? " - " + escapeHtml(String(method)) : ""}${protectors ? " - " + escapeHtml(protectors) : ""}</span></span>
+        <span class="tree-label"><span class="muted tiny">${escapeHtml(bl.status || "BitLocker volume")}${method ? " - " + escapeHtml(String(method)) : ""}${protectors ? " - " + escapeHtml(protectors) : ""}${escapeHtml(boundedExtent)}</span>${inspectionQualification}</span>
         ${action}
       </div>`;
     }
 
-    async function unlockBitlockerVolume(volumeIndex) {
-      const which = window.prompt("BitLocker unlock - enter 'r' for a 48-digit recovery key, or 'p' for a password:", "r");
-      if (which == null) {
-        return;
+    let bitlockerUnlockResolver = null;
+    let bitlockerUnlockPromise = null;
+    let bitlockerUnlockOperationActive = false;
+
+    function promptBitlockerUnlock() {
+      if (bitlockerUnlockPromise) {
+        return bitlockerUnlockPromise;
       }
-      const kind = which.trim().toLowerCase().startsWith("p") ? "password" : "recovery_key";
-      const value = window.prompt(
-        kind === "password" ? "Enter the BitLocker password:" : "Enter the 48-digit recovery key (six-digit groups separated by dashes):",
-        ""
-      );
-      if (value == null || !value.trim()) {
-        setNotice("BitLocker unlock cancelled.", true);
-        return;
+      const overlay = $("bitlockerUnlockOverlay");
+      const typeSelect = $("bitlockerCredentialType");
+      const credInput = $("bitlockerCredentialInput");
+      if (typeSelect) typeSelect.value = "recovery_key";
+      if (credInput) credInput.value = "";
+      if (overlay) overlay.hidden = false;
+      window.setTimeout(() => {
+        if (credInput) credInput.focus();
+      }, 0);
+      bitlockerUnlockPromise = new Promise((resolve) => {
+        bitlockerUnlockResolver = resolve;
+      });
+      return bitlockerUnlockPromise;
+    }
+
+    function cancelBitlockerUnlock() {
+      const credInput = $("bitlockerCredentialInput");
+      if (credInput) credInput.value = "";
+      const overlay = $("bitlockerUnlockOverlay");
+      if (overlay) overlay.hidden = true;
+      const resolve = bitlockerUnlockResolver;
+      bitlockerUnlockResolver = null;
+      bitlockerUnlockPromise = null;
+      if (resolve) resolve(null);
+    }
+
+    function submitBitlockerUnlock() {
+      const typeSelect = $("bitlockerCredentialType");
+      const credInput = $("bitlockerCredentialInput");
+      const kind = (typeSelect && typeSelect.value) || "recovery_key";
+      const value = credInput ? credInput.value.trim() : "";
+      if (credInput) credInput.value = "";
+      const overlay = $("bitlockerUnlockOverlay");
+      if (overlay) overlay.hidden = true;
+      const resolve = bitlockerUnlockResolver;
+      bitlockerUnlockResolver = null;
+      bitlockerUnlockPromise = null;
+      if (resolve) {
+        if (!value) {
+          resolve(null);
+        } else {
+          resolve({ type: kind, value: value });
+        }
+      }
+    }
+
+    function attachBitlockerSessionToLiveState(session, liveState) {
+      if (!bitlockerSessionMatchesContext(session, liveState && liveState.evidenceId, session && session.volumeIndex)) {
+        return false;
+      }
+      if (!liveState || !liveState.active || !liveState.volumes.some((volume) => Number(volume.index) === Number(session.volumeIndex))) {
+        return false;
+      }
+      const path = normalizeLogicalPath(session.path || "/");
+      session.path = path;
+      session.dirCache = session.dirCache || {};
+      session.entries = session.dirCache[path] || session.entries || [];
+      session.expanded = session.expanded || new Set(["/"]);
+      treeAncestors(path).forEach((ancestor) => session.expanded.add(ancestor));
+      session.expanded.add(path);
+      liveState.selKey = liveKey(session.volumeIndex, path);
+      return true;
+    }
+
+    async function unlockBitlockerVolume(volumeIndex, options = {}) {
+      if (bitlockerUnlockOperationActive) {
+        return false;
+      }
+      bitlockerUnlockOperationActive = true;
+      const expectedCasePath = currentCasePath();
+      const expectedEvidenceId = state.live.evidenceId;
+      const expectedEvidence = selectedEvidenceSource();
+      const expectedLiveState = state.live;
+      const previous = currentAnalyzeLocation();
+      const initialPath = normalizeLogicalPath(options.initialPath || "/");
+      const suppliedCredential = options.credential;
+      const cred = suppliedCredential && suppliedCredential.value
+        ? { type: suppliedCredential.type || "recovery_key", value: suppliedCredential.value }
+        : await promptBitlockerUnlock();
+      if (!cred || !cred.value) {
+        bitlockerUnlockOperationActive = false;
+        if (!suppliedCredential) {
+          setNotice("BitLocker unlock cancelled.");
+        }
+        return false;
+      }
+      let credentialRetained = false;
+      if (currentCasePath() !== expectedCasePath
+        || state.live !== expectedLiveState
+        || !state.live.active
+        || Number(state.live.evidenceId) !== Number(expectedEvidenceId)
+        || !selectedEvidenceIdentityMatches(expectedEvidence)) {
+        cred.value = "";
+        bitlockerUnlockOperationActive = false;
+        return false;
       }
       setNotice("Unlocking BitLocker volume " + volumeIndex + " (key used for this request, held in memory only)...");
       try {
         const data = await apiPost("/api/image/bitlocker/unlock/list", {
-          case_path: currentCasePath(),
-          evidence_id: state.live.evidenceId,
+          case_path: expectedCasePath,
+          evidence_id: expectedEvidenceId,
           volume_index: Number(volumeIndex),
-          unlock: { type: kind, value: value },
-          dir_path: "/"
+          unlock: cred,
+          dir_path: initialPath
         });
-        state.bitlocker = { active: true, volumeIndex: Number(volumeIndex), unlock: { type: kind, value: value }, path: "/", entries: data.entries || [], preview: null };
+        if (currentCasePath() !== expectedCasePath
+          || state.live !== expectedLiveState
+          || !state.live.active
+          || Number(state.live.evidenceId) !== Number(expectedEvidenceId)
+          || !selectedEvidenceIdentityMatches(expectedEvidence)) {
+          return false;
+        }
+        const priorSelKey = expectedLiveState.selKey;
+        resetBitlockerRasterPreview();
+        if (state.bitlocker && state.bitlocker.unlock) {
+          state.bitlocker.unlock.value = "";
+        }
+        state.bitlocker = {
+          active: true,
+          evidenceId: expectedEvidenceId,
+          casePath: expectedCasePath,
+          volumeIndex: Number(volumeIndex),
+          priorSelKey: priorSelKey,
+          unlock: cred,
+          path: initialPath,
+          entries: data.entries || [],
+          dirCache: { [initialPath]: data.entries || [] },
+          expanded: new Set(treeAncestors(initialPath).concat([initialPath])),
+          unlockNoticeExpiresAt: Date.now() + 7000
+        };
+        credentialRetained = true;
+        state.live.selKey = liveKey(volumeIndex, initialPath);
+        state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
         renderLiveBrowse();
-        renderBitlockerEntries();
-        setNotice("Unlocked BitLocker volume " + volumeIndex + ": " + (data.entries || []).length + " root entries. Use Lock to clear the key from memory.");
+        renderHexViewer();
+        setNotice("Unlocked BitLocker volume " + volumeIndex + ": " + (data.entries || []).length + " entries at " + initialPath + ". Use Lock to clear the key from memory.");
+        if (options.recordNavigation !== false) {
+          commitAnalyzeNavigation(previous);
+        } else {
+          updateAnalyzeNavButtons();
+        }
+        return true;
       } catch (err) {
+        if (currentCasePath() !== expectedCasePath
+          || state.live !== expectedLiveState
+          || !selectedEvidenceIdentityMatches(expectedEvidence)) {
+          return false;
+        }
         setNotice("BitLocker unlock failed: " + err.message, true);
+        return false;
+      } finally {
+        if (!credentialRetained) {
+          cred.value = "";
+        }
+        bitlockerUnlockOperationActive = false;
       }
     }
 
     function lockBitlockerVolume() {
-      if (state.bitlocker && state.bitlocker.unlock) {
-        state.bitlocker.unlock.value = ""; // best-effort scrub before dropping
+      const lockedSession = state.bitlocker;
+      const prior = lockedSession ? lockedSession.priorSelKey : null;
+      if (lockedSession) {
+        const belongsToLockedSession = (location) => Boolean(
+          location
+          && location.bitlocker
+          && Number(location.evidenceId) === Number(lockedSession.evidenceId)
+          && Number(location.liveVolume) === Number(lockedSession.volumeIndex)
+        );
+        state.analyzeHistory.back = state.analyzeHistory.back.filter((location) => !belongsToLockedSession(location));
+        state.analyzeHistory.forward = state.analyzeHistory.forward.filter((location) => !belongsToLockedSession(location));
       }
-      state.bitlocker = null;
+      forgetBitlockerCredential();
+      if (prior) {
+        state.live.selKey = prior;
+      } else {
+        const first = state.live.volumes.find((v) => v.browsable) || state.live.volumes[0];
+        state.live.selKey = first ? liveKey(first.index, "/") : null;
+      }
       renderLiveBrowse();
+      updateAnalyzeNavButtons();
       setNotice("BitLocker volume locked - the key was cleared from memory.");
     }
 
-    async function bitlockerDrill(path) {
+    async function resumeBitlockerBrowse(volumeIndex, recordNavigation = true) {
       const bl = state.bitlocker;
-      if (!bl || !bl.active) {
+      if (!bitlockerSessionMatchesContext(bl, bl && bl.evidenceId, volumeIndex)) {
         return;
       }
+      const previous = currentAnalyzeLocation();
+      if (!state.live.active
+        || Number(state.live.evidenceId) !== Number(bl.evidenceId)
+        || !state.live.volumes.length) {
+        const initialLiveState = state.live;
+        const expectedEvidence = selectedEvidenceSource();
+        try {
+          const data = await loadLiveVolumes(bl.evidenceId);
+          if (state.live !== initialLiveState
+            || state.bitlocker !== bl
+            || !bitlockerSessionMatchesContext(bl, bl.evidenceId, volumeIndex)
+            || !selectedEvidenceIdentityMatches(expectedEvidence)) {
+            return;
+          }
+          state.live = {
+            active: true,
+            evidenceId: bl.evidenceId,
+            volumes: data.volumes || [],
+            dirCache: {},
+            expanded: new Set(),
+            selKey: null,
+            selected: new Map(),
+            lastKey: null
+          };
+        } catch (err) {
+          if (state.bitlocker === bl && bitlockerSessionMatchesContext(bl, bl.evidenceId, volumeIndex)) {
+            setNotice("Could not reopen the unlocked BitLocker volume: " + err.message, true);
+          }
+          return;
+        }
+      }
+      if (!attachBitlockerSessionToLiveState(bl, state.live)) {
+        setNotice("The unlocked BitLocker partition is no longer present in this evidence source.", true);
+        return;
+      }
+      if (!state.hex || !state.hex.bitlocker) {
+        state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
+      }
+      renderLiveBrowse();
+      renderHexViewer();
+      if (recordNavigation) {
+        commitAnalyzeNavigation(previous);
+      } else {
+        updateAnalyzeNavButtons();
+      }
+    }
+
+    async function bitlockerLoadDir(path) {
+      const bl = state.bitlocker;
+      if (!bitlockerSessionMatchesContext(bl, bl && bl.evidenceId, bl && bl.volumeIndex)) {
+        return null;
+      }
+      const normPath = normalizeLogicalPath(path || "/");
+      if (bl.dirCache && bl.dirCache[normPath]) {
+        return bl.dirCache[normPath];
+      }
+      const expectedCasePath = bl.casePath;
+      const expectedEvidenceId = bl.evidenceId;
+      const expectedVolumeIndex = bl.volumeIndex;
+      const expectedLiveState = state.live;
+      const data = await apiPost("/api/image/bitlocker/unlock/list", {
+        case_path: expectedCasePath,
+        evidence_id: expectedEvidenceId,
+        volume_index: expectedVolumeIndex,
+        unlock: bl.unlock,
+        dir_path: normPath
+      });
+      if (state.bitlocker !== bl
+        || state.live !== expectedLiveState
+        || !bitlockerSessionMatchesContext(bl, expectedEvidenceId, expectedVolumeIndex)) {
+        return null;
+      }
+      bl.dirCache = bl.dirCache || {};
+      bl.dirCache[normPath] = data.entries || [];
+      return bl.dirCache[normPath];
+    }
+
+    async function bitlockerToggleDir(path) {
+      const bl = state.bitlocker;
+      if (!bl || !bl.active) return;
+      const normPath = normalizeLogicalPath(path || "/");
+      bl.expanded = bl.expanded || new Set(["/"]);
+      if (bl.expanded.has(normPath)) {
+        bl.expanded.delete(normPath);
+      } else {
+        try {
+          await bitlockerLoadDir(normPath);
+        } catch (err) {
+          if (state.bitlocker !== bl) {
+            return;
+          }
+          setNotice("BitLocker folder read failed: " + err.message, true);
+          return;
+        }
+        if (state.bitlocker !== bl || !bl.active) {
+          return;
+        }
+        bl.expanded.add(normPath);
+      }
+      renderLiveBrowse();
+    }
+
+    async function bitlockerSelectDir(path, recordNavigation = true) {
+      const bl = state.bitlocker;
+      if (!bl || !bl.active) return;
+      resetBitlockerRasterPreview();
+      bl.navGeneration = (bl.navGeneration || 0) + 1;
+      const generation = bl.navGeneration;
+      const previous = currentAnalyzeLocation();
+      path = normalizeLogicalPath(path || "/");
       try {
-        const data = await apiPost("/api/image/bitlocker/unlock/list", {
-          case_path: currentCasePath(),
-          evidence_id: state.live.evidenceId,
-          volume_index: bl.volumeIndex,
-          unlock: bl.unlock,
-          dir_path: path
-        });
+        const entries = await bitlockerLoadDir(path);
+        if (state.bitlocker !== bl || generation !== bl.navGeneration || entries === null || !bl.active) return;
         bl.path = path;
-        bl.entries = data.entries || [];
-        bl.preview = null;
-        renderBitlockerEntries();
+        bl.entries = entries;
+        bl.expanded = bl.expanded || new Set(["/"]);
+        treeAncestors(path).forEach((ancestor) => bl.expanded.add(ancestor));
+        bl.expanded.add(path);
+        state.live.selKey = liveKey(bl.volumeIndex, path);
+        if (state.hex && state.hex.bitlocker) {
+          state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
+        }
+        renderLiveBrowse();
+        renderHexViewer();
+        if (recordNavigation) {
+          commitAnalyzeNavigation(previous);
+        } else {
+          updateAnalyzeNavButtons();
+        }
       } catch (err) {
+        if (state.bitlocker !== bl || generation !== bl.navGeneration) return;
         setNotice("BitLocker browse failed: " + err.message, true);
+      }
+    }
+
+    async function bitlockerDrill(path) {
+      await bitlockerSelectDir(path, true);
+    }
+
+    function renderBitlockerDirRows(path, depth, rows) {
+      const bl = state.bitlocker;
+      if (!bl || !bl.active) return;
+      const normPath = normalizeLogicalPath(path || "/");
+      const entries = (bl.dirCache && bl.dirCache[normPath]) || [];
+      entries.filter((entry) => entry.is_dir).forEach((entry) => {
+        const childPath = liveChildPath(normPath, entry.name);
+        const key = liveKey(bl.volumeIndex, childPath);
+        const expanded = Boolean(bl.expanded && bl.expanded.has(childPath));
+        const active = state.live.selKey === key ? " active" : "";
+        rows.push(`<button class="tree-row${active}" style="--depth:${depth}" onclick="bitlockerSelectDir('${escapeAttr(escapeJs(childPath))}')" title="${escapeAttr(childPath)}">
+          <span class="tree-toggle can-toggle" onclick="event.stopPropagation(); bitlockerToggleDir('${escapeAttr(escapeJs(childPath))}')">${expanded ? "-" : "+"}</span>
+          <span class="tree-label">${escapeHtml(entry.name)}</span>
+          <span class="muted tiny"></span>
+        </button>`);
+        if (expanded) {
+          renderBitlockerDirRows(childPath, depth + 1, rows);
+        }
+      });
+    }
+
+    async function loadBitlockerRasterPreview(session, selection, entry) {
+      resetBitlockerRasterPreview();
+      if (!isBitlockerRasterPreviewEntry(entry)) {
+        return;
+      }
+      const selectionKey = bitlockerPreviewSelectionKey(session, selection);
+      const controller = new AbortController();
+      const preview = state.bitlockerPreview;
+      preview.controller = controller;
+      preview.selectionKey = selectionKey;
+      preview.status = "loading";
+      renderHexViewer();
+      try {
+        const payloadStr = JSON.stringify({
+          case_path: session.casePath,
+          evidence_id: session.evidenceId,
+          volume_index: session.volumeIndex,
+          unlock: session.unlock,
+          file_path: selection.path
+        });
+        const encodedBody = new TextEncoder().encode(payloadStr);
+        let response;
+        try {
+          response = await fetchWithLocalAuthRetry(() => fetch("/api/image/bitlocker/unlock/raw", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            cache: "no-store",
+            credentials: "same-origin",
+            body: encodedBody,
+            signal: controller.signal
+          }));
+        } finally {
+          encodedBody.fill(0);
+        }
+        if (!response.ok) {
+          let message = response.statusText || "Raster preview failed";
+          try {
+            const payload = await response.json();
+            message = payload.error || message;
+          } catch (_) {}
+          throw new Error(message);
+        }
+        const blob = await response.blob();
+        const contentType = String(response.headers.get("Content-Type") || blob.type || "")
+          .split(";", 1)[0]
+          .trim()
+          .toLowerCase();
+        if (!BITLOCKER_RASTER_PREVIEW_MIME_TYPES.has(contentType)) {
+          throw new Error("The server returned a non-raster preview format.");
+        }
+        if (!bitlockerRasterPreviewIsCurrent(preview, session, selectionKey)) {
+          return;
+        }
+        preview.objectUrl = URL.createObjectURL(blob);
+        preview.status = "ready";
+        if ($("viewerMode").value === "metadata") {
+          renderHexViewer();
+        }
+      } catch (err) {
+        if (err && err.name === "AbortError") {
+          return;
+        }
+        if (!bitlockerRasterPreviewIsCurrent(preview, session, selectionKey)) {
+          return;
+        }
+        preview.status = "error";
+        preview.error = err && err.message ? err.message : String(err);
+        if ($("viewerMode").value === "metadata") {
+          renderHexViewer();
+        }
+      } finally {
+        if (state.bitlockerPreview === preview && preview.controller === controller) {
+          preview.controller = null;
+        }
       }
     }
 
@@ -17707,23 +19526,121 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!bl || !bl.active) {
         return;
       }
-      try {
-        const data = await apiPost("/api/image/bitlocker/unlock/bytes", {
-          case_path: currentCasePath(),
-          evidence_id: state.live.evidenceId,
-          volume_index: bl.volumeIndex,
-          unlock: bl.unlock,
-          file_path: path,
-          offset: 0,
-          length: 256
-        });
-        const bytes = data.bytes || [];
-        bl.preview = { name: name, offset: 0, hex: bytes.map(byteHex).join(" "), ascii: printableAsciiPreview(bytes) };
-        renderBitlockerEntries();
-        setNotice("Read " + (data.bytes_read || bytes.length) + " bytes of " + name + " (total " + formatBytes(data.total_size || 0) + ").");
-      } catch (err) {
-        setNotice("BitLocker byte read failed: " + err.message, true);
+      resetBitlockerRasterPreview();
+      const entries = (bl.dirCache && bl.dirCache[bl.path]) || bl.entries || [];
+      const entry = entries.find((e) => e.name === name) || null;
+      state.hex = makeHexState(null, 0, numberValue("hexLength", 512));
+      state.hex.bitlocker = {
+        evidenceId: bl.evidenceId,
+        volume: bl.volumeIndex,
+        path: path,
+        name: name,
+        entry: entry,
+        sizeBytes: entry && entry.size_bytes != null ? entry.size_bytes : null
+      };
+      const selectedEntry = currentHexEntry();
+      const supportsRasterPreview = isBitlockerRasterPreviewEntry(selectedEntry);
+      if (supportsRasterPreview) {
+        $("viewerMode").value = "metadata";
+      } else {
+        $("viewerMode").value = "hex";
       }
+      $("hexOffset").value = "0";
+      setInspectorCollapsed(false);
+      renderBitlockerEntries();
+      renderHexViewer();
+      const selection = state.hex.bitlocker;
+      const previewRequest = supportsRasterPreview
+        ? loadBitlockerRasterPreview(bl, selection, selectedEntry)
+        : Promise.resolve();
+      await Promise.all([fetchEntryBytes(), previewRequest]);
+    }
+
+    function bitlockerGridColumns() {
+      return [
+        { key: "name", label: "Name", sortable: true, filterable: true, sortType: "text" },
+        { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
+        { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
+        { key: "created", label: "Created", sortable: true, filterable: true, sortType: "time" },
+        { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" },
+        { key: "accessed", label: "Accessed", sortable: true, filterable: true, sortType: "time" },
+        { key: "mftModified", label: "MFT Modified", sortable: true, filterable: true, sortType: "time" }
+      ];
+    }
+
+    function bitlockerGridRow(entry, current) {
+      const child = liveChildPath(current, entry.name);
+      const createdRaw = firstText(entry.created_utc);
+      const modifiedRaw = firstText(entry.modified_utc);
+      const accessedRaw = firstText(entry.accessed_utc);
+      const mftModifiedRaw = liveMftModifiedTimestamp(entry);
+      return {
+        entry,
+        child,
+        values: {
+          name: entry.name,
+          type: entry.is_dir ? "Folder" : "File",
+          size: entry.size_bytes == null ? "" : formatBytes(entry.size_bytes),
+          created: liveTimestampDisplay(createdRaw),
+          modified: liveTimestampDisplay(modifiedRaw),
+          accessed: liveTimestampDisplay(accessedRaw),
+          mftModified: liveTimestampDisplay(mftModifiedRaw)
+        },
+        sortValues: {
+          size: entry.size_bytes == null ? NaN : Number(entry.size_bytes),
+          created: Date.parse(createdRaw),
+          modified: Date.parse(modifiedRaw),
+          accessed: Date.parse(accessedRaw),
+          mftModified: Date.parse(mftModifiedRaw)
+        }
+      };
+    }
+
+    function renderBitlockerGridRow(row) {
+      const entry = row.entry;
+      const child = row.child;
+      const selected = Boolean(
+        !entry.is_dir
+        && state.hex && state.hex.bitlocker
+        && Number(state.hex.bitlocker.volume) === Number(state.bitlocker.volumeIndex)
+        && state.hex.bitlocker.path === child
+      );
+      const selectedClass = selected ? " selected" : "";
+      const open = entry.is_dir
+        ? `bitlockerDrill('${escapeAttr(escapeJs(child))}')`
+        : `openBitlockerFileBytes('${escapeAttr(escapeJs(child))}','${escapeAttr(escapeJs(entry.name))}')`;
+      const pathAttr = entry.is_dir ? "" : ` data-bitlocker-path="${escapeAttr(child)}"`;
+      return `<tr class="entry-row${selectedClass}"${pathAttr} onclick="${open}">
+          <td><span class="entry-name">${escapeHtml(entry.name)}${entry.is_dir ? "/" : ""}</span></td>
+          <td class="entry-kind">${escapeHtml(row.values.type)}</td>
+          <td class="entry-size">${escapeHtml(row.values.size)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.created)}">${escapeHtml(row.values.created)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.modified)}">${escapeHtml(row.values.modified)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.accessed)}">${escapeHtml(row.values.accessed)}</td>
+          <td class="entry-time" title="${escapeAttr(row.values.mftModified)}">${escapeHtml(row.values.mftModified)}</td>
+        </tr>`;
+    }
+
+    function bitlockerDirectoryNavigationRow(name, targetPath, onOpen, columnCount) {
+      const label = name === "." ? "Current folder" : "Parent folder";
+      const trailingCells = Array.from({ length: Math.max(0, columnCount - 2) }, () => "<td></td>").join("");
+      return `<tr class="entry-row directory-nav-row" style="cursor:pointer" onclick="${onOpen}" title="${escapeAttr(label + ": " + displayPath(targetPath))}"><td><span class="entry-name">${escapeHtml(name)}</span></td><td class="entry-kind">Folder</td>${trailingCells}</tr>`;
+    }
+
+    function bitlockerDirectoryNavigationRows(path) {
+      const current = normalizeLogicalPath(path || "/");
+      const parent = parentLogicalPath(current);
+      return bitlockerDirectoryNavigationRow(
+        ".",
+        current,
+        `bitlockerDrill('${escapeAttr(escapeJs(current))}')`,
+        bitlockerGridColumns().length
+      ) + bitlockerDirectoryNavigationRow(
+        "..",
+        parent,
+        `bitlockerDrill('${escapeAttr(escapeJs(parent))}')`,
+        bitlockerGridColumns().length
+      );
     }
 
     function renderBitlockerEntries() {
@@ -17732,26 +19649,27 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return;
       }
       $("folderTitle").textContent = "BitLocker vol " + bl.volumeIndex + " : " + (bl.path || "/");
-      const parent = bl.path && bl.path !== "/" ? (bl.path.replace(/\/[^\/]*$/, "") || "/") : null;
-      const rows = [];
-      if (parent !== null) {
-        rows.push(`<tr><td colspan="3"><button class="ghost tiny" onclick="bitlockerDrill('${escapeAttr(escapeJs(parent))}')">.. up</button></td></tr>`);
-      }
-      (bl.entries || []).forEach((entry) => {
-        const child = liveChildPath(bl.path || "/", entry.name);
-        if (entry.is_dir) {
-          rows.push(`<tr><td><button class="ghost tiny" onclick="bitlockerDrill('${escapeAttr(escapeJs(child))}')">${escapeHtml(entry.name)}/</button></td><td>Folder</td><td></td></tr>`);
-        } else {
-          rows.push(`<tr><td><button class="ghost tiny" onclick="openBitlockerFileBytes('${escapeAttr(escapeJs(child))}','${escapeAttr(escapeJs(entry.name))}')">${escapeHtml(entry.name)}</button></td><td>File</td><td>${entry.size_bytes == null ? "" : escapeHtml(formatBytes(entry.size_bytes))}</td></tr>`);
-        }
-      });
-      const dump = bl.preview
-        ? `<div class="analysis-status">First bytes of ${escapeHtml(bl.preview.name)} (offset ${bl.preview.offset}):<br><span class="mono tiny">${escapeHtml(bl.preview.hex)}</span><br><span class="mono tiny">${escapeHtml(bl.preview.ascii)}</span></div>`
+      const current = normalizeLogicalPath(bl.path || "/");
+      const columns = bitlockerGridColumns();
+      const entries = bl.entries || [];
+      const tableResult = sortableGridTable(
+        "bitlocker",
+        columns,
+        entries.map((entry) => bitlockerGridRow(entry, current)),
+        "bitlocker-table",
+        renderBitlockerGridRow,
+        bitlockerDirectoryNavigationRows(current)
+      );
+      const unlockNoticeRemainingMs = Math.max(0, Number(bl.unlockNoticeExpiresAt || 0) - Date.now());
+      const unlockNotice = unlockNoticeRemainingMs > 0
+        ? `<div class="analysis-status transient-guidance" role="status" style="--guidance-duration:${unlockNoticeRemainingMs}ms">Decrypted BitLocker NTFS volume — read-only; recovery key held in memory only. Use <strong>Lock (forget key)</strong> in the volume tree when finished.</div>`
         : "";
+      const filterStatus = gridFilterStatusHtml("bitlocker", columns, tableResult.visibleRows.length, entries.length, "items");
       $("entryTable").innerHTML =
-        `<div class="analysis-status">Decrypted BitLocker NTFS volume - read-only, key held in memory only. <button class="ghost tiny" onclick="lockBitlockerVolume()">Lock (forget key)</button></div>` +
-        dump +
-        `<table class="live-table"><thead><tr><th>Name</th><th>Type</th><th>Size</th></tr></thead><tbody>${rows.join("") || '<tr><td colspan="3" class="muted">Empty folder.</td></tr>'}</tbody></table>`;
+        unlockNotice +
+        filterStatus +
+        tableResult.html +
+        (entries.length && !tableResult.visibleRows.length ? empty("No items match the column filters.") : "");
     }
 
     // Lazy indexed browse: for cases too big to ship every entry, load folders
@@ -18753,23 +20671,81 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderCategoryRows(rows, status);
     }
 
-    function categoryGridColumns() {
-      return [
+    const CATEGORY_OPTIONAL_COLUMNS = [
+      { key: "offset", label: "Media offset", sortable: true, filterable: true, sortType: "number" },
+      { key: "artifactTime", label: "Artifact time", sortable: true, filterable: true, sortType: "time" },
+      { key: "created", label: "Created", sortable: true, filterable: true, sortType: "time" },
+      { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" },
+      { key: "accessed", label: "Accessed", sortable: true, filterable: true, sortType: "time" },
+      { key: "mftModified", label: "MFT modified", sortable: true, filterable: true, sortType: "time" },
+      { key: "sha256", label: "SHA-256", sortable: true, filterable: true, sortType: "text" },
+      { key: "evtx_event_id", label: "Event ID", sortable: true, filterable: true, sortType: "number", meta: "evtx_event_id" },
+      { key: "evtx_provider_name", label: "Provider", sortable: true, filterable: true, sortType: "text", meta: "evtx_provider_name" },
+      { key: "evtx_channel", label: "Channel", sortable: true, filterable: true, sortType: "text", meta: "evtx_channel" },
+      { key: "evtx_computer_name", label: "Computer", sortable: true, filterable: true, sortType: "text", meta: "evtx_computer_name" },
+      { key: "evtx_record_id", label: "Record ID", sortable: true, filterable: true, sortType: "number", meta: "evtx_record_id" },
+      { key: "url", label: "URL", sortable: true, filterable: true, sortType: "text", meta: "url" },
+      { key: "title", label: "Title", sortable: true, filterable: true, sortType: "text", meta: "title" },
+      { key: "referrer", label: "Referrer", sortable: true, filterable: true, sortType: "text", meta: "referrer" },
+      { key: "visit_count", label: "Visit count", sortable: true, filterable: true, sortType: "number", meta: "visit_count" },
+      { key: "browser_profile", label: "Profile", sortable: true, filterable: true, sortType: "text", meta: "browser_profile" },
+      { key: "account_name", label: "Account", sortable: true, filterable: true, sortType: "text", meta: "account_name" },
+      { key: "network_name", label: "Network", sortable: true, filterable: true, sortType: "text", meta: "network_name" }
+    ];
+
+    function toggleCategoryColumn(key, visible) {
+      if (!state.categoryColumnVisibility) state.categoryColumnVisibility = {};
+      state.categoryColumnVisibility[key] = visible;
+      renderState();
+    }
+
+    function categoryColumnChooserHtml() {
+      if (!state.availableCategoryColumns || !state.availableCategoryColumns.length) return "";
+      const checkboxes = CATEGORY_OPTIONAL_COLUMNS
+        .filter(c => state.availableCategoryColumns.includes(c.key))
+        .map(c => {
+          const checked = state.categoryColumnVisibility[c.key] ? "checked" : "";
+          return `<label style="display:block; font-size:11px; margin-bottom:4px; white-space:nowrap;"><input type="checkbox" ${checked} onchange="toggleCategoryColumn('${c.key}', this.checked)"> ${escapeHtml(c.label)}</label>`;
+        }).join("");
+      return `<details class="column-chooser" style="position:relative; display:inline-block; margin-left:8px;">
+        <summary class="ghost button" style="padding:4px 8px; font-size:11px; height:auto;">Columns</summary>
+        <div style="position:absolute; right:0; top:100%; background:var(--surface); border:1px solid var(--line); padding:8px; border-radius:4px; z-index:10; min-width:120px; box-shadow:0 4px 6px rgba(0,0,0,0.3);">
+          ${checkboxes}
+        </div>
+      </details>`;
+    }
+
+    function categoryGridColumns(rows) {
+      const base = [
         { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
         { key: "name", label: "Name", sortable: true, filterable: true, sortType: "text" },
         { key: "category", label: "Category", sortable: true, filterable: true, sortType: "text" },
         { key: "type", label: "Type", sortable: true, filterable: true, sortType: "text" },
         { key: "ext", label: "Extension", sortable: true, filterable: true, sortType: "text" },
         { key: "size", label: "Size", sortable: true, filterable: true, sortType: "number" },
-        { key: "flags", label: "Flags", sortable: true, filterable: true, sortType: "text" },
-        { key: "offset", label: "Media offset", sortable: true, filterable: true, sortType: "number" },
-        { key: "artifactTime", label: "Artifact time", sortable: true, filterable: true, sortType: "time" },
-        { key: "created", label: "Created", sortable: true, filterable: true, sortType: "time" },
-        { key: "modified", label: "Modified", sortable: true, filterable: true, sortType: "time" },
-        { key: "accessed", label: "Accessed", sortable: true, filterable: true, sortType: "time" },
-        { key: "mftModified", label: "MFT modified", sortable: true, filterable: true, sortType: "time" },
-        { key: "sha256", label: "SHA-256", sortable: true, filterable: true, sortType: "text" }
+        { key: "flags", label: "Flags", sortable: true, filterable: true, sortType: "text" }
       ];
+
+      if (!state.categoryColumnVisibility) {
+        state.categoryColumnVisibility = {
+          offset: true, artifactTime: true, created: true, modified: true,
+          accessed: true, mftModified: true, sha256: true
+        };
+      }
+
+      const availableKeys = new Set(["offset", "artifactTime", "created", "modified", "accessed", "mftModified", "sha256"]);
+      for (const row of (rows || [])) {
+        const meta = row.metadata_json || {};
+        for (const c of CATEGORY_OPTIONAL_COLUMNS) {
+          if (c.meta && meta[c.meta] !== undefined) {
+            availableKeys.add(c.key);
+          }
+        }
+      }
+
+      state.availableCategoryColumns = Array.from(availableKeys);
+      const activeOptional = CATEGORY_OPTIONAL_COLUMNS.filter(c => availableKeys.has(c.key) && state.categoryColumnVisibility[c.key]);
+      return base.concat(activeOptional);
     }
 
     function categoryGridRow(entry) {
@@ -18784,76 +20760,96 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const mftModified = filesystemMftModifiedTime(entry);
       const flags = entryFlagsText(entry) || "-";
       const sha256 = filesystemFileHashDisplay(entry);
-      return {
-        entry,
-        values: {
-          name: compactParts([name, displayPath(entry.logical_path)]),
-          category: entryCategoryLabel(entry),
-          type: activityLabel(entry),
-          ext,
-          size,
-          flags,
-          offset,
-          artifactTime,
-          created,
-          modified,
-          accessed,
-          mftModified,
-          sha256
-        },
-        sortValues: {
-          size: entry.size_bytes == null ? NaN : Number(entry.size_bytes),
-          offset: gridNumericValue(offset),
-          artifactTime: Date.parse(artifactTime),
-          created: Date.parse(created),
-          modified: Date.parse(modified),
-          accessed: Date.parse(accessed),
-          mftModified: Date.parse(mftModified)
-        }
+      const meta = entry.metadata_json || {};
+
+      const values = {
+        name: compactParts([name, displayPath(entry.logical_path)]),
+        category: entryCategoryLabel(entry),
+        type: activityLabel(entry),
+        ext,
+        size,
+        flags,
+        offset,
+        artifactTime,
+        created,
+        modified,
+        accessed,
+        mftModified,
+        sha256
       };
+
+      const sortValues = {
+        size: entry.size_bytes == null ? NaN : Number(entry.size_bytes),
+        offset: gridNumericValue(offset),
+        artifactTime: Date.parse(artifactTime),
+        created: Date.parse(created),
+        modified: Date.parse(modified),
+        accessed: Date.parse(accessed),
+        mftModified: Date.parse(mftModified)
+      };
+
+      for (const c of CATEGORY_OPTIONAL_COLUMNS) {
+        if (c.meta && meta[c.meta] !== undefined) {
+          values[c.key] = String(meta[c.meta]);
+          sortValues[c.key] = c.sortType === "number" ? Number(meta[c.meta]) : values[c.key];
+        }
+      }
+
+      return { entry, values, sortValues };
     }
 
     // Rows use selection and the context menu; per-row action buttons would
     // overlap evidence metadata columns in narrow layouts.
-    function renderCategoryGridRow(row) {
+    function renderCategoryGridRow(row, columns = null) {
       const entry = row.entry;
       const selectedRow = state.hex.entryId === entry.id ? " selected" : "";
       const isChecked = state.selectedEntryIds.has(entry.id);
       const checked = isChecked ? " checked" : "";
       const multiSelected = isChecked ? " multi-selected" : "";
       const deletedRow = isDeletedRecoveryEntry(entry) ? " deleted" : "";
-      return `
-          <tr class="entry-row${deletedRow}${selectedRow}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">
-            <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleEntrySelection(${entry.id}, this.checked, event)"></td>
-            <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span><span class="entry-path">${escapeHtml(displayPath(entry.logical_path))}</span></td>
-            <td title="${escapeAttr(entryCategoryLabel(entry) + " | " + entryCategoryDetail(entry))}">${categoryIconHtml(entryCategory(entry).main)}<span class="entry-category">${escapeHtml(entryCategoryLabel(entry))}</span></td>
-            <td class="entry-kind">${escapeHtml(activityLabel(entry))}</td>
-            <td class="entry-ext">${escapeHtml(filesystemFileExtension(entry))}</td>
-            <td class="entry-size">${entry.size_bytes == null ? "" : formatBytes(entry.size_bytes)}</td>
-            <td class="entry-flags" title="${escapeAttr(entryFlagsText(entry))}">${entryFlagsHtml(entry)}</td>
-            <td class="entry-offset" title="${escapeAttr(entryPrimaryOffset(entry))}">${escapeHtml(entryPrimaryOffset(entry))}</td>
-            <td class="entry-time entry-artifact-time" title="${escapeAttr(artifactEventTime(entry))}">${escapeHtml(artifactEventTime(entry))}</td>
-            <td class="entry-time" title="${escapeAttr(filesystemCreatedTime(entry))}">${escapeHtml(filesystemCreatedTime(entry))}</td>
-            <td class="entry-time" title="${escapeAttr(filesystemModifiedTime(entry))}">${escapeHtml(filesystemModifiedTime(entry))}</td>
-            <td class="entry-time" title="${escapeAttr(filesystemAccessedTime(entry))}">${escapeHtml(filesystemAccessedTime(entry))}</td>
-            <td class="entry-time" title="${escapeAttr(filesystemMftModifiedTime(entry))}">${escapeHtml(filesystemMftModifiedTime(entry))}</td>
-            <td class="entry-hash mono" title="${escapeAttr(row.values.sha256)}">${escapeHtml(row.values.sha256)}</td>
-          </tr>`;
+
+      if (!columns) columns = categoryGridColumns([]);
+
+      let html = `<tr class="entry-row${deletedRow}${selectedRow}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">`;
+      for (const col of columns) {
+        if (col.key === "select") {
+          html += `<td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleEntrySelection(${entry.id}, this.checked, event)"></td>`;
+        } else if (col.key === "name") {
+          html += `<td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span><span class="entry-path">${escapeHtml(displayPath(entry.logical_path))}</span></td>`;
+        } else if (col.key === "category") {
+          html += `<td title="${escapeAttr(entryCategoryLabel(entry) + " | " + entryCategoryDetail(entry))}">${categoryIconHtml(entryCategory(entry).main)}<span class="entry-category">${escapeHtml(entryCategoryLabel(entry))}</span></td>`;
+        } else if (col.key === "type") {
+          html += `<td class="entry-kind">${escapeHtml(activityLabel(entry))}</td>`;
+        } else if (col.key === "ext") {
+          html += `<td class="entry-ext">${escapeHtml(filesystemFileExtension(entry))}</td>`;
+        } else if (col.key === "size") {
+          html += `<td class="entry-size">${entry.size_bytes == null ? "" : formatBytes(entry.size_bytes)}</td>`;
+        } else if (col.key === "flags") {
+          html += `<td class="entry-flags" title="${escapeAttr(entryFlagsText(entry))}">${entryFlagsHtml(entry)}</td>`;
+        } else {
+          const val = row.values[col.key] || "";
+          const classAttr = col.sortType === "time" ? ' class="entry-time"' : (col.key === "sha256" ? ' class="entry-hash mono"' : '');
+          html += `<td${classAttr} title="${escapeAttr(val)}">${escapeHtml(val)}</td>`;
+        }
+      }
+      html += `</tr>`;
+      return html;
     }
 
     function visibleCategoryGridRows(rows) {
-      return visibleGridRows("category", categoryGridColumns(), rows.map(categoryGridRow));
+      const columns = categoryGridColumns(rows);
+      return visibleGridRows("category", columns, rows.map(categoryGridRow));
     }
 
     function renderCategoryRows(rows, prefixHtml = "", suffixHtml = "") {
-      const columns = categoryGridColumns();
-      const tableResult = sortableGridTable("category", columns, rows.map(categoryGridRow), "category-table", renderCategoryGridRow);
+      const columns = categoryGridColumns(rows);
+      const tableResult = sortableGridTable("category", columns, rows.map(categoryGridRow), "category-table", (row) => renderCategoryGridRow(row, columns));
       const gridToggle = rows.length > 0 && (selectedCategoryUsesPictureGallery() || rows.every((entry) => isImageEntry(entry)))
         ? `<div class="thumb-toolbar"><button class="ghost" onclick="setPictureViewMode('grid')">Gallery view</button></div>`
         : "";
       setCurrentEntryGrid("category", tableResult.visibleRows.map((row) => row.entry));
       const filterStatus = gridFilterStatusHtml("category", columns, tableResult.visibleRows.length, rows.length, "entries");
-      $("entryTable").innerHTML = prefixHtml + gridToggle + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No entries match the column filters.")) + suffixHtml;
+      $("entryTable").innerHTML = prefixHtml + gridToggle + filterStatus + categoryColumnChooserHtml() + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No entries match the column filters.")) + suffixHtml;
       renderSelectionCount();
       armCategoryInfiniteScroll();
     }
@@ -19752,17 +21748,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function updateSelectedActionControls() {
-      const reportButton = $("bookmarkReportSelected");
       const selectedAction = $("selectedAction");
       const count = state.live.active
         ? selectedVisibleLiveItems().length
         : selectedEntriesForActions().length;
-      if (reportButton) {
-        reportButton.disabled = count === 0;
-      }
       if (!selectedAction) {
         return;
       }
+      ["bookmark", "bookmark_report", "export_csv", "clear"].forEach((value) => {
+        const option = selectedAction.querySelector('option[value="' + value + '"]');
+        if (option) {
+          option.disabled = count === 0;
+        }
+      });
       const exportOption = selectedAction.querySelector('option[value="export_files"]');
       if (!exportOption) {
         return;
@@ -20483,7 +22481,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("A timeline build is already running.");
         return;
       }
-      const total = Number(state.data.entry_count || 0);
+      const total = Number(state.data.database_entry_count || state.data.entry_count || 0);
       const rangeActive = timelineRangeActive();
       if (rangeActive) {
         const bounds = timelineRangeBounds();
@@ -21344,7 +23342,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         return "";
       }
       const loaded = Number(state.timeline.loadedEntryCount || 0).toLocaleString();
-      const total = Number(state.timeline.totalEntryCount || state.data.entry_count || 0).toLocaleString();
+      const total = Number(state.timeline.totalEntryCount || state.data.database_entry_count || state.data.entry_count || 0).toLocaleString();
       return `<span class="timeline-scope-chip" title="The bounded build prioritizes parsed artifact records, then file metadata. Narrow the date range and rebuild to examine another window.">Coverage: ${loaded} of ${total} timeline records</span>`;
     }
 
@@ -21398,7 +23396,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       if (!state.timeline.built) {
         count.textContent = "not built";
-        summary.innerHTML = `<span><strong>${Number(state.data.entry_count || 0).toLocaleString()}</strong> indexed entries available</span>`;
+        summary.innerHTML = `<span><strong>${Number(state.data.database_entry_count || state.data.entry_count || 0).toLocaleString()}</strong> indexed entries available</span>`;
         graph.innerHTML = empty("No timeline data to plot.");
         timestampNav.innerHTML = `<div class="timeline-selection-title muted">Build the timeline to select timestamped events</div>`;
         table.innerHTML = empty("Build the timeline to aggregate timestamped events from loaded entries.");
@@ -21890,8 +23888,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function browserActivityItemRef(entry) {
       const metadata = entry.metadata_json || {};
       const ref = {
-        kind: "browser_activity",
-        activity_kind: metadata.artifact_kind || "record",
+        kind: metadata.artifact_kind || "record",
         browser_family: metadata.browser_family || "chromium",
         evidence_id: entry.evidence_id,
         entry_id: entry.id,
@@ -21920,7 +23917,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         "homepage_is_newtabpage", "download_default_directory", "prompt_for_download",
         "created_by_version", "last_used", "avatar_index", "extension_count",
         "source_artifact", "source_artifact_path", "source_file_size_bytes",
-        "source_file_created_utc", "source_file_modified_utc", "source_file_accessed_utc"
+        "source_file_created_utc", "source_file_modified_utc", "source_file_accessed_utc",
+        "source_table", "source_row", "source_path", "browser_family", "referrer"
       ].forEach((key) => {
         if (metadata[key] !== undefined && metadata[key] !== null && String(metadata[key]).length > 0) {
           ref[key] = metadata[key];
@@ -21995,7 +23993,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const evidence = evidenceSourceForEntry(entry) || {};
       const isRaw = metadata.source === "raw_image";
       const isLive = metadata.source === "live_browse";
-      const filesystemContext = isRaw || (!isLive && state.hex.entryId === entry.id && state.hex.byteContext === "filesystem");
+      const isBitlocker = metadata.source === "bitlocker_live_browse";
+      const filesystemContext = isRaw || (!isLive && !isBitlocker && state.hex.entryId === entry.id && state.hex.byteContext === "filesystem");
       const liveEntry = isLive ? (liveEntryByPath(metadata.volume, metadata.image_path) || {}) : {};
       const containerStartOffset = isRaw ? (Number(metadata.start_offset) || 0) : null;
       const fileDataPhysicalOffset = firstDefined(isLive ? liveEntry.file_data_physical_offset : metadata.file_data_physical_offset);
@@ -22004,7 +24003,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const fileDataContiguousBytes = Number(firstDefined(isLive ? liveEntry.file_data_contiguous_bytes : metadata.file_data_contiguous_bytes));
       const fileDataDirectMapping = firstDefined(isLive ? liveEntry.file_data_direct_logical_mapping : metadata.file_data_direct_logical_mapping);
       const fileDataPhysicalBasis = firstDefined(isLive ? liveEntry.physical_offset_basis : metadata.physical_offset_basis);
-      const diskLocation = !isRaw && !isLive ? resolvedDiskLocation() : null;
+      const diskLocation = !isRaw && !isLive && !isBitlocker ? resolvedDiskLocation() : null;
       const selectionLength = range.end - range.start + 1;
       let selectionFileStart = range.start;
       let selectionFileEnd = range.end;
@@ -22041,6 +24040,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
           selectionFileStart = null;
           selectionFileEnd = null;
         }
+      } else if (isBitlocker && fileDataLogicalOffset != null) {
+        const delta = range.start - fileDataFileOffset;
+        const rangeIsVerified = fileDataDirectMapping !== false && delta >= 0
+          && Number.isFinite(fileDataContiguousBytes)
+          && range.end < fileDataFileOffset + fileDataContiguousBytes;
+        if (rangeIsVerified || (fileDataDirectMapping !== false && delta === 0 && selectionLength === 1)) {
+          selectionVolumeStart = Number(fileDataLogicalOffset) + delta;
+          selectionVolumeEnd = selectionVolumeStart + selectionLength - 1;
+        }
+        physicalBasis = "decrypted NTFS logical mapping; encrypted evidence-media offset is unavailable";
       } else if (diskLocation && fileRangeWithinDiskLocation(diskLocation, range.start, range.end)) {
         selectionDecodedStart = Number(diskLocation.decoded_media_offset)
           + range.start - Number(diskLocation.file_relative_offset || 0);
@@ -22067,19 +24076,23 @@ const INDEX_HTML: &str = r###"<!doctype html>
             : (fileDataPhysicalBasis || "parser-recorded exact file-data start");
         }
       }
-      const createdUtc = firstDefined(isLive ? liveEntry.created_utc : metadata.created_utc);
-      const modifiedUtc = firstDefined(isLive ? liveEntry.modified_utc : metadata.modified_utc);
-      const accessedUtc = firstDefined(isLive ? liveEntry.accessed_utc : metadata.accessed_utc);
+      const createdUtc = firstDefined(isLive ? liveEntry.created_utc : entry.created_utc, metadata.created_utc);
+      const modifiedUtc = firstDefined(isLive ? liveEntry.modified_utc : entry.modified_utc, metadata.modified_utc);
+      const accessedUtc = firstDefined(isLive ? liveEntry.accessed_utc : entry.accessed_utc, metadata.accessed_utc);
       return {
         kind: "highlighted_bytes",
         entry_kind: entry.entry_kind,
         evidence_id: entry.evidence_id,
         entry_id: entry.id || null,
         logical_path: entry.logical_path,
-        relative_path: isLive ? metadata.image_path : entry.logical_path,
+        relative_path: (isLive || isBitlocker) ? metadata.image_path : entry.logical_path,
         display_name: entry.name || logicalName(entry.logical_path),
         evidence_source: evidence.display_name || evidence.source_path || "",
-        source: isRaw ? "raw_decoded_evidence_media" : (isLive ? "live_browse_unindexed" : "indexed_case_entry"),
+        source: isRaw
+          ? "raw_decoded_evidence_media"
+          : (isLive
+            ? "live_browse_unindexed"
+            : (isBitlocker ? "bitlocker_decrypted_live_browse" : "indexed_case_entry")),
         volume: metadata.volume == null ? null : metadata.volume,
         size_bytes: isLive ? (liveEntry.size_bytes == null ? null : liveEntry.size_bytes) : entry.size_bytes,
         is_deleted: Boolean(entry.is_deleted),
@@ -22109,7 +24122,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         selection_volume_offset_end: selectionVolumeEnd,
         selection_decoded_media_offset_start: selectionDecodedStart,
         selection_decoded_media_offset_end: selectionDecodedEnd,
-        selection_offset_coordinate_system: "file_relative / volume_relative / decoded_evidence_media",
+        selection_offset_coordinate_system: isBitlocker
+          ? "file_relative / decrypted_volume_relative; decoded_evidence_media unavailable"
+          : "file_relative / volume_relative / decoded_evidence_media",
         selection_physical_offset_start: selectionDecodedStart,
         selection_physical_offset_end: selectionDecodedEnd,
         physical_offset_basis: physicalBasis,
@@ -22221,6 +24236,44 @@ const INDEX_HTML: &str = r###"<!doctype html>
           }
         };
       }
+      if (state.hex.bitlocker) {
+        const bitlockerEntry = state.hex.bitlocker.entry || {};
+        const blVolume = (state.live.volumes || []).find(
+          (item) => Number(item.index) === Number(state.hex.bitlocker.volume)
+        ) || {};
+        const metadata = {
+          source: "bitlocker_live_browse",
+          volume: state.hex.bitlocker.volume,
+          partition_start_offset: blVolume.start_offset,
+          partition_size_bytes: blVolume.size_bytes,
+          image_path: state.hex.bitlocker.path,
+          ntfs_file_record_number: bitlockerEntry.ntfs_file_record_number,
+          mft_record_logical_offset: bitlockerEntry.mft_record_logical_offset,
+          file_data_logical_offset: bitlockerEntry.file_data_logical_offset,
+          file_data_file_offset: bitlockerEntry.file_data_file_offset,
+          file_data_contiguous_bytes: bitlockerEntry.file_data_contiguous_bytes,
+          file_data_direct_logical_mapping: bitlockerEntry.file_data_direct_logical_mapping,
+          physical_offset_basis: bitlockerEntry.physical_offset_basis,
+          offset_coordinate_system: "decrypted_ntfs_volume_and_file_relative",
+          ntfs_mft_record_modification_time_utc: bitlockerEntry.ntfs_mft_record_modification_time_utc,
+          diagnostics: []
+        };
+        return {
+          id: null,
+          entry_kind: "file",
+          evidence_id: state.hex.bitlocker.evidenceId,
+          name: state.hex.bitlocker.name,
+          logical_path: "[vol " + state.hex.bitlocker.volume + "] " + state.hex.bitlocker.path,
+          size_bytes: bitlockerEntry.size_bytes != null
+            ? bitlockerEntry.size_bytes
+            : (state.hex.bitlocker.sizeBytes != null ? state.hex.bitlocker.sizeBytes : null),
+          is_deleted: false,
+          created_utc: bitlockerEntry.created_utc || null,
+          modified_utc: bitlockerEntry.modified_utc || null,
+          accessed_utc: bitlockerEntry.accessed_utc || null,
+          metadata_json: metadata
+        };
+      }
       // Live-browse files have no indexed entry row; synthesize one so the
       // viewer renders instead of falling back to "No item selected".
       if (state.hex.live) {
@@ -22310,10 +24363,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         if (!isReadableFileEntry(entry)) {
           return;
         }
-        if ($("viewerMode").value === "metadata") {
-          $("viewerMode").value = "hex";
-        }
-        if (!state.hex.data && (state.hex.entryId || state.hex.live || state.hex.raw) && !state.hex.fetching) {
+
+        if (!state.hex.data && (state.hex.entryId || state.hex.live || state.hex.bitlocker || state.hex.raw) && !state.hex.fetching) {
           fetchEntryBytes();
         } else {
           renderHexViewer();
@@ -22447,6 +24498,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function renderHexViewer(error) {
+      reconcileBitlockerRasterPreviewSelection();
       updateDataInterpreter();
       updateByteContextControls();
       const data = state.hex.data;
@@ -23033,6 +25085,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
           volume = media - Number(volumeStart);
         }
         basis = "Raw decoded evidence-media view";
+      } else if (state.hex.bitlocker) {
+        const bitlockerEntry = state.hex.bitlocker.entry || {};
+        file = cursor == null ? 0 : cursor;
+        const mappedFileStart = safeOffset(bitlockerEntry.file_data_file_offset) ?? 0;
+        const mappedVolumeStart = safeOffset(bitlockerEntry.file_data_logical_offset);
+        const mappedLength = safeOffset(bitlockerEntry.file_data_contiguous_bytes) ?? 1;
+        const directlyMapped = bitlockerEntry.file_data_direct_logical_mapping !== false
+          && offsetWithinExtent(file, mappedFileStart, mappedLength);
+        if (directlyMapped && mappedVolumeStart != null) {
+          volume = mappedVolumeStart + file - mappedFileStart;
+        }
+        // A position in the decrypted NTFS stream is not byte-equivalent to a
+        // position in the encrypted evidence. Never manufacture a physical
+        // image offset by adding the partition start.
+        media = null;
+        basis = "Decrypted BitLocker logical stream; evidence-media offset is unavailable because encrypted and decrypted bytes are not directly equivalent.";
       } else if (state.hex.live) {
         const liveEntry = state.hex.live.entry
           || liveEntryByPath(state.hex.live.volume, state.hex.live.path)
@@ -23583,6 +25651,21 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function imagePreviewSection(entry) {
+      if (entry && entry.metadata_json && entry.metadata_json.source === "bitlocker_live_browse") {
+        const preview = state.bitlockerPreview;
+        const selectionKey = bitlockerPreviewSelectionKey(state.bitlocker, state.hex && state.hex.bitlocker);
+        const matches = Boolean(preview && selectionKey && preview.selectionKey === selectionKey);
+        if (matches && preview.status === "error") {
+          return `<section class="metadata-section"><h3>Preview</h3><div class="preview-error">${escapeHtml(preview.error)}</div></section>`;
+        }
+        if (matches && preview.status === "ready" && preview.objectUrl) {
+          return `<section class="metadata-section"><h3>Preview</h3><div class="preview-card image-preview"><img loading="lazy" src="${escapeAttr(preview.objectUrl)}" alt="" onerror="this.parentElement.classList.add('thumb-broken'); this.remove();"></div></section>`;
+        }
+        if (matches && preview.status === "loading") {
+          return `<section class="metadata-section"><h3>Preview</h3><div class="muted">Loading bounded native raster preview...</div></section>`;
+        }
+        return `<section class="metadata-section"><h3>Preview</h3><div class="muted">Native preview is limited to JPEG, PNG, GIF, BMP, WebP, and ICO raster files. Hex and text views remain available.</div></section>`;
+      }
       return `<section class="metadata-section"><h3>Preview</h3><div class="preview-card image-preview">
         <img loading="lazy" src="${escapeAttr(entryRawUrl(entry))}" alt="" onerror="this.parentElement.classList.add('thumb-broken'); this.remove();">
       </div></section>`;
@@ -23922,6 +26005,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Transition Code", metadata.transition],
           ["Hidden", metadata.hidden],
           ["Source Artifact", metadata.source_artifact],
+          ["Source Table", metadata.source_table],
+          ["Source Row", metadata.source_row],
           ["Source Path", metadata.source_artifact_path_exact || metadata.source_artifact_path]
         ]);
       }
@@ -23938,6 +26023,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Chrome Last Used", metadata.date_last_used_chrome],
           ["GUID", metadata.guid],
           ["Source Artifact", metadata.source_artifact],
+          ["Source Table", metadata.source_table],
+          ["Source Row", metadata.source_row],
           ["Source Path", metadata.source_artifact_path_exact || metadata.source_artifact_path]
         ]);
       }
@@ -23956,6 +26043,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Homepage Is New Tab", metadata.homepage_is_newtabpage],
           ["Prompt For Download", metadata.prompt_for_download],
           ["Source Artifact", metadata.source_artifact],
+          ["Source Table", metadata.source_table],
+          ["Source Row", metadata.source_row],
           ["Source Path", metadata.source_artifact_path_exact || metadata.source_artifact_path]
         ]);
       }
@@ -24417,6 +26506,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         case "bookmarks": return bookmarksGridColumns();
         case "email": return emailGridColumns();
         case "live": return liveGridColumns();
+        case "bitlocker": return bitlockerGridColumns();
         case "indexed": return indexedGridColumns();
         case "evidence": return evidenceGridColumns();
         case "attached": return attachedEvidenceGridColumns();
@@ -24909,7 +26999,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         renderSearchSelectionCount();
         return;
       }
-      if (state.searchResults.length === 0 && state.data && Number(state.data.entry_count || 0) === 0) {
+      if (state.searchResults.length === 0 && state.data && Number(state.data.database_entry_count || state.data.entry_count || 0) === 0) {
         $("searchResults").innerHTML = frozenWarning + (currentSearchMode() === "all"
           ? `<div class="analysis-status"><strong>Indexed search unavailable:</strong> this case has no processed entries. The independent bitwise whole-disk results appear below and search decoded evidence bytes, including unallocated space and slack.</div>`
           : `<div class="analysis-status"><strong>Indexed search unavailable:</strong> this case has no processed entries. Process the evidence first, switch to All for a bitwise whole-disk scan, or use raw find in Browse.</div>`);
@@ -25158,10 +27248,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function handleGlobalKeydown(event) {
-      if (event.key === "Escape" && state.viewerFullscreen) {
-        event.preventDefault();
-        setViewerFullscreen(false);
-        return;
+      if (event.key === "Escape") {
+        if (state.viewerFullscreen) {
+          event.preventDefault();
+          setViewerFullscreen(false);
+          return;
+        }
+        const bitlockerModal = $("bitlockerUnlockOverlay");
+        if (bitlockerModal && !bitlockerModal.hidden) {
+          event.preventDefault();
+          cancelBitlockerUnlock();
+          return;
+        }
       }
       if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "f" && state.hex.raw) {
         event.preventDefault();
@@ -25281,7 +27379,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
     document.addEventListener("contextmenu", handleGlobalContextMenu);
 
     $("casePath").value = normalizePathInput(state.casePath);
-    $("evidencePath").value = normalizePathInput(localStorage.getItem("kdft.evidencePath") || BOOTSTRAP.defaultEvidencePath);
+    // Older builds persisted this field globally, which leaked the previous
+    // case's evidence path into every newly opened case. Remove that legacy
+    // value and always start the form empty.
+    localStorage.removeItem("kdft.evidencePath");
+    $("evidencePath").value = "";
     $("reportPath").value = normalizePathInput(BOOTSTRAP.defaultReportPath);
     populateEvidenceTimezones();
     $("evidenceTimezone").addEventListener("change", () => {
@@ -25316,8 +27418,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     document.querySelectorAll("#evidenceTypeRow .evidence-type").forEach((button) => {
       button.addEventListener("click", () => setEvidenceType(button.dataset.type));
     });
-    $("selectVisibleRows").addEventListener("click", selectVisibleEntries);
-    $("bookmarkReportSelected").addEventListener("click", bookmarkSelectionAndExportReport);
+    $("readFileSystem")?.addEventListener("change", updateAddEvidenceButton);
     $("selectedAction").addEventListener("change", handleSelectedAction);
     // "input" fires as soon as a complete date is typed or picked - no Enter
     // needed; the value stays "" until the date is complete.
@@ -25338,6 +27439,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
     $("timelineDateFilterClear").addEventListener("click", clearTimelineRange);
     $("buildTimeline").addEventListener("click", requestTimelineBuild);
     $("toggleInspector").addEventListener("click", toggleInspectorPane);
+    $("toggleLeftPane").addEventListener("click", toggleNavigationPane);
+
     $("analyzeBack").addEventListener("click", analyzeBack);
     $("analyzeForward").addEventListener("click", analyzeForward);
     $("exportReportFromAnalyze").addEventListener("click", exportReport);
@@ -25346,6 +27449,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       recategorizeButton.addEventListener("click", recategorizeCase);
     }
     $("openAnalyzeWindow").addEventListener("click", openAnalyzeWindow);
+    updateAnalyzeFullscreenButton();
     $("liveBrowse").addEventListener("click", toggleLiveBrowse);
     $("treeModeFilesystem").addEventListener("click", () => setBrowserTreeMode("filesystem"));
     $("treeModeCategories").addEventListener("click", () => setBrowserTreeMode("categories"));
@@ -25382,7 +27486,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     $("toggleViewerFullscreen").addEventListener("click", toggleViewerFullscreen);
     $("bookmarkSelectedEntry").addEventListener("click", bookmarkHexTarget);
     $("viewerMode").addEventListener("change", () => {
-      if ((state.hex.entryId || state.hex.live || state.hex.raw) && $("viewerMode").value !== "metadata" && !state.hex.data && !state.hex.fetching) {
+      if ((state.hex.entryId || state.hex.live || state.hex.bitlocker || state.hex.raw) && $("viewerMode").value !== "metadata" && !state.hex.data && !state.hex.fetching) {
         fetchEntryBytes();
       } else {
         renderHexViewer();
@@ -25397,6 +27501,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     });
     document.addEventListener("keydown", handleGlobalKeydown);
     window.addEventListener("pagehide", persistDeepSearchSession);
+    window.addEventListener("pagehide", resetBitlockerRasterPreview);
     window.addEventListener("popstate", (event) => {
       state.viewerFullscreenHistoryPending = false;
       setViewerFullscreen(Boolean(event.state && event.state.kdftViewerFullscreen), "popstate");
@@ -25404,6 +27509,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     bindTabs();
     bindInspectorResize();
     bindHexSelection();
+    setNavigationCollapsed(state.navigationCollapsed);
     setInspectorCollapsed(state.inspectorCollapsed);
     updateAnalyzeNavButtons();
     if (ANALYSIS_MODE) {

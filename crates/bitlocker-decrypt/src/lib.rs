@@ -79,7 +79,19 @@ pub struct BitLockerInspection {
     pub encryption_method: Option<BitLockerEncryptionMethod>,
     pub metadata_offsets: [u64; 3],
     pub metadata_size: Option<u32>,
+    /// The encrypted-volume-size value declared by the FVE metadata block.
+    ///
+    /// Windows can leave this value stale when a BitLocker partition is
+    /// shrunk. Callers must therefore use [`Self::effective_encrypted_volume_size`]
+    /// when they need a boundary within the supplied volume reader.
     pub encrypted_volume_size: Option<u64>,
+    /// The encrypted byte count bounded to the supplied volume reader.
+    ///
+    /// An on-disk value of zero means that the whole bounded volume remains
+    /// encrypted. A non-zero value is capped at the bounded reader length.
+    pub effective_encrypted_volume_size: Option<u64>,
+    /// Non-fatal geometry qualification retained during inspection.
+    pub geometry_warning: Option<String>,
     pub volume_header_offset: Option<u64>,
     pub volume_header_size: Option<u64>,
     pub protectors: Vec<BitLockerKeyProtector>,
@@ -254,9 +266,9 @@ pub fn inspect_reader<R: Read + Seek>(reader: &mut R) -> Result<Option<BitLocker
         Err(err) => return Err(err.into()),
     };
 
-    let inspection = BitLockerInspection::from_header_and_metadata(&header, metadata);
+    let mut inspection = BitLockerInspection::from_header_and_metadata(&header, metadata);
     let total_size = reader.seek(SeekFrom::End(0))?;
-    validate_inspection_geometry(&inspection, total_size)?;
+    validate_inspection_geometry(&mut inspection, total_size)?;
     reader.seek(SeekFrom::Start(0))?;
     Ok(Some(inspection))
 }
@@ -304,6 +316,8 @@ impl BitLockerInspection {
                 metadata_offsets: header.fve_metadata_offsets,
                 metadata_size: None,
                 encrypted_volume_size: None,
+                effective_encrypted_volume_size: None,
+                geometry_warning: None,
                 volume_header_offset: None,
                 volume_header_size: None,
                 protectors: Vec::new(),
@@ -348,6 +362,8 @@ impl BitLockerInspection {
             metadata_offsets: metadata.metadata_offsets,
             metadata_size: Some(metadata.metadata_size),
             encrypted_volume_size: Some(metadata.encrypted_volume_size),
+            effective_encrypted_volume_size: None,
+            geometry_warning: None,
             volume_header_offset: Some(metadata.volume_header_offset),
             volume_header_size: Some(metadata.volume_header_size),
             protectors,
@@ -386,7 +402,10 @@ fn encryption_method(raw: u16) -> BitLockerEncryptionMethod {
     }
 }
 
-fn validate_inspection_geometry(inspection: &BitLockerInspection, total_size: u64) -> Result<()> {
+fn validate_inspection_geometry(
+    inspection: &mut BitLockerInspection,
+    total_size: u64,
+) -> Result<()> {
     if inspection.metadata_state != BitLockerMetadataState::Parsed {
         return Ok(());
     }
@@ -408,13 +427,6 @@ fn validate_inspection_geometry(inspection: &BitLockerInspection, total_size: u6
     {
         validate_range("metadata", offset, metadata_size, total_size, false)?;
     }
-    if let Some(encrypted_size) = inspection.encrypted_volume_size {
-        if encrypted_size != 0 && encrypted_size > total_size {
-            return Err(BitLockerDecryptError::InvalidMetadataGeometry(format!(
-                "encrypted byte count {encrypted_size} exceeds volume size {total_size}"
-            )));
-        }
-    }
     let header_offset = inspection.volume_header_offset.unwrap_or(0);
     let header_size = inspection.volume_header_size.unwrap_or(0);
     if header_size != 0 {
@@ -425,6 +437,26 @@ fn validate_inspection_geometry(inspection: &BitLockerInspection, total_size: u6
             total_size,
             true,
         )?;
+    }
+    if let Some(declared_size) = inspection.encrypted_volume_size {
+        // The FVE value is a byte count, not an image-absolute offset. Windows
+        // can nevertheless leave the pre-shrink count in metadata after Disk
+        // Management shrinks a BitLocker partition. The bounded reader is the
+        // authoritative accessible extent. Keeping this condition non-fatal is
+        // safe: the wrapped decryptor also derives its read limit from that
+        // reader, and a stale larger boundary merely means every accessible
+        // byte is still treated as encrypted.
+        let effective_size = if declared_size == 0 {
+            total_size
+        } else {
+            declared_size.min(total_size)
+        };
+        inspection.effective_encrypted_volume_size = Some(effective_size);
+        if declared_size > total_size {
+            inspection.geometry_warning = Some(format!(
+                "FVE metadata declares {declared_size} encrypted bytes, which exceeds the bounded volume length {total_size}; using {effective_size} encrypted bytes for this reader (the declaration may be stale after a partition shrink)"
+            ));
+        }
     }
     Ok(())
 }
@@ -470,9 +502,63 @@ fn read_available<R: Read>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<us
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
 
     const META_BLOCK_OFFSET: u64 = 0x1000;
+
+    struct SparsePrefixReader {
+        prefix: Vec<u8>,
+        len: u64,
+        pos: u64,
+    }
+
+    impl SparsePrefixReader {
+        fn new(prefix: Vec<u8>, len: u64) -> Self {
+            assert!(len >= prefix.len() as u64);
+            Self {
+                prefix,
+                len,
+                pos: 0,
+            }
+        }
+    }
+
+    impl Read for SparsePrefixReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.len || buf.is_empty() {
+                return Ok(0);
+            }
+            let count = usize::try_from((self.len - self.pos).min(buf.len() as u64))
+                .expect("read length is bounded by the destination buffer");
+            buf[..count].fill(0);
+            if self.pos < self.prefix.len() as u64 {
+                let source_start = self.pos as usize;
+                let source_end = self.prefix.len().min(source_start + count);
+                buf[..source_end - source_start]
+                    .copy_from_slice(&self.prefix[source_start..source_end]);
+            }
+            self.pos += count as u64;
+            Ok(count)
+        }
+    }
+
+    impl Seek for SparsePrefixReader {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            let next = match pos {
+                SeekFrom::Start(offset) => i128::from(offset),
+                SeekFrom::Current(offset) => i128::from(self.pos) + i128::from(offset),
+                SeekFrom::End(offset) => i128::from(self.len) + i128::from(offset),
+            };
+            if next < 0 || next > i128::from(u64::MAX) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sparse reader seek is outside u64",
+                ));
+            }
+            self.pos = next as u64;
+            Ok(self.pos)
+        }
+    }
 
     fn synthetic_recovery_key(words: [u16; 8]) -> String {
         words
@@ -514,6 +600,12 @@ mod tests {
         image[mb + 64 + 36..mb + 64 + 38].copy_from_slice(&method.to_le_bytes());
         image[mb + 64 + 48..mb + 64 + 48 + entries.len()].copy_from_slice(&entries);
         image
+    }
+
+    fn parsed_test_inspection() -> BitLockerInspection {
+        let image = metadata_image(0x8004, &[PROTECTOR_PASSWORD]);
+        let mut reader = Cursor::new(image);
+        inspect_reader(&mut reader).unwrap().unwrap()
     }
 
     #[test]
@@ -640,6 +732,75 @@ mod tests {
             inspect_reader(&mut reader),
             Err(BitLockerDecryptError::InvalidMetadataGeometry(_))
         ));
+    }
+
+    #[test]
+    fn stale_pre_shrink_encrypted_size_is_bounded_without_coordinate_subtraction() {
+        // Regression for a real image whose BitLocker volume was 100,000 MiB
+        // smaller than the encrypted byte count retained in its FVE metadata.
+        // Windows can leave the old value behind after shrinking a partition;
+        // it is not an image-absolute endpoint and the partition base must not
+        // be subtracted from it.
+        const DECLARED_PRE_SHRINK_SIZE: u64 = 255_937_478_656;
+        const BOUNDED_VOLUME_SIZE: u64 = 151_079_878_656;
+        const OBSERVED_DIFFERENCE: u64 = 104_857_600_000;
+
+        assert_eq!(
+            DECLARED_PRE_SHRINK_SIZE - BOUNDED_VOLUME_SIZE,
+            OBSERVED_DIFFERENCE
+        );
+        assert_eq!(OBSERVED_DIFFERENCE, 100_000 * 1_048_576);
+
+        let mut image = metadata_image(0x8004, &[PROTECTOR_PASSWORD]);
+        let metadata_offset = META_BLOCK_OFFSET as usize;
+        image[metadata_offset + 16..metadata_offset + 24]
+            .copy_from_slice(&DECLARED_PRE_SHRINK_SIZE.to_le_bytes());
+        let mut reader = SparsePrefixReader::new(image, BOUNDED_VOLUME_SIZE);
+        let inspection = inspect_reader(&mut reader).unwrap().unwrap();
+
+        assert_eq!(
+            inspection.encrypted_volume_size,
+            Some(DECLARED_PRE_SHRINK_SIZE)
+        );
+        assert_eq!(
+            inspection.effective_encrypted_volume_size,
+            Some(BOUNDED_VOLUME_SIZE)
+        );
+        let warning = inspection.geometry_warning.unwrap();
+        assert!(warning.contains("255937478656 encrypted bytes"));
+        assert!(warning.contains("bounded volume length 151079878656"));
+        assert!(warning.contains("stale after a partition shrink"));
+    }
+
+    #[test]
+    fn stale_pre_shrink_encrypted_size_no_longer_blocks_the_unlock_path() {
+        const DECLARED_PRE_SHRINK_SIZE: u64 = 255_937_478_656;
+        const BOUNDED_VOLUME_SIZE: u64 = 151_079_878_656;
+
+        let mut image = metadata_image(0x8002, &[PROTECTOR_PASSWORD]);
+        let metadata_offset = META_BLOCK_OFFSET as usize;
+        image[metadata_offset + 16..metadata_offset + 24]
+            .copy_from_slice(&DECLARED_PRE_SHRINK_SIZE.to_le_bytes());
+        let reader = SparsePrefixReader::new(image, BOUNDED_VOLUME_SIZE);
+
+        let error = match unlock_reader(reader, BitLockerCredential::password("test credential")) {
+            Ok(_) => panic!("the minimal fixture deliberately lacks wrapped key material"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, BitLockerDecryptError::Bde(_)),
+            "unlock should reach the wrapped decrypt core instead of failing geometry validation: {error}"
+        );
+    }
+
+    #[test]
+    fn zero_encrypted_size_sentinel_means_the_bounded_volume() {
+        let mut inspection = parsed_test_inspection();
+        inspection.encrypted_volume_size = Some(0);
+        validate_inspection_geometry(&mut inspection, 8_192).unwrap();
+
+        assert_eq!(inspection.effective_encrypted_volume_size, Some(8_192));
+        assert!(inspection.geometry_warning.is_none());
     }
 
     #[test]

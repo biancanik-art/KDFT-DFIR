@@ -640,6 +640,28 @@ pub struct ProcessEvidenceResult {
     pub status: String,
     pub bookmark_items_relinked: usize,
     pub truncation_reasons: Vec<String>,
+    /// Publication outcome for the specifically requested memory-only
+    /// BitLocker generation. This remains `None` for ordinary processing.
+    /// A caller must not infer that a visible prior image snapshot satisfies
+    /// the decrypted request when `published` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitlocker_generation: Option<BitLockerGenerationResult>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BitLockerGenerationResult {
+    pub volume_index_zero_based: usize,
+    /// True only when rows produced under the requested decrypted context are
+    /// the generation now visible in `filesystem_entries`.
+    pub published: bool,
+    /// True only when the requested decrypted filesystem inventory reached a
+    /// complete generation boundary.
+    pub complete: bool,
+    /// Stable examiner-facing disposition. In particular,
+    /// `prior_canonical_preserved` means the visible rows are deliberately the
+    /// older complete image generation, not the requested decrypted attempt.
+    pub status: String,
+    pub canonical_generation_preserved: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -685,6 +707,31 @@ pub struct DeepSearchResult {
     /// values are package-relative and explicitly never evidence-physical.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parsed_segment_provenance: Option<serde_json::Value>,
+    /// Compact decoded context for imported browser records. Deep Search is
+    /// intentionally useful without a raw evidence byte stream, and callers
+    /// should not need to load every matching record individually just to
+    /// render its URL, host, time, or artifact type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_context: Option<DeepSearchRecordContext>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeepSearchRecordContext {
+    pub artifact_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referrer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_time_utc: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_artifact: Option<String>,
 }
 
 /// Opaque-in-practice continuation returned by [`deep_search_page`].  The UI
@@ -2801,12 +2848,21 @@ struct IndexedFileHashCandidate {
     entry_id: i64,
     size_bytes: Option<i64>,
     logical_path: String,
+    is_deleted: bool,
+    deleted_recovery_has_unavailable_structural_extent: bool,
 }
 
 #[derive(Debug)]
 enum IndexedFileHashDisposition {
-    Hashed { digest: String, bytes_hashed: u64 },
-    Skipped { reason: String, read_error: bool },
+    Hashed {
+        digest: String,
+        bytes_hashed: u64,
+        input_scope: &'static str,
+    },
+    Skipped {
+        reason: String,
+        read_error: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -2904,11 +2960,32 @@ fn hash_one_indexed_file(
             }
         }
     };
+    if candidate.is_deleted
+        && candidate
+            .size_bytes
+            .and_then(|value| u64::try_from(value).ok())
+            .is_some_and(|declared| declared != total_size)
+    {
+        return skipped(
+            format!(
+                "deleted-file readable stream size {total_size} does not match its filesystem-declared size {}; no hash recorded as a complete recovery",
+                candidate.size_bytes.unwrap_or_default().max(0)
+            ),
+            false,
+        );
+    }
     if offset != total_size {
         return skipped(
             format!(
                 "file content is not fully reconstructable ({offset} of {total_size} bytes readable); no hash recorded for partial content"
             ),
+            false,
+        );
+    }
+    if candidate.is_deleted && candidate.deleted_recovery_has_unavailable_structural_extent {
+        return skipped(
+            "deleted-file bytes cover the filesystem-declared stream, but the recovered PE header references unavailable bytes beyond that stream; no complete-file hash was recorded"
+                .to_string(),
             false,
         );
     }
@@ -2923,6 +3000,11 @@ fn hash_one_indexed_file(
         disposition: IndexedFileHashDisposition::Hashed {
             digest,
             bytes_hashed: offset,
+            input_scope: if candidate.is_deleted {
+                "complete readable recovery stream (original-content integrity unverified)"
+            } else {
+                "complete reconstructed file content"
+            },
         },
     }
 }
@@ -2941,7 +3023,7 @@ fn commit_indexed_file_hash_batch(
              json_set(metadata_json,
                  '$.file_sha256', ?2,
                  '$.file_sha256_at', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                 '$.file_sha256_input', 'complete reconstructed file content',
+                 '$.file_sha256_input', ?4,
                  '$.file_sha256_analysis', ?3),
              '$.file_sha256_skipped')
          WHERE id = ?1",
@@ -2957,10 +3039,15 @@ fn commit_indexed_file_hash_batch(
     )?;
     for outcome in outcomes {
         let changed = match &outcome.disposition {
-            IndexedFileHashDisposition::Hashed { digest, .. } => success.execute(params![
+            IndexedFileHashDisposition::Hashed {
+                digest,
+                input_scope,
+                ..
+            } => success.execute(params![
                 outcome.entry_id,
                 digest,
-                FILE_HASH_CHECKPOINT_VERSION
+                FILE_HASH_CHECKPOINT_VERSION,
+                input_scope
             ])?,
             IndexedFileHashDisposition::Skipped { reason, .. } => {
                 skipped.execute(params![outcome.entry_id, reason])?
@@ -3010,7 +3097,15 @@ pub fn hash_indexed_files(
         .context("file-hash eligible source count exceeds usize")?;
     let candidates: Vec<IndexedFileHashCandidate> = {
         let mut stmt = conn.prepare(
-            "SELECT id, size_bytes, logical_path FROM filesystem_entries
+            "SELECT id, size_bytes, logical_path, is_deleted,
+                    CASE
+                      WHEN COALESCE(json_extract(metadata_json, '$.pe_filesystem_declared_shortfall_bytes'), 0) > 0
+                        OR COALESCE(json_extract(metadata_json, '$.pe_stream_addressable_shortfall_bytes'), 0) > 0
+                        OR COALESCE(json_extract(metadata_json, '$.pe_structural_recovery_status'), '')
+                           = 'partial_addressable_stream_ends_before_pe_referenced_file_extent'
+                      THEN 1 ELSE 0
+                    END
+             FROM filesystem_entries
              WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind = 'file'
                AND COALESCE(json_extract(metadata_json, '$.artifact_kind'), '')
                    NOT IN ('unallocated_space')
@@ -3033,6 +3128,8 @@ pub fn hash_indexed_files(
                     entry_id: row.get(0)?,
                     size_bytes: row.get(1)?,
                     logical_path: row.get(2)?,
+                    is_deleted: row.get::<_, i64>(3)? != 0,
+                    deleted_recovery_has_unavailable_structural_extent: row.get::<_, i64>(4)? != 0,
                 })
             },
         )?;
@@ -10203,8 +10300,16 @@ fn finalize_cancelled_filesystem_index(
     job_id: i64,
     prior_complete_image_entry_count: usize,
     requested_entry_limit: usize,
+    requested_bitlocker_volume_index: Option<usize>,
 ) -> Result<ProcessEvidenceResult> {
     let cancel_reason = "job cancelled";
+    let bitlocker_generation = bitlocker_generation_result(
+        requested_bitlocker_volume_index,
+        false,
+        false,
+        prior_complete_image_entry_count > 0,
+        true,
+    );
     // The in-process shared JobProgressTracker is the live interrupt: loops
     // poll check_cancellation() at safe boundaries and roll back the active
     // SQLite transaction. That rollback releases the SQLite writer lock, so
@@ -10231,6 +10336,17 @@ fn finalize_cancelled_filesystem_index(
          WHERE case_id = ?3 AND id = ?4",
         params![cancel_reason, checkpoint, case_id, job_id],
     )?;
+    if let Some(generation) = bitlocker_generation.as_ref() {
+        tx.execute(
+            "UPDATE evidence_jobs
+             SET parameters_json = json_set(
+                 parameters_json,
+                 '$.bitlocker_processing.generation', json(?1)
+             )
+             WHERE case_id = ?2 AND id = ?3",
+            params![serde_json::to_string(generation)?, case_id, job_id],
+        )?;
+    }
     let retained_entry_count: i64 = tx.query_row(
         "SELECT COUNT(*) FROM filesystem_entries
          WHERE case_id = ?1 AND evidence_id = ?2",
@@ -10269,6 +10385,7 @@ fn finalize_cancelled_filesystem_index(
         status: "cancelled".to_string(),
         bookmark_items_relinked: 0,
         truncation_reasons: Vec::new(),
+        bitlocker_generation,
     })
 }
 
@@ -10431,7 +10548,16 @@ pub fn record_job_progress_summary(
              WHERE case_id = ?1
                AND id = (
                    SELECT evidence_id FROM evidence_jobs
-                   WHERE case_id = ?1 AND id = ?2 AND job_type = 'filesystem_index'
+                   WHERE case_id = ?1
+                     AND id = ?2
+                     AND job_type = 'filesystem_index'
+                     AND (
+                         json_type(parameters_json, '$.bitlocker_processing.generation') IS NULL
+                         OR json_extract(
+                             parameters_json,
+                             '$.bitlocker_processing.generation.complete'
+                         ) = 1
+                     )
                )",
             params![case_id, job_id],
         )?;
@@ -10451,16 +10577,36 @@ pub fn process_evidence_with_profile(
             None,
         );
         return progress::with_job_progress(&tracker, || {
-            process_evidence_with_profile_inner(case_path, options, profile)
+            process_evidence_with_profile_inner(case_path, options, profile, None)
         });
     }
-    process_evidence_with_profile_inner(case_path, options, profile)
+    process_evidence_with_profile_inner(case_path, options, profile, None)
+}
+
+pub fn process_evidence_with_profile_and_bitlocker(
+    case_path: &Path,
+    options: ProcessEvidenceOptions,
+    profile: ProcessingProfile,
+    bitlocker_ctx: Option<BitLockerProcessingContext<'_>>,
+) -> Result<ProcessEvidenceResult> {
+    if !progress::has_active_progress() {
+        let tracker = progress::JobProgressTracker::new(
+            format!("process-evidence-{}", options.evidence_id),
+            "process",
+            None,
+        );
+        return progress::with_job_progress(&tracker, || {
+            process_evidence_with_profile_inner(case_path, options, profile, bitlocker_ctx)
+        });
+    }
+    process_evidence_with_profile_inner(case_path, options, profile, bitlocker_ctx)
 }
 
 fn process_evidence_with_profile_inner(
     case_path: &Path,
     options: ProcessEvidenceOptions,
     profile: ProcessingProfile,
+    bitlocker_ctx: Option<BitLockerProcessingContext<'_>>,
 ) -> Result<ProcessEvidenceResult> {
     // 0 means "index everything"; there is no examiner-facing entry cap.
     let max_entries = unlimited_if_zero(options.max_entries);
@@ -10471,13 +10617,27 @@ fn process_evidence_with_profile_inner(
     progress::progress_set_evidence_id(evidence.id);
     let requested_entry_limit = options.max_entries;
     let effective_entry_limit = (requested_entry_limit != 0).then_some(requested_entry_limit);
-    let context_fingerprint = filesystem_index_processing_context_fingerprint(&options, profile);
+    let requested_bitlocker_volume_index =
+        bitlocker_ctx.as_ref().map(|context| context.volume_index);
+    let bitlocker_processing = bitlocker_ctx.as_ref().map(bitlocker_processing_descriptor);
+    let mut context_fingerprint: serde_json::Value = serde_json::from_str(
+        &filesystem_index_processing_context_fingerprint(&options, profile),
+    )
+    .context("parsing filesystem processing-context fingerprint")?;
+    if let (Some(object), Some(bitlocker)) = (
+        context_fingerprint.as_object_mut(),
+        bitlocker_processing.as_ref(),
+    ) {
+        object.insert("bitlocker_processing".to_string(), bitlocker.clone());
+    }
+    let context_fingerprint = context_fingerprint.to_string();
     let parameters_json = serde_json::json!({
         "max_entries": requested_entry_limit,
         "effective_max_entries": effective_entry_limit,
         "capture_content": profile.capture_content,
         "parse_emails": profile.parse_emails,
         "parse_browsers": profile.parse_browsers,
+        "bitlocker_processing": bitlocker_processing,
     })
     .to_string();
 
@@ -10539,13 +10699,16 @@ fn process_evidence_with_profile_inner(
             job_id,
             prior_complete_image_entry_count,
             requested_entry_limit,
+            requested_bitlocker_volume_index,
         );
     }
 
     let processing_result = match evidence.source_kind.as_str() {
         "file" => process_file_evidence(&tx, case_id, &evidence, job_id, max_entries),
         "folder" => process_folder_evidence(&tx, case_id, &evidence, job_id, max_entries),
-        "image" => process_image_evidence(&tx, case_id, &evidence, job_id, max_entries),
+        "image" => {
+            process_image_evidence(&tx, case_id, &evidence, job_id, max_entries, bitlocker_ctx)
+        }
         other => Err(anyhow!(
             "unsupported evidence source kind for processing: {other}"
         )),
@@ -10561,6 +10724,7 @@ fn process_evidence_with_profile_inner(
                 job_id,
                 prior_complete_image_entry_count,
                 requested_entry_limit,
+                requested_bitlocker_volume_index,
             );
         }
         Err(error) => {
@@ -10642,6 +10806,7 @@ fn process_evidence_with_profile_inner(
             job_id,
             prior_complete_image_entry_count,
             requested_entry_limit,
+            requested_bitlocker_volume_index,
         );
     }
 
@@ -10681,10 +10846,23 @@ fn process_evidence_with_profile_inner(
         progress_truncation_reasons
             .push("parser reported partial processing before the end of the source".to_string());
     }
-    let truncation_reason =
-        processing_reported_partial_coverage.then(|| progress_truncation_reasons.join("; "));
     let canonical_generation_preserved =
         image_replacement_staged && processing_reported_partial_coverage;
+    if processing_reported_partial_coverage && requested_bitlocker_volume_index.is_some() {
+        let bitlocker_reason = if canonical_generation_preserved {
+            "requested decrypted BitLocker filesystem generation was incomplete and was not published; the prior complete canonical image generation remains visible"
+        } else {
+            "decrypted BitLocker filesystem generation is visible but explicitly incomplete because no prior complete canonical image generation existed"
+        };
+        if !progress_truncation_reasons
+            .iter()
+            .any(|reason| reason == bitlocker_reason)
+        {
+            progress_truncation_reasons.push(bitlocker_reason.to_string());
+        }
+    }
+    let truncation_reason =
+        processing_reported_partial_coverage.then(|| progress_truncation_reasons.join("; "));
     if image_replacement_staged {
         if canonical_generation_preserved {
             tx.execute_batch(&format!(
@@ -10696,6 +10874,13 @@ fn process_evidence_with_profile_inner(
     }
     let replacement_committed = !canonical_generation_preserved;
     let source_processing_complete = replacement_committed && !processing_reported_partial_coverage;
+    let bitlocker_generation = bitlocker_generation_result(
+        requested_bitlocker_volume_index,
+        replacement_committed,
+        source_processing_complete,
+        canonical_generation_preserved,
+        false,
+    );
     let entries_indexed = if canonical_generation_preserved {
         0
     } else {
@@ -10761,11 +10946,25 @@ fn process_evidence_with_profile_inner(
             job_id
         ],
     )?;
+    if let Some(generation) = bitlocker_generation.as_ref() {
+        tx.execute(
+            "UPDATE evidence_jobs
+             SET parameters_json = json_set(
+                 parameters_json,
+                 '$.bitlocker_processing.generation', json(?1)
+             )
+             WHERE case_id = ?2 AND id = ?3",
+            params![serde_json::to_string(generation)?, case_id, job_id],
+        )?;
+    }
+    let incomplete_published_bitlocker = bitlocker_generation
+        .as_ref()
+        .is_some_and(|generation| generation.published && !generation.complete);
     tx.execute(
         "UPDATE evidence_sources
          SET indexed_at = CASE
              WHEN ?3 != 0 THEN indexed_at
-             WHEN ?4 = 0
+             WHEN ?4 = 0 AND ?5 = 0
              THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              ELSE NULL
          END
@@ -10774,7 +10973,8 @@ fn process_evidence_with_profile_inner(
             evidence.id,
             case_id,
             if canonical_generation_preserved { 1 } else { 0 },
-            if stopped_at_examiner_limit { 1 } else { 0 }
+            if stopped_at_examiner_limit { 1 } else { 0 },
+            if incomplete_published_bitlocker { 1 } else { 0 }
         ],
     )?;
     tx.execute(
@@ -10828,6 +11028,7 @@ fn process_evidence_with_profile_inner(
         status: status.to_string(),
         bookmark_items_relinked,
         truncation_reasons: progress_truncation_reasons,
+        bitlocker_generation,
     })
 }
 
@@ -13754,6 +13955,90 @@ fn deep_search_coverage() -> DeepSearchCoverage {
     }
 }
 
+fn deep_search_metadata_text(metadata: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        metadata
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn deep_search_record_context(metadata: &serde_json::Value) -> Option<DeepSearchRecordContext> {
+    let artifact_kind = deep_search_metadata_text(metadata, &["artifact_kind"])?;
+    if !artifact_kind.starts_with("browser_") {
+        return None;
+    }
+
+    let url = deep_search_metadata_text(
+        metadata,
+        &[
+            "url",
+            "download_url",
+            "source_url",
+            "origin_url",
+            "site_url",
+            "hostname",
+        ],
+    );
+    let host = deep_search_metadata_text(metadata, &["host", "hostname"]).or_else(|| {
+        url.as_deref().and_then(|value| {
+            let host = host_from_url(value);
+            (host != "unknown-host").then_some(host)
+        })
+    });
+    Some(DeepSearchRecordContext {
+        artifact_kind,
+        browser_family: deep_search_metadata_text(metadata, &["browser_family", "browser_brand"]),
+        title: deep_search_metadata_text(
+            metadata,
+            &["title", "name", "file_name", "search_term", "cookie_name"],
+        ),
+        url,
+        host,
+        referrer: deep_search_metadata_text(
+            metadata,
+            &[
+                "referrer_url",
+                "external_referrer_url",
+                "referrer",
+                "tab_referrer_url",
+                "tab_url",
+            ],
+        ),
+        event_time_utc: deep_search_metadata_text(
+            metadata,
+            &[
+                "visit_time_utc",
+                "start_time_utc",
+                "date_added_utc",
+                "last_visit_time_utc",
+                "last_access_time_utc",
+                "last_access_utc",
+                "creation_utc",
+                "time_created_utc",
+            ],
+        ),
+        source_artifact: deep_search_metadata_text(
+            metadata,
+            &[
+                "source_artifact",
+                "source_artifact_path",
+                "source_path_exact",
+            ],
+        ),
+    })
+}
+
+fn deep_search_record_context_json(metadata_json: &str) -> Option<DeepSearchRecordContext> {
+    serde_json::from_str::<serde_json::Value>(metadata_json)
+        .ok()
+        .as_ref()
+        .and_then(deep_search_record_context)
+}
+
 fn deep_search_scope_token(options: &DeepSearchOptions, max_file_bytes: u64) -> Result<String> {
     serde_json::to_string(&(
         options.query.trim(),
@@ -14053,9 +14338,9 @@ fn path_search_page_results(
     for row in rows {
         let (entry_id, evidence_id, logical_path, name, entry_kind, metadata_json) =
             row.context("reading paged indexed-path result")?;
-        let source_path_exact = serde_json::from_str::<serde_json::Value>(&metadata_json)
-            .ok()
-            .and_then(|metadata| source_path_exact_from_metadata(&metadata));
+        let metadata = serde_json::from_str::<serde_json::Value>(&metadata_json).ok();
+        let source_path_exact = metadata.as_ref().and_then(source_path_exact_from_metadata);
+        let record_context = metadata.as_ref().and_then(deep_search_record_context);
         let matched_path_or_name = logical_path.to_ascii_lowercase().contains(query_lower)
             || name.to_ascii_lowercase().contains(query_lower);
         let (match_kind, preview) = if matched_path_or_name {
@@ -14092,6 +14377,7 @@ fn path_search_page_results(
             data_preview: preview,
             parsed_segment_kind: None,
             parsed_segment_provenance: None,
+            record_context,
         });
     }
     let exhausted = results.len() < limit;
@@ -14219,6 +14505,7 @@ fn parsed_text_search_page_results(
                 )),
                 parsed_segment_kind: Some(segment_kind),
                 parsed_segment_provenance: serde_json::from_str(&segment_provenance).ok(),
+                record_context: deep_search_record_context_json(&metadata_json),
             });
             matched_entry = Some(entry_id);
             if results.len() >= limit {
@@ -14453,6 +14740,7 @@ fn content_hex_search_page_results(
                 )),
                 parsed_segment_kind: None,
                 parsed_segment_provenance: None,
+                record_context: None,
             });
             if results.len() >= limit {
                 exhausted = false;
@@ -14571,6 +14859,7 @@ fn parsed_text_search_results(
                 data_preview: Some(preview),
                 parsed_segment_kind: Some(segment_kind),
                 parsed_segment_provenance: serde_json::from_str(&segment_provenance).ok(),
+                record_context: deep_search_record_context_json(&metadata_json),
             });
             parsed_matched.insert(entry_id);
             continue;
@@ -14635,7 +14924,31 @@ impl SearchScope {
                 {
                     bail!("file type filter contains unsupported characters: {raw}");
                 }
-                likes.push(format!("lower(fe.name) LIKE '%.{ext}'"));
+                // Browser-history records are searchable processed entries,
+                // but their file identity often lives in decoded metadata
+                // rather than `fe.name` (for example a download URL or the
+                // target/current path). Keep ordinary files exact while also
+                // allowing URL query/fragment suffixes for imported browser
+                // activity. The extension is strictly validated above before
+                // being embedded in this SQL fragment.
+                likes.push(format!(
+                    "(lower(fe.name) LIKE '%.{ext}' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.file_name'),'')) LIKE '%.{ext}' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.target_path'),'')) LIKE '%.{ext}' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.current_path'),'')) LIKE '%.{ext}' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.full_path'),'')) LIKE '%.{ext}' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.target_uri'),'')) LIKE '%.{ext}' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.url'),'')) LIKE '%.{ext}' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.url'),'')) LIKE '%.{ext}?%' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.url'),'')) LIKE '%.{ext}#%' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.download_url'),'')) LIKE '%.{ext}' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.download_url'),'')) LIKE '%.{ext}?%' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.download_url'),'')) LIKE '%.{ext}#%' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.source_url'),'')) LIKE '%.{ext}' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.source_url'),'')) LIKE '%.{ext}?%' \
+                      OR lower(coalesce(json_extract(fe.metadata_json,'$.source_url'),'')) LIKE '%.{ext}#%' \
+                      OR instr(lower(coalesce(json_extract(fe.metadata_json,'$.url_chain'),'')), '.{ext}') > 0)"
+                ));
             }
             if !likes.is_empty() {
                 sql_clause.push_str(&format!(" AND ({})", likes.join(" OR ")));
@@ -15010,18 +15323,18 @@ pub fn raw_disk_search_page(
                 let opened = open_disk_image(Path::new(&source_path))?;
                 (opened.reader, opened.decoded_size)
             }
-            "file" => {
+            "file" | "browser_history" => {
                 let metadata = fs::metadata(&source_path)
                     .with_context(|| format!("reading evidence metadata {source_path}"))?;
                 if !metadata.is_file() {
-                    bail!("raw disk search supports image and file evidence; this evidence path is not a file");
+                    bail!("raw disk search supports image, file, and browser_history evidence; this evidence path is not a file");
                 }
                 let file = fs::File::open(&source_path)
                     .with_context(|| format!("opening evidence {source_path}"))?;
                 (Box::new(file), metadata.len())
             }
             _ => bail!(
-                "raw disk search supports image and file evidence; {source_kind} evidence has no single raw byte stream to scan"
+                "raw disk search supports image, file, and browser_history evidence; {source_kind} evidence has no single raw byte stream to scan"
             ),
         };
 
@@ -16767,6 +17080,30 @@ pub fn recover_filesystem_entry(
     recover_filesystem_entry_in_session(&mut session, options)
 }
 
+fn deleted_recovery_output_status(entry: &EntryForBytes) -> &'static str {
+    if metadata_u64_or_i64(
+        &entry.metadata_json,
+        "pe_filesystem_declared_shortfall_bytes",
+    )
+    .is_some_and(|shortfall| shortfall > 0)
+        || metadata_u64_or_i64(
+            &entry.metadata_json,
+            "pe_stream_addressable_shortfall_bytes",
+        )
+        .is_some_and(|shortfall| shortfall > 0)
+        || entry.metadata_json["pe_structural_recovery_status"].as_str()
+            == Some("partial_addressable_stream_ends_before_pe_referenced_file_extent")
+    {
+        "completed_partial_recovery_pe_structural_shortfall_original_integrity_unverified"
+    } else if entry.metadata_json["recovery_attribute_list_status"].as_str()
+        == Some("present_resolution_incomplete")
+    {
+        "completed_readable_recovery_stream_attribute_list_resolution_incomplete_original_integrity_unverified"
+    } else {
+        "completed_readable_recovery_stream_original_integrity_unverified"
+    }
+}
+
 pub(crate) fn recover_filesystem_entry_in_session(
     session: &mut EvidenceReadSession,
     options: RecoverEntryOptions,
@@ -16774,6 +17111,7 @@ pub(crate) fn recover_filesystem_entry_in_session(
     if options.output_path.as_os_str().is_empty() {
         bail!("output path cannot be empty");
     }
+    let indexed_entry = read_entry_for_bytes(&session.conn, session.case_id, options.entry_id)?;
     let mut offset = 0_u64;
     let mut bytes = read_filesystem_entry_bytes_in_session(
         session,
@@ -16823,6 +17161,17 @@ pub(crate) fn recover_filesystem_entry_in_session(
     if offset != total_size {
         bail!("recovery ended after {offset} of {total_size} bytes; no final output was published");
     }
+    let filesystem_declared_size = indexed_entry
+        .size_bytes
+        .and_then(|value| u64::try_from(value).ok());
+    if indexed_entry.is_deleted
+        && filesystem_declared_size.is_some_and(|declared| declared != total_size)
+    {
+        bail!(
+            "deleted-file readable stream is {total_size} bytes but its filesystem-declared logical size is {} bytes; no ambiguous output was published",
+            filesystem_declared_size.unwrap_or_default()
+        );
+    }
     output.commit().with_context(|| {
         format!(
             "publishing recovered output {}",
@@ -16835,7 +17184,11 @@ pub(crate) fn recover_filesystem_entry_in_session(
         output_path: options.output_path.to_string_lossy().into_owned(),
         bytes_written: offset,
         total_size,
-        status: "completed".to_string(),
+        status: if indexed_entry.is_deleted {
+            deleted_recovery_output_status(&indexed_entry).to_string()
+        } else {
+            "completed".to_string()
+        },
     })
 }
 
@@ -18186,19 +18539,19 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
         }
         for bookmark in &folder.bookmarks {
             html.push_str("<article><h3>");
-            html.push_str(&escape_html(
-                bookmark.title.as_deref().unwrap_or(&bookmark.bookmark_type),
-            ));
-            html.push_str("</h3><p class=\"meta\">Type: ");
-            html.push_str(&escape_html(&bookmark.bookmark_type));
-            if let Some(data_type) = &bookmark.data_type {
-                html.push_str(" | Data type: ");
-                html.push_str(&escape_html(data_type));
-            }
-            html.push_str(" | Created: ");
+            html.push_str(&escape_html(bookmark.title.as_deref().unwrap_or(
+                if bookmark.bookmark_type == "file_group" {
+                    "Bookmark"
+                } else {
+                    &bookmark.bookmark_type
+                },
+            )));
+            html.push_str("</h3><p class=\"meta\">Bookmarked: ");
             html.push_str(&escape_html(&bookmark.created_at));
             html.push_str("</p>");
-            if let Some(comment) = &bookmark.examiner_comment {
+            if let Some(comment) = bookmark.examiner_comment.as_deref().filter(|comment| {
+                !comment.trim().is_empty() && !is_legacy_bulk_bookmark_timestamp(bookmark, comment)
+            }) {
                 html.push_str("<p class=\"comment\">");
                 html.push_str(&escape_html(comment));
                 html.push_str("</p>");
@@ -18229,6 +18582,12 @@ pub fn render_report(report: &ReportData) -> RenderedReport {
         html,
         content_prefix_sha256: sha256,
     }
+}
+
+fn is_legacy_bulk_bookmark_timestamp(bookmark: &ReportBookmark, comment: &str) -> bool {
+    bookmark.bookmark_type == "file_group"
+        && comment.starts_with("Bookmarked via Selected actions on ")
+        && comment.ends_with('.')
 }
 
 fn format_size_bytes(size: i64) -> String {
@@ -19584,6 +19943,7 @@ struct EntryForBytes {
     logical_path: String,
     entry_kind: String,
     size_bytes: Option<i64>,
+    is_deleted: bool,
     metadata_json: serde_json::Value,
     source_kind: String,
     source_path: String,
@@ -19694,6 +20054,7 @@ struct RawEntryForBytes {
     logical_path: String,
     entry_kind: String,
     size_bytes: Option<i64>,
+    is_deleted: bool,
     metadata_json: String,
     source_kind: String,
     source_path: String,
@@ -19794,7 +20155,7 @@ fn read_entry_for_bytes(conn: &Connection, case_id: i64, entry_id: i64) -> Resul
     let raw = conn
         .query_row(
             "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.entry_kind,
-                fe.size_bytes, fe.metadata_json,
+                fe.size_bytes, fe.is_deleted, fe.metadata_json,
                 es.source_kind, es.source_path
          FROM filesystem_entries fe
          JOIN evidence_sources es ON es.id = fe.evidence_id
@@ -19807,9 +20168,10 @@ fn read_entry_for_bytes(conn: &Connection, case_id: i64, entry_id: i64) -> Resul
                     logical_path: row.get(2)?,
                     entry_kind: row.get(3)?,
                     size_bytes: row.get(4)?,
-                    metadata_json: row.get(5)?,
-                    source_kind: row.get(6)?,
-                    source_path: row.get(7)?,
+                    is_deleted: row.get::<_, i64>(5)? != 0,
+                    metadata_json: row.get(6)?,
+                    source_kind: row.get(7)?,
+                    source_path: row.get(8)?,
                 })
             },
         )
@@ -19827,6 +20189,7 @@ fn read_entry_for_bytes(conn: &Connection, case_id: i64, entry_id: i64) -> Resul
         logical_path: raw.logical_path,
         entry_kind: raw.entry_kind,
         size_bytes: raw.size_bytes,
+        is_deleted: raw.is_deleted,
         metadata_json,
         source_kind: raw.source_kind,
         source_path: raw.source_path,
@@ -30997,12 +31360,23 @@ fn process_folder_evidence(
     Ok((indexed, truncated))
 }
 
+fn merge_bitlocker_ntfs_inventory_outcome(
+    image_partial_coverage: &mut bool,
+    ntfs_partial_coverage: bool,
+) {
+    // The unlocked branch must obey the same generation boundary as ordinary
+    // NTFS. Dropping this bit would publish a bounded or diagnostically
+    // incomplete plaintext inventory as a complete canonical image snapshot.
+    *image_partial_coverage |= ntfs_partial_coverage;
+}
+
 fn process_image_evidence(
     conn: &Connection,
     case_id: i64,
     evidence: &EvidenceForProcessing,
     job_id: i64,
     max_entries: usize,
+    mut bitlocker_ctx: Option<BitLockerProcessingContext<'_>>,
 ) -> Result<(usize, bool)> {
     let path = PathBuf::from(&evidence.source_path);
     progress::progress_current(evidence.source_path.clone());
@@ -31154,6 +31528,10 @@ fn process_image_evidence(
                 } else {
                     None
                 };
+                let unlock_this_partition = bitlocker_locked
+                    && bitlocker_ctx
+                        .as_ref()
+                        .is_some_and(|context| context.volume_index == index);
                 let filesystem_metadata = if bitlocker_locked {
                     Some(BITLOCKER_LOCKED_FILESYSTEM)
                 } else {
@@ -31172,7 +31550,9 @@ fn process_image_evidence(
                             partition.filesystem.as_deref(),
                         ));
                 let can_parse_ext = !bitlocker_locked && detected_filesystem == Some("EXT");
-                let filesystem_parser = if bitlocker_locked {
+                let filesystem_parser = if unlock_this_partition {
+                    "bitlocker-decrypt+ntfs"
+                } else if bitlocker_locked {
                     "locked"
                 } else if can_parse_fat {
                     "fatfs"
@@ -31183,7 +31563,9 @@ fn process_image_evidence(
                 } else {
                     "pending"
                 };
-                let filesystem_browsing_status = if bitlocker_locked {
+                let filesystem_browsing_status = if unlock_this_partition {
+                    "BitLocker volume decrypted from a memory-only credential; NTFS inventory is stored without the credential"
+                } else if bitlocker_locked {
                     bitlocker_status_message(bitlocker_inspection.as_ref())
                 } else if can_parse_fat {
                     "FAT parser attempted; parsed entries appear under /Image Analysis/Volumes"
@@ -31194,11 +31576,12 @@ fn process_image_evidence(
                 } else {
                     "pending filesystem parser"
                 };
-                let volume_entry_prefix = if can_parse_fat || can_parse_ntfs || can_parse_ext {
-                    Some(volume_prefix.as_str())
-                } else {
-                    None
-                };
+                let volume_entry_prefix =
+                    if unlock_this_partition || can_parse_fat || can_parse_ntfs || can_parse_ext {
+                        Some(volume_prefix.as_str())
+                    } else {
+                        None
+                    };
                 let partition_end = partition
                     .start_offset
                     .checked_add(partition.size_bytes)
@@ -31297,6 +31680,59 @@ fn process_image_evidence(
                             }
                         }
                     }
+                } else if unlock_this_partition && indexed < max_entries {
+                    let context = bitlocker_ctx
+                        .take()
+                        .context("selected BitLocker processing context disappeared")?;
+                    let slice = PartitionSlice::new(
+                        &mut *opened.reader,
+                        partition.start_offset,
+                        partition.size_bytes,
+                    );
+                    let mut decrypted = bitlocker_decrypt::unlock_reader(
+                        slice,
+                        bitlocker_credential(context.credential)?,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "unlocking selected BitLocker volume index {index} for NTFS processing"
+                        )
+                    })?;
+                    let bitlocker_ntfs_partial = process_ntfs_partition_entries(
+                        conn,
+                        case_id,
+                        evidence.id,
+                        job_id,
+                        &mut decrypted,
+                        NtfsProvenance::DecryptedBitLocker {
+                            volume_index: index,
+                            encrypted_partition_start_offset: partition.start_offset,
+                        },
+                        partition.size_bytes,
+                        &volume_prefix,
+                        name,
+                        index + 1,
+                        &mut indexed,
+                        max_entries,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "processing decrypted NTFS from selected BitLocker volume index {index}"
+                        )
+                    })?;
+                    merge_bitlocker_ntfs_inventory_outcome(&mut truncated, bitlocker_ntfs_partial);
+                    progress::progress_diagnostic(
+                        progress::JobDiagnosticKind::ParserDiagnostic,
+                        if bitlocker_ntfs_partial {
+                            format!(
+                                "BitLocker volume index {index} NTFS inventory ended with partial coverage from a memory-only credential; generation publication policy will retain a prior complete canonical image when one exists"
+                            )
+                        } else {
+                            format!(
+                                "BitLocker volume index {index} NTFS inventory completed from a memory-only credential; follow-up processors must explicitly support the decrypted source context"
+                            )
+                        },
+                    );
                 } else if can_parse_ntfs && indexed < max_entries {
                     match process_ntfs_partition_entries(
                         conn,
@@ -31304,7 +31740,9 @@ fn process_image_evidence(
                         evidence.id,
                         job_id,
                         &mut *opened.reader,
-                        partition.start_offset,
+                        NtfsProvenance::RawPhysical {
+                            partition_start_offset: partition.start_offset,
+                        },
                         partition.size_bytes,
                         &volume_prefix,
                         name,
@@ -31552,6 +31990,13 @@ fn process_image_evidence(
                 )?;
             }
         }
+    }
+
+    if let Some(context) = bitlocker_ctx.as_ref() {
+        bail!(
+            "BitLocker processing volume index {} did not identify a detected locked BitLocker partition",
+            context.volume_index
+        );
     }
 
     Ok((indexed, truncated))
@@ -31959,6 +32404,18 @@ pub struct LiveBitLockerInfo {
     pub status: String,
     pub metadata_state: String,
     pub variant: String,
+    /// Non-fatal reason why the FVE metadata summary could not be completed.
+    /// The locked volume remains visible so a damaged partition cannot hide
+    /// later partitions from the examiner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspection_warning: Option<String>,
+    /// Raw byte count declared by the FVE metadata. This can be stale after a
+    /// BitLocker partition is shrunk and is therefore not an image offset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypted_volume_size: Option<u64>,
+    /// Declared encrypted byte count bounded to this partition reader.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_encrypted_volume_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -31976,6 +32433,53 @@ pub struct LiveBitLockerProtector {
     pub raw: u16,
     pub raw_hex: String,
     pub kind: String,
+}
+pub struct BitLockerProcessingContext<'a> {
+    pub volume_index: usize,
+    pub credential: BitLockerUnlockCredential<'a>,
+}
+
+fn bitlocker_processing_descriptor(context: &BitLockerProcessingContext<'_>) -> serde_json::Value {
+    let credential_kind = match &context.credential {
+        BitLockerUnlockCredential::RecoveryKey(_) => "recovery_key",
+        BitLockerUnlockCredential::Password(_) => "password",
+    };
+    serde_json::json!({
+        "mode": "memory_only_bitlocker_ntfs",
+        "volume_index_zero_based": context.volume_index,
+        "credential_kind": credential_kind,
+    })
+}
+
+fn bitlocker_generation_result(
+    volume_index: Option<usize>,
+    replacement_committed: bool,
+    generation_complete: bool,
+    canonical_generation_preserved: bool,
+    cancelled: bool,
+) -> Option<BitLockerGenerationResult> {
+    volume_index.map(|volume_index_zero_based| {
+        let published = !cancelled && replacement_committed;
+        let complete = published && generation_complete;
+        let status = if cancelled {
+            "cancelled"
+        } else if canonical_generation_preserved {
+            "prior_canonical_preserved"
+        } else if complete {
+            "published_complete"
+        } else if published {
+            "published_partial"
+        } else {
+            "not_published"
+        };
+        BitLockerGenerationResult {
+            volume_index_zero_based,
+            published,
+            complete,
+            status: status.to_string(),
+            canonical_generation_preserved,
+        }
+    })
 }
 
 pub enum BitLockerUnlockCredential<'a> {
@@ -32079,13 +32583,11 @@ pub fn list_image_volumes(image_path: &Path) -> Result<Vec<LiveVolume>> {
             )?;
             let browsable = matches!(filesystem.as_str(), "NTFS" | "FAT" | "EXT");
             let bitlocker = if filesystem == BITLOCKER_LOCKED_FILESYSTEM {
-                bitlocker_inspection_at(
+                Some(live_bitlocker_info_at(
                     &mut *opened.reader,
                     partition.start_offset,
                     Some(partition.size_bytes),
-                )?
-                .as_ref()
-                .map(live_bitlocker_info)
+                ))
             } else {
                 None
             };
@@ -32116,9 +32618,11 @@ pub fn list_image_volumes(image_path: &Path) -> Result<Vec<LiveVolume>> {
         if filesystem != "unknown" {
             let browsable = matches!(filesystem.as_str(), "NTFS" | "FAT" | "EXT");
             let bitlocker = if filesystem == BITLOCKER_LOCKED_FILESYSTEM {
-                bitlocker_inspection_at(&mut *opened.reader, 0, Some(opened.decoded_size))?
-                    .as_ref()
-                    .map(live_bitlocker_info)
+                Some(live_bitlocker_info_at(
+                    &mut *opened.reader,
+                    0,
+                    Some(opened.decoded_size),
+                ))
             } else {
                 None
             };
@@ -32188,6 +32692,9 @@ fn live_bitlocker_info(inspection: &bitlocker_decrypt::BitLockerInspection) -> L
         status: inspection.status_message().to_string(),
         metadata_state: bitlocker_metadata_state_label(inspection.metadata_state).to_string(),
         variant: bitlocker_variant_label(inspection.variant).to_string(),
+        inspection_warning: inspection.geometry_warning.clone(),
+        encrypted_volume_size: inspection.encrypted_volume_size,
+        effective_encrypted_volume_size: inspection.effective_encrypted_volume_size,
         encryption_method: encryption_method.map(str::to_string),
         encryption_method_raw: inspection
             .encryption_method
@@ -32207,6 +32714,58 @@ fn live_bitlocker_info(inspection: &bitlocker_decrypt::BitLockerInspection) -> L
                 kind: protector.kind.label().to_string(),
             })
             .collect(),
+    }
+}
+
+fn live_bitlocker_info_at(
+    reader: &mut dyn disk_forensic::container::ReadSeek,
+    start_offset: u64,
+    size_bytes: Option<u64>,
+) -> LiveBitLockerInfo {
+    match bitlocker_inspection_at(reader, start_offset, size_bytes) {
+        Ok(Some(inspection)) => live_bitlocker_info(&inspection),
+        Ok(None) => live_bitlocker_inspection_warning(
+            start_offset,
+            size_bytes,
+            "the FVE header was detected, but metadata inspection did not return a BitLocker volume",
+        ),
+        Err(error) => live_bitlocker_inspection_warning(
+            start_offset,
+            size_bytes,
+            &format!("{error:#}"),
+        ),
+    }
+}
+
+fn live_bitlocker_inspection_warning(
+    start_offset: u64,
+    size_bytes: Option<u64>,
+    inspection_error: &str,
+) -> LiveBitLockerInfo {
+    let extent = match size_bytes {
+        Some(size) => {
+            let end = start_offset
+                .checked_add(size)
+                .map_or_else(|| "overflow".to_string(), |value| value.to_string());
+            format!("partition start {start_offset}, length {size}, absolute end (exclusive) {end}")
+        }
+        None => format!("partition start {start_offset}, length/end unavailable"),
+    };
+    let warning = format!("{extent}; original inspection error: {inspection_error}");
+    LiveBitLockerInfo {
+        status: format!("BitLocker volume detected; FVE metadata inspection warning: {warning}"),
+        metadata_state: "inspection-warning".to_string(),
+        variant: "unknown".to_string(),
+        inspection_warning: Some(warning),
+        encrypted_volume_size: None,
+        effective_encrypted_volume_size: None,
+        encryption_method: None,
+        encryption_method_raw: None,
+        decrypt_supported: None,
+        can_unlock_with_recovery_key: false,
+        can_unlock_with_password: false,
+        tpm_only: false,
+        protectors: Vec::new(),
     }
 }
 
@@ -35548,7 +36107,9 @@ fn process_whole_volume_fallback(
             evidence_id,
             job_id,
             reader,
-            0,
+            NtfsProvenance::RawPhysical {
+                partition_start_offset: 0,
+            },
             decoded_size,
             volume_prefix,
             "Whole Image",
@@ -37741,7 +38302,8 @@ fn validate_lost_partition_candidate(
             let is_validated_volume =
                 inspection.metadata_state == bitlocker_decrypt::BitLockerMetadataState::Parsed;
             let size_bytes = inspection
-                .encrypted_volume_size
+                .effective_encrypted_volume_size
+                .or(inspection.encrypted_volume_size)
                 .filter(|size| *size > 0 && *size <= available_bytes);
             if is_validated_volume && size_bytes.is_none() {
                 return Ok(None);
@@ -38036,7 +38598,9 @@ fn scan_lost_partitions(
                                 evidence_id,
                                 job_id,
                                 reader,
-                                candidate_offset,
+                                NtfsProvenance::RawPhysical {
+                                    partition_start_offset: candidate_offset,
+                                },
                                 parser_bound,
                                 &volume_prefix,
                                 &name,
@@ -38434,10 +38998,16 @@ fn detect_volume_filesystem_at(
 
     // BitLocker-To-Go can use an MSWIN4.1-looking header, which is also common
     // on ordinary FAT media. Only label it as BitLocker when the FVE metadata
-    // itself parses; otherwise continue with normal FAT detection below.
+    // itself parses; otherwise continue with normal FAT detection below. Once
+    // inspection reaches malformed/unsupported FVE metadata, keep the volume
+    // locked and let `live_bitlocker_info_at` expose the per-volume warning;
+    // never abort enumeration of every later partition.
     if bytes_read >= 11
         && &header[3..11] == b"MSWIN4.1"
-        && bitlocker_inspection_at(reader, start_offset, None)?.is_some()
+        && matches!(
+            bitlocker_inspection_at(reader, start_offset, None),
+            Ok(Some(_)) | Err(_)
+        )
     {
         return Ok(Some(BITLOCKER_LOCKED_FILESYSTEM));
     }
@@ -38756,10 +39326,98 @@ fn dos_datetime_to_utc(date: u16, time: u16) -> Option<String> {
     Some(stamp.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
+fn recovery_byte_range(start: u64, end_exclusive: u64, reason: &str) -> serde_json::Value {
+    serde_json::json!({
+        "start": start,
+        "end_exclusive": end_exclusive,
+        "length": end_exclusive.saturating_sub(start),
+        "reason": reason,
+    })
+}
+
+/// Returns the smallest byte length capable of containing all PE structures
+/// that point into the file (headers, section raw data, and certificate table).
+/// This is a structural lower bound, not proof that the file is authentic or
+/// executable. `None` means the bounded prefix is not a complete PE header.
+fn windows_pe_minimum_file_extent(bytes: &[u8]) -> Option<u64> {
+    fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(
+            bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+        ))
+    }
+    fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+        ))
+    }
+
+    if bytes.get(..2) != Some(b"MZ") {
+        return None;
+    }
+    let pe_offset = usize::try_from(u32_at(bytes, 0x3c)?).ok()?;
+    if bytes.get(pe_offset..pe_offset.checked_add(4)?) != Some(b"PE\0\0") {
+        return None;
+    }
+    let coff = pe_offset.checked_add(4)?;
+    let section_count = usize::from(u16_at(bytes, coff.checked_add(2)?)?);
+    // A zero-section image is not useful evidence of a complete Windows PE;
+    // cap hostile headers before multiplying section-table geometry.
+    if section_count == 0 || section_count > 96 {
+        return None;
+    }
+    let optional_size = usize::from(u16_at(bytes, coff.checked_add(16)?)?);
+    let optional = coff.checked_add(20)?;
+    let section_table = optional.checked_add(optional_size)?;
+    let section_table_end = section_table.checked_add(section_count.checked_mul(40)?)?;
+    if section_table_end > bytes.len() {
+        return None;
+    }
+    let magic = u16_at(bytes, optional)?;
+    let (directory_count_offset, data_directory_offset) = match magic {
+        0x10b => (92_usize, 96_usize),
+        0x20b => (108_usize, 112_usize),
+        _ => return None,
+    };
+    if optional_size < data_directory_offset {
+        return None;
+    }
+
+    let mut minimum = u64::try_from(section_table_end).ok()?;
+    if optional_size >= 64 {
+        minimum = minimum.max(u64::from(u32_at(bytes, optional.checked_add(60)?)?));
+    }
+    for index in 0..section_count {
+        let section = section_table.checked_add(index.checked_mul(40)?)?;
+        let raw_size = u64::from(u32_at(bytes, section.checked_add(16)?)?);
+        let raw_offset = u64::from(u32_at(bytes, section.checked_add(20)?)?);
+        if raw_size != 0 {
+            minimum = minimum.max(raw_offset.checked_add(raw_size)?);
+        }
+    }
+
+    let directory_count = if optional_size >= directory_count_offset.checked_add(4)? {
+        u32_at(bytes, optional.checked_add(directory_count_offset)?)?
+    } else {
+        0
+    };
+    // IMAGE_DIRECTORY_ENTRY_SECURITY is entry 4. Unlike other directories its
+    // address is a file offset, so it contributes to the minimum file length.
+    if directory_count > 4 && optional_size >= data_directory_offset.checked_add(5 * 8)? {
+        let security = optional.checked_add(data_directory_offset.checked_add(4 * 8)?)?;
+        let certificate_offset = u64::from(u32_at(bytes, security)?);
+        let certificate_size = u64::from(u32_at(bytes, security.checked_add(4)?)?);
+        if certificate_offset != 0 && certificate_size != 0 {
+            minimum = minimum.max(certificate_offset.checked_add(certificate_size)?);
+        }
+    }
+    Some(minimum)
+}
+
 /// Indexes deleted (0xE5) FAT directory entries under
-/// `{volume_prefix}/Recovery/Deleted Files`. Data recovery assumes the
-/// original allocation was contiguous from the recorded first cluster, which
-/// is the standard FAT undelete heuristic.
+/// `{volume_prefix}/Recovery/Deleted Files`. KDFT deliberately exposes only
+/// the recorded first cluster:
+/// subsequent FAT chain links are no longer authoritative after deletion, so
+/// adjacent clusters must not be silently presented as complete file bytes.
 #[allow(clippy::too_many_arguments)]
 fn scan_fat_deleted_entries(
     conn: &Connection,
@@ -38850,8 +39508,28 @@ fn scan_fat_deleted_entries(
                     .sectors_per_cluster
                     .checked_mul(layout.bytes_per_sector)
                     .context("FAT cluster byte length overflow")?;
-                let authoritative_contiguous_bytes =
-                    (!is_directory).then_some(file_size.min(cluster_bytes));
+                let authoritative_contiguous_bytes = (!is_directory)
+                    .then(|| {
+                        data_logical_offset.map(|offset| {
+                            file_size
+                                .min(cluster_bytes)
+                                .min(size_bytes.saturating_sub(offset))
+                        })
+                    })
+                    .flatten();
+                let mapping_complete = !is_directory
+                    && (file_size == 0 || authoritative_contiguous_bytes == Some(file_size));
+                let missing_ranges = if is_directory
+                    || authoritative_contiguous_bytes.unwrap_or_default() >= file_size
+                {
+                    Vec::new()
+                } else {
+                    vec![recovery_byte_range(
+                        authoritative_contiguous_bytes.unwrap_or_default(),
+                        file_size,
+                        "deleted FAT allocation chain is unavailable; bytes after the recorded first cluster are not authoritatively mapped",
+                    )]
+                };
                 let logical_path = format!(
                     "{recovery_prefix}/{}{}-cluster{first_cluster}",
                     if parent_rel.is_empty() {
@@ -38867,10 +39545,26 @@ fn scan_fat_deleted_entries(
                     "recovery_source": "fat_directory_entry",
                     "recovery_status": if is_directory {
                         "deleted directory entry; child directory records scanned when its cluster chain remains intact"
+                    } else if mapping_complete {
+                        "declared logical range fits in the recorded first cluster; bytes are readable but deleted-cluster content integrity is unverified"
                     } else {
-                        "deleted directory entry; data assumed contiguous from first cluster"
+                        "partial deleted-file recovery; only the recorded first cluster is exposed because the deleted FAT chain is unavailable"
                     },
                     "recovery_read": if is_directory { serde_json::Value::Null } else { serde_json::json!("physical_extent") },
+                    "filesystem_declared_size_bytes": (!is_directory).then_some(file_size),
+                    "recovery_stream_addressable_bytes": authoritative_contiguous_bytes,
+                    "recovery_mapped_readable_bytes": authoritative_contiguous_bytes,
+                    "recovery_authoritative_bytes": 0,
+                    "recovery_original_content_authoritative_bytes": 0,
+                    "recovery_authoritative_byte_basis": "successfully read bytes within the directory entry's first-cluster mapping; this does not prove original deleted content",
+                    "recovery_complete": false,
+                    "recovery_partial": !is_directory,
+                    "recovery_missing_ranges": missing_ranges,
+                    "recovery_size_consistency_status": if mapping_complete { "filesystem_declared_range_fits_authoritative_first_cluster_mapping" } else { "filesystem_declared_range_exceeds_authoritative_first_cluster_mapping" },
+                    "recovery_mapping_inventory_complete": mapping_complete,
+                    "recovery_contiguous_assumption": "not used for exposed bytes; only the directory entry's first-cluster mapping is treated as authoritative",
+                    "recovery_confidence": if mapping_complete { "complete_range_mapped_content_unverified" } else { "partial_first_cluster_mapping_content_unverified" },
+                    "recovery_content_integrity_status": "unverified_deleted_clusters_may_have_been_reallocated_or_overwritten",
                     "storage_area": "deleted_filesystem_record",
                     "partition_index": partition_index,
                     "partition_start_offset": start_offset,
@@ -38895,7 +39589,6 @@ fn scan_fat_deleted_entries(
                         u16::from_le_bytes([entry[22], entry[23]]),
                     ),
                 });
-                add_entry_category(&mut metadata, &logical_path, &name, entry_kind);
                 let content_head = if !is_directory && processing_profile().capture_content {
                     data_physical_offset.and_then(|offset| {
                         let head_len =
@@ -38914,6 +39607,18 @@ fn scan_fat_deleted_entries(
                 } else {
                     None
                 };
+                if !is_directory {
+                    let verified_bytes = content_head
+                        .as_ref()
+                        .map_or(0_u64, |bytes| bytes.len() as u64);
+                    finalize_deleted_recovery_probe(
+                        &mut metadata,
+                        file_size,
+                        verified_bytes,
+                        content_head.as_deref(),
+                    );
+                }
+                add_entry_category(&mut metadata, &logical_path, &name, entry_kind);
                 upsert_deleted_filesystem_entry_with_content(
                     conn,
                     case_id,
@@ -38981,13 +39686,160 @@ fn collect_fat_chain_regions(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum NtfsProvenance {
+    RawPhysical {
+        partition_start_offset: u64,
+    },
+    DecryptedBitLocker {
+        volume_index: usize,
+        encrypted_partition_start_offset: u64,
+    },
+}
+
+impl NtfsProvenance {
+    fn raw_physical_base(&self) -> Option<u64> {
+        match self {
+            Self::RawPhysical {
+                partition_start_offset,
+            } => Some(*partition_start_offset),
+            Self::DecryptedBitLocker { .. } => None,
+        }
+    }
+
+    fn slice_start_offset(&self) -> u64 {
+        match self {
+            Self::RawPhysical {
+                partition_start_offset,
+            } => *partition_start_offset,
+            Self::DecryptedBitLocker { .. } => 0,
+        }
+    }
+
+    fn apply_volume_metadata(&self, metadata: &mut serde_json::Value) {
+        let Some(obj) = metadata.as_object_mut() else {
+            return;
+        };
+        match self {
+            Self::RawPhysical {
+                partition_start_offset,
+            } => {
+                obj.insert(
+                    "offset_coordinate_system".to_string(),
+                    serde_json::json!("decoded_media_byte_stream"),
+                );
+                obj.insert(
+                    "partition_start_offset".to_string(),
+                    serde_json::json!(*partition_start_offset),
+                );
+            }
+            Self::DecryptedBitLocker {
+                volume_index,
+                encrypted_partition_start_offset,
+            } => {
+                obj.insert(
+                    "offset_coordinate_system".to_string(),
+                    serde_json::json!("decrypted_bitlocker_volume_logical_bytes"),
+                );
+                obj.insert(
+                    "bitlocker_volume_index_zero_based".to_string(),
+                    serde_json::json!(*volume_index),
+                );
+                obj.insert(
+                    "encrypted_partition_decoded_media_start_offset".to_string(),
+                    serde_json::json!(*encrypted_partition_start_offset),
+                );
+                obj.insert(
+                    "evidence_physical_offset_available".to_string(),
+                    serde_json::json!(false),
+                );
+                obj.insert(
+                    "evidence_physical_offset_unavailable_reason".to_string(),
+                    serde_json::json!(
+                        "decrypted plaintext volume offsets do not map one-to-one to encrypted decoded-media byte offsets"
+                    ),
+                );
+            }
+        }
+    }
+
+    fn apply_entry_metadata(
+        &self,
+        metadata: &mut serde_json::Value,
+        mft_record_logical_offset: Option<u64>,
+        file_data_logical_offset: Option<u64>,
+    ) {
+        let Some(obj) = metadata.as_object_mut() else {
+            return;
+        };
+        match self {
+            Self::RawPhysical {
+                partition_start_offset,
+            } => {
+                obj.insert(
+                    "offset_coordinate_system".to_string(),
+                    serde_json::json!("decoded_media_byte_stream"),
+                );
+                obj.insert(
+                    "partition_start_offset".to_string(),
+                    serde_json::json!(*partition_start_offset),
+                );
+                if let Some(offset) = mft_record_logical_offset {
+                    obj.insert(
+                        "mft_record_physical_offset".to_string(),
+                        serde_json::json!(partition_start_offset.checked_add(offset)),
+                    );
+                }
+                if let Some(offset) = file_data_logical_offset {
+                    obj.insert(
+                        "file_data_physical_offset".to_string(),
+                        serde_json::json!(partition_start_offset.checked_add(offset)),
+                    );
+                }
+            }
+            Self::DecryptedBitLocker {
+                volume_index,
+                encrypted_partition_start_offset,
+            } => {
+                obj.insert(
+                    "offset_coordinate_system".to_string(),
+                    serde_json::json!("decrypted_bitlocker_volume_logical_bytes"),
+                );
+                obj.insert(
+                    "bitlocker_volume_index_zero_based".to_string(),
+                    serde_json::json!(*volume_index),
+                );
+                obj.insert(
+                    "encrypted_partition_decoded_media_start_offset".to_string(),
+                    serde_json::json!(*encrypted_partition_start_offset),
+                );
+                if let Some(basis) = obj.remove("physical_offset_basis") {
+                    obj.insert("decrypted_volume_logical_offset_basis".to_string(), basis);
+                }
+                obj.remove("mft_record_physical_offset");
+                obj.remove("file_data_physical_offset");
+                obj.insert(
+                    "evidence_physical_offset_available".to_string(),
+                    serde_json::json!(false),
+                );
+                obj.insert(
+                    "evidence_physical_offset_unavailable_reason".to_string(),
+                    serde_json::json!(
+                        "decrypted plaintext volume offsets do not map one-to-one to encrypted decoded-media byte offsets"
+                    ),
+                );
+            }
+        }
+    }
+}
+
 fn process_ntfs_partition_entries(
     conn: &Connection,
     case_id: i64,
     evidence_id: i64,
     job_id: i64,
     reader: &mut dyn disk_forensic::container::ReadSeek,
-    start_offset: u64,
+    provenance: NtfsProvenance,
     size_bytes: u64,
     volume_prefix: &str,
     volume_name: &str,
@@ -38995,9 +39847,13 @@ fn process_ntfs_partition_entries(
     indexed: &mut usize,
     max_entries: usize,
 ) -> Result<bool> {
-    let mut slice = PartitionSlice::new(reader, start_offset, size_bytes);
-    let ntfs = ntfs::Ntfs::new(&mut slice)
-        .with_context(|| format!("opening NTFS filesystem at image offset {start_offset}"))?;
+    let mut slice = PartitionSlice::new(reader, provenance.slice_start_offset(), size_bytes);
+    let ntfs = ntfs::Ntfs::new(&mut slice).with_context(|| {
+        format!(
+            "opening NTFS filesystem at image offset {}",
+            provenance.slice_start_offset()
+        )
+    })?;
     let volume_label = ntfs
         .volume_name(&mut slice)
         .and_then(|value| value.ok())
@@ -39008,6 +39864,22 @@ fn process_ntfs_partition_entries(
         .file_record_number();
     progress::check_cancellation()?;
 
+    let mut volume_metadata = serde_json::json!({
+        "artifact_kind": "filesystem_volume",
+        "filesystem_parser": "ntfs",
+        "filesystem": "NTFS",
+        "volume_label": volume_label,
+        "partition_index": partition_index,
+        "partition_size_bytes": size_bytes,
+        "ntfs_cluster_size": ntfs.cluster_size(),
+        "ntfs_sector_size": ntfs.sector_size(),
+        "ntfs_volume_size": ntfs.size(),
+        "ntfs_serial_number": format!("{:016X}", ntfs.serial_number()),
+        "ntfs_mft_position": ntfs.mft_position().value().map(|value| value.get()),
+        "ntfs_root_record_number": root_record_number,
+    });
+    provenance.apply_volume_metadata(&mut volume_metadata);
+
     upsert_filesystem_entry(
         conn,
         case_id,
@@ -39016,26 +39888,7 @@ fn process_ntfs_partition_entries(
         volume_name,
         "directory",
         None,
-        &categorized_metadata_json(
-            serde_json::json!({
-                "artifact_kind": "filesystem_volume",
-                "filesystem_parser": "ntfs",
-                "filesystem": "NTFS",
-                "volume_label": volume_label,
-                "partition_index": partition_index,
-                "partition_start_offset": start_offset,
-                "partition_size_bytes": size_bytes,
-                "ntfs_cluster_size": ntfs.cluster_size(),
-                "ntfs_sector_size": ntfs.sector_size(),
-                "ntfs_volume_size": ntfs.size(),
-                "ntfs_serial_number": format!("{:016X}", ntfs.serial_number()),
-                "ntfs_mft_position": ntfs.mft_position().value().map(|value| value.get()),
-                "ntfs_root_record_number": root_record_number,
-            }),
-            volume_prefix,
-            volume_name,
-            "directory",
-        ),
+        &categorized_metadata_json(volume_metadata, volume_prefix, volume_name, "directory"),
         job_id,
     )?;
     *indexed += 1;
@@ -39044,7 +39897,7 @@ fn process_ntfs_partition_entries(
     }
 
     let mut truncated = false;
-    match ntfs_unallocated_summary(&ntfs, &mut slice, start_offset) {
+    match ntfs_unallocated_summary(&ntfs, &mut slice, provenance.raw_physical_base()) {
         Ok(Some(summary)) if summary.total_size_bytes > 0 => {
             let logical_path = format!("{volume_prefix}/UnallocatedSpace");
             let mut metadata = serde_json::json!({
@@ -39057,7 +39910,6 @@ fn process_ntfs_partition_entries(
                 "is_unallocated": true,
                 "is_file_slack": false,
                 "partition_index": partition_index,
-                "partition_start_offset": start_offset,
                 "partition_size_bytes": size_bytes,
                 "ntfs_cluster_size": ntfs.cluster_size(),
                 "ntfs_volume_size": ntfs.size(),
@@ -39069,6 +39921,7 @@ fn process_ntfs_partition_entries(
                 "unallocated_size_bytes": summary.total_size_bytes,
                 "unallocated_sample_extents": summary.sample_extents,
             });
+            provenance.apply_volume_metadata(&mut metadata);
             add_entry_category(&mut metadata, &logical_path, "UnallocatedSpace", "file");
             upsert_filesystem_entry(
                 conn,
@@ -39131,7 +39984,7 @@ fn process_ntfs_partition_entries(
         volume_prefix,
         "",
         partition_index,
-        start_offset,
+        provenance,
         size_bytes,
         indexed,
         max_entries,
@@ -39148,7 +40001,7 @@ fn process_ntfs_partition_entries(
                 &mut slice,
                 volume_prefix,
                 partition_index,
-                start_offset,
+                provenance,
                 size_bytes,
                 indexed,
                 max_entries,
@@ -39171,7 +40024,7 @@ fn process_ntfs_partition_entries(
         &mut slice,
         volume_prefix,
         partition_index,
-        start_offset,
+        provenance,
         size_bytes,
         indexed,
         max_entries,
@@ -39192,7 +40045,7 @@ fn process_ntfs_partition_entries(
             &mut slice,
             volume_prefix,
             partition_index,
-            start_offset,
+            provenance,
             size_bytes,
             &mft_reconciliation.deleted_paths,
             &mut used_logical_paths,
@@ -39288,7 +40141,8 @@ struct NtfsDirChildrenResult {
 #[derive(Clone, Serialize)]
 struct NtfsUnallocatedExtent {
     logical_offset: u64,
-    physical_offset: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    physical_offset: Option<u64>,
     length_bytes: u64,
 }
 
@@ -39312,7 +40166,7 @@ fn walk_ntfs_volume<T: Read + Seek>(
     volume_prefix: &str,
     root_ntfs_path: &str,
     partition_index: usize,
-    partition_start_offset: u64,
+    provenance: NtfsProvenance,
     partition_size_bytes: u64,
     indexed: &mut usize,
     max_entries: usize,
@@ -39438,18 +40292,12 @@ fn walk_ntfs_volume<T: Read + Seek>(
             let size_bytes =
                 (!child.is_directory).then(|| i64::try_from(child.size_bytes).unwrap_or(i64::MAX));
             let mft_record_logical_offset = child.mft_record_logical_offset;
-            let mft_record_physical_offset = mft_record_logical_offset
-                .and_then(|offset| partition_start_offset.checked_add(offset));
             let data_location = child.data_location;
             let file_data_logical_offset = data_location.map(|location| location.filesystem_offset);
-            let file_data_physical_offset = data_location.and_then(|location| {
-                partition_start_offset.checked_add(location.filesystem_offset)
-            });
             let mut metadata = serde_json::json!({
                 "artifact_kind": "filesystem_entry",
                 "filesystem_parser": "ntfs",
                 "partition_index": partition_index,
-                "partition_start_offset": partition_start_offset,
                 "partition_size_bytes": partition_size_bytes,
                 "storage_area": "allocated_file",
                 "source_entry_name": child.name,
@@ -39464,14 +40312,11 @@ fn walk_ntfs_volume<T: Read + Seek>(
                 "ntfs_directory_entry_source": child.directory_entry_source,
                 "ntfs_file_name_attribute_flags": child.file_attribute_flags,
                 "mft_record_logical_offset": mft_record_logical_offset,
-                "mft_record_physical_offset": mft_record_physical_offset,
                 "file_data_logical_offset": file_data_logical_offset,
-                "file_data_physical_offset": file_data_physical_offset,
                 "file_data_file_offset": data_location.map(|location| location.file_offset),
                 "file_data_contiguous_bytes": data_location.and_then(|location| location.contiguous_bytes),
                 "physical_offset_basis": data_location.map(|location| location.basis),
                 "file_data_direct_logical_mapping": data_location.map(|location| location.direct_logical_mapping),
-                "offset_coordinate_system": "decoded_media_byte_stream",
                 "ntfs_namespace": child.namespace,
                 "ntfs_allocated_size": child.allocated_size,
                 "ntfs_creation_time_raw": child.creation_time_raw,
@@ -39491,6 +40336,12 @@ fn walk_ntfs_volume<T: Read + Seek>(
                 "ntfs_standard_mft_record_modification_time_raw": child.standard_mft_record_modification_time_raw,
                 "ntfs_standard_mft_record_modification_time_utc": child.standard_mft_record_modification_time_utc,
             });
+            provenance.apply_entry_metadata(
+                &mut metadata,
+                mft_record_logical_offset,
+                file_data_logical_offset,
+            );
+
             if !child.is_directory
                 && child.file_attribute_flags
                     & (NTFS_FILE_ATTRIBUTE_SPARSE_FILE | NTFS_FILE_ATTRIBUTE_REPARSE_POINT)
@@ -39662,14 +40513,10 @@ fn walk_ntfs_volume<T: Read + Seek>(
                         let stream_data_location = stream.data_location;
                         let stream_logical_offset =
                             stream_data_location.map(|location| location.filesystem_offset);
-                        let stream_physical_offset = stream_data_location.and_then(|location| {
-                            partition_start_offset.checked_add(location.filesystem_offset)
-                        });
                         let mut stream_metadata = serde_json::json!({
                             "artifact_kind": "filesystem_entry",
                             "filesystem_parser": "ntfs",
                             "partition_index": partition_index,
-                            "partition_start_offset": partition_start_offset,
                             "partition_size_bytes": partition_size_bytes,
                             "storage_area": "alternate_data_stream",
                             "source_entry_name": stream_display_name,
@@ -39690,14 +40537,11 @@ fn walk_ntfs_volume<T: Read + Seek>(
                             "ntfs_data_stream_sparse": stream.is_sparse,
                             "ntfs_stream_read_support": ntfs_stream_read_support(stream.is_compressed, stream.is_encrypted),
                             "mft_record_logical_offset": mft_record_logical_offset,
-                            "mft_record_physical_offset": mft_record_physical_offset,
                             "file_data_logical_offset": stream_logical_offset,
-                            "file_data_physical_offset": stream_physical_offset,
                             "file_data_file_offset": stream_data_location.map(|location| location.file_offset),
                             "file_data_contiguous_bytes": stream_data_location.and_then(|location| location.contiguous_bytes),
                             "physical_offset_basis": stream_data_location.map(|location| location.basis),
                             "file_data_direct_logical_mapping": stream_data_location.map(|location| location.direct_logical_mapping),
-                            "offset_coordinate_system": "decoded_media_byte_stream",
                             "ntfs_namespace": child.namespace,
                             "ntfs_data_size": stream.size_bytes,
                             "ntfs_allocated_size": stream.allocated_size_bytes,
@@ -39721,6 +40565,11 @@ fn walk_ntfs_volume<T: Read + Seek>(
                             "is_unallocated": false,
                             "is_file_slack": false,
                         });
+                        provenance.apply_entry_metadata(
+                            &mut stream_metadata,
+                            mft_record_logical_offset,
+                            stream_logical_offset,
+                        );
                         add_entry_category(
                             &mut stream_metadata,
                             &stream_logical_path,
@@ -40157,6 +41006,360 @@ mod deleted_ntfs_path_selection_tests {
     }
 }
 
+fn annotate_deleted_ntfs_recovery_metadata(
+    metadata: &mut serde_json::Value,
+    filesystem_declared_size: u64,
+    resolved_stream_size: Option<u64>,
+    data_location: Option<NtfsDataLocation>,
+    native_attribute_summary: &serde_json::Value,
+) {
+    let attribute_list_present = native_attribute_summary["attribute_list_present"]
+        .as_bool()
+        .unwrap_or(false);
+    let attribute_inventory_complete = native_attribute_summary["complete"]
+        .as_bool()
+        .unwrap_or(false);
+    let addressable_bytes = resolved_stream_size
+        .unwrap_or_default()
+        .min(filesystem_declared_size);
+    let size_consistency_status = match resolved_stream_size {
+        None => "unnamed_data_stream_unavailable",
+        Some(size) if size < filesystem_declared_size => {
+            "resolved_stream_shorter_than_filesystem_declared_size"
+        }
+        Some(size) if size > filesystem_declared_size => {
+            "resolved_stream_longer_than_filesystem_declared_size"
+        }
+        Some(_) => "resolved_stream_matches_filesystem_declared_size",
+    };
+    let missing_ranges = if addressable_bytes < filesystem_declared_size {
+        vec![recovery_byte_range(
+            addressable_bytes,
+            filesystem_declared_size,
+            if resolved_stream_size.is_none() {
+                "no readable unnamed NTFS $DATA stream was resolved from the deleted FILE record"
+            } else {
+                "resolved NTFS $DATA stream is shorter than the filesystem-declared logical size"
+            },
+        )]
+    } else {
+        Vec::new()
+    };
+    let unverified_ranges = if addressable_bytes > 0 {
+        vec![recovery_byte_range(
+            0,
+            addressable_bytes,
+            "logical stream mapping was resolved but these bytes were not yet read during bounded indexing",
+        )]
+    } else {
+        Vec::new()
+    };
+    let runlist_status = if filesystem_declared_size == 0 {
+        "empty_logical_stream"
+    } else if resolved_stream_size.is_none() {
+        "unnamed_data_stream_unavailable"
+    } else if attribute_list_present && !attribute_inventory_complete {
+        "attribute_list_resolution_incomplete"
+    } else if attribute_list_present {
+        "flattened_attribute_list_stream_resolved"
+    } else if data_location.is_some_and(|location| location.direct_logical_mapping) {
+        "logical_stream_resolved_first_direct_run_located"
+    } else {
+        "logical_stream_resolved_raw_contiguous_mapping_unavailable"
+    };
+    let attribute_list_status = if attribute_list_present && attribute_inventory_complete {
+        "present_flattened_iterator_completed"
+    } else if attribute_list_present {
+        "present_resolution_incomplete"
+    } else if attribute_inventory_complete {
+        "not_present"
+    } else {
+        "not_observed_inventory_incomplete"
+    };
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "filesystem_declared_size_bytes".to_string(),
+        serde_json::json!(filesystem_declared_size),
+    );
+    object.insert(
+        "ntfs_resolved_stream_size_bytes".to_string(),
+        serde_json::json!(resolved_stream_size),
+    );
+    object.insert(
+        "recovery_stream_addressable_bytes".to_string(),
+        serde_json::json!(addressable_bytes),
+    );
+    object.insert(
+        "recovery_mapped_readable_bytes".to_string(),
+        serde_json::json!(addressable_bytes),
+    );
+    object.insert(
+        "recovery_size_consistency_status".to_string(),
+        serde_json::json!(size_consistency_status),
+    );
+    object.insert(
+        "recovery_stream_excess_bytes".to_string(),
+        serde_json::json!(resolved_stream_size
+            .unwrap_or_default()
+            .saturating_sub(filesystem_declared_size)),
+    );
+    object.insert("recovered_bytes".to_string(), serde_json::json!(0));
+    object.insert(
+        "recovery_verified_readable_bytes".to_string(),
+        serde_json::json!(0),
+    );
+    object.insert(
+        "recovery_authoritative_bytes".to_string(),
+        serde_json::json!(0),
+    );
+    object.insert(
+        "recovery_original_content_authoritative_bytes".to_string(),
+        serde_json::json!(0),
+    );
+    object.insert(
+        "recovery_authoritative_byte_basis".to_string(),
+        serde_json::json!(
+            "successfully read logical-stream bytes; this does not prove original deleted content"
+        ),
+    );
+    object.insert("recovery_complete".to_string(), serde_json::json!(false));
+    object.insert("recovery_partial".to_string(), serde_json::json!(true));
+    object.insert(
+        "recovery_missing_ranges".to_string(),
+        serde_json::json!(missing_ranges),
+    );
+    object.insert(
+        "recovery_unverified_ranges".to_string(),
+        serde_json::json!(unverified_ranges),
+    );
+    object.insert(
+        "recovery_byte_coverage_status".to_string(),
+        serde_json::json!(if addressable_bytes == 0 {
+            "no_deleted_file_bytes_verified_readable"
+        } else {
+            "resolved_stream_not_yet_fully_read"
+        }),
+    );
+    object.insert(
+        "recovery_content_integrity_status".to_string(),
+        serde_json::json!(
+            "unverified_deleted_ntfs_clusters_may_have_been_reallocated_or_overwritten"
+        ),
+    );
+    object.insert(
+        "recovery_contiguous_assumption".to_string(),
+        serde_json::json!(
+            "not used; logical reads follow the NTFS $DATA attribute and decoded data runs"
+        ),
+    );
+    object.insert(
+        "recovery_runlist_status".to_string(),
+        serde_json::json!(runlist_status),
+    );
+    object.insert(
+        "recovery_mapping_inventory_complete".to_string(),
+        serde_json::json!(attribute_inventory_complete),
+    );
+    object.insert(
+        "recovery_attribute_list_status".to_string(),
+        serde_json::json!(attribute_list_status),
+    );
+    object.insert(
+        "recovery_runlist_limitations".to_string(),
+        serde_json::json!(
+            "A resolved runlist proves where current evidence bytes are read, not that deleted clusters still contain the original file. Raw contiguous offsets describe only the first directly mapped run; logical reads may span additional runs. ATTRIBUTE_LIST resolution is limited to entries reached by the ntfs crate flattened iterator and is incomplete when its inventory reports errors or truncation."
+        ),
+    );
+}
+
+fn finalize_deleted_recovery_probe(
+    metadata: &mut serde_json::Value,
+    filesystem_declared_size: u64,
+    verified_bytes: u64,
+    content_head: Option<&[u8]>,
+) {
+    let addressable_bytes = metadata_u64_or_i64(metadata, "recovery_stream_addressable_bytes")
+        .unwrap_or_default()
+        .min(filesystem_declared_size);
+    let verified_bytes = verified_bytes.min(addressable_bytes);
+    let filesystem_range_complete =
+        verified_bytes == filesystem_declared_size && addressable_bytes == filesystem_declared_size;
+    let pe_minimum = content_head.and_then(windows_pe_minimum_file_extent);
+    let structural_extent_addressable =
+        pe_minimum.is_none_or(|minimum| addressable_bytes >= minimum);
+    let structural_range_complete = pe_minimum.is_none_or(|minimum| verified_bytes >= minimum);
+    let recovery_complete = filesystem_range_complete && structural_range_complete;
+    let unverified_ranges = if verified_bytes < addressable_bytes {
+        vec![recovery_byte_range(
+            verified_bytes,
+            addressable_bytes,
+            "resolved stream bytes beyond the bounded indexing probe were not read during indexing",
+        )]
+    } else {
+        Vec::new()
+    };
+    // A bounded indexing probe is not evidence that later mapped bytes are
+    // absent. Report a structural *missing* range only when the resolved
+    // logical stream itself ends before the PE-referenced extent. Bytes that
+    // are addressable but outside the probe belong in a separate unverified
+    // range so later export/hash passes may read and validate them.
+    let structural_missing_ranges = pe_minimum
+        .filter(|minimum| addressable_bytes < *minimum)
+        .map(|minimum| {
+            vec![recovery_byte_range(
+                addressable_bytes,
+                minimum,
+                "the recovered PE header references a file extent beyond the resolved addressable logical stream",
+            )]
+        })
+        .unwrap_or_default();
+    let structural_unverified_ranges = pe_minimum
+        .filter(|minimum| verified_bytes < *minimum && addressable_bytes >= *minimum)
+        .map(|minimum| {
+            vec![recovery_byte_range(
+                verified_bytes,
+                minimum,
+                "the PE-referenced extent is addressable but extends beyond the bounded bytes read during indexing",
+            )]
+        })
+        .unwrap_or_default();
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "recovered_bytes".to_string(),
+        serde_json::json!(verified_bytes),
+    );
+    object.insert(
+        "recovery_verified_readable_bytes".to_string(),
+        serde_json::json!(verified_bytes),
+    );
+    object.insert(
+        "recovery_authoritative_bytes".to_string(),
+        serde_json::json!(verified_bytes),
+    );
+    object.insert(
+        "recovery_original_content_authoritative_bytes".to_string(),
+        serde_json::json!(0),
+    );
+    object.insert(
+        "recovery_complete".to_string(),
+        serde_json::json!(recovery_complete),
+    );
+    object.insert(
+        "recovery_partial".to_string(),
+        serde_json::json!(!recovery_complete),
+    );
+    object.insert(
+        "recovery_filesystem_declared_range_complete".to_string(),
+        serde_json::json!(filesystem_range_complete),
+    );
+    object.insert(
+        "recovery_structural_range_complete".to_string(),
+        serde_json::json!(structural_range_complete),
+    );
+    object.insert(
+        "recovery_structural_extent_addressable".to_string(),
+        serde_json::json!(structural_extent_addressable),
+    );
+    object.insert(
+        "recovery_original_content_completeness".to_string(),
+        serde_json::json!("unverifiable_after_deletion"),
+    );
+    object.insert(
+        "recovery_completeness_basis".to_string(),
+        serde_json::json!(if recovery_complete {
+            "filesystem-declared logical range was read and no recognized file-structure reference extends beyond it; original deleted content remains unverified"
+        } else if !structural_extent_addressable {
+            "a recognized PE structure references bytes beyond the resolved addressable logical stream"
+        } else if verified_bytes < addressable_bytes {
+            "the logical stream is addressable, but bounded indexing read only a prefix; later export/hash reads must validate the remaining bytes"
+        } else {
+            "not all filesystem-declared logical bytes were both mapped and read during the bounded indexing probe"
+        }),
+    );
+    object.insert(
+        "recovery_status".to_string(),
+        serde_json::json!(if recovery_complete {
+            "filesystem-declared logical byte range read; original deleted-cluster integrity remains unverified"
+        } else if !structural_extent_addressable {
+            "partial recovery: the PE header references unavailable bytes beyond the resolved addressable logical stream"
+        } else if verified_bytes > 0 && verified_bytes < addressable_bytes {
+            "partial indexing probe: the logical stream and PE-referenced extent are addressable, but only a bounded prefix was read during indexing"
+        } else if verified_bytes > 0 {
+            "partial recovery: only part of the filesystem-declared logical byte range was verified readable during indexing"
+        } else if addressable_bytes > 0 {
+            "logical stream mapping resolved, but no bytes were verified readable during indexing"
+        } else {
+            "deleted-file data stream unavailable; metadata only"
+        }),
+    );
+    object.insert(
+        "recovery_byte_coverage_status".to_string(),
+        serde_json::json!(if filesystem_range_complete {
+            "complete_declared_logical_range_read_during_indexing"
+        } else if verified_bytes > 0 {
+            "partial_declared_logical_range_read_during_indexing"
+        } else {
+            "no_deleted_file_bytes_verified_readable"
+        }),
+    );
+    object.insert(
+        "recovery_unverified_ranges".to_string(),
+        serde_json::json!(unverified_ranges),
+    );
+    object.insert(
+        "recovery_structural_missing_ranges".to_string(),
+        serde_json::json!(structural_missing_ranges),
+    );
+    object.insert(
+        "recovery_structural_unverified_ranges".to_string(),
+        serde_json::json!(structural_unverified_ranges),
+    );
+    if let Some(minimum) = pe_minimum {
+        object.insert(
+            "pe_minimum_file_extent_bytes".to_string(),
+            serde_json::json!(minimum),
+        );
+        object.insert(
+            "pe_filesystem_declared_shortfall_bytes".to_string(),
+            serde_json::json!(minimum.saturating_sub(filesystem_declared_size)),
+        );
+        object.insert(
+            "pe_recovered_shortfall_bytes".to_string(),
+            serde_json::json!(minimum.saturating_sub(verified_bytes)),
+        );
+        object.insert(
+            "pe_stream_addressable_shortfall_bytes".to_string(),
+            serde_json::json!(minimum.saturating_sub(addressable_bytes)),
+        );
+        object.insert(
+            "pe_index_probe_unverified_bytes".to_string(),
+            serde_json::json!(minimum
+                .min(addressable_bytes)
+                .saturating_sub(verified_bytes)),
+        );
+        object.insert(
+            "pe_recovered_shortfall_scope".to_string(),
+            serde_json::json!(
+                "bounded indexing probe only; this field does not by itself prove that later addressable bytes are unavailable"
+            ),
+        );
+        object.insert(
+            "pe_structural_recovery_status".to_string(),
+            serde_json::json!(if addressable_bytes < minimum {
+                "partial_addressable_stream_ends_before_pe_referenced_file_extent"
+            } else if verified_bytes >= minimum {
+                "minimum_file_extent_present_in_verified_bytes"
+            } else {
+                "pe_referenced_extent_addressable_but_not_fully_verified_during_indexing"
+            }),
+        );
+    }
+}
+
 fn process_deleted_ntfs_mft_records<T: Read + Seek>(
     conn: &Connection,
     case_id: i64,
@@ -40166,7 +41369,7 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
     fs: &mut T,
     volume_prefix: &str,
     partition_index: usize,
-    partition_start_offset: u64,
+    provenance: NtfsProvenance,
     partition_size_bytes: u64,
     resolved_paths: &HashMap<u64, DeletedNtfsPathResolution>,
     used_logical_paths: &mut HashSet<String>,
@@ -40302,18 +41505,17 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
                 }
             }
         };
+        let resolved_stream_size = (!is_directory)
+            .then(|| ntfs_default_data_size(&file, fs))
+            .flatten();
         let file_data_logical_offset = data_location.map(|location| location.filesystem_offset);
-        let file_data_physical_offset = data_location
-            .and_then(|location| partition_start_offset.checked_add(location.filesystem_offset));
         let mft_record_logical_offset = file.position().value().map(|position| position.get());
-        let mft_record_physical_offset =
-            mft_record_logical_offset.and_then(|offset| partition_start_offset.checked_add(offset));
         let recovery_status = if is_directory {
             "metadata only"
-        } else if file_data_logical_offset.is_some() {
-            "data stream located"
+        } else if resolved_stream_size.is_some() {
+            "deleted NTFS logical stream resolved; byte coverage and original-content integrity require verification"
         } else {
-            "data stream not located"
+            "deleted NTFS data stream not resolved; metadata only"
         };
         let mut metadata = serde_json::json!({
             "artifact_kind": "deleted_file_record",
@@ -40324,7 +41526,6 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
             "is_unallocated": false,
             "is_file_slack": false,
             "partition_index": partition_index,
-            "partition_start_offset": partition_start_offset,
             "partition_size_bytes": partition_size_bytes,
             "source_entry_name": name.name,
             "source_path_exact": path_selection.source_path_exact,
@@ -40343,14 +41544,11 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
             "logical_path_collision_disambiguated": path_selection.collision_disambiguated,
             "ntfs_file_name_attribute_flags": name.file_attribute_flags,
             "mft_record_logical_offset": mft_record_logical_offset,
-            "mft_record_physical_offset": mft_record_physical_offset,
             "file_data_logical_offset": file_data_logical_offset,
-            "file_data_physical_offset": file_data_physical_offset,
             "file_data_file_offset": data_location.map(|location| location.file_offset),
             "file_data_contiguous_bytes": data_location.and_then(|location| location.contiguous_bytes),
             "physical_offset_basis": data_location.map(|location| location.basis),
             "file_data_direct_logical_mapping": data_location.map(|location| location.direct_logical_mapping),
-            "offset_coordinate_system": "decoded_media_byte_stream",
             "ntfs_namespace": name.namespace,
             "ntfs_allocated_size": name.allocated_size,
             "ntfs_creation_time_raw": name.creation_time_raw,
@@ -40370,8 +41568,22 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
             "ntfs_standard_mft_record_modification_time_raw": standard_info.as_ref().map(|info| info.mft_record_modification_time().nt_timestamp()),
             "ntfs_standard_mft_record_modification_time_utc": standard_info.as_ref().and_then(|info| ntfs_time_to_rfc3339(info.mft_record_modification_time())),
         });
+        provenance.apply_entry_metadata(
+            &mut metadata,
+            mft_record_logical_offset,
+            file_data_logical_offset,
+        );
         let native_attribute_summary = ntfs_native_attribute_summary(&file, fs);
         merge_native_ntfs_attribute_summary(&mut metadata, &native_attribute_summary);
+        if !is_directory {
+            annotate_deleted_ntfs_recovery_metadata(
+                &mut metadata,
+                name.data_size,
+                resolved_stream_size,
+                data_location,
+                &native_attribute_summary,
+            );
+        }
         if entry_kind == "file"
             && name.file_attribute_flags
                 & (NTFS_FILE_ATTRIBUTE_SPARSE_FILE | NTFS_FILE_ATTRIBUTE_REPARSE_POINT)
@@ -40513,7 +41725,14 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
         add_entry_category(&mut metadata, &logical_path, &name.name, entry_kind);
         let content_head = if should_index_content_head(&metadata, entry_kind) {
             match read_ntfs_file_record_bytes(ntfs, fs, record_number, CONTENT_INDEX_BYTES) {
-                Ok(bytes) => Some(bytes),
+                Ok(mut bytes) => {
+                    bytes.truncate(
+                        usize::try_from(name.data_size)
+                            .unwrap_or(usize::MAX)
+                            .min(CONTENT_INDEX_BYTES),
+                    );
+                    Some(bytes)
+                }
                 Err(error) => {
                     diagnostics.record_error(record_number, "content_read", error, false);
                     truncated = true;
@@ -40523,6 +41742,16 @@ fn process_deleted_ntfs_mft_records<T: Read + Seek>(
         } else {
             None
         };
+        if !is_directory {
+            finalize_deleted_recovery_probe(
+                &mut metadata,
+                name.data_size,
+                content_head
+                    .as_ref()
+                    .map_or(0_u64, |bytes| bytes.len() as u64),
+                content_head.as_deref(),
+            );
+        }
         upsert_deleted_filesystem_entry_with_content(
             conn,
             case_id,
@@ -40983,7 +42212,7 @@ fn ntfs_named_data_streams<T: Read + Seek>(
 fn ntfs_unallocated_summary<T: Read + Seek>(
     ntfs: &ntfs::Ntfs,
     fs: &mut T,
-    partition_start_offset: u64,
+    raw_physical_base: Option<u64>,
 ) -> Result<Option<NtfsUnallocatedSummary>> {
     let Some(bitmap) = ntfs_bitmap_bytes(ntfs, fs)? else {
         return Ok(None);
@@ -41002,9 +42231,12 @@ fn ntfs_unallocated_summary<T: Read + Seek>(
         summary.total_size_bytes = summary.total_size_bytes.saturating_add(length_bytes);
         summary.run_count = summary.run_count.saturating_add(1);
         if summary.sample_extents.len() < NTFS_UNALLOCATED_METADATA_EXTENTS_LIMIT {
-            let physical_offset = partition_start_offset
-                .checked_add(logical_offset)
-                .context("NTFS unallocated physical-offset overflow")?;
+            let physical_offset = raw_physical_base
+                .map(|base| {
+                    base.checked_add(logical_offset)
+                        .context("NTFS unallocated physical-offset overflow")
+                })
+                .transpose()?;
             summary.sample_extents.push(NtfsUnallocatedExtent {
                 logical_offset,
                 physical_offset,
@@ -41190,6 +42422,7 @@ fn ntfs_native_attribute_summary<T: Read + Seek>(
     let mut errors = Vec::new();
     let mut error_count = 0_usize;
     let mut truncated = false;
+    let mut attribute_list_present = false;
     let mut iter = file.attributes();
 
     while let Some(item_result) = iter.next(fs) {
@@ -41239,6 +42472,7 @@ fn ntfs_native_attribute_summary<T: Read + Seek>(
                 String::new()
             }
         };
+        attribute_list_present |= attribute_type == ntfs::NtfsAttributeType::AttributeList;
         let flags = attribute.flags();
         attributes.push(serde_json::json!({
             "type": format!("{attribute_type:?}"),
@@ -41265,6 +42499,7 @@ fn ntfs_native_attribute_summary<T: Read + Seek>(
         "attribute_errors_omitted": error_count.saturating_sub(NTFS_NATIVE_ATTRIBUTE_ERROR_LIMIT),
         "truncated": truncated,
         "complete": !truncated && error_count == 0,
+        "attribute_list_present": attribute_list_present,
         "attribute_list_resolution": "flattened iterator follows connected ATTRIBUTE_LIST entries",
     })
 }
@@ -41311,6 +42546,10 @@ fn merge_native_ntfs_attribute_summary(
     object.insert(
         "ntfs_attribute_list_resolution".to_string(),
         summary["attribute_list_resolution"].clone(),
+    );
+    object.insert(
+        "ntfs_attribute_list_present".to_string(),
+        summary["attribute_list_present"].clone(),
     );
 }
 
@@ -41875,7 +43114,7 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
     fs: &mut T,
     volume_prefix: &str,
     partition_index: usize,
-    partition_start_offset: u64,
+    provenance: NtfsProvenance,
     partition_size_bytes: u64,
     indexed: &mut usize,
     max_entries: usize,
@@ -42238,11 +43477,6 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
             let mft_record_logical_offset = native_file
                 .as_ref()
                 .and_then(|file| file.position().value().map(|position| position.get()));
-            let mft_record_physical_offset = mft_record_logical_offset
-                .and_then(|offset| partition_start_offset.checked_add(offset));
-            let file_data_physical_offset = data_location.and_then(|location| {
-                partition_start_offset.checked_add(location.filesystem_offset)
-            });
             let base_logical_path = ntfs_internal_logical_path(volume_prefix, &ntfs_path);
             let logical_path = unique_reconciled_ntfs_logical_path(
                 base_logical_path,
@@ -42254,7 +43488,6 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
                 "artifact_kind": "filesystem_entry",
                 "filesystem_parser": "ntfs",
                 "partition_index": partition_index,
-                "partition_start_offset": partition_start_offset,
                 "partition_size_bytes": partition_size_bytes,
                 "storage_area": "allocated_file",
                 "source_entry_name": best_name.name,
@@ -42270,14 +43503,11 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
                 "ntfs_path_reconciled": true,
                 "mft_path_reconstruction_status": "resolved",
                 "mft_record_logical_offset": mft_record_logical_offset,
-                "mft_record_physical_offset": mft_record_physical_offset,
                 "file_data_logical_offset": file_data_logical_offset,
-                "file_data_physical_offset": file_data_physical_offset,
                 "file_data_file_offset": data_location.map(|location| location.file_offset),
                 "file_data_contiguous_bytes": data_location.and_then(|location| location.contiguous_bytes),
                 "physical_offset_basis": data_location.map(|location| location.basis),
                 "file_data_direct_logical_mapping": data_location.map(|location| location.direct_logical_mapping),
-                "offset_coordinate_system": "decoded_media_byte_stream",
                 "ntfs_namespace": format!("{:?}", best_name.namespace),
                 "ntfs_file_name_attribute_flags": best_name.flags.bits(),
                 "ntfs_creation_time_utc": best_name.created.to_string(),
@@ -42289,6 +43519,11 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
                 "is_unallocated": false,
                 "is_file_slack": false,
             });
+            provenance.apply_entry_metadata(
+                &mut metadata,
+                mft_record_logical_offset,
+                file_data_logical_offset,
+            );
             merge_mft_summary_into_ntfs_metadata(&mut metadata, &summary);
             if let Some(native_summary) = native_attribute_summary.as_ref() {
                 merge_native_ntfs_attribute_summary(&mut metadata, native_summary);
@@ -42393,19 +43628,13 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
                 .position()
                 .value()
                 .map(|position| position.get());
-            let mft_record_physical_offset = mft_record_logical_offset
-                .and_then(|offset| partition_start_offset.checked_add(offset));
             let stream_data_location = stream.data_location;
             let stream_logical_offset =
                 stream_data_location.map(|location| location.filesystem_offset);
-            let stream_physical_offset = stream_data_location.and_then(|location| {
-                partition_start_offset.checked_add(location.filesystem_offset)
-            });
             let mut stream_metadata = serde_json::json!({
                 "artifact_kind": "filesystem_entry",
                 "filesystem_parser": "ntfs",
                 "partition_index": partition_index,
-                "partition_start_offset": partition_start_offset,
                 "partition_size_bytes": partition_size_bytes,
                 "storage_area": "alternate_data_stream",
                 "source_entry_name": stream_display_name,
@@ -42431,14 +43660,11 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
                 "ntfs_data_stream_sparse": stream.is_sparse,
                 "ntfs_stream_read_support": ntfs_stream_read_support(stream.is_compressed, stream.is_encrypted),
                 "mft_record_logical_offset": mft_record_logical_offset,
-                "mft_record_physical_offset": mft_record_physical_offset,
                 "file_data_logical_offset": stream_logical_offset,
-                "file_data_physical_offset": stream_physical_offset,
                 "file_data_file_offset": stream_data_location.map(|location| location.file_offset),
                 "file_data_contiguous_bytes": stream_data_location.and_then(|location| location.contiguous_bytes),
                 "physical_offset_basis": stream_data_location.map(|location| location.basis),
                 "file_data_direct_logical_mapping": stream_data_location.map(|location| location.direct_logical_mapping),
-                "offset_coordinate_system": "decoded_media_byte_stream",
                 "ntfs_namespace": format!("{:?}", best_name.namespace),
                 "ntfs_file_name_attribute_flags": best_name.flags.bits(),
                 "ntfs_creation_time_utc": best_name.created.to_string(),
@@ -42451,6 +43677,11 @@ fn enrich_ntfs_entries_with_shared_mft_parser<T: Read + Seek>(
                 "is_unallocated": false,
                 "is_file_slack": false,
             });
+            provenance.apply_entry_metadata(
+                &mut stream_metadata,
+                mft_record_logical_offset,
+                stream_logical_offset,
+            );
             merge_mft_summary_into_ntfs_metadata(&mut stream_metadata, &summary);
             if let Some(native_summary) = native_attribute_summary.as_ref() {
                 merge_native_ntfs_attribute_summary(&mut stream_metadata, native_summary);
@@ -43401,6 +44632,36 @@ fn read_image_physical_extent_bytes(
         return Ok(None);
     }
     let decoded_extent = recovery_read == Some("decoded_media_extent");
+    let declared_total_size = entry
+        .size_bytes
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(0);
+    // Deleted FAT records deliberately cap this at the only mapped readable
+    // range (the recorded first cluster). `recovery_authoritative_bytes`
+    // records only bytes actually read by the bounded indexing probe and must
+    // not prevent a later examiner-requested read of the rest of that mapped
+    // first cluster. Carved extents normally report a contiguous length equal
+    // to their declared size. Keeping the declared size in
+    // `EntryBytes::total_size` lets recovery/hash callers detect and reject
+    // partial data instead of publishing a misleading complete file.
+    let readable_size = metadata_u64_or_i64(&entry.metadata_json, "recovery_mapped_readable_bytes")
+        .or_else(|| metadata_u64_or_i64(&entry.metadata_json, "recovery_stream_addressable_bytes"))
+        .or_else(|| metadata_u64_or_i64(&entry.metadata_json, "file_data_contiguous_bytes"))
+        .unwrap_or(declared_total_size)
+        .min(declared_total_size);
+    if declared_total_size == 0 {
+        return Ok(Some(EntryBytes {
+            entry_id: entry.entry_id,
+            evidence_id: entry.evidence_id,
+            logical_path: entry.logical_path.clone(),
+            offset,
+            requested_length: length,
+            bytes_read: 0,
+            total_size: 0,
+            eof: true,
+            bytes: Vec::new(),
+        }));
+    }
     let extent_start = if decoded_extent {
         metadata_u64_or_i64(&entry.metadata_json, "file_data_decoded_media_offset")
     } else {
@@ -43412,18 +44673,14 @@ fn read_image_physical_extent_bytes(
             entry.logical_path
         );
     };
-    let total_size = entry
-        .size_bytes
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or(0);
-    let remaining = total_size.saturating_sub(offset.min(total_size));
+    let remaining = readable_size.saturating_sub(offset.min(readable_size));
     let want = usize::try_from(remaining).unwrap_or(usize::MAX).min(length);
     let mut bytes = vec![0_u8; want];
     let mut bytes_read = 0_usize;
     if want > 0 {
         let mut opened = open_disk_image(Path::new(&entry.source_path))?;
         let extent_end = extent_start
-            .checked_add(total_size)
+            .checked_add(readable_size)
             .context("recovered extent end overflow")?;
         if decoded_extent {
             if extent_end > opened.decoded_size {
@@ -43479,8 +44736,8 @@ fn read_image_physical_extent_bytes(
         offset,
         requested_length: length,
         bytes_read,
-        total_size,
-        eof: offset.saturating_add(bytes_read as u64) >= total_size,
+        total_size: declared_total_size,
+        eof: offset.saturating_add(bytes_read as u64) >= readable_size,
         bytes,
     }))
 }
@@ -45306,9 +46563,9 @@ fn path_search_results(
         .into_iter()
         .map(
             |(entry_id, evidence_id, logical_path, name, entry_kind, metadata_json)| {
-                let source_path_exact = serde_json::from_str::<serde_json::Value>(&metadata_json)
-                    .ok()
-                    .and_then(|metadata| source_path_exact_from_metadata(&metadata));
+                let metadata = serde_json::from_str::<serde_json::Value>(&metadata_json).ok();
+                let source_path_exact = metadata.as_ref().and_then(source_path_exact_from_metadata);
+                let record_context = metadata.as_ref().and_then(deep_search_record_context);
                 // A hit can come from the path/name text or from parsed metadata (e.g. an email
                 // subject/body a parser extracted). Report which one actually matched instead of
                 // always labeling it "path", and show the real matching text for metadata hits
@@ -45330,6 +46587,7 @@ fn path_search_results(
                         data_preview: source_path_exact.or(Some(logical_path)),
                         parsed_segment_kind: None,
                         parsed_segment_provenance: None,
+                        record_context,
                     };
                 }
                 if let Some(offset) = metadata_json.to_ascii_lowercase().find(query_lower) {
@@ -45347,6 +46605,7 @@ fn path_search_results(
                         data_preview: Some(content_preview(&metadata_json, offset, query.len())),
                         parsed_segment_kind: None,
                         parsed_segment_provenance: None,
+                        record_context,
                     };
                 }
                 // The SQL WHERE clause guarantees one of the three fields matched; fall back to a
@@ -45366,6 +46625,7 @@ fn path_search_results(
                     data_preview: source_path_exact.or(Some(logical_path)),
                     parsed_segment_kind: None,
                     parsed_segment_provenance: None,
+                    record_context,
                 }
             },
         )
@@ -45527,6 +46787,7 @@ fn content_hex_search_results(
                 data_preview: Some(hex_match_preview(bytes, offset, needle.len())),
                 parsed_segment_kind: None,
                 parsed_segment_provenance: None,
+                record_context: deep_search_record_context_json(&metadata_json),
             });
         }
     }
@@ -45566,6 +46827,7 @@ fn push_content_search_result(
         data_preview: Some(hit.data_preview),
         parsed_segment_kind: None,
         parsed_segment_provenance: None,
+        record_context: None,
     });
 }
 
@@ -48266,8 +49528,7 @@ fn render_report_item_reference_html(html: &mut String, item: &BookmarkItem) {
         html.push_str("<span class=\"meta\">email</span>");
         return;
     }
-    if browser_activity_kind(&item.item_ref_json).is_some() {
-        html.push_str("<span class=\"meta\">browser_activity</span>");
+    if render_browser_activity_reference_html(html, item) {
         return;
     }
     if item
@@ -48303,6 +49564,19 @@ fn render_report_item_reference_html(html: &mut String, item: &BookmarkItem) {
         serde_json::to_string_pretty(&item_ref_value).unwrap_or_else(|_| "{}".to_string());
     html.push_str(&escape_html(&item_ref));
     html.push_str("</pre>");
+}
+
+fn render_browser_activity_reference_html(html: &mut String, item: &BookmarkItem) -> bool {
+    let item_ref = &item.item_ref_json;
+    let Some(kind) = browser_activity_kind(item_ref) else {
+        return false;
+    };
+    html.push_str("<dl class=\"activity-details\"><dt>Record Type</dt><dd>");
+    html.push_str(&escape_html(browser_activity_label(kind)));
+    html.push_str("</dd>");
+    push_browser_source_details(html, item_ref);
+    html.push_str("</dl>");
+    true
 }
 
 fn render_forensic_context_details_html(
@@ -48661,6 +49935,106 @@ fn render_forensic_context_details_html(
         push_activity_detail(html, metadata, "Source Kind", &["source_kind"]);
         push_activity_detail(html, metadata, "Recovery Source", &["recovery_source"]);
         push_activity_detail(html, metadata, "Recovery Status", &["recovery_status"]);
+        push_activity_detail(
+            html,
+            metadata,
+            "Filesystem-declared Logical Size",
+            &["filesystem_declared_size_bytes"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "Mapped / Addressable Recovery Bytes",
+            &[
+                "recovery_mapped_readable_bytes",
+                "recovery_stream_addressable_bytes",
+            ],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "Bytes Read During Indexing",
+            &["recovery_verified_readable_bytes", "recovered_bytes"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "Authoritative Read Bytes",
+            &["recovery_authoritative_bytes"],
+        );
+        push_activity_detail(html, metadata, "Recovery Complete", &["recovery_complete"]);
+        push_activity_detail(
+            html,
+            metadata,
+            "Recovery Completeness Basis",
+            &["recovery_completeness_basis"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "Missing Declared Ranges",
+            &["recovery_missing_ranges"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "Structural Missing Ranges",
+            &["recovery_structural_missing_ranges"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "Structural Ranges Not Yet Read During Indexing",
+            &["recovery_structural_unverified_ranges"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "Deleted-content Integrity",
+            &["recovery_content_integrity_status"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "NTFS Runlist Status",
+            &["recovery_runlist_status"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "NTFS ATTRIBUTE_LIST Status",
+            &["recovery_attribute_list_status"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "Runlist / ATTRIBUTE_LIST Limitations",
+            &["recovery_runlist_limitations"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "PE Minimum Referenced Extent",
+            &["pe_minimum_file_extent_bytes"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "PE Filesystem-declared Shortfall",
+            &["pe_filesystem_declared_shortfall_bytes"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "PE Addressable-stream Shortfall",
+            &["pe_stream_addressable_shortfall_bytes"],
+        );
+        push_activity_detail(
+            html,
+            metadata,
+            "PE Bytes Not Yet Read During Indexing",
+            &["pe_index_probe_unverified_bytes"],
+        );
     }
     html.push_str("</dl>");
     true
@@ -48744,6 +50118,7 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
     html.push_str("<dl class=\"activity-details\"><dt>Activity</dt><dd>");
     html.push_str(&escape_html(browser_activity_label(kind)));
     html.push_str("</dd>");
+    push_activity_detail(html, item_ref, "Browser Family", &["browser_family"]);
     match kind {
         "browser_history_visit" => {
             push_activity_detail(html, item_ref, "URL", &["url"]);
@@ -48790,7 +50165,6 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             );
             push_activity_detail(html, item_ref, "Firefox PRTime", &["visit_time_prtime"]);
             push_activity_detail(html, item_ref, "Safari Time", &["visit_time_safari"]);
-            push_browser_source_details(html, item_ref);
         }
         "browser_url" => {
             push_activity_detail(html, item_ref, "URL", &["url"]);
@@ -48816,7 +50190,6 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 "Firefox PRTime",
                 &["last_visit_time_prtime"],
             );
-            push_browser_source_details(html, item_ref);
         }
         "browser_search_term" => {
             push_activity_detail(html, item_ref, "Search Term", &["search_term"]);
@@ -48828,7 +50201,6 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(html, item_ref, "Times Used", &["times_used"]);
             push_activity_detail(html, item_ref, "URL ID", &["url_id"]);
             push_activity_detail(html, item_ref, "Form History ID", &["formhistory_id"]);
-            push_browser_source_details(html, item_ref);
         }
         "browser_omnibox_shortcut" => {
             push_activity_detail(html, item_ref, "Typed Text", &["text"]);
@@ -48840,7 +50212,6 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(html, item_ref, "Keyword", &["keyword"]);
             push_activity_detail(html, item_ref, "Last Access", &["last_access_time_utc"]);
             push_activity_detail(html, item_ref, "Hits", &["number_of_hits"]);
-            push_browser_source_details(html, item_ref);
         }
         "browser_autofill" => {
             push_activity_detail(html, item_ref, "Form Field", &["name"]);
@@ -48861,7 +50232,6 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(html, item_ref, "Use Count", &["count"]);
             push_activity_detail(html, item_ref, "Created", &["date_created_utc"]);
             push_activity_detail(html, item_ref, "Last Used", &["date_last_used_utc"]);
-            push_browser_source_details(html, item_ref);
         }
         "browser_download" => {
             push_activity_detail(html, item_ref, "File Name", &["file_name", "display_name"]);
@@ -48872,6 +50242,18 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
             push_activity_detail(html, item_ref, "Original URL", &["original_url"]);
             push_activity_detail(html, item_ref, "URL Chain", &["url_chain"]);
             push_activity_detail(html, item_ref, "Source URL", &["source_url"]);
+            push_activity_detail(html, item_ref, "Source Table", &["source_table"]);
+            push_activity_detail(html, item_ref, "Source Row", &["source_row"]);
+            push_activity_detail(
+                html,
+                item_ref,
+                "Source Path",
+                &[
+                    "source_path",
+                    "source_artifact_path",
+                    "source_artifact_path_exact",
+                ],
+            );
             push_activity_detail(html, item_ref, "Site URL", &["site_url"]);
             push_activity_detail(html, item_ref, "Tab URL", &["tab_url"]);
             push_activity_detail(html, item_ref, "Referrer", &["referrer"]);
@@ -48926,7 +50308,6 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 "Annotation Content",
                 &["annotation_content"],
             );
-            push_browser_source_details(html, item_ref);
         }
         "browser_bookmark" => {
             push_activity_detail(html, item_ref, "Name", &["name", "display_name"]);
@@ -48942,7 +50323,6 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 &["date_last_used_chrome"],
             );
             push_activity_detail(html, item_ref, "GUID", &["guid"]);
-            push_browser_source_details(html, item_ref);
         }
         "browser_login" => {
             push_activity_detail(html, item_ref, "Host", &["host"]);
@@ -49041,7 +50421,6 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 "Credential Note",
                 &["credential_note", "password_note"],
             );
-            push_browser_source_details(html, item_ref);
         }
         "browser_cookie" => {
             push_activity_detail(html, item_ref, "Host", &["host"]);
@@ -49107,7 +50486,6 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 &["sensitive_value_policy"],
             );
             push_activity_detail(html, item_ref, "Value Note", &["value_note"]);
-            push_browser_source_details(html, item_ref);
         }
         "browser_cache_entry" => {
             push_activity_detail(html, item_ref, "URL", &["url", "cache_key"]);
@@ -49128,7 +50506,6 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 "Parser Scope",
                 &["browser_cache_parser_scope"],
             );
-            push_browser_source_details(html, item_ref);
         }
         "browser_preference" => {
             push_activity_detail(html, item_ref, "Category", &["category"]);
@@ -49149,7 +50526,6 @@ fn render_browser_activity_details_html(html: &mut String, item_ref: &serde_json
                 &["created_by_version"],
             );
             push_activity_detail(html, item_ref, "Last Used", &["last_used"]);
-            push_browser_source_details(html, item_ref);
         }
         _ => {
             push_activity_detail(html, item_ref, "Name", &["display_name", "name", "title"]);
@@ -54345,6 +55721,123 @@ mod tests {
         image
     }
 
+    struct SparseOverlayReader {
+        len: u64,
+        pos: u64,
+        overlay_start: u64,
+        overlay: Vec<u8>,
+        reads: Vec<(u64, usize)>,
+    }
+
+    impl SparseOverlayReader {
+        fn new(len: u64, overlay_start: u64, overlay: Vec<u8>) -> Self {
+            assert!(overlay_start
+                .checked_add(overlay.len() as u64)
+                .is_some_and(|end| end <= len));
+            Self {
+                len,
+                pos: 0,
+                overlay_start,
+                overlay,
+                reads: Vec::new(),
+            }
+        }
+    }
+
+    impl std::io::Read for SparseOverlayReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.len || buf.is_empty() {
+                return Ok(0);
+            }
+            let count = usize::try_from((self.len - self.pos).min(buf.len() as u64))
+                .expect("read length is bounded by the destination buffer");
+            let read_start = self.pos;
+            let read_end = read_start + count as u64;
+            buf[..count].fill(0);
+
+            let overlay_end = self.overlay_start + self.overlay.len() as u64;
+            let copy_start = read_start.max(self.overlay_start);
+            let copy_end = read_end.min(overlay_end);
+            if copy_start < copy_end {
+                let destination_start = (copy_start - read_start) as usize;
+                let source_start = (copy_start - self.overlay_start) as usize;
+                let copy_len = (copy_end - copy_start) as usize;
+                buf[destination_start..destination_start + copy_len]
+                    .copy_from_slice(&self.overlay[source_start..source_start + copy_len]);
+            }
+
+            self.reads.push((read_start, count));
+            self.pos = read_end;
+            Ok(count)
+        }
+    }
+
+    impl std::io::Seek for SparseOverlayReader {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            let next = match pos {
+                std::io::SeekFrom::Start(offset) => i128::from(offset),
+                std::io::SeekFrom::Current(offset) => i128::from(self.pos) + i128::from(offset),
+                std::io::SeekFrom::End(offset) => i128::from(self.len) + i128::from(offset),
+            };
+            if next < 0 || next > i128::from(u64::MAX) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "sparse reader seek is outside u64",
+                ));
+            }
+            self.pos = next as u64;
+            Ok(self.pos)
+        }
+    }
+
+    #[test]
+    fn bitlocker_partition_slice_keeps_fve_offsets_volume_relative_at_large_image_base(
+    ) -> Result<()> {
+        const PARTITION_START: u64 = 100_000 * 1_048_576;
+        const PARTITION_LENGTH: u64 = 151_079_878_656;
+        const DECLARED_PRE_SHRINK_SIZE: u64 = 255_937_478_656;
+        const METADATA_OFFSET: usize = 0x1000;
+
+        let mut volume_prefix = bitlocker_metadata_only_image(0x8002, &[0x0800]);
+        volume_prefix[METADATA_OFFSET + 16..METADATA_OFFSET + 24]
+            .copy_from_slice(&DECLARED_PRE_SHRINK_SIZE.to_le_bytes());
+        let parent_length = PARTITION_START
+            .checked_add(PARTITION_LENGTH)
+            .expect("test image geometry must fit u64");
+        let mut reader = SparseOverlayReader::new(parent_length, PARTITION_START, volume_prefix);
+
+        let inspection =
+            bitlocker_inspection_at(&mut reader, PARTITION_START, Some(PARTITION_LENGTH))?
+                .expect("BitLocker metadata should parse through the partition window");
+
+        assert_eq!(
+            inspection.encrypted_volume_size,
+            Some(DECLARED_PRE_SHRINK_SIZE)
+        );
+        assert_eq!(
+            inspection.effective_encrypted_volume_size,
+            Some(PARTITION_LENGTH)
+        );
+        assert!(inspection.geometry_warning.is_some());
+        assert!(reader
+            .reads
+            .iter()
+            .any(|(offset, _)| *offset == PARTITION_START));
+        assert!(reader
+            .reads
+            .iter()
+            .any(|(offset, _)| *offset == PARTITION_START + METADATA_OFFSET as u64));
+        assert!(reader.reads.iter().all(|(offset, count)| {
+            *offset >= PARTITION_START
+                && offset.saturating_add(*count as u64) <= PARTITION_START + PARTITION_LENGTH
+        }));
+        assert!(!reader
+            .reads
+            .iter()
+            .any(|(offset, _)| *offset == METADATA_OFFSET as u64));
+        Ok(())
+    }
+
     #[test]
     fn list_image_volumes_surfaces_bitlocker_metadata_summary() -> Result<()> {
         let evidence_dir = unique_temp_dir("bitlocker-live-summary");
@@ -54365,6 +55858,9 @@ mod tests {
             .expect("locked volume should include BitLocker inspection summary");
         assert_eq!(bitlocker.metadata_state, "parsed");
         assert_eq!(bitlocker.variant, "Windows 7 or later");
+        assert_eq!(bitlocker.encrypted_volume_size, Some(0));
+        assert_eq!(bitlocker.effective_encrypted_volume_size, Some(8_192));
+        assert!(bitlocker.inspection_warning.is_none());
         assert_eq!(bitlocker.encryption_method.as_deref(), Some("AES-128-CBC"));
         assert_eq!(bitlocker.encryption_method_raw.as_deref(), Some("0x8002"));
         assert_eq!(bitlocker.protectors.len(), 1);
@@ -54374,6 +55870,104 @@ mod tests {
             bitlocker.status,
             "BitLocker volume detected; cannot decrypt without recovery key/password"
         );
+
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    fn bitlocker_image_with_invalid_metadata_range() -> Vec<u8> {
+        let mut image = bitlocker_metadata_only_image(0x8002, &[0x0800]);
+        let metadata_offset = 0x1000;
+        // The first FVE metadata copy parses, but it claims a second metadata
+        // copy outside the enclosing test partition. Inspection must report
+        // this exact geometry defect without hiding another partition.
+        image[metadata_offset + 40..metadata_offset + 48]
+            .copy_from_slice(&0x20_000_u64.to_le_bytes());
+        image
+    }
+
+    #[test]
+    fn list_image_volumes_isolates_bitlocker_inspection_error_per_partition() -> Result<()> {
+        const SECTOR_SIZE: usize = 512;
+        const FIRST_START_SECTOR: u32 = 2048;
+        const FIRST_SECTORS: u32 = 32;
+        const SECOND_START_SECTOR: u32 = 4096;
+        const SECOND_SECTORS: u32 = 32;
+
+        let evidence_dir = unique_temp_dir("bitlocker-live-inspection-isolation");
+        let image_path = evidence_dir.join("two-partitions.img");
+        let mut image = vec![0_u8; 4 * 1024 * 1024];
+        for (slot, start_sector, sectors) in [
+            (0_usize, FIRST_START_SECTOR, FIRST_SECTORS),
+            (1_usize, SECOND_START_SECTOR, SECOND_SECTORS),
+        ] {
+            let entry = 446 + slot * 16;
+            image[entry + 4] = 0x07;
+            image[entry + 8..entry + 12].copy_from_slice(&start_sector.to_le_bytes());
+            image[entry + 12..entry + 16].copy_from_slice(&sectors.to_le_bytes());
+        }
+        image[510..512].copy_from_slice(&[0x55, 0xAA]);
+
+        let locked_start = FIRST_START_SECTOR as usize * SECTOR_SIZE;
+        let locked = bitlocker_image_with_invalid_metadata_range();
+        image[locked_start..locked_start + locked.len()].copy_from_slice(&locked);
+
+        let ntfs_start = SECOND_START_SECTOR as usize * SECTOR_SIZE;
+        image[ntfs_start + 3..ntfs_start + 11].copy_from_slice(b"NTFS    ");
+        image[ntfs_start + 510..ntfs_start + 512].copy_from_slice(&[0x55, 0xAA]);
+        fs::write(&image_path, image)?;
+
+        let volumes = list_image_volumes(&image_path)?;
+        assert_eq!(
+            volumes.len(),
+            2,
+            "a damaged first partition hid a later one"
+        );
+
+        let locked_volume = &volumes[0];
+        assert_eq!(locked_volume.filesystem, BITLOCKER_LOCKED_FILESYSTEM);
+        assert!(!locked_volume.browsable);
+        let warning = locked_volume
+            .bitlocker
+            .as_ref()
+            .expect("locked partition should retain a BitLocker warning");
+        assert_eq!(warning.metadata_state, "inspection-warning");
+        let warning_text = warning
+            .inspection_warning
+            .as_deref()
+            .expect("inspection failure should retain its diagnostic");
+        assert!(warning_text.contains("partition start 1048576"));
+        assert!(warning_text.contains("length 16384"));
+        assert!(warning_text.contains("absolute end (exclusive) 1064960"));
+        assert!(warning_text.contains("metadata range 131072..131156 exceeds volume size 16384"));
+
+        let later_volume = &volumes[1];
+        assert_eq!(later_volume.filesystem, "NTFS");
+        assert!(later_volume.browsable);
+
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn list_image_volumes_retains_whole_bitlocker_after_inspection_error() -> Result<()> {
+        let evidence_dir = unique_temp_dir("bitlocker-live-whole-inspection-warning");
+        let image_path = evidence_dir.join("locked.img");
+        fs::write(&image_path, bitlocker_image_with_invalid_metadata_range())?;
+
+        let volumes = list_image_volumes(&image_path)?;
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].filesystem, BITLOCKER_LOCKED_FILESYSTEM);
+        assert!(!volumes[0].browsable);
+        let warning = volumes[0]
+            .bitlocker
+            .as_ref()
+            .and_then(|info| info.inspection_warning.as_deref())
+            .expect("whole-image BitLocker inspection failure should be visible");
+        assert!(warning.contains("partition start 0"));
+        assert!(warning.contains("length 8192"));
+        assert!(warning.contains("absolute end (exclusive) 8192"));
+        assert!(warning.contains("metadata range 131072..131156 exceeds volume size 8192"));
 
         let _ = fs::remove_dir_all(evidence_dir);
         Ok(())
@@ -59385,6 +60979,419 @@ mod tests {
         Ok(())
     }
 
+    fn synthetic_pe_with_referenced_extent(
+        total_bytes: usize,
+        raw_offset: u32,
+        referenced_end: u32,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0_u8; total_bytes];
+        let pe_offset = 0x80_usize;
+        let coff = pe_offset + 4;
+        let optional = coff + 20;
+        let optional_size = 0xE0_u16;
+        let section = optional + usize::from(optional_size);
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+        bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+        bytes[coff + 2..coff + 4].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[coff + 16..coff + 18].copy_from_slice(&optional_size.to_le_bytes());
+        bytes[optional..optional + 2].copy_from_slice(&0x10b_u16.to_le_bytes());
+        bytes[optional + 60..optional + 64].copy_from_slice(&0x200_u32.to_le_bytes());
+        bytes[optional + 92..optional + 96].copy_from_slice(&0_u32.to_le_bytes());
+        let raw_size = referenced_end
+            .checked_sub(raw_offset)
+            .expect("referenced extent follows the synthetic section start");
+        bytes[section + 16..section + 20].copy_from_slice(&raw_size.to_le_bytes());
+        bytes[section + 20..section + 24].copy_from_slice(&raw_offset.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn deleted_ntfs_pe_shortfall_distinguishes_declared_readable_and_structural_sizes() -> Result<()>
+    {
+        const FILESYSTEM_DECLARED: u64 = 58_696;
+        const PE_MINIMUM_EXTENT: u64 = 90_136;
+        const SHORTFALL: u64 = 31_440;
+        let bytes = synthetic_pe_with_referenced_extent(
+            FILESYSTEM_DECLARED as usize,
+            FILESYSTEM_DECLARED as u32,
+            PE_MINIMUM_EXTENT as u32,
+        );
+        assert_eq!(
+            windows_pe_minimum_file_extent(&bytes),
+            Some(PE_MINIMUM_EXTENT)
+        );
+
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "deleted_file_record",
+            "recovery_source": "ntfs_deleted_mft",
+        });
+        annotate_deleted_ntfs_recovery_metadata(
+            &mut metadata,
+            FILESYSTEM_DECLARED,
+            Some(FILESYSTEM_DECLARED),
+            None,
+            &serde_json::json!({
+                "attribute_list_present": false,
+                "complete": true,
+            }),
+        );
+        finalize_deleted_recovery_probe(
+            &mut metadata,
+            FILESYSTEM_DECLARED,
+            FILESYSTEM_DECLARED,
+            Some(&bytes),
+        );
+
+        assert_eq!(
+            metadata["filesystem_declared_size_bytes"].as_u64(),
+            Some(FILESYSTEM_DECLARED)
+        );
+        assert_eq!(
+            metadata["recovery_stream_addressable_bytes"].as_u64(),
+            Some(FILESYSTEM_DECLARED)
+        );
+        assert_eq!(
+            metadata["recovery_verified_readable_bytes"].as_u64(),
+            Some(FILESYSTEM_DECLARED)
+        );
+        assert_eq!(
+            metadata["pe_minimum_file_extent_bytes"].as_u64(),
+            Some(PE_MINIMUM_EXTENT)
+        );
+        assert_eq!(
+            metadata["pe_filesystem_declared_shortfall_bytes"].as_u64(),
+            Some(SHORTFALL)
+        );
+        assert_eq!(
+            metadata["pe_recovered_shortfall_bytes"].as_u64(),
+            Some(SHORTFALL)
+        );
+        assert_eq!(
+            metadata["pe_stream_addressable_shortfall_bytes"].as_u64(),
+            Some(SHORTFALL)
+        );
+        assert_eq!(metadata["recovery_complete"].as_bool(), Some(false));
+        assert_eq!(metadata["recovery_partial"].as_bool(), Some(true));
+        assert_eq!(
+            metadata["recovery_filesystem_declared_range_complete"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            metadata["recovery_structural_range_complete"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            metadata["recovery_structural_extent_addressable"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            metadata["pe_structural_recovery_status"].as_str(),
+            Some("partial_addressable_stream_ends_before_pe_referenced_file_extent")
+        );
+        assert_eq!(
+            metadata["recovery_structural_missing_ranges"][0]["start"].as_u64(),
+            Some(FILESYSTEM_DECLARED)
+        );
+        assert_eq!(
+            metadata["recovery_structural_missing_ranges"][0]["end_exclusive"].as_u64(),
+            Some(PE_MINIMUM_EXTENT)
+        );
+        assert_eq!(
+            metadata["recovery_structural_missing_ranges"][0]["length"].as_u64(),
+            Some(SHORTFALL)
+        );
+
+        let entry = EntryForBytes {
+            entry_id: 1,
+            evidence_id: 1,
+            logical_path: "/Recovery/Deleted Files/sample.dll".to_string(),
+            entry_kind: "file".to_string(),
+            size_bytes: Some(FILESYSTEM_DECLARED as i64),
+            is_deleted: true,
+            metadata_json: metadata.clone(),
+            source_kind: "image".to_string(),
+            source_path: "synthetic.img".to_string(),
+        };
+        assert_eq!(
+            deleted_recovery_output_status(&entry),
+            "completed_partial_recovery_pe_structural_shortfall_original_integrity_unverified"
+        );
+
+        // Exercise the public export and hash paths with the synthetic bytes.
+        // The backing file is fully readable through its filesystem-declared
+        // EOF, but it must still be disclosed as a structurally partial PE.
+        let case_path = unique_case_path("deleted-pe-structural-shortfall");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("deleted-pe-structural-shortfall-source");
+        let source_path = evidence_dir.join("sample.dll");
+        fs::write(&source_path, &bytes)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        let sample = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .find(|candidate| candidate.name == "sample.dll")
+            .expect("synthetic PE should be indexed");
+        {
+            let conn = open_existing_case(&case_path)?;
+            conn.execute(
+                "UPDATE filesystem_entries
+                 SET is_deleted = 1, metadata_json = ?2
+                 WHERE id = ?1",
+                params![sample.id, metadata.to_string()],
+            )?;
+        }
+
+        let output_path = evidence_dir.join("exported-sample.dll");
+        let exported = recover_filesystem_entry(
+            &case_path,
+            RecoverEntryOptions {
+                entry_id: sample.id,
+                output_path: output_path.clone(),
+            },
+        )?;
+        assert_eq!(exported.bytes_written, FILESYSTEM_DECLARED);
+        assert_eq!(
+            exported.status,
+            "completed_partial_recovery_pe_structural_shortfall_original_integrity_unverified"
+        );
+        assert_eq!(fs::read(&output_path)?, bytes);
+
+        let hashes = hash_indexed_files(
+            &case_path,
+            HashIndexedFilesOptions {
+                evidence_id,
+                max_files: 0,
+                max_file_bytes: 0,
+            },
+        )?;
+        assert_eq!(hashes.files_hashed, 0);
+        assert_eq!(hashes.files_incomplete, 1);
+        let refreshed = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .find(|candidate| candidate.id == sample.id)
+            .expect("synthetic PE should remain indexed");
+        assert!(refreshed.metadata_json.get("file_sha256").is_none());
+        assert!(refreshed.metadata_json["file_sha256_skipped"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("PE header references unavailable bytes")));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_ntfs_pe_probe_does_not_claim_addressable_bytes_are_missing() -> Result<()> {
+        const COMPLETE_STREAM_SIZE: u64 = 90_136;
+        const INDEX_PROBE_SIZE: u64 = 4_096;
+        let bytes = synthetic_pe_with_referenced_extent(
+            COMPLETE_STREAM_SIZE as usize,
+            0x200,
+            COMPLETE_STREAM_SIZE as u32,
+        );
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "deleted_file_record",
+            "recovery_source": "ntfs_deleted_mft",
+        });
+        annotate_deleted_ntfs_recovery_metadata(
+            &mut metadata,
+            COMPLETE_STREAM_SIZE,
+            Some(COMPLETE_STREAM_SIZE),
+            None,
+            &serde_json::json!({
+                "attribute_list_present": false,
+                "complete": true,
+            }),
+        );
+        finalize_deleted_recovery_probe(
+            &mut metadata,
+            COMPLETE_STREAM_SIZE,
+            INDEX_PROBE_SIZE,
+            Some(&bytes[..INDEX_PROBE_SIZE as usize]),
+        );
+
+        assert_eq!(
+            metadata["recovery_verified_readable_bytes"].as_u64(),
+            Some(INDEX_PROBE_SIZE)
+        );
+        assert_eq!(
+            metadata["recovery_stream_addressable_bytes"].as_u64(),
+            Some(COMPLETE_STREAM_SIZE)
+        );
+        assert_eq!(
+            metadata["recovery_structural_extent_addressable"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            metadata["recovery_structural_range_complete"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            metadata["pe_filesystem_declared_shortfall_bytes"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            metadata["pe_stream_addressable_shortfall_bytes"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            metadata["pe_index_probe_unverified_bytes"].as_u64(),
+            Some(COMPLETE_STREAM_SIZE - INDEX_PROBE_SIZE)
+        );
+        assert_eq!(
+            metadata["pe_structural_recovery_status"].as_str(),
+            Some("pe_referenced_extent_addressable_but_not_fully_verified_during_indexing")
+        );
+        assert_eq!(
+            metadata["recovery_structural_missing_ranges"]
+                .as_array()
+                .map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(
+            metadata["recovery_structural_unverified_ranges"][0]["start"].as_u64(),
+            Some(INDEX_PROBE_SIZE)
+        );
+        assert_eq!(
+            metadata["recovery_structural_unverified_ranges"][0]["end_exclusive"].as_u64(),
+            Some(COMPLETE_STREAM_SIZE)
+        );
+
+        let entry = EntryForBytes {
+            entry_id: 1,
+            evidence_id: 1,
+            logical_path: "/Recovery/Deleted Files/addressable.dll".to_string(),
+            entry_kind: "file".to_string(),
+            size_bytes: Some(COMPLETE_STREAM_SIZE as i64),
+            is_deleted: true,
+            metadata_json: metadata.clone(),
+            source_kind: "image".to_string(),
+            source_path: "synthetic.img".to_string(),
+        };
+        assert_eq!(
+            deleted_recovery_output_status(&entry),
+            "completed_readable_recovery_stream_original_integrity_unverified"
+        );
+
+        // A full later hash read must not be blocked merely because indexing
+        // sampled a bounded prefix. The stream remains clearly qualified as a
+        // deleted recovery whose original-content integrity is unverified.
+        let case_path = unique_case_path("deleted-pe-addressable-probe");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("deleted-pe-addressable-probe-source");
+        fs::write(evidence_dir.join("addressable.dll"), &bytes)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        let sample = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .find(|candidate| candidate.name == "addressable.dll")
+            .context("synthetic addressable PE should be indexed")?;
+        {
+            let conn = open_existing_case(&case_path)?;
+            conn.execute(
+                "UPDATE filesystem_entries
+                 SET is_deleted = 1, metadata_json = ?2
+                 WHERE id = ?1",
+                params![sample.id, metadata.to_string()],
+            )?;
+        }
+        let hashes = hash_indexed_files(
+            &case_path,
+            HashIndexedFilesOptions {
+                evidence_id,
+                max_files: 0,
+                max_file_bytes: 0,
+            },
+        )?;
+        assert_eq!(hashes.files_hashed, 1);
+        assert_eq!(hashes.files_incomplete, 0);
+        let refreshed = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .find(|candidate| candidate.id == sample.id)
+            .context("synthetic addressable PE should remain indexed")?;
+        assert!(refreshed.metadata_json["file_sha256"].as_str().is_some());
+        assert_eq!(
+            refreshed.metadata_json["file_sha256_input"].as_str(),
+            Some("complete readable recovery stream (original-content integrity unverified)")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_ntfs_metadata_discloses_attribute_list_and_runlist_limits() {
+        let mut metadata = serde_json::json!({
+            "artifact_kind": "deleted_file_record",
+            "recovery_source": "ntfs_deleted_mft",
+        });
+        annotate_deleted_ntfs_recovery_metadata(
+            &mut metadata,
+            8_192,
+            Some(8_192),
+            None,
+            &serde_json::json!({
+                "attribute_list_present": true,
+                "complete": false,
+            }),
+        );
+
+        assert_eq!(
+            metadata["recovery_attribute_list_status"].as_str(),
+            Some("present_resolution_incomplete")
+        );
+        assert_eq!(
+            metadata["recovery_runlist_status"].as_str(),
+            Some("attribute_list_resolution_incomplete")
+        );
+        assert_eq!(
+            metadata["recovery_mapping_inventory_complete"].as_bool(),
+            Some(false)
+        );
+        assert!(metadata["recovery_runlist_limitations"]
+            .as_str()
+            .is_some_and(|value| value.contains("ATTRIBUTE_LIST")));
+        assert_eq!(
+            metadata["recovery_mapped_readable_bytes"].as_u64(),
+            Some(8_192)
+        );
+        assert_eq!(metadata["recovery_authoritative_bytes"].as_u64(), Some(0));
+        assert_eq!(
+            metadata["recovery_original_content_authoritative_bytes"].as_u64(),
+            Some(0)
+        );
+    }
+
     #[test]
     fn image_process_indexes_deleted_fat_entries() -> Result<()> {
         let case_path = unique_case_path("image-fat-deleted");
@@ -59460,6 +61467,34 @@ mod tests {
             Some("Deleted files")
         );
         assert!(deleted.metadata_json["file_data_physical_offset"].is_u64());
+        assert_eq!(
+            deleted.metadata_json["filesystem_declared_size_bytes"].as_u64(),
+            Some(payload.len() as u64)
+        );
+        assert_eq!(
+            deleted.metadata_json["recovery_mapped_readable_bytes"].as_u64(),
+            Some(payload.len() as u64)
+        );
+        assert_eq!(
+            deleted.metadata_json["recovery_verified_readable_bytes"].as_u64(),
+            Some(payload.len() as u64)
+        );
+        assert_eq!(
+            deleted.metadata_json["recovery_authoritative_bytes"].as_u64(),
+            Some(payload.len() as u64)
+        );
+        assert_eq!(
+            deleted.metadata_json["recovery_original_content_authoritative_bytes"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            deleted.metadata_json["recovery_complete"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            deleted.metadata_json["recovery_content_integrity_status"].as_str(),
+            Some("unverified_deleted_clusters_may_have_been_reallocated_or_overwritten")
+        );
         // The fixture's fatfs build writes zeroed DOS timestamps, so
         // modified_utc is absent here; real volumes carry it.
 
@@ -59475,10 +61510,163 @@ mod tests {
         assert_eq!(bytes.bytes, payload);
         assert!(bytes.eof);
 
+        let recovered_path = evidence_dir.join("recovered-secret.txt");
+        let recovered = recover_filesystem_entry(
+            &case_path,
+            RecoverEntryOptions {
+                entry_id: deleted.id,
+                output_path: recovered_path.clone(),
+            },
+        )?;
+        assert_eq!(
+            recovered.status,
+            "completed_readable_recovery_stream_original_integrity_unverified"
+        );
+        assert_eq!(fs::read(&recovered_path)?, payload);
+
         // Live files are untouched by the deleted scan.
         assert!(entries
             .iter()
             .any(|entry| { entry.logical_path.ends_with("/keep.txt") && !entry.is_deleted }));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_fat_multicluster_file_never_reads_exports_or_hashes_as_complete() -> Result<()> {
+        let case_path = unique_case_path("image-fat-deleted-partial");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("image-fat-deleted-partial-source");
+        let image_path = evidence_dir.join("fat-deleted-partial.img");
+        let payload = (0..64 * 1024)
+            .map(|index| u8::try_from(index % 251).expect("pattern byte fits u8"))
+            .collect::<Vec<_>>();
+        let mut volume = {
+            let mut cursor = io::Cursor::new(vec![0_u8; 2 * 1024 * 1024]);
+            fatfs::format_volume(&mut cursor, fatfs::FormatVolumeOptions::new())?;
+            cursor.seek(SeekFrom::Start(0))?;
+            {
+                let fs = fatfs::FileSystem::new(&mut cursor, fatfs::FsOptions::new())?;
+                let root = fs.root_dir();
+                let mut file = root.create_file("partial.bin")?;
+                file.write_all(&payload)?;
+                file.flush()?;
+            }
+            cursor.into_inner()
+        };
+        let marker = b"PARTIAL BIN";
+        let position = volume
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .expect("PARTIAL.BIN directory entry present");
+        volume[position] = 0xE5;
+        fs::write(&image_path, &volume)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path,
+                kind: EvidenceKind::Image,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 200,
+            },
+        )?;
+
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let deleted = entries
+            .iter()
+            .find(|entry| {
+                entry.is_deleted
+                    && entry.metadata_json["recovery_source"].as_str()
+                        == Some("fat_directory_entry")
+            })
+            .expect("deleted multi-cluster FAT entry should be indexed");
+        let mapped = deleted.metadata_json["recovery_mapped_readable_bytes"]
+            .as_u64()
+            .expect("first-cluster readable byte count");
+        assert!(mapped > 0);
+        assert!(mapped < payload.len() as u64);
+        assert_eq!(
+            deleted.metadata_json["filesystem_declared_size_bytes"].as_u64(),
+            Some(payload.len() as u64)
+        );
+        assert_eq!(
+            deleted.metadata_json["recovery_missing_ranges"][0]["start"].as_u64(),
+            Some(mapped)
+        );
+        assert_eq!(
+            deleted.metadata_json["recovery_missing_ranges"][0]["end_exclusive"].as_u64(),
+            Some(payload.len() as u64)
+        );
+        assert_eq!(
+            deleted.metadata_json["recovery_complete"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            deleted.metadata_json["recovery_partial"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            deleted.metadata_json["recovery_contiguous_assumption"].as_str(),
+            Some(
+                "not used for exposed bytes; only the directory entry's first-cluster mapping is treated as authoritative"
+            )
+        );
+
+        let bytes = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: deleted.id,
+                offset: 0,
+                length: payload.len(),
+            },
+        )?;
+        assert_eq!(bytes.total_size, payload.len() as u64);
+        assert_eq!(bytes.bytes_read as u64, mapped);
+        assert_eq!(bytes.bytes, payload[..mapped as usize]);
+        assert!(bytes.eof, "the authoritative mapped stream ends here");
+
+        let output_path = evidence_dir.join("must-not-publish.bin");
+        let recovery_error = recover_filesystem_entry(
+            &case_path,
+            RecoverEntryOptions {
+                entry_id: deleted.id,
+                output_path: output_path.clone(),
+            },
+        )
+        .expect_err("partial deleted FAT recovery must not publish as a complete file");
+        assert!(format!("{recovery_error:#}").contains(&format!(
+            "recovery ended after {mapped} of {} bytes",
+            payload.len()
+        )));
+        assert!(!output_path.exists());
+
+        let hashes = hash_indexed_files(
+            &case_path,
+            HashIndexedFilesOptions {
+                evidence_id,
+                max_files: 0,
+                max_file_bytes: 0,
+            },
+        )?;
+        assert!(hashes.files_incomplete >= 1);
+        let refreshed = list_filesystem_entries(&case_path, Some(evidence_id))?
+            .into_iter()
+            .find(|entry| entry.id == deleted.id)
+            .expect("deleted entry remains after hashing");
+        assert!(refreshed.metadata_json.get("file_sha256").is_none());
+        assert!(refreshed.metadata_json["file_sha256_skipped"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("not fully reconstructable")));
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
@@ -66415,6 +68603,71 @@ mod tests {
     }
 
     #[test]
+    fn partial_bitlocker_generation_is_not_later_marked_fully_indexed() -> Result<()> {
+        let case_path = unique_case_path("partial-bitlocker-progress-summary");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("partial-bitlocker-progress-summary-source");
+        fs::write(evidence_dir.join("finding.txt"), b"validated finding")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let processed = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        let conn = Connection::open(&case_path)?;
+        let generation = bitlocker_generation_result(Some(2), true, false, false, false)
+            .context("BitLocker generation fixture")?;
+        conn.execute(
+            "UPDATE evidence_jobs
+             SET parameters_json = json_set(
+                 parameters_json,
+                 '$.bitlocker_processing', json_object(
+                     'mode', 'memory_only_bitlocker_ntfs',
+                     'volume_index_zero_based', 2,
+                     'generation', json(?1)
+                 )
+             )
+             WHERE id = ?2",
+            params![serde_json::to_string(&generation)?, processed.job_id],
+        )?;
+        conn.execute(
+            "UPDATE evidence_sources SET indexed_at = NULL WHERE id = ?1",
+            [evidence_id],
+        )?;
+        drop(conn);
+
+        let tracker = progress::JobProgressTracker::new(
+            "partial-bitlocker-progress-summary",
+            "process",
+            None,
+        );
+        tracker.set_job_id(processed.job_id);
+        tracker.set_evidence_id(evidence_id);
+        tracker.record_truncation("decrypted filesystem inventory is explicitly incomplete");
+        tracker.finish(progress::JobProgressState::CompleteWithDiagnostics);
+        record_job_progress_summary(&case_path, processed.job_id, &tracker.snapshot())?;
+
+        assert!(
+            list_evidence(&case_path)?[0].indexed_at.is_none(),
+            "progress telemetry must not promote a published-partial decrypted generation to fully indexed"
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
     fn legacy_truncated_parser_diagnostic_is_not_called_an_examiner_stop() {
         let reason = "optional parser retained usable records with bounded diagnostics";
         let coverage = processing_coverage_text(
@@ -66499,6 +68752,39 @@ mod tests {
         assert!(bookmark.in_report);
         assert_eq!(bookmark.source_ref_json["evidence_id"], 1);
         assert_eq!(bookmark.content_ref_json["offset"], 128);
+
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn report_uses_examiner_bulk_bookmark_name_without_internal_type_or_duplicate_time(
+    ) -> Result<()> {
+        let case_path = unique_case_path("named-bookmark-group-report");
+        create_test_case(&case_path)?;
+        let folder_id = create_bookmark_folder(&case_path, None, "Findings", None, true)?;
+        create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::FileGroup,
+                data_type: Some("Selected items".to_string()),
+                title: Some("SharePoint authentication review".to_string()),
+                examiner_comment: Some(
+                    "Bookmarked via Selected actions on 2026-10-01T10:27:17.284Z.".to_string(),
+                ),
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+
+        let html = render_report_html(&report_data(&case_path)?);
+        assert!(html.contains("SharePoint authentication review"));
+        assert!(html.contains("<p class=\"meta\">Bookmarked: "));
+        assert!(!html.contains("Type: file_group"));
+        assert!(!html.contains("Data type: Selected items"));
+        assert!(!html.contains("Bookmarked via Selected actions on"));
 
         cleanup_case_path(&case_path);
         Ok(())
@@ -68302,6 +70588,9 @@ mod tests {
                     "url": "https://example.com/<q>",
                     "title": "Example & Evidence",
                     "visit_time_utc": "2026-06-28T10:00:00Z",
+                    "source_artifact": "History",
+                    "source_sqlite_table": "visits",
+                    "source_sqlite_rowid": 42,
                     "source_file_modified_utc": "2026-06-28T10:05:00Z",
                     "source_file_time_basis": "original_evidence_filesystem",
                     "metadata": {
@@ -68441,13 +70730,18 @@ mod tests {
         )?;
 
         let html = render_report_html(&report_data(&case_path)?);
-        assert!(html.contains("Browser Activity"));
+        assert!(html.contains("Browser Activities"));
         assert!(html.contains("<dd>Visit</dd>"));
         assert!(html.contains("Example &amp; Evidence"));
         assert!(html.contains("https://example.com/&lt;q&gt;"));
         assert!(html.contains("<dt>Transition</dt><dd>typed</dd>"));
         assert!(html.contains("<dt>Visit Count</dt><dd>3</dd>"));
+        assert!(html.contains("<dt>Record Type</dt><dd>Visit</dd>"));
+        assert!(html.contains("<dt>Source Artifact</dt><dd>History</dd>"));
+        assert!(html.contains("<dt>Source Table</dt><dd>visits</dd>"));
+        assert!(html.contains("<dt>Source Row</dt><dd>42</dd>"));
         assert!(html.contains("<dt>Original Source File Modified</dt>"));
+        assert!(!html.contains("<span class=\"meta\">browser_activity</span>"));
         assert!(html.contains("<dd>URL</dd>"));
         assert!(html.contains("<dt>Last Visit</dt><dd>2026-06-28T09:00:00Z</dd>"));
         assert!(html.contains("<dd>Search</dd>"));
@@ -70785,6 +73079,181 @@ mod tests {
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn bitlocker_processing_descriptor_never_contains_the_credential() {
+        const DUMMY_SECRET: &str = "dummy-secret-must-not-escape";
+        let context = BitLockerProcessingContext {
+            volume_index: 2,
+            credential: BitLockerUnlockCredential::Password(DUMMY_SECRET),
+        };
+
+        let descriptor = bitlocker_processing_descriptor(&context).to_string();
+        assert!(!descriptor.contains(DUMMY_SECRET));
+        assert!(descriptor.contains("memory_only_bitlocker_ntfs"));
+        assert!(descriptor.contains("password"));
+        assert!(descriptor.contains('2'));
+
+        let debug = format!("{:?}", context.credential);
+        assert!(!debug.contains(DUMMY_SECRET));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn bitlocker_ntfs_partial_inventory_propagates_to_image_generation() {
+        let mut image_partial = false;
+        merge_bitlocker_ntfs_inventory_outcome(&mut image_partial, true);
+        assert!(
+            image_partial,
+            "a partial decrypted NTFS walk must never be published as a complete image generation"
+        );
+
+        let mut already_partial = true;
+        merge_bitlocker_ntfs_inventory_outcome(&mut already_partial, false);
+        assert!(
+            already_partial,
+            "later complete work must not erase an earlier gap"
+        );
+    }
+
+    #[test]
+    fn bitlocker_generation_disposition_is_explicit_for_every_publication_path() {
+        let complete = bitlocker_generation_result(Some(2), true, true, false, false)
+            .expect("BitLocker request should produce a disposition");
+        assert!(complete.published);
+        assert!(complete.complete);
+        assert_eq!(complete.status, "published_complete");
+
+        let partial_without_prior = bitlocker_generation_result(Some(2), true, false, false, false)
+            .expect("BitLocker request should produce a disposition");
+        assert!(partial_without_prior.published);
+        assert!(!partial_without_prior.complete);
+        assert_eq!(partial_without_prior.status, "published_partial");
+
+        let preserved = bitlocker_generation_result(Some(2), false, false, true, false)
+            .expect("BitLocker request should produce a disposition");
+        assert!(!preserved.published);
+        assert!(!preserved.complete);
+        assert!(preserved.canonical_generation_preserved);
+        assert_eq!(preserved.status, "prior_canonical_preserved");
+
+        let cancelled = bitlocker_generation_result(Some(2), false, false, true, true)
+            .expect("BitLocker request should produce a disposition");
+        assert!(!cancelled.published);
+        assert!(!cancelled.complete);
+        assert_eq!(cancelled.status, "cancelled");
+
+        assert!(bitlocker_generation_result(None, true, true, false, false).is_none());
+    }
+
+    #[test]
+    fn decrypted_bitlocker_provenance_never_claims_raw_physical_offsets() {
+        let provenance = NtfsProvenance::DecryptedBitLocker {
+            volume_index: 2,
+            encrypted_partition_start_offset: 0x4000,
+        };
+        let mut metadata = serde_json::json!({
+            "physical_offset_basis": "NTFS runlist",
+            "mft_record_physical_offset": 0x4100,
+            "file_data_physical_offset": 0x4200,
+        });
+
+        provenance.apply_entry_metadata(&mut metadata, Some(0x100), Some(0x200));
+
+        assert_eq!(
+            metadata["offset_coordinate_system"].as_str(),
+            Some("decrypted_bitlocker_volume_logical_bytes")
+        );
+        assert_eq!(
+            metadata["bitlocker_volume_index_zero_based"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            metadata["encrypted_partition_decoded_media_start_offset"].as_u64(),
+            Some(0x4000)
+        );
+        assert_eq!(
+            metadata["evidence_physical_offset_available"].as_bool(),
+            Some(false)
+        );
+        assert!(metadata.get("mft_record_physical_offset").is_none());
+        assert!(metadata.get("file_data_physical_offset").is_none());
+        assert!(metadata.get("physical_offset_basis").is_none());
+        assert_eq!(
+            metadata["decrypted_volume_logical_offset_basis"].as_str(),
+            Some("NTFS runlist")
+        );
+        assert_eq!(provenance.raw_physical_base(), None);
+    }
+
+    #[test]
+    fn raw_ntfs_provenance_preserves_decoded_media_offsets() {
+        let provenance = NtfsProvenance::RawPhysical {
+            partition_start_offset: 0x4000,
+        };
+        let mut metadata = serde_json::json!({
+            "physical_offset_basis": "NTFS runlist",
+        });
+
+        provenance.apply_entry_metadata(&mut metadata, Some(0x100), Some(0x200));
+
+        assert_eq!(
+            metadata["offset_coordinate_system"].as_str(),
+            Some("decoded_media_byte_stream")
+        );
+        assert_eq!(metadata["partition_start_offset"].as_u64(), Some(0x4000));
+        assert_eq!(
+            metadata["mft_record_physical_offset"].as_u64(),
+            Some(0x4100)
+        );
+        assert_eq!(metadata["file_data_physical_offset"].as_u64(), Some(0x4200));
+        assert_eq!(provenance.raw_physical_base(), Some(0x4000));
+    }
+
+    #[test]
+    fn raw_disk_search_browser_history_real_file() -> Result<()> {
+        let case_path = unique_case_path("raw-search-browser");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("raw-search-browser-source");
+        let evidence_path = evidence_dir.join("history.sqlite");
+        fs::write(&evidence_path, b"sqlite format 3... BROWSER_NEEDLE ...")?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_path.clone(),
+                kind: EvidenceKind::File,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+
+        // Manually update source_kind to browser_history
+        {
+            let conn = open_existing_case(&case_path)?;
+            conn.execute(
+                "UPDATE evidence_sources SET source_kind = 'browser_history' WHERE id = ?1",
+                rusqlite::params![evidence_id],
+            )?;
+        }
+
+        let result = raw_disk_search(
+            &case_path,
+            RawDiskSearchOptions {
+                evidence_id,
+                query: "BROWSER_NEEDLE".to_string(),
+                max_results: 5,
+                max_scan_bytes: 0,
+            },
+        )?;
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.source_path, stable_path_string(&evidence_path));
+
+        let _ = fs::remove_dir_all(evidence_dir);
+        cleanup_case_path(&case_path);
         Ok(())
     }
 
