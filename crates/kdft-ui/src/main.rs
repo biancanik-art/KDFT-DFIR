@@ -270,6 +270,7 @@ struct RegisteredProgress {
     sequence: u64,
     tracker: JobProgressTracker,
     diagnostic_log_path: Option<PathBuf>,
+    case_path: Option<PathBuf>,
 }
 
 impl ProgressRegistry {
@@ -277,6 +278,7 @@ impl ProgressRegistry {
         &self,
         operation_id: &str,
         job_type: &str,
+        case_path: Option<&Path>,
         diagnostic_observer: Option<DiagnosticObserver>,
         diagnostic_log_path: Option<PathBuf>,
     ) -> Result<JobProgressTracker> {
@@ -319,6 +321,7 @@ impl ProgressRegistry {
                 sequence,
                 tracker: tracker.clone(),
                 diagnostic_log_path,
+                case_path: case_path.map(progress_case_identity),
             },
         );
         Ok(tracker)
@@ -369,6 +372,46 @@ impl ProgressRegistry {
         registered.tracker.request_cancellation();
         Ok(true)
     }
+
+    fn latest_evidence_process_job(
+        &self,
+        case_path: &Path,
+        evidence_id: i64,
+    ) -> Option<(JobProgressSnapshot, Option<PathBuf>)> {
+        let case_path = progress_case_identity(case_path);
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .jobs
+            .values()
+            .filter(|registered| {
+                let snap = registered.tracker.snapshot();
+                registered.case_path.as_ref() == Some(&case_path)
+                    && snap.evidence_id == Some(evidence_id)
+                    && matches!(snap.job_type.as_str(), "process" | "processors")
+            })
+            .max_by_key(|registered| registered.sequence)
+            .map(|registered| {
+                (
+                    registered.tracker.snapshot(),
+                    registered.diagnostic_log_path.clone(),
+                )
+            })
+    }
+}
+
+fn progress_case_identity(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
 }
 
 fn validate_progress_id(operation_id: &str) -> Result<()> {
@@ -1106,6 +1149,7 @@ fn route_request(mut request: HttpRequest, config: &ServerConfig) -> HttpRespons
         ("GET", "/api/entry/disk-location") => api_response(api_entry_disk_location(&query)),
         ("GET", "/api/entries/category") => api_response(api_entries_category(&query)),
         ("GET", "/api/state") => api_response(api_state(&query)),
+        ("GET", "/api/evidence/status") => api_response(api_evidence_status(&query, config)),
         ("GET", "/api/timeline/entries") => api_response(api_timeline_entries(&query)),
         ("GET", "/api/entry/bytes") => api_response(api_entry_bytes(&query)),
         ("GET", "/api/entry/raw") => match api_entry_raw(&query) {
@@ -1223,6 +1267,62 @@ fn api_state(query: &HashMap<String, String>) -> Result<UiState> {
         database_entry_count,
         report: report_data(&case_path)?,
     })
+}
+
+fn api_evidence_status(
+    query: &HashMap<String, String>,
+    config: &ServerConfig,
+) -> Result<serde_json::Value> {
+    let case_path = query
+        .get("case_path")
+        .map(String::as_str)
+        .context("case_path query parameter is required")
+        .and_then(|value| request_path(value, "case_path"))?;
+    let evidence_id_str = query
+        .get("evidence_id")
+        .map(String::as_str)
+        .context("evidence_id query parameter is required")?;
+    let evidence_id: i64 = evidence_id_str
+        .parse()
+        .context("evidence_id must be a valid integer")?;
+
+    match config
+        .progress
+        .latest_evidence_process_job(&case_path, evidence_id)
+    {
+        Some((snapshot, diagnostic_log_path)) => {
+            let status = match snapshot.state {
+                JobProgressState::Complete => "completed",
+                JobProgressState::CompleteWithDiagnostics => "completed_with_diagnostics",
+                JobProgressState::Truncated => "truncated",
+                JobProgressState::Cancelled => "cancelled",
+                JobProgressState::Failed => "failed",
+                JobProgressState::Active => "running",
+            };
+            let mut progress =
+                serde_json::to_value(snapshot).context("serializing job progress")?;
+            if let Some(path) = diagnostic_log_path {
+                progress
+                    .as_object_mut()
+                    .context("job progress serialized to a non-object")?
+                    .insert(
+                        "diagnostic_log_path".to_string(),
+                        serde_json::json!(path.to_string_lossy()),
+                    );
+            }
+            let diagnostic_log_path = progress["diagnostic_log_path"].clone();
+            Ok(serde_json::json!({
+                "evidence_id": evidence_id,
+                "status": status,
+                "truncated": status == "truncated",
+                "completed_with_diagnostics": status == "completed_with_diagnostics",
+                "partial_artifact_coverage": matches!(status, "completed_with_diagnostics" | "truncated"),
+                "diagnostic_log_path": diagnostic_log_path,
+                "progress": progress,
+            }))
+        }
+        None => bail!("no processing operation found for this evidence"),
+    }
 }
 
 fn api_job_progress(
@@ -1615,10 +1715,13 @@ fn api_image_forensic_build(body: &mut [u8], config: &ServerConfig) -> Result<se
     if source.source_kind != "image" {
         bail!("transient forensic reconstruction is only available for image evidence");
     }
-    let tracker =
-        config
-            .progress
-            .start(&request.progress_id, "forensic_live_browse", None, None)?;
+    let tracker = config.progress.start(
+        &request.progress_id,
+        "forensic_live_browse",
+        Some(&case_path),
+        None,
+        None,
+    )?;
     tracker.set_evidence_id(request.evidence_id);
     let result = with_job_progress(&tracker, || {
         kdft_case::ntfs_forensic::build_ntfs_forensic_volume_cache(
@@ -2819,6 +2922,7 @@ fn api_process_evidence(body: &mut [u8], config: &ServerConfig) -> Result<serde_
         Some(operation_id) => config.progress.start(
             operation_id,
             "process",
+            Some(&case_path),
             diagnostic_observer,
             diagnostic_log_path,
         )?,
@@ -2901,6 +3005,7 @@ fn api_run_processors(body: &mut [u8], config: &ServerConfig) -> Result<serde_js
         Some(operation_id) => config.progress.start(
             operation_id,
             "processors",
+            Some(&case_path),
             diagnostic_observer,
             diagnostic_log_path,
         )?,
@@ -5523,6 +5628,25 @@ fn is_separator(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn ui_generic_registry_inspector_branch() {
+        assert!(INDEX_HTML
+            .contains(r#"["registry_hive", "registry_key", "registry_value"].includes(kind)"#));
+        assert!(
+            INDEX_HTML.contains(r#"["Parser limitations", metadata.windows_registry_limitations]"#)
+        );
+        assert!(INDEX_HTML.contains(r#"["Key LastWrite semantics", metadata.registry_key_last_write_semantics || "modification time of the key, not necessarily its child values"]"#));
+        assert!(INDEX_HTML.contains(r#"["Time semantics", "LastWrite time belongs to the containing key; Windows Registry does not track individual value modification times"]"#));
+        assert!(INDEX_HTML.contains(r#"["Value byte size", metadata.registry_value_data_size]"#));
+        assert!(
+            INDEX_HTML.contains(r#"["Value truncated", metadata.registry_value_data_truncated]"#)
+        );
+        assert!(INDEX_HTML.contains(r#"["Offset basis", metadata.registry_value_offset_basis || "byte offset within the recovered Registry hive file; not a decoded-media or acquisition-container physical offset"]"#));
+        assert!(INDEX_HTML.contains("generic key(s)"));
+        assert!(INDEX_HTML.contains("generic value(s)"));
+    }
+
     #[test]
     fn ui_imported_browser_only_search_state_relies_on_database_entry_count() {
         assert!(INDEX_HTML.contains("state.data.database_entry_count"));
@@ -6039,6 +6163,7 @@ mod tests {
         let tracker = config.progress.start(
             progress_id,
             "process",
+            Some(&case_path),
             Some(log.observer()),
             Some(log.path.clone()),
         )?;
@@ -8026,7 +8151,7 @@ mod tests {
     fn progress_registry_cancel_signals_tracker_across_threads() {
         let registry = ProgressRegistry::default();
         let tracker = registry
-            .start("cross-thread-cancel", "process", None, None)
+            .start("cross-thread-cancel", "process", None, None, None)
             .expect("start progress operation");
         let saw_cancel = Arc::new(AtomicBool::new(false));
         let saw_cancel_clone = saw_cancel.clone();
@@ -8062,7 +8187,7 @@ mod tests {
         let config = ServerConfig::new(None).expect("create server config");
         let tracker = config
             .progress
-            .start("cancel-api-test", "process", None, None)
+            .start("cancel-api-test", "process", None, None, None)
             .expect("start progress operation");
         let active_body = br#"{"progress_id":"cancel-api-test"}"#;
         let response =
@@ -8479,11 +8604,15 @@ mod tests {
         assert!(!INDEX_HTML.contains("selectVisibleRows()"));
         assert!(INDEX_HTML.contains("<option value=\"select_visible\">Select visible</option>"));
         assert!(INDEX_HTML.contains("<option value=\"bookmark_report\">Report selected</option>"));
+        assert!(INDEX_HTML.contains("<option value=\"export_csv\">Export selected as CSV</option>"));
+        assert!(INDEX_HTML.contains("<option value=\"export_tsv\">Export selected as TSV</option>"));
         assert!(INDEX_HTML
             .contains("if (action === \"select_visible\") {\n        selectVisibleEntries();"));
         assert!(INDEX_HTML.contains(
             "if (action === \"bookmark_report\") {\n        await bookmarkSelectionAndExportReport();"
         ));
+        assert!(INDEX_HTML
+            .contains("if (action === \"export_tsv\") {\n        exportSelectedArtifacts('tsv');"));
     }
 
     #[test]
@@ -8510,6 +8639,59 @@ mod tests {
         assert!(INDEX_HTML.contains("CATEGORY_OPTIONAL_COLUMNS"));
         assert!(INDEX_HTML.contains("min-width: max-content;"));
         assert!(!INDEX_HTML.contains("min-width: 2480px;"));
+    }
+
+    #[test]
+    fn ui_add_evidence_routes_to_process_evidence_for_duplicate_image() {
+        assert!(INDEX_HTML.contains(
+            "item.source_kind === \"image\" && sameLocalPath(item.source_path, pathDetails.value)"
+        ));
+        assert!(INDEX_HTML.contains("if (existing) {"));
+        assert!(INDEX_HTML.contains("return processEvidence(existing.id);"));
+        assert!(
+            INDEX_HTML.contains("const windowsPath = isWindowsPath(left) || isWindowsPath(right);")
+        );
+        assert!(INDEX_HTML.contains("return windowsPath ? normalized.toLowerCase() : normalized;"));
+        assert!(INDEX_HTML.contains(".replace(/^\\\\\\\\\\?\\\\/, \"\")"));
+    }
+
+    #[test]
+    fn ui_process_evidence_preflight_guards_run_analyze_and_add_evidence_routes() {
+        assert!(INDEX_HTML.contains("const addedId = await runAnalyze("));
+        assert!(INDEX_HTML
+            .contains("addEvidenceInner(type, processDuringAttach, progressId, processNow)"));
+        assert!(INDEX_HTML.contains("read_file_system: readFileSystemRequested"));
+        assert!(INDEX_HTML.contains("state.liveAutoTried.add(data.evidence_id);"));
+        assert!(
+            INDEX_HTML.contains("if (type === \"image\" && processNow && addedId !== undefined) {")
+        );
+        assert!(INDEX_HTML.contains("return processEvidence(addedId);"));
+        assert!(INDEX_HTML.contains("const data = await loadLiveVolumes(id);"));
+        assert!(INDEX_HTML.contains("bitlockerVolumes.some((v) =>"));
+        assert!(INDEX_HTML.contains("bitlockerUnlockCapability(v).canUnlock"));
+        assert!(!INDEX_HTML.contains("v.bitlocker.metadata_inspected"));
+        assert!(!INDEX_HTML.contains("v.bitlocker.cipher_supported"));
+        assert!(!INDEX_HTML.contains("v.bitlocker.has_password_or_recovery_protector"));
+        assert!(
+            INDEX_HTML
+                .find("const data = await loadLiveVolumes(id);")
+                .unwrap()
+                < INDEX_HTML
+                    .find("const evidenceSignatureBefore = evidenceListSignature();")
+                    .unwrap()
+        );
+        assert!(INDEX_HTML.contains("if (!unlocked) {"));
+        assert!(INDEX_HTML
+            .contains("if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) {"));
+        assert!(INDEX_HTML.contains("if (imageProcessPreflightToken) {"));
+        assert!(INDEX_HTML.contains("if (state.analyzing || imageProcessPreflightToken) {"));
+        assert!(INDEX_HTML.contains("imageProcessPreflightToken = null;"));
+        assert!(INDEX_HTML.contains("const forensicReady = await ensureLiveForensicCatalog"));
+        assert!(INDEX_HTML.contains("if (!forensicReady || state.live !== liveState"));
+        assert!(INDEX_HTML.contains("function imagePreflightBlocksDirectOperation()"));
+        assert!(INDEX_HTML.contains("Cannot automatically unlock:"));
+        assert!(!INDEX_HTML.contains("url.searchParams.append(\"unlock\""));
+        assert!(!INDEX_HTML.contains("localStorage.setItem(\"kdft.unlock\""));
     }
 }
 
@@ -8705,6 +8887,35 @@ fn open_target(target: &str) -> Result<()> {
             .context("opening target")?;
     }
     Ok(())
+}
+
+#[test]
+fn api_evidence_status_wraps_latest_progress_snapshot_in_progress_object() {
+    let config = ServerConfig::new(None).unwrap();
+    let tracker = config
+        .progress
+        .start(
+            "test-progress",
+            "process",
+            Some(Path::new("any.kdft.sqlite")),
+            None,
+            None,
+        )
+        .unwrap();
+    tracker.set_evidence_id(999);
+    tracker.set_total_items(Some(100));
+
+    let mut query = HashMap::new();
+    query.insert("case_path".to_string(), "any.kdft.sqlite".to_string());
+    query.insert("evidence_id".to_string(), "999".to_string());
+
+    let result = api_evidence_status(&query, &config).unwrap();
+    assert!(result.get("progress").is_some());
+
+    let progress = &result["progress"];
+    assert_eq!(progress["evidence_id"], 999);
+    assert_eq!(progress["job_type"], "process");
+    assert_eq!(progress["total_items"], 100);
 }
 
 fn index_html(config: &ServerConfig) -> String {
@@ -11615,6 +11826,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
                         <option value="bookmark_report">Report selected</option>
                         <option value="export_files">Export selected file bytes</option>
                         <option value="export_csv">Export selected as CSV</option>
+                        <option value="export_tsv">Export selected as TSV</option>
                         <option value="clear">Clear selection</option>
                       </select>
                     </span>
@@ -11977,6 +12189,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     let categoryFilterTimer = null;
     let categoryScrollObserver = null;
     const liveVolumeRequests = new Map();
+    let imageProcessPreflightToken = null;
     let localAuthRefreshPromise = null;
 
     function loadLiveVolumes(evidenceId) {
@@ -12001,8 +12214,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const volume = (liveState.volumes || []).find((item) => Number(item.index) === Number(volumeIndex));
       const evidence = state.data && state.data.evidence.find((item) => Number(item.id) === Number(liveState.evidenceId));
       if (!volume || !evidence || evidence.source_kind !== "image" || volume.filesystem !== "NTFS") {
-        return false;
+        return true;
       }
+      const expectedCasePath = currentCasePath();
       liveState.forensicReady = liveState.forensicReady || new Set();
       liveState.forensicSummary = liveState.forensicSummary || {};
       if (liveState.forensicReady.has(Number(volumeIndex))) {
@@ -12010,21 +12224,24 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
 
       const status = await apiGet("/api/image/forensic/status", {
-        case_path: currentCasePath(),
+        case_path: expectedCasePath,
         evidence_id: liveState.evidenceId,
         volume: volumeIndex
       });
+      if (state.live !== liveState || !evidenceIdentityStillAvailable(expectedCasePath, evidence)) {
+        return false;
+      }
       let finalStatus = status;
       if (!status.cached) {
         const progressId = newJobProgressId();
         const build = async () => apiPost("/api/image/forensic/build", {
-          case_path: currentCasePath(),
+          case_path: expectedCasePath,
           evidence_id: liveState.evidenceId,
           volume: Number(volumeIndex),
           progress_id: progressId
         });
         let result;
-        if (state.analyzing) {
+        if (state.analyzing && state.analyzing.mode === "attach" && !imageProcessPreflightToken) {
           // Attach-only auto-browse may still be inside its protected overlay.
           // Reuse that visible barrier instead of nesting another operation.
           result = await build();
@@ -12036,9 +12253,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
             progressId
           });
         }
+        if (!result) {
+          return false;
+        }
         finalStatus = result && result.status ? result.status : status;
       }
-      if (state.live !== liveState) {
+      if (state.live !== liveState || !evidenceIdentityStillAvailable(expectedCasePath, evidence)) {
         return false;
       }
       liveState.forensicReady.add(Number(volumeIndex));
@@ -12337,6 +12557,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function selectedEvidenceIdentityMatches(expected) {
       return sameEvidenceIdentity(selectedEvidenceSource(), expected);
+    }
+
+    function evidenceIdentityStillAvailable(expectedCasePath, expected) {
+      return Boolean(
+        expected
+        && currentCasePath() === expectedCasePath
+        && state.loadedCasePath === expectedCasePath
+        && state.data
+        && state.data.evidence.some((item) => sameEvidenceIdentity(item, expected))
+      );
     }
 
     const BITLOCKER_RASTER_PREVIEW_EXTENSIONS = new Set([
@@ -12684,6 +12914,64 @@ const INDEX_HTML: &str = r###"<!doctype html>
         }
         await new Promise((resolve) => window.setTimeout(resolve, 250));
         return apiPost(path, body);
+      }
+    }
+
+    const activeBackgroundJobs = new Set();
+
+    async function recoverBackgroundEvidenceJob(evidence) {
+      if (activeBackgroundJobs.has(evidence.id)) return;
+      if (state.analyzing) return;
+      try {
+        const statusResult = await apiGet("/api/evidence/status", { case_path: currentCasePath(), evidence_id: evidence.id }).catch(() => null);
+        if (statusResult && statusResult.progress && statusResult.progress.state === "active") {
+          activeBackgroundJobs.add(evidence.id);
+          try {
+            const data = await runAnalyze(evidence.display_name, async () => pollEvidenceJobUntilTerminal(evidence.id), {
+              mode: "analyze",
+              title: "Reconnected to ",
+              note: "Processing was already running in the background. Please wait and do not click Analyze again or open other views until it finishes.",
+              progressId: statusResult.progress.operation_id
+            });
+            if (data) {
+              const message = processingCompletionNotice(
+                data,
+                "Evidence " + evidence.id + " background processing finished"
+              );
+              invalidateIndexedBrowseCache(evidence.id);
+              await refresh();
+              if (state.data && state.data.evidence.some((item) => item.id === evidence.id)) {
+                selectEvidenceSource(evidence.id, preferredAnalysisPath(evidence.id), "filesystem");
+                setNotice(message);
+              }
+            }
+          } finally {
+            activeBackgroundJobs.delete(evidence.id);
+          }
+        }
+      } catch (e) {
+      }
+    }
+
+    async function pollEvidenceJobUntilTerminal(evidenceId) {
+      let consecutiveFailures = 0;
+      while (true) {
+        try {
+          const statusResult = await apiGet("/api/evidence/status", { case_path: currentCasePath(), evidence_id: evidenceId });
+          consecutiveFailures = 0;
+          if (statusResult && statusResult.progress && statusResult.progress.state !== "active") {
+            return statusResult;
+          }
+        } catch (error) {
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 8) {
+            throw new Error("Could not reconnect to the background analysis after 8 attempts: " + String(error && error.message || error));
+          }
+        }
+        const delayMs = consecutiveFailures
+          ? Math.min(5000, 500 * Math.pow(2, consecutiveFailures - 1))
+          : 1000;
+        await new Promise((resolve) => window.setTimeout(resolve, delayMs));
       }
     }
 
@@ -13168,6 +13456,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
           searchRevisionChanged
         );
         restoreDeepSearchSession();
+
+        if (state.data && state.data.evidence) {
+          for (const ev of state.data.evidence) {
+            recoverBackgroundEvidenceJob(ev);
+          }
+        }
+
         return true;
       } catch (err) {
         if (!refreshRequestIsCurrent(casePath, generation)) {
@@ -13392,20 +13687,35 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     async function addEvidence() {
       const pathDetails = currentEvidencePathDetails();
-      const pathParts = String(pathDetails.value || "evidence").split(/[\\/]/);
-      const displayName = pathParts[pathParts.length - 1] || "evidence";
       const type = currentEvidenceType();
       const processNow = type !== "browser_history" && $("readFileSystem").value === "true";
-      const progressId = processNow ? newJobProgressId() : null;
-      return runAnalyze(displayName, () => addEvidenceInner(type, processNow, progressId), {
+
+      if (type === "image" && processNow && state.data) {
+        const existing = state.data.evidence.find((item) =>
+          item.source_kind === "image" && sameLocalPath(item.source_path, pathDetails.value));
+        if (existing) {
+          return processEvidence(existing.id);
+        }
+      }
+
+      const pathParts = String(pathDetails.value || "evidence").split(/[\\/]/);
+      const displayName = pathParts[pathParts.length - 1] || "evidence";
+      const processDuringAttach = type === "image" ? false : processNow;
+      const progressId = processDuringAttach ? newJobProgressId() : null;
+      const addedId = await runAnalyze(displayName, () => addEvidenceInner(type, processDuringAttach, progressId, processNow), {
         mode: "attach",
         title: "Adding evidence ",
-        note: "Discovering split segments and opening the evidence container. If processing was selected, indexing continues in this same protected operation. Please wait and do not open other views or click Add Evidence again.",
+        note: type === "image" && processNow
+          ? "Discovering split segments and opening the evidence container. BitLocker inspection and analysis begin immediately after attachment. Please wait and do not click Add Evidence again."
+          : "Discovering split segments and opening the evidence container. If processing was selected, indexing continues in this protected operation. Please wait and do not open other views or click Add Evidence again.",
         progressId
       });
+      if (type === "image" && processNow && addedId !== undefined) {
+        return processEvidence(addedId);
+      }
     }
 
-    async function addEvidenceInner(type, processNow, progressId = null) {
+    async function addEvidenceInner(type, processNow, progressId = null, readFileSystemRequested = processNow) {
       if (type === "browser_history") {
         await importHistory();
         return;
@@ -13419,7 +13729,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           case_path: currentCasePath(),
           path: evidencePath.value,
           kind: type,
-          read_file_system: processNow,
+          read_file_system: readFileSystemRequested,
           notes: $("evidenceNotes").value,
           timezone: evidenceTimezoneValue()
         });
@@ -13447,18 +13757,38 @@ const INDEX_HTML: &str = r###"<!doctype html>
             setNotice("");
             return;
           }
+          if (type === "image" && readFileSystemRequested) {
+            // Add + Analyze immediately enters the shared BitLocker preflight.
+            // Prevent the attach-only auto-browse from racing that protected
+            // operation; manual Browse source remains available.
+            state.liveAutoTried = state.liveAutoTried || new Set();
+            state.liveAutoTried.add(data.evidence_id);
+          }
           selectEvidenceSource(data.evidence_id, "/");
           setNotice(withPathCorrectionNotice("Attached evidence " + data.evidence_id + ".", evidencePath));
-          return;
+          return data.evidence_id;
         }
+        let processed;
         try {
-          const processed = await apiPost("/api/evidence/process", {
-            case_path: currentCasePath(),
-            evidence_id: data.evidence_id,
-            max_entries: currentProcessMaxEntries(),
-            progress_id: progressId,
-            ...processingOptionsPayload(true)
-          });
+          try {
+            processed = await apiPost("/api/evidence/process", {
+              case_path: currentCasePath(),
+              evidence_id: data.evidence_id,
+              max_entries: currentProcessMaxEntries(),
+              progress_id: progressId,
+              ...processingOptionsPayload(true)
+            });
+          } catch (processErr) {
+            const networkFailure = processErr instanceof TypeError && /failed to fetch|network/i.test(String(processErr.message || processErr));
+            if (networkFailure) {
+              processed = await pollEvidenceJobUntilTerminal(data.evidence_id);
+              if (!processed) {
+                throw processErr; // Could not recover, throw original error
+              }
+            } else {
+              throw processErr;
+            }
+          }
           if (state.analyzing) {
             state.analyzing.telemetry = processed.progress || state.analyzing.telemetry;
             state.analyzing.telemetryReceivedAt = Date.now();
@@ -13743,7 +14073,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function runAnalyze(name, worker, options = {}) {
-      if (state.analyzing) {
+      if (state.analyzing || imageProcessPreflightToken) {
         setNotice("A protected evidence operation is already running - wait for it to finish before starting another.", true);
         return undefined;
       }
@@ -13884,6 +14214,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         parts.push(wr.error
           ? "Windows Registry artifact parsing FAILED: " + wr.error
           : "Windows Registry artifacts (" + String(wr.status || "unknown") + "): "
+            + (wr.generic_keys_indexed !== undefined ? Number(wr.generic_keys_indexed).toLocaleString() + " generic key(s), " : "")
+            + (wr.generic_values_indexed !== undefined ? Number(wr.generic_values_indexed).toLocaleString() + " generic value(s), " : "")
             + Number(wr.amcache_records_indexed || 0).toLocaleString() + " Amcache, "
             + Number(wr.userassist_records_indexed || 0).toLocaleString() + " UserAssist, "
             + Number(wr.shellbag_records_indexed || 0).toLocaleString() + " ShellBag, "
@@ -13987,7 +14319,82 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     async function processEvidence(id) {
       const evidence = state.data && state.data.evidence.find((item) => item.id === id);
-      const label = evidence ? evidence.display_name : "evidence #" + id;
+      if (!evidence) {
+        setNotice("Evidence #" + id + " is no longer attached to the loaded case. Refresh the case before trying again.", true);
+        return;
+      }
+      if (state.analyzing) {
+        setNotice("A protected evidence operation is already running - wait for it to finish before starting another.", true);
+        return;
+      }
+      if (imageProcessPreflightToken) {
+        setNotice("BitLocker volume inspection is already running - wait for it to finish before starting another analysis.", true);
+        return;
+      }
+      const label = evidence.display_name;
+      const expectedCasePath = currentCasePath();
+
+      if (evidence.source_kind === "image") {
+        const preflightToken = {};
+        imageProcessPreflightToken = preflightToken;
+        try {
+          const data = await loadLiveVolumes(id);
+          if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) {
+            return;
+          }
+          const bitlockerVolumes = (data.volumes || []).filter((v) => v.bitlocker);
+          if (bitlockerVolumes.length > 0) {
+            const hasUnlockedMatch = bitlockerVolumes.some((v) =>
+              state.bitlocker && bitlockerSessionMatchesContext(state.bitlocker, id, v.index) && state.bitlocker.unlock
+            );
+            if (!hasUnlockedMatch) {
+              const unlockable = bitlockerVolumes.filter((v) => bitlockerUnlockCapability(v).canUnlock);
+
+              state.live = {
+                ...newLiveBrowseState(),
+                active: true,
+                evidenceId: id,
+                volumes: data.volumes || []
+              };
+              selectEvidenceSource(id, "/");
+
+              if (unlockable.length === 1 && bitlockerVolumes.length === 1) {
+                const unlocked = await unlockBitlockerVolume(unlockable[0].index, { recordNavigation: false });
+                if (!unlocked) {
+                  return;
+                }
+                if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) {
+                  return;
+                }
+              } else {
+                if (bitlockerVolumes.length > 1) {
+                  setNotice("Automatic BitLocker analysis is ambiguous: multiple encrypted volumes were detected. In Browse source, unlock the intended volume, then choose Analyze image again.", true);
+                } else {
+                  const capability = bitlockerUnlockCapability(bitlockerVolumes[0]);
+                  let reason = "the volume cannot be unlocked by this build";
+                  if (capability.inspectionFailed) reason = "metadata inspection failed";
+                  else if (capability.cipherUnsupported) reason = "the encryption cipher is unsupported";
+                  else if (!capability.hasCredentialProtector) reason = "no supported recovery-key or password protector exists";
+                  setNotice("Cannot automatically unlock: " + reason + ". Browse source remains available for raw bytes and any unencrypted volumes, but KDFT will not create a misleading partial analysis of the locked volume.", true);
+                }
+                return;
+              }
+            }
+          }
+        } catch (err) {
+          setNotice("Preflight volume inspection failed: " + err.message, true);
+          return;
+        } finally {
+          if (imageProcessPreflightToken === preflightToken) {
+            imageProcessPreflightToken = null;
+          }
+        }
+      }
+
+      if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) {
+        return;
+      }
+
       const evidenceSignatureBefore = evidenceListSignature();
       const progressId = newJobProgressId();
       const options = processingOptionsPayload();
@@ -13995,7 +14402,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       let additive = hasExistingIndex && !options.reindex_filesystem;
 
       let payload = {
-        case_path: currentCasePath(),
+        case_path: expectedCasePath,
         evidence_id: id,
         max_entries: currentProcessMaxEntries(),
         progress_id: progressId,
@@ -14017,8 +14424,21 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
 
       await runAnalyze(label, async () => {
+        let data;
         try {
-          const data = await apiPost(additive ? "/api/evidence/run-processors" : "/api/evidence/process", payload);
+          try {
+            data = await apiPost(additive ? "/api/evidence/run-processors" : "/api/evidence/process", payload);
+          } catch (processErr) {
+            const networkFailure = processErr instanceof TypeError && /failed to fetch|network/i.test(String(processErr.message || processErr));
+            if (networkFailure) {
+              data = await pollEvidenceJobUntilTerminal(id);
+              if (!data) {
+                throw processErr;
+              }
+            } else {
+              throw processErr;
+            }
+          }
           if (state.analyzing) {
             state.analyzing.telemetry = data.progress || state.analyzing.telemetry;
             state.analyzing.telemetryReceivedAt = Date.now();
@@ -14883,6 +15303,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       if (action === "export_csv") {
         exportSelectedCsv();
+        return;
+      }
+      if (action === "export_tsv") {
+        exportSelectedArtifacts('tsv');
         return;
       }
       if (action === "clear") {
@@ -17601,7 +18025,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
       $("evidenceTable").innerHTML = filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No evidence sources match the column filters."));
     }
 
+    function imagePreflightBlocksDirectOperation() {
+      if (!imageProcessPreflightToken) {
+        return false;
+      }
+      setNotice("BitLocker volume inspection is already running - wait for it to finish before starting another full-image operation.", true);
+      return true;
+    }
+
     async function carveEvidence(id) {
+      if (imagePreflightBlocksDirectOperation()) {
+        return;
+      }
       const gib = window.prompt("Signature-carve decoded image data. Scan how many GiB from the start? Leave blank for the whole image.", "");
       if (gib === null) {
         return;
@@ -17648,6 +18083,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     async function hashEvidence(id) {
+      if (imagePreflightBlocksDirectOperation()) {
+        return;
+      }
       setNotice("Hashing evidence " + id + " (reads the full source; large images take a while)...");
       try {
         const data = await apiPost("/api/evidence/hash", {
@@ -17834,8 +18272,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const evidenceId = liveState.evidenceId;
       liveState.dirPaging = liveState.dirPaging || {};
       if (!liveState.dirCache[key]) {
-        await ensureLiveForensicCatalog(liveState, volume);
-        if (state.live !== liveState || state.live.evidenceId !== evidenceId) {
+        const forensicReady = await ensureLiveForensicCatalog(liveState, volume);
+        if (!forensicReady || state.live !== liveState || state.live.evidenceId !== evidenceId) {
           return null;
         }
         const data = await apiGet("/api/image/dir", {
@@ -19045,6 +19483,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
     // The decrypt layer is read-only over the evidence; the recovery key/password
     // is held in memory only (state.bitlocker.unlock) for the browse session and
     // never written to localStorage, the case DB, notices, or logs.
+    function bitlockerUnlockCapability(volume) {
+      const bl = (volume && volume.bitlocker) || {};
+      const hasCredentialProtector = Boolean(bl.can_unlock_with_recovery_key || bl.can_unlock_with_password);
+      const cipherUnsupported = bl.decrypt_supported === false;
+      const inspectionFailed = bl.metadata_state === "inspection-warning";
+      return {
+        hasCredentialProtector,
+        cipherUnsupported,
+        inspectionFailed,
+        canUnlock: hasCredentialProtector && !cipherUnsupported && !inspectionFailed
+      };
+    }
+
     function bitlockerStatusRow(volume) {
       const bl = volume.bitlocker || {};
       const method = typeof bl.encryption_method === "string"
@@ -19053,14 +19504,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const protectors = Array.isArray(bl.protectors)
         ? bl.protectors.map((p) => (p && (p.kind || p.label || p.raw)) || "").filter(Boolean).join(", ")
         : "";
-      const hasCredentialProtector = bl.can_unlock_with_recovery_key || bl.can_unlock_with_password;
       // decrypt_supported === false means the cipher was identified but this
       // build's decrypt layer refuses it; a credential cannot help until then,
       // so say that honestly instead of offering a doomed unlock. Do not list
       // algorithms here because the wrapped decrypt core is the authority.
-      const cipherUnsupported = bl.decrypt_supported === false;
-      const inspectionFailed = bl.metadata_state === "inspection-warning";
-      const canUnlock = hasCredentialProtector && !cipherUnsupported && !inspectionFailed;
+      const capability = bitlockerUnlockCapability(volume);
+      const cipherUnsupported = capability.cipherUnsupported;
+      const inspectionFailed = capability.inspectionFailed;
+      const canUnlock = capability.canUnlock;
       const unlocked = state.bitlocker && state.bitlocker.active && Number(state.bitlocker.volumeIndex) === Number(volume.index);
       const declaredEncryptedSize = Number(bl.encrypted_volume_size || 0);
       const effectiveEncryptedSize = Number(bl.effective_encrypted_volume_size || 0);
@@ -21755,7 +22206,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!selectedAction) {
         return;
       }
-      ["bookmark", "bookmark_report", "export_csv", "clear"].forEach((value) => {
+      ["bookmark", "bookmark_report", "export_csv", "export_tsv", "clear"].forEach((value) => {
         const option = selectedAction.querySelector('option[value="' + value + '"]');
         if (option) {
           option.disabled = count === 0;
@@ -21899,11 +22350,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function sameLocalPath(left, right) {
-      const normalize = (value) => String(value || "")
-        .replace(/^\\\\\?\\/, "")
-        .replace(/\\/g, "/")
-        .replace(/\/+$/g, "")
-        .toLowerCase();
+      const isWindowsPath = (value) => {
+        const text = String(value || "");
+        return /^[A-Za-z]:[\\/]/.test(text) || text.startsWith("\\\\") || text.startsWith("//");
+      };
+      const windowsPath = isWindowsPath(left) || isWindowsPath(right);
+      const normalize = (value) => {
+        const normalized = String(value || "")
+          .replace(/^\\\\\?\\UNC\\/i, "\\\\")
+          .replace(/^\\\\\?\\/, "")
+          .replace(/\\/g, "/")
+          .replace(/\/+$/g, "");
+        return windowsPath ? normalized.toLowerCase() : normalized;
+      };
       return normalize(left) === normalize(right);
     }
 
@@ -25754,6 +26213,36 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Coverage", coverage.coverage],
           ["Limitation", coverage.limitation]
         );
+      } else if (["registry_hive", "registry_key", "registry_value"].includes(kind)) {
+        if (kind === "registry_hive") {
+          rows.push(
+            ["Total entries seen", metadata.windows_registry_entries_seen],
+            ["Parser scope limit", metadata.windows_registry_entry_limit],
+            ["Parser truncated", metadata.windows_registry_truncated],
+            ["Parser keys indexed", metadata.windows_registry_keys_indexed],
+            ["Parser values indexed", metadata.windows_registry_values_indexed],
+            ["Parser limitations", metadata.windows_registry_limitations]
+          );
+        } else if (kind === "registry_key") {
+          rows.push(
+            ["Key path", metadata.registry_key_path],
+            ["Key LastWrite", metadata.registry_key_last_write_utc],
+            ["Key LastWrite semantics", metadata.registry_key_last_write_semantics || "modification time of the key, not necessarily its child values"]
+          );
+        } else if (kind === "registry_value") {
+          rows.push(
+            ["Containing key path", metadata.registry_key_path],
+            ["Containing key LastWrite", metadata.registry_key_last_write_utc],
+            ["Time semantics", "LastWrite time belongs to the containing key; Windows Registry does not track individual value modification times"],
+            ["Value name", metadata.registry_value_name],
+            ["Value type", metadata.registry_value_type],
+            ["Value byte size", metadata.registry_value_data_size],
+            ["Value preview", metadata.registry_value_data],
+            ["Value truncated", metadata.registry_value_data_truncated],
+            ["Hive-relative offset", metadata.registry_value_offset],
+            ["Offset basis", metadata.registry_value_offset_basis || "byte offset within the recovered Registry hive file; not a decoded-media or acquisition-container physical offset"]
+          );
+        }
       } else if (["windows_recent_docs_record", "windows_run_mru_record", "windows_typed_path_record", "windows_search_query_record"].includes(kind)) {
         rows.push(
           ["Decoded value", metadata.user_activity_value],

@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use flate2::read::ZlibDecoder;
 use lru::LruCache;
@@ -29,6 +30,49 @@ use crate::types::{AcquisitionError, EwfMetadata, StoredHashes};
 /// `&File` and never touches a shared cursor. That makes it safe to call
 /// concurrently from many threads on one handle: each call carries its own
 /// offset, so there is no read/seek race. Keeps `forbid(unsafe)` (no mmap).
+const TRANSIENT_DEVICE_RETRY_DELAYS: [Duration; 9] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+    Duration::from_secs(30),
+];
+
+fn is_transient_windows_device_error(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    if let Some(code) = error.raw_os_error() {
+        // 21: ERROR_NOT_READY (The device is not ready)
+        // 1117: ERROR_IO_DEVICE (The request could not be performed because of an I/O device error)
+        // 1167: ERROR_DEVICE_NOT_CONNECTED (The device is not connected)
+        return matches!(code, 21 | 1117 | 1167);
+    }
+    let _ = error;
+    false
+}
+
+fn retry_transient_windows_device_io<T>(
+    mut operation: impl FnMut() -> io::Result<T>,
+    mut sleep: impl FnMut(Duration),
+) -> io::Result<T> {
+    let mut delays = TRANSIENT_DEVICE_RETRY_DELAYS.into_iter();
+    loop {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if is_transient_windows_device_error(&error) => {
+                let Some(delay) = delays.next() else {
+                    return Err(error);
+                };
+                sleep(delay);
+            }
+            result => return result,
+        }
+    }
+}
+
 fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     #[cfg(unix)]
     use std::os::unix::fs::FileExt;
@@ -40,18 +84,101 @@ fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         let read_offset = offset
             .checked_add(total as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read offset overflow"))?;
-        #[cfg(unix)]
-        let res = file.read_at(&mut buf[total..], read_offset);
-        #[cfg(windows)]
-        let res = file.seek_read(&mut buf[total..], read_offset);
-        match res {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+
+        let read = retry_transient_windows_device_io(
+            || {
+                #[cfg(unix)]
+                let result = file.read_at(&mut buf[total..], read_offset);
+                #[cfg(windows)]
+                let result = file.seek_read(&mut buf[total..], read_offset);
+                result
+            },
+            std::thread::sleep,
+        )?;
+        if read == 0 {
+            break;
         }
+        total += read;
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod transient_device_retry_tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_transient_device_error_classification_is_narrow() {
+        for code in [21, 1117, 1167] {
+            assert!(is_transient_windows_device_error(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
+        for code in [2, 5, 32, 87] {
+            assert!(!is_transient_windows_device_error(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transient_retry_sequence_is_bounded_and_does_not_sleep_in_tests() {
+        let mut attempts = 0_usize;
+        let mut observed_delays = Vec::new();
+        let result = retry_transient_windows_device_io(
+            || {
+                attempts += 1;
+                if attempts <= 2 {
+                    Err(io::Error::from_raw_os_error(21))
+                } else {
+                    Ok(7_usize)
+                }
+            },
+            |delay| observed_delays.push(delay),
+        )
+        .unwrap();
+
+        assert_eq!(result, 7);
+        assert_eq!(attempts, 3);
+        assert_eq!(observed_delays, TRANSIENT_DEVICE_RETRY_DELAYS[..2].to_vec());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transient_retry_exhaustion_returns_the_final_io_error() {
+        let mut attempts = 0_usize;
+        let mut observed_delays = Vec::new();
+        let error = retry_transient_windows_device_io(
+            || {
+                attempts += 1;
+                Err::<(), _>(io::Error::from_raw_os_error(21))
+            },
+            |delay| observed_delays.push(delay),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(21));
+        assert_eq!(attempts, TRANSIENT_DEVICE_RETRY_DELAYS.len() + 1);
+        assert_eq!(observed_delays, TRANSIENT_DEVICE_RETRY_DELAYS);
+    }
+
+    #[test]
+    fn non_transient_errors_are_not_retried() {
+        let mut attempts = 0_usize;
+        let error = retry_transient_windows_device_io(
+            || {
+                attempts += 1;
+                Err::<(), _>(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            },
+            |_| panic!("non-transient errors must not sleep"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 1);
+    }
 }
 
 // ---------------------------------------------------------------------------

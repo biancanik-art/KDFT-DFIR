@@ -920,6 +920,7 @@ mod tests {
                 logical_path: "/gold/SYSTEM".to_string(),
                 exact_path: "Windows/System32/config/SYSTEM".to_string(),
                 name: "SYSTEM".to_string(),
+                size: None,
             };
             let (records, counts) = super::super::derive_hive_records(&candidate, &import);
             Ok((

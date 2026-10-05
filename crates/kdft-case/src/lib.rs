@@ -307,6 +307,9 @@ const REGISTRY_PARSER_NAME: &str = "notatin 1.0.1";
 const REGISTRY_VALUE_TEXT_PREVIEW_CHARS: usize = 4096;
 const REGISTRY_BINARY_PREVIEW_BYTES: usize = 256;
 const REGISTRY_STRUCTURED_VALUE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const REGISTRY_MULTI_STRING_ITEM_LIMIT: usize = 128;
+const REGISTRY_MULTI_STRING_ITEM_PREVIEW_CHARS: usize = 1024;
+const REGISTRY_MULTI_STRING_ITEMS_TOTAL_CHARS: usize = REGISTRY_VALUE_TEXT_PREVIEW_CHARS;
 const EVTX_PARSER_NAME: &str = "evtx 0.12.2";
 const EVTX_EVENT_SUMMARY_PREVIEW_CHARS: usize = 1200;
 const EVTX_PARSER_ERROR_LIMIT: usize = 16;
@@ -27372,7 +27375,6 @@ impl RegistryImportCollector {
             "registry_hive": self.hive_display_name.as_str(),
             "registry_key_path": key_path,
             "registry_key_last_write_utc": last_write,
-            "modified_utc": last_write,
             "registry_value_name": value_name,
             "registry_value_type": value_type,
             "registry_value_data": rendered.text,
@@ -27395,6 +27397,22 @@ impl RegistryImportCollector {
                     serde_json::Value::Array(
                         items.into_iter().map(serde_json::Value::String).collect(),
                     ),
+                );
+                object.insert(
+                    "registry_value_data_items_total".to_string(),
+                    serde_json::json!(rendered.items_total),
+                );
+                object.insert(
+                    "registry_value_data_items_retained".to_string(),
+                    serde_json::json!(rendered.items_retained),
+                );
+                object.insert(
+                    "registry_value_data_items_omitted".to_string(),
+                    serde_json::json!(rendered.items_omitted),
+                );
+                object.insert(
+                    "registry_value_data_items_truncated".to_string(),
+                    serde_json::json!(rendered.items_truncated),
                 );
             }
             if let Some(warnings) = warnings {
@@ -27422,6 +27440,24 @@ struct RegistryRenderedValue {
     text: String,
     truncated: bool,
     items: Option<Vec<String>>,
+    items_total: usize,
+    items_retained: usize,
+    items_omitted: usize,
+    items_truncated: bool,
+}
+
+impl RegistryRenderedValue {
+    fn scalar(text: String, truncated: bool) -> Self {
+        Self {
+            text,
+            truncated,
+            items: None,
+            items_total: 0,
+            items_retained: 0,
+            items_omitted: 0,
+            items_truncated: false,
+        }
+    }
 }
 
 fn registry_render_value(
@@ -27434,45 +27470,72 @@ fn registry_render_value(
                 &registry_clean_string(value),
                 REGISTRY_VALUE_TEXT_PREVIEW_CHARS,
             );
-            RegistryRenderedValue {
-                text,
-                truncated,
-                items: None,
-            }
+            RegistryRenderedValue::scalar(text, truncated)
         }
         RegistryCellValue::MultiString(values) => {
-            let cleaned = values
-                .iter()
-                .map(|value| registry_clean_string(value))
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>();
-            let joined = cleaned.join(" | ");
-            let (text, truncated) =
-                truncate_registry_text(&joined, REGISTRY_VALUE_TEXT_PREVIEW_CHARS);
+            let mut text = String::new();
+            let mut text_chars = 0_usize;
+            let mut text_truncated = false;
+            let mut items = Vec::new();
+            let mut retained_item_chars = 0_usize;
+            let mut items_total = 0_usize;
+            let mut items_truncated = false;
+
+            for value in values {
+                let cleaned = value.trim_end_matches('\0').trim();
+                if cleaned.is_empty() {
+                    continue;
+                }
+                items_total = items_total.saturating_add(1);
+
+                if items_total > 1 {
+                    text_truncated |= append_registry_text_bounded(
+                        &mut text,
+                        &mut text_chars,
+                        " | ",
+                        REGISTRY_VALUE_TEXT_PREVIEW_CHARS,
+                    );
+                }
+                text_truncated |= append_registry_text_bounded(
+                    &mut text,
+                    &mut text_chars,
+                    cleaned,
+                    REGISTRY_VALUE_TEXT_PREVIEW_CHARS,
+                );
+
+                if items.len() >= REGISTRY_MULTI_STRING_ITEM_LIMIT
+                    || retained_item_chars >= REGISTRY_MULTI_STRING_ITEMS_TOTAL_CHARS
+                {
+                    continue;
+                }
+                let available = REGISTRY_MULTI_STRING_ITEMS_TOTAL_CHARS
+                    .saturating_sub(retained_item_chars)
+                    .min(REGISTRY_MULTI_STRING_ITEM_PREVIEW_CHARS);
+                let (item, item_truncated) = truncate_registry_text(cleaned, available);
+                retained_item_chars = retained_item_chars.saturating_add(item.chars().count());
+                items_truncated |= item_truncated;
+                items.push(item);
+            }
+            let items_retained = items.len();
+            let items_omitted = items_total.saturating_sub(items_retained);
             RegistryRenderedValue {
                 text,
-                truncated,
-                items: Some(cleaned),
+                truncated: text_truncated,
+                items: Some(items),
+                items_total,
+                items_retained,
+                items_omitted,
+                items_truncated: items_truncated || items_omitted > 0,
             }
         }
         RegistryCellValue::Binary(bytes) => {
             let (text, truncated) = registry_hex_preview(bytes);
-            RegistryRenderedValue {
-                text,
-                truncated,
-                items: None,
-            }
+            RegistryRenderedValue::scalar(text, truncated)
         }
-        RegistryCellValue::U32(value) => RegistryRenderedValue {
-            text: format!("{value} (0x{value:08X})"),
-            truncated: false,
-            items: None,
-        },
-        RegistryCellValue::I32(value) => RegistryRenderedValue {
-            text: value.to_string(),
-            truncated: false,
-            items: None,
-        },
+        RegistryCellValue::U32(value) => {
+            RegistryRenderedValue::scalar(format!("{value} (0x{value:08X})"), false)
+        }
+        RegistryCellValue::I32(value) => RegistryRenderedValue::scalar(value.to_string(), false),
         RegistryCellValue::U64(value) => {
             let mut text = format!("{value} (0x{value:016X})");
             if data_type == RegistryValueDataType::REG_FILETIME {
@@ -27482,28 +27545,28 @@ fn registry_render_value(
                     text.push_str(&utc);
                 }
             }
-            RegistryRenderedValue {
-                text,
-                truncated: false,
-                items: None,
-            }
+            RegistryRenderedValue::scalar(text, false)
         }
-        RegistryCellValue::I64(value) => RegistryRenderedValue {
-            text: value.to_string(),
-            truncated: false,
-            items: None,
-        },
-        RegistryCellValue::None => RegistryRenderedValue {
-            text: String::new(),
-            truncated: false,
-            items: None,
-        },
-        RegistryCellValue::Error => RegistryRenderedValue {
-            text: "value content could not be decoded".to_string(),
-            truncated: false,
-            items: None,
-        },
+        RegistryCellValue::I64(value) => RegistryRenderedValue::scalar(value.to_string(), false),
+        RegistryCellValue::None => RegistryRenderedValue::scalar(String::new(), false),
+        RegistryCellValue::Error => {
+            RegistryRenderedValue::scalar("value content could not be decoded".to_string(), false)
+        }
     }
+}
+
+fn append_registry_text_bounded(
+    target: &mut String,
+    target_chars: &mut usize,
+    value: &str,
+    max_chars: usize,
+) -> bool {
+    let available = max_chars.saturating_sub(*target_chars);
+    let mut chars = value.chars();
+    let appended = chars.by_ref().take(available).collect::<String>();
+    *target_chars = target_chars.saturating_add(appended.chars().count());
+    target.push_str(&appended);
+    chars.next().is_some()
 }
 
 fn registry_clean_string(value: &str) -> String {
@@ -31370,6 +31433,15 @@ fn merge_bitlocker_ntfs_inventory_outcome(
     *image_partial_coverage |= ntfs_partial_coverage;
 }
 
+fn bitlocker_ntfs_inventory_started(indexed_before: usize, indexed_after: usize) -> bool {
+    // The BitLocker partition/container rows are written before the decrypted
+    // NTFS parser is entered. Only a row written by the NTFS parser itself
+    // proves that plaintext enumeration began. Unlock/authentication and NTFS
+    // bootstrap failures therefore remain hard, unpublished failures instead
+    // of being mislabeled as a usable partial filesystem generation.
+    indexed_after > indexed_before
+}
+
 fn process_image_evidence(
     conn: &Connection,
     case_id: i64,
@@ -31513,18 +31585,81 @@ fn process_image_evidence(
                 );
                 progress::progress_set_volume(Some(format!("Partition {}: {}", index + 1, name)));
                 progress::progress_current(logical_path.clone());
-                let detected_filesystem = detect_volume_filesystem_in_range(
+                let detected_filesystem = match detect_volume_filesystem_in_range(
                     &mut *opened.reader,
                     partition.start_offset,
                     partition.size_bytes,
-                )?;
+                ) {
+                    Ok(filesystem) => filesystem,
+                    Err(error) => {
+                        if error_chain_is_job_cancelled(&error) {
+                            return Err(error);
+                        }
+                        let reason = format!(
+                            "filesystem probe failed on partition {} after prior results were indexed: {error}",
+                            index + 1
+                        );
+                        progress::progress_error(Some(logical_path.clone()));
+                        progress::progress_skip(Some(logical_path.clone()));
+                        progress::progress_truncated(reason.clone());
+                        truncated = true;
+                        let partition_end = partition
+                            .start_offset
+                            .checked_add(partition.size_bytes)
+                            .context("validated partition end offset overflow")?;
+                        insert_image_record(
+                            conn,
+                            case_id,
+                            evidence.id,
+                            &logical_path,
+                            name,
+                            Some(i64::try_from(partition.size_bytes).unwrap_or(i64::MAX)),
+                            &serde_json::json!({
+                                "artifact_kind": "disk_partition",
+                                "container_format": opened.format,
+                                "partition_scheme": scheme,
+                                "index": index + 1,
+                                "name": partition.name,
+                                "label": partition.label,
+                                "partition_type": partition.partition_type,
+                                "partition_reported_filesystem": partition.filesystem,
+                                "start_offset": partition.start_offset,
+                                "size_bytes": partition.size_bytes,
+                                "end_offset_exclusive": partition_end,
+                                "offset_coordinate_system": "decoded_media_byte_stream",
+                                "filesystem_parser": "probe_failed",
+                                "filesystem_browsing_status": "filesystem probe failed; earlier partition results were retained as a partial generation",
+                                "partial_coverage": true,
+                                "error": error.to_string(),
+                            }),
+                            job_id,
+                        )?;
+                        indexed += 1;
+                        continue;
+                    }
+                };
                 let bitlocker_locked = detected_filesystem == Some(BITLOCKER_LOCKED_FILESYSTEM);
                 let bitlocker_inspection = if bitlocker_locked {
-                    bitlocker_inspection_at(
+                    match bitlocker_inspection_at(
                         &mut *opened.reader,
                         partition.start_offset,
                         Some(partition.size_bytes),
-                    )?
+                    ) {
+                        Ok(inspection) => inspection,
+                        Err(error) => {
+                            if error_chain_is_job_cancelled(&error) {
+                                return Err(error);
+                            }
+                            let reason = format!(
+                                "BitLocker metadata inspection failed on partition {}: {error}",
+                                index + 1
+                            );
+                            progress::progress_error(Some(logical_path.clone()));
+                            progress::progress_truncated(reason);
+                            truncated = true;
+                            None
+                        }
+                    }
                 } else {
                     None
                 };
@@ -31695,10 +31830,11 @@ fn process_image_evidence(
                     )
                     .with_context(|| {
                         format!(
-                            "unlocking selected BitLocker volume index {index} for NTFS processing"
+                            "unlocking selected BitLocker volume index {index} before NTFS enumeration"
                         )
                     })?;
-                    let bitlocker_ntfs_partial = process_ntfs_partition_entries(
+                    let indexed_before_bitlocker_ntfs = indexed;
+                    match process_ntfs_partition_entries(
                         conn,
                         case_id,
                         evidence.id,
@@ -31714,25 +31850,85 @@ fn process_image_evidence(
                         index + 1,
                         &mut indexed,
                         max_entries,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "processing decrypted NTFS from selected BitLocker volume index {index}"
-                        )
-                    })?;
-                    merge_bitlocker_ntfs_inventory_outcome(&mut truncated, bitlocker_ntfs_partial);
-                    progress::progress_diagnostic(
-                        progress::JobDiagnosticKind::ParserDiagnostic,
-                        if bitlocker_ntfs_partial {
-                            format!(
-                                "BitLocker volume index {index} NTFS inventory ended with partial coverage from a memory-only credential; generation publication policy will retain a prior complete canonical image when one exists"
-                            )
-                        } else {
-                            format!(
-                                "BitLocker volume index {index} NTFS inventory completed from a memory-only credential; follow-up processors must explicitly support the decrypted source context"
-                            )
-                        },
-                    );
+                    ) {
+                        Ok(bitlocker_ntfs_partial) => {
+                            merge_bitlocker_ntfs_inventory_outcome(
+                                &mut truncated,
+                                bitlocker_ntfs_partial,
+                            );
+                            progress::progress_diagnostic(
+                                progress::JobDiagnosticKind::ParserDiagnostic,
+                                if bitlocker_ntfs_partial {
+                                    format!(
+                                        "BitLocker volume index {index} NTFS inventory ended with partial coverage from a memory-only credential; generation publication policy will retain a prior complete canonical image when one exists"
+                                    )
+                                } else {
+                                    format!(
+                                        "BitLocker volume index {index} NTFS inventory completed from a memory-only credential; follow-up processors must explicitly support the decrypted source context"
+                                    )
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            if error_chain_is_job_cancelled(&error) {
+                                return Err(error);
+                            }
+                            if !bitlocker_ntfs_inventory_started(
+                                indexed_before_bitlocker_ntfs,
+                                indexed,
+                            ) {
+                                return Err(error).with_context(|| {
+                                    format!(
+                                        "opening decrypted NTFS from selected BitLocker volume index {index} before any filesystem entries were enumerated"
+                                    )
+                                });
+                            }
+
+                            let rows_retained =
+                                indexed.saturating_sub(indexed_before_bitlocker_ntfs);
+                            let error_message =
+                                error.to_string().chars().take(2_000).collect::<String>();
+                            let reason = format!(
+                                "decrypted BitLocker NTFS parser stopped on volume index {index} after retaining {rows_retained} filesystem row(s): {error_message}"
+                            );
+                            progress::progress_error(Some(volume_prefix.clone()));
+                            progress::progress_skip(Some(volume_prefix.clone()));
+                            progress::progress_truncated(reason.clone());
+                            truncated = true;
+
+                            if indexed < max_entries {
+                                insert_image_record(
+                                    conn,
+                                    case_id,
+                                    evidence.id,
+                                    &format!("{volume_prefix}/Parser Error.record"),
+                                    "Parser Error",
+                                    None,
+                                    &serde_json::json!({
+                                        "artifact_kind": "filesystem_parser_error",
+                                        "filesystem": "NTFS",
+                                        "filesystem_parser": "bitlocker-decrypt+ntfs",
+                                        "partition_index": index + 1,
+                                        "bitlocker_volume_index_zero_based": index,
+                                        "failure_phase": "decrypted_ntfs_inventory",
+                                        "partial_rows_retained": true,
+                                        "filesystem_rows_retained_before_error": rows_retained,
+                                        "error": error_message,
+                                        "bitlocker_credential_storage": "not persisted; recovery key/password was supplied only to the in-memory decrypt session",
+                                    }),
+                                    job_id,
+                                )?;
+                                indexed += 1;
+                            }
+
+                            progress::progress_diagnostic(
+                                progress::JobDiagnosticKind::ParserDiagnostic,
+                                format!(
+                                    "BitLocker volume index {index} NTFS inventory stopped after enumeration began; the partial plaintext generation is publishable only when no prior complete canonical generation exists"
+                                ),
+                            );
+                        }
+                    }
                 } else if can_parse_ntfs && indexed < max_entries {
                     match process_ntfs_partition_entries(
                         conn,
@@ -31856,12 +32052,12 @@ fn process_image_evidence(
                 {
                     // btrfs is not yet browsable; if its superblock is present,
                     // record the volume with parsed metadata (pending walk).
-                    if let Some(info) = read_btrfs_superblock_in_range(
+                    match read_btrfs_superblock_in_range(
                         &mut *opened.reader,
                         partition.start_offset,
                         partition.size_bytes,
-                    )? {
-                        record_btrfs_volume(
+                    ) {
+                        Ok(Some(info)) => record_btrfs_volume(
                             conn,
                             case_id,
                             evidence.id,
@@ -31873,7 +32069,37 @@ fn process_image_evidence(
                             index + 1,
                             &info,
                             &mut indexed,
-                        )?;
+                        )?,
+                        Ok(None) => {}
+                        Err(error) => {
+                            if error_chain_is_job_cancelled(&error) {
+                                return Err(error);
+                            }
+                            let reason = format!(
+                                "optional btrfs probe failed on partition {}: {error}",
+                                index + 1
+                            );
+                            progress::progress_error(Some(volume_prefix.clone()));
+                            progress::progress_truncated(reason.clone());
+                            truncated = true;
+                            insert_image_record(
+                                conn,
+                                case_id,
+                                evidence.id,
+                                &format!("{volume_prefix}/Parser Error.record"),
+                                "Parser Error",
+                                None,
+                                &serde_json::json!({
+                                    "artifact_kind": "filesystem_parser_error",
+                                    "filesystem_parser": "btrfs-probe",
+                                    "partition_index": index + 1,
+                                    "error": error.to_string(),
+                                    "partial_coverage": true,
+                                }),
+                                job_id,
+                            )?;
+                            indexed += 1;
+                        }
                     }
                 }
             }
@@ -31912,7 +32138,7 @@ fn process_image_evidence(
                     .collect();
                 // The whole-image fallback already probed offset 0.
                 let skip: &[u64] = if declared.is_empty() { &[0] } else { &[] };
-                truncated |= scan_lost_partitions(
+                match scan_lost_partitions(
                     conn,
                     case_id,
                     evidence.id,
@@ -31925,7 +32151,21 @@ fn process_image_evidence(
                     declared.len(),
                     &mut indexed,
                     max_entries,
-                )?;
+                ) {
+                    Ok(scan_truncated) => truncated |= scan_truncated,
+                    Err(error) => {
+                        if error_chain_is_job_cancelled(&error) {
+                            return Err(error);
+                        }
+                        progress::progress_error(Some(
+                            "/Image Analysis/Lost Partitions".to_string(),
+                        ));
+                        progress::progress_truncated(format!(
+                            "lost-partition scan stopped after declared-volume results were indexed: {error}"
+                        ));
+                        truncated = true;
+                    }
+                }
             }
         }
         Err(err) => {
@@ -31974,7 +32214,7 @@ fn process_image_evidence(
                 // No partition table at all (e.g. wiped/zeroed sector 0):
                 // sweep the whole disk for orphaned boot sectors. Offset 0 was
                 // already probed by the fallback.
-                truncated |= scan_lost_partitions(
+                match scan_lost_partitions(
                     conn,
                     case_id,
                     evidence.id,
@@ -31987,7 +32227,21 @@ fn process_image_evidence(
                     0,
                     &mut indexed,
                     max_entries,
-                )?;
+                ) {
+                    Ok(scan_truncated) => truncated |= scan_truncated,
+                    Err(error) => {
+                        if error_chain_is_job_cancelled(&error) {
+                            return Err(error);
+                        }
+                        progress::progress_error(Some(
+                            "/Image Analysis/Lost Partitions".to_string(),
+                        ));
+                        progress::progress_truncated(format!(
+                            "whole-image lost-partition scan stopped with partial coverage: {error}"
+                        ));
+                        truncated = true;
+                    }
+                }
             }
         }
     }
@@ -54506,6 +54760,10 @@ mod tests {
             multi.items,
             Some(vec!["one".to_string(), "two".to_string()])
         );
+        assert_eq!(multi.items_total, 2);
+        assert_eq!(multi.items_retained, 2);
+        assert_eq!(multi.items_omitted, 0);
+        assert!(!multi.items_truncated);
 
         let binary_small = registry_render_value(
             RegistryValueDataType::REG_BIN,
@@ -54547,6 +54805,46 @@ mod tests {
         let error_val =
             registry_render_value(RegistryValueDataType::REG_SZ, &RegistryCellValue::Error);
         assert!(error_val.text.contains("could not be decoded"));
+    }
+
+    #[test]
+    fn registry_multi_string_previews_and_item_metadata_are_strictly_bounded() {
+        let mut values = vec!["X".repeat(REGISTRY_MULTI_STRING_ITEM_PREVIEW_CHARS + 100)];
+        values.extend(
+            (0..REGISTRY_MULTI_STRING_ITEM_LIMIT + 10)
+                .map(|index| format!("item-{index:04}-{}", "Y".repeat(80))),
+        );
+        let expected_total = values.len();
+
+        let rendered = registry_render_value(
+            RegistryValueDataType::REG_MULTI_SZ,
+            &RegistryCellValue::MultiString(values),
+        );
+
+        let items = rendered.items.as_ref().expect("multi-string item preview");
+        assert!(rendered.text.chars().count() <= REGISTRY_VALUE_TEXT_PREVIEW_CHARS);
+        assert!(rendered.truncated);
+        assert!(items.len() <= REGISTRY_MULTI_STRING_ITEM_LIMIT);
+        assert!(items
+            .iter()
+            .all(|item| item.chars().count() <= REGISTRY_MULTI_STRING_ITEM_PREVIEW_CHARS));
+        assert!(
+            items.iter().map(|item| item.chars().count()).sum::<usize>()
+                <= REGISTRY_MULTI_STRING_ITEMS_TOTAL_CHARS
+        );
+        assert_eq!(rendered.items_total, expected_total);
+        assert_eq!(rendered.items_retained, items.len());
+        assert_eq!(
+            rendered.items_omitted,
+            expected_total.saturating_sub(items.len())
+        );
+        assert!(rendered.items_omitted > 0);
+        assert!(rendered.items_truncated);
+
+        // JSON escaping can expand a retained character, but the character and
+        // item caps still put a small deterministic ceiling on persisted data.
+        let serialized = serde_json::to_vec(items).expect("serialize bounded item preview");
+        assert!(serialized.len() <= 32 * 1024);
     }
 
     #[test]
@@ -73115,6 +73413,18 @@ mod tests {
         assert!(
             already_partial,
             "later complete work must not erase an earlier gap"
+        );
+    }
+
+    #[test]
+    fn bitlocker_ntfs_failure_is_partial_only_after_decrypted_enumeration_starts() {
+        assert!(
+            !bitlocker_ntfs_inventory_started(12, 12),
+            "unlock/authentication and NTFS bootstrap failures must remain unpublished hard failures"
+        );
+        assert!(
+            bitlocker_ntfs_inventory_started(12, 13),
+            "a row written by the decrypted NTFS parser proves that a partial generation can be retained"
         );
     }
 

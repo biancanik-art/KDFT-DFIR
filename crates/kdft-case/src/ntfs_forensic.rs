@@ -813,6 +813,36 @@ pub fn drop_ntfs_forensic_cache(image_path: &Path, volume_index: usize) -> Resul
 
 fn build_forensic_cache_from_reader<T: Read + Seek>(
     fs: &mut T,
+    partition_start_offset: u64,
+    partition_size_bytes: u64,
+    key: &NtfsForensicCacheKey,
+    tracker: Option<&JobProgressTracker>,
+) -> Result<NtfsForensicCacheEntry> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_forensic_cache_from_reader_inner(
+            fs,
+            partition_start_offset,
+            partition_size_bytes,
+            key,
+            tracker,
+        )
+    })) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = if let Some(message) = payload.downcast_ref::<&str>() {
+                (*message).to_string()
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                message.clone()
+            } else {
+                "unknown panic (no string payload)".to_string()
+            };
+            bail!("NTFS parser panicked during live browse: {message}");
+        }
+    }
+}
+
+fn build_forensic_cache_from_reader_inner<T: Read + Seek>(
+    fs: &mut T,
     _partition_start_offset: u64,
     partition_size_bytes: u64,
     key: &NtfsForensicCacheKey,
@@ -1305,6 +1335,45 @@ mod tests {
         assert_eq!(normalize_dir_path("/Users/Admin/"), "Users/Admin");
         assert_eq!(normalize_dir_path("\\Users\\Admin"), "Users/Admin");
         assert_eq!(normalize_dir_path("/"), "");
+    }
+
+    #[test]
+    fn live_catalog_parser_panic_is_contained_as_an_error() {
+        struct PanickingReader;
+
+        impl Read for PanickingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("simulated live NTFS parser panic");
+            }
+        }
+
+        impl Seek for PanickingReader {
+            fn seek(&mut self, _position: std::io::SeekFrom) -> std::io::Result<u64> {
+                Ok(0)
+            }
+        }
+
+        let key = NtfsForensicCacheKey {
+            image_path: PathBuf::from("synthetic.E01"),
+            volume_start_offset: 0,
+            volume_size_bytes: 1_024,
+            source_modified_utc: None,
+            source_size_bytes: 1_024,
+        };
+        let error = build_forensic_cache_from_reader(
+            &mut PanickingReader,
+            0,
+            key.volume_size_bytes,
+            &key,
+            None,
+        )
+        .expect_err("the live parser panic must be converted to an error");
+        let message = error.to_string();
+        assert!(message.contains("NTFS parser panicked"), "{message}");
+        assert!(
+            message.contains("simulated live NTFS parser panic"),
+            "{message}"
+        );
     }
 
     /// Manual, read-only validation against a real examiner image. The test is

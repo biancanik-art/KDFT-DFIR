@@ -29,6 +29,8 @@ pub use srum::{SrumEseHeaderProbe, SrumLiveRowCounts};
 const PARSER_NAME: &str = "kdft-windows-registry-artifacts-v1";
 const ERROR_SAMPLE_LIMIT: usize = 32;
 const TEMPORARY_DIRECTORY_ATTEMPTS: usize = 1_024;
+const MAX_EMBEDDED_REGISTRY_HIVE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_EMBEDDED_REGISTRY_ENTRIES: usize = 5_000_000;
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -36,6 +38,8 @@ pub struct WindowsRegistryArtifactParseResult {
     pub evidence_id: i64,
     pub hives_found: usize,
     pub hives_parsed: usize,
+    pub generic_keys_indexed: usize,
+    pub generic_values_indexed: usize,
     pub amcache_records_indexed: usize,
     pub userassist_records_indexed: usize,
     pub shellbag_records_indexed: usize,
@@ -120,6 +124,7 @@ struct HiveCandidate {
     logical_path: String,
     exact_path: String,
     name: String,
+    size: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -143,8 +148,10 @@ enum SrumStagedOutcome {
 #[derive(Debug)]
 struct DerivedRecord {
     logical_path: String,
+    entry_kind: &'static str,
     display_name: String,
     metadata: serde_json::Value,
+    size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +168,8 @@ struct ValueObservation {
 
 #[derive(Debug, Default)]
 struct DerivedCounts {
+    generic_keys: usize,
+    generic_values: usize,
     amcache: usize,
     userassist: usize,
     shellbags: usize,
@@ -225,6 +234,12 @@ pub fn parse_windows_registry_artifacts(
         match parse_one_hive(case_path, &mut read_session, evidence_id, candidate) {
             Ok(counts) => {
                 result.hives_parsed = result.hives_parsed.saturating_add(1);
+                result.generic_keys_indexed = result
+                    .generic_keys_indexed
+                    .saturating_add(counts.generic_keys);
+                result.generic_values_indexed = result
+                    .generic_values_indexed
+                    .saturating_add(counts.generic_values);
                 result.amcache_records_indexed = result
                     .amcache_records_indexed
                     .saturating_add(counts.amcache);
@@ -521,7 +536,8 @@ fn registry_candidates(case_path: &Path, evidence_id: i64) -> Result<Vec<HiveCan
                     NULLIF(json_extract(metadata_json, '$.ext_path'), ''),
                     NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''),
                     logical_path
-                )
+                ),
+                size_bytes
          FROM filesystem_entries
          WHERE case_id = ?1 AND evidence_id = ?2
            AND entry_kind = 'file' AND is_deleted = 0
@@ -536,6 +552,9 @@ fn registry_candidates(case_path: &Path, evidence_id: i64) -> Result<Vec<HiveCan
             logical_path: row.get(2)?,
             name: row.get(3)?,
             exact_path: row.get(4)?,
+            size: row
+                .get::<_, Option<i64>>(5)?
+                .and_then(|s| u64::try_from(s).ok()),
         })
     })?;
     let mut candidates = Vec::new();
@@ -557,9 +576,7 @@ fn is_supported_hive_path(name: &str, path: &str) -> bool {
     match name.as_str() {
         "amcache.hve" => path.contains("/windows/appcompat/programs/"),
         "system" | "software" => path.contains("/windows/system32/config/"),
-        "ntuser.dat" | "usrclass.dat" => {
-            path.contains("/users/") || path.contains("/documents and settings/")
-        }
+        "ntuser.dat" | "usrclass.dat" => true,
         _ => false,
     }
 }
@@ -702,9 +719,11 @@ fn derive_srum_records(
         );
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
         records.push(DerivedRecord {
+            entry_kind: "record",
             logical_path,
             display_name,
             metadata,
+            size_bytes: None,
         });
     }
 
@@ -745,9 +764,11 @@ fn derive_srum_records(
         );
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
         records.push(DerivedRecord {
+            entry_kind: "record",
             logical_path,
             display_name,
             metadata,
+            size_bytes: None,
         });
     }
 
@@ -795,9 +816,11 @@ fn derive_srum_records(
         );
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
         records.push(DerivedRecord {
+            entry_kind: "record",
             logical_path,
             display_name,
             metadata,
+            size_bytes: None,
         });
     }
 
@@ -837,9 +860,11 @@ fn derive_srum_records(
         );
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
         records.push(DerivedRecord {
+            entry_kind: "record",
             logical_path,
             display_name,
             metadata,
+            size_bytes: None,
         });
     }
     Ok(records)
@@ -895,8 +920,8 @@ fn replace_srum_source_records(
             evidence_id,
             &record.logical_path,
             &record.display_name,
-            "record",
-            None,
+            record.entry_kind,
+            record.size_bytes.map(|s| s as i64),
             &metadata_text,
             candidate.source_job_id,
         )?;
@@ -963,6 +988,14 @@ fn parse_one_hive(
     let (directory, staging_path) =
         reserve_staging_destination(candidate.entry_id, &candidate.name)?;
     let parsed = (|| -> Result<(Vec<DerivedRecord>, DerivedCounts)> {
+        if let Some(size) = candidate.size {
+            if size > MAX_EMBEDDED_REGISTRY_HIVE_BYTES {
+                anyhow::bail!(
+                    "recovered Registry hive is {} bytes, exceeding the 512 MiB guard limit",
+                    size
+                );
+            }
+        }
         recover_filesystem_entry_in_session(
             read_session,
             RecoverEntryOptions {
@@ -971,8 +1004,39 @@ fn parse_one_hive(
             },
         )
         .with_context(|| format!("recovering Registry hive {}", candidate.exact_path))?;
-        let import = collect_registry_hive_import(&staging_path, &candidate.name, usize::MAX)
-            .with_context(|| format!("parsing Registry hive {}", candidate.exact_path))?;
+
+        let staged_size = fs::metadata(&staging_path)
+            .with_context(|| format!("reading staged Registry hive {}", staging_path.display()))?
+            .len();
+        if staged_size > MAX_EMBEDDED_REGISTRY_HIVE_BYTES {
+            bail!(
+                "recovered Registry hive is {staged_size} bytes, exceeding the 512 MiB guard limit"
+            );
+        }
+
+        if candidate.name.eq_ignore_ascii_case("ntuser.dat")
+            || candidate.name.eq_ignore_ascii_case("usrclass.dat")
+        {
+            let path_lower = candidate.exact_path.replace('\\', "/").to_ascii_lowercase();
+            if !path_lower.contains("/users/") && !path_lower.contains("/documents and settings/") {
+                let mut f = std::fs::File::open(&staging_path)?;
+                let mut magic = [0u8; 4];
+                use std::io::Read;
+                if f.read(&mut magic).unwrap_or(0) < 4 || &magic != b"regf" {
+                    bail!(
+                        "candidate {} does not have a Registry regf header",
+                        candidate.exact_path
+                    );
+                }
+            }
+        }
+
+        let import = collect_registry_hive_import(
+            &staging_path,
+            &candidate.name,
+            MAX_EMBEDDED_REGISTRY_ENTRIES,
+        )
+        .with_context(|| format!("parsing Registry hive {}", candidate.exact_path))?;
         let (mut records, mut counts) = derive_hive_records(candidate, &import);
         if let Some(tool_path) =
             super::external_tools::configured_tool("KDFT_REGRIPPER_PATH", &["rip.exe", "rip"])
@@ -1059,9 +1123,11 @@ fn derive_regripper_records(
     source_metadata(&mut status_metadata, candidate);
     add_entry_category(&mut status_metadata, &status_path, &status_name, "record");
     records.push(DerivedRecord {
+        entry_kind: "record",
         logical_path: status_path,
         display_name: status_name,
         metadata: status_metadata,
+        size_bytes: None,
     });
 
     let mut current_plugin = String::new();
@@ -1104,9 +1170,11 @@ fn derive_regripper_records(
         source_metadata(&mut metadata, candidate);
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
         records.push(DerivedRecord {
+            entry_kind: "record",
             logical_path,
             display_name,
             metadata,
+            size_bytes: None,
         });
         line_count = line_count.saturating_add(1);
     }
@@ -1172,9 +1240,11 @@ fn regripper_failure_record(
     source_metadata(&mut metadata, candidate);
     add_entry_category(&mut metadata, &logical_path, &display_name, "record");
     DerivedRecord {
+        entry_kind: "record",
         logical_path,
         display_name,
         metadata,
+        size_bytes: None,
     }
 }
 
@@ -1219,7 +1289,81 @@ fn derive_hive_records(
         .collect::<Vec<_>>();
     let hive = candidate.name.to_ascii_lowercase();
     let mut records = Vec::new();
-    let mut counts = DerivedCounts::default();
+    let mut counts = DerivedCounts {
+        generic_keys: import.keys_indexed,
+        generic_values: import.values_indexed,
+        ..DerivedCounts::default()
+    };
+
+    for entry in &import.entries {
+        let import_root = import.root_logical_path.trim_end_matches('/');
+        let entry_path = entry.logical_path.trim_end_matches('/');
+        let is_hive_root = entry_path == import_root
+            || entry.metadata["artifact_kind"].as_str() == Some("registry_hive");
+        let relative_path = if is_hive_root {
+            ""
+        } else {
+            entry_path
+                .strip_prefix(import_root)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .unwrap_or_else(|| entry_path.trim_start_matches('/'))
+        };
+        let hive_root = format!("/Windows Artifacts/Registry/{}/Hive", candidate.entry_id);
+        let logical_path = if relative_path.is_empty() {
+            hive_root
+        } else {
+            format!("{hive_root}/{relative_path}")
+        };
+        let mut metadata = entry.metadata.clone();
+        source_metadata(&mut metadata, candidate);
+        metadata["windows_registry_source_exact_path"] = serde_json::json!(candidate.exact_path);
+        metadata["registry_key_last_write_semantics"] = serde_json::json!(
+            "LastWrite belongs to the containing key; Windows Registry does not track an individual value modification time"
+        );
+        if metadata["registry_key_offset"].is_number() {
+            metadata["registry_key_offset_basis"] = serde_json::json!(
+                "byte offset within the recovered Registry hive file; not a decoded-media or acquisition-container physical offset"
+            );
+        }
+        if metadata["registry_value_offset"].is_number() {
+            metadata["registry_value_offset_basis"] = serde_json::json!(
+                "byte offset within the recovered Registry hive file; not a decoded-media or acquisition-container physical offset"
+            );
+        }
+        if is_hive_root {
+            metadata["windows_registry_keys_indexed"] = serde_json::json!(import.keys_indexed);
+            metadata["windows_registry_values_indexed"] = serde_json::json!(import.values_indexed);
+            metadata["windows_registry_entries_seen"] =
+                serde_json::json!(import.total_entries_seen);
+            metadata["windows_registry_entry_limit"] =
+                serde_json::json!(MAX_EMBEDDED_REGISTRY_ENTRIES);
+            metadata["windows_registry_truncated"] = serde_json::json!(import.truncated);
+            metadata["windows_registry_limitations"] = serde_json::json!(
+                "Allocated keys and values only; transaction-log replay and deleted/slack recovery were not attempted"
+            );
+        }
+
+        let entry_kind = if entry.entry_kind == "directory" {
+            "directory"
+        } else {
+            "record"
+        };
+        add_entry_category(
+            &mut metadata,
+            &logical_path,
+            &entry.display_name,
+            entry_kind,
+        );
+
+        records.push(DerivedRecord {
+            entry_kind,
+            logical_path,
+            display_name: entry.display_name.clone(),
+            metadata,
+            size_bytes: entry.size_bytes.and_then(|size| u64::try_from(size).ok()),
+        });
+    }
+
     if hive == "amcache.hve" {
         let derived = derive_amcache(candidate, &observations);
         counts.amcache = derived.len();
@@ -1404,9 +1548,11 @@ fn derive_shimcache(
             source_metadata(&mut metadata, candidate);
             add_entry_category(&mut metadata, &logical_path, &display_name, "record");
             records.push(DerivedRecord {
+                entry_kind: "record",
                 logical_path,
                 display_name,
                 metadata,
+                size_bytes: None,
             });
         }
 
@@ -1524,9 +1670,11 @@ fn derive_amcache(
             source_metadata(&mut metadata, candidate);
             add_entry_category(&mut metadata, &logical_path, &display_name, "record");
             DerivedRecord {
+                entry_kind: "record",
                 logical_path,
                 display_name,
                 metadata,
+                size_bytes: None,
             }
         })
         .collect()
@@ -1571,7 +1719,7 @@ fn derive_userassist(
             });
             source_metadata(&mut metadata, candidate);
             add_entry_category(&mut metadata, &logical_path, &decoded_name, "record");
-            DerivedRecord { logical_path, display_name: decoded_name, metadata }
+            DerivedRecord { entry_kind: "record",  logical_path, display_name: decoded_name, metadata, size_bytes: None }
         })
         .collect()
 }
@@ -1775,9 +1923,11 @@ fn derive_user_registry_activity(
         source_metadata(&mut metadata, candidate);
         add_entry_category(&mut metadata, &logical_path, &display_name, "record");
         records.push(DerivedRecord {
+            entry_kind: "record",
             logical_path,
             display_name,
             metadata,
+            size_bytes: None,
         });
     }
     records
@@ -1843,11 +1993,12 @@ fn derive_mount_point_records(
             });
             source_metadata(&mut metadata, candidate);
             add_entry_category(&mut metadata, &logical_path, &display_name, "record");
-            DerivedRecord {
+            DerivedRecord { entry_kind: "record",
                 logical_path,
                 display_name,
                 metadata,
-            }
+            size_bytes: None,
+        }
         })
         .collect()
 }
@@ -2007,7 +2158,7 @@ fn derive_shellbags(
             });
             source_metadata(&mut metadata, candidate);
             add_entry_category(&mut metadata, &logical_path, &resolved_path, "record");
-            DerivedRecord { logical_path, display_name: resolved_path, metadata }
+            DerivedRecord { entry_kind: "record",  logical_path, display_name: resolved_path, metadata, size_bytes: None }
         })
         .collect()
 }
@@ -2041,7 +2192,7 @@ fn derive_startup_records(
             });
             source_metadata(&mut metadata, candidate);
             add_entry_category(&mut metadata, &logical_path, &display_name, "record");
-            DerivedRecord { logical_path, display_name, metadata }
+            DerivedRecord { entry_kind: "record",  logical_path, display_name, metadata, size_bytes: None }
         })
         .collect()
 }
@@ -2082,6 +2233,10 @@ fn source_metadata(metadata: &mut serde_json::Value, candidate: &HiveCandidate) 
             "source_hive_name".to_string(),
             serde_json::json!(candidate.name),
         );
+        object.insert(
+            "windows_registry_source_job_id".to_string(),
+            serde_json::json!(candidate.source_job_id),
+        );
     }
 }
 
@@ -2108,8 +2263,10 @@ fn replace_source_records(
             evidence_id,
             &record.logical_path,
             &record.display_name,
-            "record",
-            None,
+            record.entry_kind,
+            record
+                .size_bytes
+                .map(|size| i64::try_from(size).unwrap_or(i64::MAX)),
             &record.metadata.to_string(),
             candidate.source_job_id,
         )?;
@@ -2360,6 +2517,7 @@ mod tests {
             logical_path: format!("/C/Users/Alice/{name}"),
             exact_path: format!("C/Users/Alice/{name}"),
             name: name.to_string(),
+            size: None,
         }
     }
 
@@ -2450,6 +2608,11 @@ mod tests {
         assert!(is_supported_hive_path(
             "UsrClass.dat",
             "/Documents and Settings/Alice/UsrClass.dat"
+        ));
+        assert!(is_supported_hive_path("NTUSER.DAT", "NTUSER.DAT"));
+        assert!(is_supported_hive_path(
+            "UsrClass.dat",
+            "extracted/UsrClass.dat"
         ));
         assert!(!is_supported_hive_path(
             "SYSTEM",
@@ -2719,6 +2882,7 @@ mod tests {
             logical_path: "/Image Analysis/SYSTEM".to_string(),
             exact_path: "Windows/System32/config/SYSTEM".to_string(),
             name: "SYSTEM".to_string(),
+            size: None,
         };
         let (records, coverage) = derive_shimcache(&candidate, &observations);
         assert_eq!(records.len(), 1);
@@ -2763,6 +2927,7 @@ mod tests {
             logical_path: "/Image Analysis/SYSTEM".to_string(),
             exact_path: "Windows/System32/config/SYSTEM".to_string(),
             name: "SYSTEM".to_string(),
+            size: None,
         };
         let (records, coverage) = derive_shimcache(&candidate, &observations);
         assert!(records.is_empty());
@@ -2772,5 +2937,110 @@ mod tests {
             .limitation
             .as_deref()
             .is_some_and(|value| value.contains("no records were claimed")));
+    }
+
+    #[test]
+    fn generic_registry_tree_persists_complete_hierarchy_with_distinct_kinds_and_provenance() {
+        let import = RegistryImportData {
+            entries: vec![
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER".to_string(),
+                    display_name: "NTUSER".to_string(),
+                    entry_kind: "directory",
+                    size_bytes: None,
+                    metadata: serde_json::json!({
+                        "artifact_kind": "registry_hive",
+                        "registry_key_path": "ROOT",
+                        "registry_key_last_write_utc": "2026-10-05T00:00:00Z",
+                    }),
+                    raw_value_bytes: None,
+                },
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER/Software".to_string(),
+                    display_name: "Software".to_string(),
+                    entry_kind: "directory",
+                    size_bytes: None,
+                    metadata: serde_json::json!({
+                        "registry_key_path": "ROOT\\Software",
+                        "registry_key_last_write_utc": "2026-10-05T00:00:01Z",
+                    }),
+                    raw_value_bytes: None,
+                },
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER/Software/Value".to_string(),
+                    display_name: "Value".to_string(),
+                    entry_kind: "record",
+                    size_bytes: Some(4),
+                    metadata: serde_json::json!({
+                        "registry_key_path": "ROOT\\Software",
+                        "registry_key_last_write_utc": "2026-10-05T00:00:01Z",
+                        "registry_value_name": "Value",
+                        "registry_value_type": "REG_DWORD",
+                        "registry_value_data": "42",
+                        "registry_deleted_recovery": "not attempted",
+                    }),
+                    raw_value_bytes: None,
+                },
+            ],
+            keys_indexed: 2,
+            values_indexed: 1,
+            total_entries_seen: 3,
+            truncated: false,
+            root_logical_path: "/Registry/NTUSER".to_string(),
+        };
+
+        let candidate = HiveCandidate {
+            entry_id: 100,
+            source_job_id: 10,
+            logical_path: "/Image Analysis/NTUSER.DAT".to_string(),
+            exact_path: "Users/Alice/NTUSER.DAT".to_string(),
+            name: "NTUSER.DAT".to_string(),
+            size: None,
+        };
+
+        let (records, counts) = derive_hive_records(&candidate, &import);
+        assert_eq!(counts.generic_keys, 2);
+        assert_eq!(counts.generic_values, 1);
+
+        let root = records
+            .iter()
+            .find(|r| r.logical_path == "/Windows Artifacts/Registry/100/Hive")
+            .unwrap();
+        assert_eq!(root.entry_kind, "directory");
+        assert_eq!(root.metadata["windows_registry_derived"], true);
+        assert_eq!(root.metadata["source_entry_id"], 100);
+        assert_eq!(
+            root.metadata["source_artifact_path"],
+            "Users/Alice/NTUSER.DAT"
+        );
+        assert_eq!(root.metadata["windows_registry_source_entry_id"], 100);
+        assert_eq!(
+            root.metadata["windows_registry_source_exact_path"],
+            "Users/Alice/NTUSER.DAT"
+        );
+        assert_eq!(root.metadata["windows_registry_keys_indexed"], 2);
+        assert_eq!(root.metadata["windows_registry_values_indexed"], 1);
+        assert_eq!(root.metadata["windows_registry_entries_seen"], 3);
+        assert_eq!(root.metadata["windows_registry_truncated"], false);
+        assert!(root.metadata["windows_registry_limitations"]
+            .as_str()
+            .is_some_and(|value| value.contains("Allocated keys and values only")));
+        assert!(root.metadata["analysis_category"].is_string());
+
+        let value = records
+            .iter()
+            .find(|r| r.logical_path == "/Windows Artifacts/Registry/100/Hive/Software/Value")
+            .unwrap();
+        assert_eq!(value.entry_kind, "record");
+        assert_eq!(value.size_bytes, Some(4));
+        assert_eq!(value.metadata["windows_registry_derived"], true);
+        assert_eq!(value.metadata["registry_value_name"], "Value");
+        assert_eq!(value.metadata["registry_value_data"], "42");
+        assert_eq!(value.metadata["registry_deleted_recovery"], "not attempted");
+        assert_eq!(
+            value.metadata["registry_key_last_write_utc"],
+            "2026-10-05T00:00:01Z"
+        );
+        assert_eq!(value.metadata["modified_utc"], serde_json::Value::Null);
     }
 }
