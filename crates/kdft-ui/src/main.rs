@@ -6767,6 +6767,24 @@ mod tests {
     }
 
     #[test]
+    fn background_analysis_recovery_surfaces_failures_for_retained_evidence() {
+        let function = INDEX_HTML
+            .split_once("async function recoverBackgroundEvidenceJob(evidence) {")
+            .expect("missing function")
+            .1
+            .split_once("async function pollEvidenceJobUntilTerminal(evidenceId, progressId) {")
+            .expect("end of function")
+            .0;
+        assert!(function.contains("} catch (e) {"));
+        assert!(function.contains("invalidateIndexedBrowseCache(evidence.id);"));
+        assert!(function.contains("await refresh();"));
+        assert!(
+            function.contains("if (evidenceIdentityStillAvailable(expectedCasePath, evidence)) {")
+        );
+        assert!(function.contains("setNotice(\"Background processing failed"));
+    }
+
+    #[test]
     fn mailbox_ui_discloses_native_boundary_and_attempt_metadata() {
         for disclosure in [
             "PST/OST/NST",
@@ -12942,8 +12960,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     async function recoverBackgroundEvidenceJob(evidence) {
       if (activeBackgroundJobs.has(evidence.id)) return;
       if (state.analyzing) return;
+      const expectedCasePath = currentCasePath();
       try {
-        const statusResult = await apiGet("/api/evidence/status", { case_path: currentCasePath(), evidence_id: evidence.id }).catch(() => null);
+        const statusResult = await apiGet("/api/evidence/status", { case_path: expectedCasePath, evidence_id: evidence.id }).catch(() => null);
         if (statusResult && statusResult.progress && statusResult.progress.state === "active") {
           activeBackgroundJobs.add(evidence.id);
           try {
@@ -12973,6 +12992,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
           }
         }
       } catch (e) {
+        invalidateIndexedBrowseCache(evidence.id);
+        await refresh();
+        if (evidenceIdentityStillAvailable(expectedCasePath, evidence)) {
+          setNotice("Background processing failed for " + evidence.display_name + ": " + e.message, true);
+        }
       }
     }
 
