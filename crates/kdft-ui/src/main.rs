@@ -6747,6 +6747,26 @@ mod tests {
     }
 
     #[test]
+    fn background_analysis_recovery_is_correlated_to_the_exact_progress_id() {
+        let recovery = INDEX_HTML
+            .split_once("async function pollEvidenceJobUntilTerminal(evidenceId, progressId) {")
+            .expect("exact-progress background recovery function")
+            .1
+            .split_once("async function readApiResponse(response) {")
+            .expect("end of background recovery function")
+            .0;
+        assert!(recovery.contains("apiGet(\"/api/jobs/progress\", { progress_id: progressId })"));
+        assert!(recovery.contains("progress.operation_id !== progressId"));
+        assert!(recovery.contains("Number(progress.evidence_id) !== Number(evidenceId)"));
+        assert!(recovery.contains("progress.state === \"failed\""));
+        assert!(recovery.contains("progress.state === \"cancelled\""));
+        assert!(!recovery.contains("/api/evidence/status"));
+        assert!(!INDEX_HTML.contains("pollEvidenceJobUntilTerminal(data.evidence_id);"));
+        assert!(!INDEX_HTML.contains("pollEvidenceJobUntilTerminal(id);"));
+        assert!(INDEX_HTML.contains("pollEvidenceJobUntilTerminal(imageEvidence.id, progressId)"));
+    }
+
+    #[test]
     fn mailbox_ui_discloses_native_boundary_and_attempt_metadata() {
         for disclosure in [
             "PST/OST/NST",
@@ -12927,7 +12947,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         if (statusResult && statusResult.progress && statusResult.progress.state === "active") {
           activeBackgroundJobs.add(evidence.id);
           try {
-            const data = await runAnalyze(evidence.display_name, async () => pollEvidenceJobUntilTerminal(evidence.id), {
+            const data = await runAnalyze(evidence.display_name, async () => pollEvidenceJobUntilTerminal(
+              evidence.id,
+              statusResult.progress.operation_id
+            ), {
               mode: "analyze",
               title: "Reconnected to ",
               note: "Processing was already running in the background. Please wait and do not click Analyze again or open other views until it finishes.",
@@ -12953,25 +12976,63 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
-    async function pollEvidenceJobUntilTerminal(evidenceId) {
+    async function pollEvidenceJobUntilTerminal(evidenceId, progressId) {
+      if (!progressId) {
+        throw new Error("Cannot reconnect to analysis without its exact progress id.");
+      }
       let consecutiveFailures = 0;
       while (true) {
+        let progress;
         try {
-          const statusResult = await apiGet("/api/evidence/status", { case_path: currentCasePath(), evidence_id: evidenceId });
-          consecutiveFailures = 0;
-          if (statusResult && statusResult.progress && statusResult.progress.state !== "active") {
-            return statusResult;
+          progress = await apiGet("/api/jobs/progress", { progress_id: progressId });
+          if (progress && progress.evidence_id == null) {
+            throw new Error("Evidence ID not yet registered.");
           }
+          consecutiveFailures = 0;
         } catch (error) {
           consecutiveFailures += 1;
           if (consecutiveFailures >= 8) {
             throw new Error("Could not reconnect to the background analysis after 8 attempts: " + String(error && error.message || error));
           }
+          const delayMs = Math.min(5000, 500 * Math.pow(2, consecutiveFailures - 1));
+          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+          continue;
         }
-        const delayMs = consecutiveFailures
-          ? Math.min(5000, 500 * Math.pow(2, consecutiveFailures - 1))
-          : 1000;
-        await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+
+        if (!progress
+          || progress.operation_id !== progressId
+          || Number(progress.evidence_id) !== Number(evidenceId)
+          || !["process", "processors"].includes(progress.job_type)) {
+          throw new Error("Background analysis progress did not match the requested operation.");
+        }
+        if (progress.state === "active") {
+          await new Promise((resolve) => window.setTimeout(resolve, 1000));
+          continue;
+        }
+        if (progress.state === "failed") {
+          throw new Error("Analysis failed."
+            + (progress.diagnostic_log_path ? " Diagnostic log: " + progress.diagnostic_log_path + "." : ""));
+        }
+        if (progress.state === "cancelled") {
+          throw new Error("Analysis was cancelled.");
+        }
+        const status = progress.state === "complete"
+          ? "completed"
+          : (progress.state === "complete_with_diagnostics"
+            ? "completed_with_diagnostics"
+            : (progress.state === "truncated" ? "truncated" : null));
+        if (!status) {
+          throw new Error("Analysis returned an unknown terminal state: " + String(progress.state || "missing") + ".");
+        }
+        return {
+          evidence_id: evidenceId,
+          status,
+          truncated: status === "truncated",
+          completed_with_diagnostics: status === "completed_with_diagnostics",
+          partial_artifact_coverage: ["completed_with_diagnostics", "truncated"].includes(status),
+          diagnostic_log_path: progress.diagnostic_log_path || null,
+          progress
+        };
       }
     }
 
@@ -13781,7 +13842,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           } catch (processErr) {
             const networkFailure = processErr instanceof TypeError && /failed to fetch|network/i.test(String(processErr.message || processErr));
             if (networkFailure) {
-              processed = await pollEvidenceJobUntilTerminal(data.evidence_id);
+              processed = await pollEvidenceJobUntilTerminal(data.evidence_id, progressId);
               if (!processed) {
                 throw processErr; // Could not recover, throw original error
               }
@@ -14431,7 +14492,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           } catch (processErr) {
             const networkFailure = processErr instanceof TypeError && /failed to fetch|network/i.test(String(processErr.message || processErr));
             if (networkFailure) {
-              data = await pollEvidenceJobUntilTerminal(id);
+              data = await pollEvidenceJobUntilTerminal(id, progressId);
               if (!data) {
                 throw processErr;
               }
@@ -14900,13 +14961,26 @@ const INDEX_HTML: &str = r###"<!doctype html>
           const additive = !newlyAttached
             && evidenceIndexedEntryCount(imageEvidence.id) > 0
             && !options.reindex_filesystem;
-          const processed = await apiPost(additive ? "/api/evidence/run-processors" : "/api/evidence/process", {
-            case_path: currentCasePath(),
-            evidence_id: imageEvidence.id,
-            max_entries: currentProcessMaxEntries(),
-            progress_id: progressId,
-            ...options
-          });
+          let processed;
+          try {
+            processed = await apiPost(additive ? "/api/evidence/run-processors" : "/api/evidence/process", {
+              case_path: currentCasePath(),
+              evidence_id: imageEvidence.id,
+              max_entries: currentProcessMaxEntries(),
+              progress_id: progressId,
+              ...options
+            });
+          } catch (processErr) {
+            const networkFailure = processErr instanceof TypeError && /failed to fetch|network/i.test(String(processErr.message || processErr));
+            if (networkFailure) {
+              processed = await pollEvidenceJobUntilTerminal(imageEvidence.id, progressId);
+              if (!processed) {
+                throw processErr;
+              }
+            } else {
+              throw processErr;
+            }
+          }
           if (state.analyzing) {
             state.analyzing.telemetry = processed.progress || state.analyzing.telemetry;
             state.analyzing.telemetryReceivedAt = Date.now();
