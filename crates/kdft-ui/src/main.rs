@@ -6785,6 +6785,163 @@ mod tests {
     }
 
     #[test]
+    fn background_analysis_recovery_is_keyed_by_case_and_full_evidence_identity() {
+        let key = INDEX_HTML
+            .split_once("function evidenceRecoveryKey(casePath, evidence) {")
+            .expect("missing recovery identity key")
+            .1
+            .split_once("const activeBackgroundJobs = new Set();")
+            .expect("end of recovery identity key")
+            .0;
+        for field in [
+            "casePath",
+            "evidence.id",
+            "evidence.source_kind",
+            "evidence.source_path",
+            "evidence.attached_at",
+        ] {
+            assert!(key.contains(field), "recovery key must include {field}");
+        }
+
+        let function = INDEX_HTML
+            .split_once("async function recoverBackgroundEvidenceJob(evidence) {")
+            .expect("missing function")
+            .1
+            .split_once("async function pollEvidenceJobUntilTerminal(evidenceId, progressId) {")
+            .expect("end of function")
+            .0;
+
+        assert!(function.contains("const expectedCasePath = currentCasePath();"));
+        assert!(
+            function.contains("const jobKey = evidenceRecoveryKey(expectedCasePath, evidence);")
+        );
+        assert_eq!(
+            function
+                .matches("if (activeBackgroundJobs.has(jobKey)) return;")
+                .count(),
+            2,
+            "both pre-status and post-status single-flight checks are required"
+        );
+        assert!(
+            function
+                .find("if (activeBackgroundJobs.has(jobKey)) return;")
+                .expect("pre-status single-flight guard")
+                < function
+                    .find("await apiGet(\"/api/evidence/status\"")
+                    .expect("status request"),
+            "the existing owner must be detected before starting another status request"
+        );
+        assert!(function.contains("if (statusResult && statusResult.progress && statusResult.progress.state === \"active\") {\n          if (activeBackgroundJobs.has(jobKey)) return;\n          activeBackgroundJobs.add(jobKey);"));
+        assert!(function.contains("activeBackgroundJobs.add(jobKey);\n          try {"));
+        assert_eq!(
+            function
+                .matches("activeBackgroundJobs.add(jobKey);")
+                .count(),
+            1
+        );
+        assert_eq!(
+            function
+                .matches("activeBackgroundJobs.delete(jobKey);")
+                .count(),
+            1
+        );
+        assert!(function.contains("activeBackgroundJobs.delete(jobKey);"));
+        assert!(!function.contains("activeBackgroundJobs.has(evidence.id)"));
+        assert!(!function.contains("activeBackgroundJobs.delete(evidence.id)"));
+    }
+
+    #[test]
+    fn background_analysis_recovery_stale_success_cannot_mutate_new_case() {
+        let function = INDEX_HTML
+            .split_once("async function recoverBackgroundEvidenceJob(evidence) {")
+            .expect("missing function")
+            .1
+            .split_once("async function pollEvidenceJobUntilTerminal(evidenceId, progressId) {")
+            .expect("end of function")
+            .0;
+        let success = function
+            .split_once("const data = await runAnalyze(")
+            .expect("background recovery await")
+            .1
+            .split_once("} finally {")
+            .expect("end of background recovery success path")
+            .0;
+
+        let post_poll_guard = success
+            .find("if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) return;")
+            .expect("missing post-poll identity guard");
+        let invalidate = success
+            .find("invalidateIndexedBrowseCache(evidence.id);")
+            .expect("missing success cache invalidation");
+        assert!(
+            post_poll_guard < invalidate,
+            "stale success must return before touching the cache"
+        );
+        assert!(success.contains("await refresh();\n              if (evidenceIdentityStillAvailable(expectedCasePath, evidence)) {\n                selectEvidenceSource(evidence.id, preferredAnalysisPath(evidence.id), \"filesystem\");\n                setNotice(message);\n              }"));
+    }
+
+    #[test]
+    fn background_analysis_recovery_stale_failure_cannot_mutate_new_case() {
+        let function = INDEX_HTML
+            .split_once("async function recoverBackgroundEvidenceJob(evidence) {")
+            .expect("missing function")
+            .1
+            .split_once("async function pollEvidenceJobUntilTerminal(evidenceId, progressId) {")
+            .expect("end of function")
+            .0;
+        let failure = function
+            .rsplit_once("} catch (e) {")
+            .expect("background recovery failure path")
+            .1;
+        assert!(failure.starts_with(
+            "\n        if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) return;"
+        ));
+        assert!(failure.contains("invalidateIndexedBrowseCache(evidence.id);\n        await refresh();\n        if (evidenceIdentityStillAvailable(expectedCasePath, evidence)) {\n          setNotice(\"Background processing failed"));
+    }
+
+    #[test]
+    fn analyze_disk_image_entry_validates_case_context_after_async() {
+        let function = INDEX_HTML
+            .split_once("async function analyzeDiskImageEntry(entryId) {")
+            .expect("missing analyzeDiskImageEntry")
+            .1
+            .split_once("async function importHistory() {")
+            .expect("end of function")
+            .0;
+        assert!(function.contains("const expectedCasePath = currentCasePath();"));
+        assert!(function.contains("case_path: expectedCasePath,"));
+        assert!(!function.contains("case_path: currentCasePath(),"));
+
+        // Structurally forbid unconditional mutations after async add/process/poll
+        assert!(!function
+            .contains("setNotice(\"\");\n            await refresh();\n            imageEvidence"));
+
+        // Check the exact pre-refresh and post-refresh structural guards are present
+        assert!(function.contains("if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) {\n              return;\n            }\n            setNotice(\"\");"));
+        assert!(function.contains("await refresh();\n            if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) {\n              return;\n            }"));
+
+        assert!(function.contains("if (!evidenceIdentityStillAvailable(expectedCasePath, evidence) ||\n              !evidenceIdentityStillAvailable(expectedCasePath, imageEvidence)) {\n            return;\n          }\n          if (state.analyzing) {"));
+
+        assert!(function.contains("await refresh();\n          if (!evidenceIdentityStillAvailable(expectedCasePath, evidence) ||\n              !evidenceIdentityStillAvailable(expectedCasePath, imageEvidence)) {\n            return;\n          }\n          if (state.live.evidenceId"));
+
+        assert!(function.contains("await refresh();\n          if (!evidenceIdentityStillAvailable(expectedCasePath, evidence) ||\n              (imageEvidence && !evidenceIdentityStillAvailable(expectedCasePath, imageEvidence))) {\n            return;\n          }\n          setNotice(err.message, true);"));
+    }
+
+    #[test]
+    fn poll_evidence_job_until_terminal_retries_empty_progress() {
+        let function = INDEX_HTML
+            .split_once("async function pollEvidenceJobUntilTerminal(evidenceId, progressId) {")
+            .expect("missing function")
+            .1
+            .split_once("async function readApiResponse(response) {")
+            .expect("end of function")
+            .0;
+        assert!(function.contains("if (!progress || progress.evidence_id == null) {"));
+        assert!(!function.contains("if (!progress\n"));
+        assert!(function.contains("throw new Error(\"Background analysis progress did not match the requested operation.\");"));
+    }
+
+    #[test]
     fn mailbox_ui_discloses_native_boundary_and_attempt_metadata() {
         for disclosure in [
             "PST/OST/NST",
@@ -12955,16 +13112,29 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
+    function evidenceRecoveryKey(casePath, evidence) {
+      return JSON.stringify([
+        casePath,
+        evidence.id,
+        evidence.source_kind,
+        evidence.source_path,
+        evidence.attached_at
+      ]);
+    }
+
     const activeBackgroundJobs = new Set();
 
     async function recoverBackgroundEvidenceJob(evidence) {
-      if (activeBackgroundJobs.has(evidence.id)) return;
-      if (state.analyzing) return;
       const expectedCasePath = currentCasePath();
+      const jobKey = evidenceRecoveryKey(expectedCasePath, evidence);
+      if (activeBackgroundJobs.has(jobKey)) return;
+      if (state.analyzing) return;
       try {
         const statusResult = await apiGet("/api/evidence/status", { case_path: expectedCasePath, evidence_id: evidence.id }).catch(() => null);
+        if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) return;
         if (statusResult && statusResult.progress && statusResult.progress.state === "active") {
-          activeBackgroundJobs.add(evidence.id);
+          if (activeBackgroundJobs.has(jobKey)) return;
+          activeBackgroundJobs.add(jobKey);
           try {
             const data = await runAnalyze(evidence.display_name, async () => pollEvidenceJobUntilTerminal(
               evidence.id,
@@ -12975,6 +13145,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
               note: "Processing was already running in the background. Please wait and do not click Analyze again or open other views until it finishes.",
               progressId: statusResult.progress.operation_id
             });
+            if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) return;
             if (data) {
               const message = processingCompletionNotice(
                 data,
@@ -12982,16 +13153,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
               );
               invalidateIndexedBrowseCache(evidence.id);
               await refresh();
-              if (state.data && state.data.evidence.some((item) => item.id === evidence.id)) {
+              if (evidenceIdentityStillAvailable(expectedCasePath, evidence)) {
                 selectEvidenceSource(evidence.id, preferredAnalysisPath(evidence.id), "filesystem");
                 setNotice(message);
               }
             }
           } finally {
-            activeBackgroundJobs.delete(evidence.id);
+            activeBackgroundJobs.delete(jobKey);
           }
         }
       } catch (e) {
+        if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) return;
         invalidateIndexedBrowseCache(evidence.id);
         await refresh();
         if (evidenceIdentityStillAvailable(expectedCasePath, evidence)) {
@@ -13009,7 +13181,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         let progress;
         try {
           progress = await apiGet("/api/jobs/progress", { progress_id: progressId });
-          if (progress && progress.evidence_id == null) {
+          if (!progress || progress.evidence_id == null) {
             throw new Error("Evidence ID not yet registered.");
           }
           consecutiveFailures = 0;
@@ -13023,8 +13195,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           continue;
         }
 
-        if (!progress
-          || progress.operation_id !== progressId
+        if (progress.operation_id !== progressId
           || Number(progress.evidence_id) !== Number(evidenceId)
           || !["process", "processors"].includes(progress.job_type)) {
           throw new Error("Background analysis progress did not match the requested operation.");
@@ -14953,6 +15124,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Select a disk image entry first.", true);
         return;
       }
+      const expectedCasePath = currentCasePath();
+      if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) {
+        return;
+      }
       const imagePath = evidenceEntryLocalPath(evidence, entry);
       if (!imagePath) {
         setNotice("This disk image entry cannot be analyzed directly from its current source.", true);
@@ -14966,14 +15141,20 @@ const INDEX_HTML: &str = r###"<!doctype html>
           imageEvidence = state.data.evidence.find((item) => sameLocalPath(item.source_path, imagePath));
           if (!imageEvidence) {
             const attached = await apiPost("/api/evidence/add", {
-              case_path: currentCasePath(),
+              case_path: expectedCasePath,
               path: imagePath,
               kind: "image",
               read_file_system: true,
               notes: "Promoted from " + evidence.display_name + " " + entry.logical_path
             });
+            if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) {
+              return;
+            }
             setNotice("");
             await refresh();
+            if (!evidenceIdentityStillAvailable(expectedCasePath, evidence)) {
+              return;
+            }
             imageEvidence = state.data.evidence.find((item) => item.id === attached.evidence_id);
             newlyAttached = true;
           }
@@ -14988,7 +15169,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           let processed;
           try {
             processed = await apiPost(additive ? "/api/evidence/run-processors" : "/api/evidence/process", {
-              case_path: currentCasePath(),
+              case_path: expectedCasePath,
               evidence_id: imageEvidence.id,
               max_entries: currentProcessMaxEntries(),
               progress_id: progressId,
@@ -15005,6 +15186,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
               throw processErr;
             }
           }
+          if (!evidenceIdentityStillAvailable(expectedCasePath, evidence) ||
+              !evidenceIdentityStillAvailable(expectedCasePath, imageEvidence)) {
+            return;
+          }
           if (state.analyzing) {
             state.analyzing.telemetry = processed.progress || state.analyzing.telemetry;
             state.analyzing.telemetryReceivedAt = Date.now();
@@ -15018,8 +15203,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           );
           invalidateIndexedBrowseCache(imageEvidence.id);
           await refresh();
-          if (!state.data || !state.data.evidence.some((item) => item.id === imageEvidence.id)) {
-            setNotice("");
+          if (!evidenceIdentityStillAvailable(expectedCasePath, evidence) ||
+              !evidenceIdentityStillAvailable(expectedCasePath, imageEvidence)) {
             return;
           }
           if (state.live.evidenceId === imageEvidence.id) {
@@ -15029,10 +15214,18 @@ const INDEX_HTML: &str = r###"<!doctype html>
           selectEvidenceSource(imageEvidence.id, preferredAnalysisPath(imageEvidence.id), "filesystem");
           setNotice(message);
         } catch (err) {
+          if (!evidenceIdentityStillAvailable(expectedCasePath, evidence) ||
+              (imageEvidence && !evidenceIdentityStillAvailable(expectedCasePath, imageEvidence))) {
+            return;
+          }
           if (imageEvidence) {
             invalidateIndexedBrowseCache(imageEvidence.id);
           }
           await refresh();
+          if (!evidenceIdentityStillAvailable(expectedCasePath, evidence) ||
+              (imageEvidence && !evidenceIdentityStillAvailable(expectedCasePath, imageEvidence))) {
+            return;
+          }
           setNotice(err.message, true);
         }
       }, { progressId });
