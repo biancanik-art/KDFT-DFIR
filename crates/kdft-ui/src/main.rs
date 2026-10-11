@@ -2878,15 +2878,15 @@ fn import_detected_browser_database(
     family: BrowserFamily,
     timezone: Option<&str>,
 ) -> Result<serde_json::Value> {
-    let profile_root = database_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
     let result = import_browser_history_for_family(
         case_path,
         family,
         ImportBrowserHistoryOptions {
-            history_path: profile_root.to_path_buf(),
+            // Preserve the examiner's exact selected file. Passing only its
+            // parent could silently import a different conventional History
+            // database or become ambiguous when a collection folder contains
+            // several browser databases.
+            history_path: database_path.to_path_buf(),
             max_visits: 0,
             evidence_name: None,
         },
@@ -5671,6 +5671,49 @@ mod tests {
     }
 
     #[test]
+    fn ui_browser_history_origin_fields_are_exposed_in_report_refs() {
+        assert!(INDEX_HTML.contains("\"visit_origin\""));
+        assert!(INDEX_HTML.contains("\"visit_source_label\""));
+        assert!(INDEX_HTML.contains("\"originator_sync_guid_short\""));
+        assert!(INDEX_HTML.contains("\"originator_sync_guid_full\""));
+        assert!(INDEX_HTML.contains("\"originator_sync_guid_note\""));
+        assert!(INDEX_HTML.contains("\"opener_visit_id\""));
+        assert!(INDEX_HTML.contains("\"external_referrer_url\""));
+        assert!(INDEX_HTML.contains("\"browser_profile\""));
+    }
+
+    #[test]
+    fn ui_browser_history_optional_columns_include_visit_origin_and_originator() {
+        assert!(INDEX_HTML.contains("key: \"visit_origin\", label: \"Visit origin\""));
+        assert!(INDEX_HTML.contains(
+            "key: \"originator_sync_guid_short\", label: \"Originator Sync Client GUID (short)\""
+        ));
+        assert!(INDEX_HTML.contains(
+            "key: \"originator_sync_guid_full\", label: \"Originator Sync Client GUID (full)\""
+        ));
+    }
+
+    #[test]
+    fn ui_browser_history_inspector_shows_visit_origin_and_originator() {
+        assert!(INDEX_HTML.contains("[\"Visit Origin\", metadata.visit_origin]"));
+        assert!(INDEX_HTML
+            .contains("[\"Originator Sync Client GUID\", metadata.originator_sync_guid_full]"));
+        assert!(INDEX_HTML.contains(
+            "[\"Originator Sync Client GUID Note\", metadata.originator_sync_guid_note]"
+        ));
+        assert!(INDEX_HTML.contains("[\"Profile\", metadata.browser_profile]"));
+    }
+
+    #[test]
+    fn ui_browser_history_search_context_includes_origin_terms() {
+        // Deep Search context is built from the backend search_text, but the
+        // category grid exposes originator columns so filtered results can be
+        // found by the device ID fragments rendered from metadata.
+        assert!(INDEX_HTML.contains("originator_sync_guid_short"));
+        assert!(INDEX_HTML.contains("originator_sync_guid_full"));
+    }
+
+    #[test]
     fn parse_json_body_with_unlock_zeroizes_raw_body_and_owns_dummy_credential() {
         use super::{parse_json_body_with_unlock, ProcessEvidenceRequest};
         let payload = r#"{"case_path":"C:\\test.kdft.sqlite","evidence_id":1,"unlock":{"type":"password","value":"dummy_secret"},"volume_index":0}"#;
@@ -7442,16 +7485,22 @@ mod tests {
     }
 
     #[test]
-    fn add_evidence_api_detects_and_imports_bare_chromium_history() -> anyhow::Result<()> {
+    fn add_evidence_api_imports_the_exact_selected_renamed_chromium_history() -> anyhow::Result<()>
+    {
         let case_path = unique_test_path("detected-history", ".kdft.sqlite");
         cleanup_ui_test_case(&case_path);
         create_ui_test_case(&case_path, "detected-history")?;
         let profile_dir = unique_test_path("chromium-profile", "");
         std::fs::create_dir_all(&profile_dir)?;
-        let history_path = profile_dir.join("History");
+        let history_path = profile_dir.join("examiner-renamed-edge-history.db");
         create_ui_test_chromium_history(&history_path)?;
-        // The already-detected family must stay authoritative even if another
-        // supported DB name is present beside the selected History file.
+        // The exact selected file must stay authoritative even if conventional
+        // and other-family database names are present beside it.
+        create_ui_test_chromium_history(&profile_dir.join("History"))?;
+        std::fs::write(
+            profile_dir.join("Bookmarks"),
+            r#"{"roots":{"bookmark_bar":{"children":[{"type":"url","name":"Unrelated sibling","url":"https://sibling.invalid/"}]}}}"#,
+        )?;
         Connection::open(profile_dir.join("places.sqlite"))?
             .execute_batch("CREATE TABLE moz_places(id INTEGER PRIMARY KEY, url TEXT);")?;
 
@@ -7468,11 +7517,16 @@ mod tests {
         let response = api_add_evidence(&mut body.as_bytes().to_vec())?;
         assert_eq!(response["detected"], "chromium_history_database");
         assert_eq!(response["visits_indexed"], 1);
+        assert_eq!(response["bookmarks_indexed"], 0);
         assert!(response["entries_indexed"].as_u64().unwrap_or_default() >= 2);
 
         let evidence = kdft_case::list_evidence(&case_path)?;
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].source_kind, "browser_history");
+        assert_eq!(
+            PathBuf::from(&evidence[0].source_path).canonicalize()?,
+            history_path.canonicalize()?
+        );
         assert_eq!(evidence[0].display_timezone, "Europe/Bucharest");
         assert_eq!(
             kdft_case::case_info(&case_path)?.timezone,
@@ -7481,6 +7535,45 @@ mod tests {
         assert!(evidence
             .iter()
             .all(|source| source.source_kind != "image" && source.source_kind != "file"));
+
+        let search_body = serde_json::json!({
+            "case_path": case_path.to_string_lossy(),
+            "query": "detected",
+            "evidence_id": evidence[0].id,
+            "include_content": true,
+            "max_results": 10,
+            "max_file_bytes": 4096
+        })
+        .to_string();
+        let search_page = super::api_deep_search(&mut search_body.as_bytes().to_vec())?;
+        assert!(!search_page.results.is_empty());
+        let visit_hit = search_page
+            .results
+            .iter()
+            .find(|hit| hit.logical_path.contains("/Visits/"))
+            .expect("visit hit in deep search");
+        assert_eq!(
+            visit_hit
+                .record_context
+                .as_ref()
+                .map(|c| c.artifact_kind.as_str()),
+            Some("browser_history_visit")
+        );
+
+        let mut query = std::collections::HashMap::new();
+        query.insert(
+            "case_path".to_string(),
+            case_path.to_string_lossy().into_owned(),
+        );
+        query.insert("entry_id".to_string(), visit_hit.entry_id.to_string());
+        query.insert("offset".to_string(), "0".to_string());
+        query.insert("length".to_string(), "16".to_string());
+        let entry_bytes = super::api_entry_bytes(&query)?;
+        assert_eq!(entry_bytes.bytes, b"SQLite format 3\0");
+        assert_eq!(
+            entry_bytes.total_size,
+            std::fs::metadata(&history_path)?.len()
+        );
 
         cleanup_ui_test_case(&case_path);
         let _ = std::fs::remove_dir_all(profile_dir);
@@ -8832,6 +8925,9 @@ mod tests {
         assert!(INDEX_HTML.contains("updateAddEvidenceButton()"));
         assert!(INDEX_HTML.contains("class=\"column-chooser\""));
         assert!(INDEX_HTML.contains("CATEGORY_OPTIONAL_COLUMNS"));
+        assert!(INDEX_HTML.contains("function categoryOptionalValuePresent(value)"));
+        assert!(INDEX_HTML.contains("value === null || value === undefined"));
+        assert!(INDEX_HTML.contains("value.trim().length > 0"));
         assert!(INDEX_HTML.contains("min-width: max-content;"));
         assert!(!INDEX_HTML.contains("min-width: 2480px;"));
     }
@@ -21430,6 +21526,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       { key: "title", label: "Title", sortable: true, filterable: true, sortType: "text", meta: "title" },
       { key: "referrer", label: "Referrer", sortable: true, filterable: true, sortType: "text", meta: "referrer" },
       { key: "visit_count", label: "Visit count", sortable: true, filterable: true, sortType: "number", meta: "visit_count" },
+      { key: "visit_origin", label: "Visit origin", sortable: true, filterable: true, sortType: "text", meta: "visit_origin" },
+      { key: "originator_sync_guid_short", label: "Originator Sync Client GUID (short)", sortable: true, filterable: true, sortType: "text", meta: "originator_sync_guid_short" },
+      { key: "originator_sync_guid_full", label: "Originator Sync Client GUID (full)", sortable: true, filterable: true, sortType: "text", meta: "originator_sync_guid_full" },
       { key: "browser_profile", label: "Profile", sortable: true, filterable: true, sortType: "text", meta: "browser_profile" },
       { key: "account_name", label: "Account", sortable: true, filterable: true, sortType: "text", meta: "account_name" },
       { key: "network_name", label: "Network", sortable: true, filterable: true, sortType: "text", meta: "network_name" }
@@ -21439,6 +21538,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!state.categoryColumnVisibility) state.categoryColumnVisibility = {};
       state.categoryColumnVisibility[key] = visible;
       renderState();
+    }
+
+    function categoryOptionalValuePresent(value) {
+      if (value === null || value === undefined) return false;
+      if (typeof value === "string") return value.trim().length > 0;
+      if (Array.isArray(value)) return value.length > 0;
+      return true;
     }
 
     function categoryColumnChooserHtml() {
@@ -21479,7 +21585,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       for (const row of (rows || [])) {
         const meta = row.metadata_json || {};
         for (const c of CATEGORY_OPTIONAL_COLUMNS) {
-          if (c.meta && meta[c.meta] !== undefined) {
+          if (c.meta && categoryOptionalValuePresent(meta[c.meta])) {
             availableKeys.add(c.key);
           }
         }
@@ -21531,7 +21637,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       };
 
       for (const c of CATEGORY_OPTIONAL_COLUMNS) {
-        if (c.meta && meta[c.meta] !== undefined) {
+        if (c.meta && categoryOptionalValuePresent(meta[c.meta])) {
           values[c.key] = String(meta[c.meta]);
           sortValues[c.key] = c.sortType === "number" ? Number(meta[c.meta]) : values[c.key];
         }
@@ -24668,7 +24774,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
         "created_by_version", "last_used", "avatar_index", "extension_count",
         "source_artifact", "source_artifact_path", "source_file_size_bytes",
         "source_file_created_utc", "source_file_modified_utc", "source_file_accessed_utc",
-        "source_table", "source_row", "source_path", "browser_family", "referrer"
+        "source_table", "source_row", "source_path", "browser_family", "referrer",
+        "browser_profile", "visit_source", "visit_source_label", "visit_origin",
+        "from_visit_id", "referrer_url", "referrer_visit_time_utc",
+        "opener_visit_id", "opener_url", "external_referrer_url",
+        "originator_cache_guid",
+        "originator_sync_guid_short", "originator_sync_guid_full",
+        "originator_sync_guid_note", "originator_visit_id", "originator_from_visit",
+        "originator_opener_visit", "is_known_to_sync"
       ].forEach((key) => {
         if (metadata[key] !== undefined && metadata[key] !== null && String(metadata[key]).length > 0) {
           ref[key] = metadata[key];
@@ -26775,6 +26888,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Visit Time", metadata.visit_time_utc],
           ["Last URL Visit", metadata.last_visit_time_utc],
           ["Transition", metadata.transition_type],
+          ["Visit Origin", metadata.visit_origin],
+          ["Visit Source", metadata.visit_source_label],
+          ["Originator Sync Client GUID", metadata.originator_sync_guid_full],
+          ["Originator Sync Client GUID Note", metadata.originator_sync_guid_note],
+          ["Is Known To Sync", metadata.is_known_to_sync],
+          ["Originator Visit ID", metadata.originator_visit_id],
+          ["Originator From Visit", metadata.originator_from_visit],
+          ["Originator Opener Visit", metadata.originator_opener_visit],
+          ["Opener Visit ID", metadata.opener_visit_id],
+          ["Opener URL", metadata.opener_url],
+          ["External Referrer", metadata.external_referrer_url],
           ["Visit Count", metadata.visit_count],
           ["Typed Count", metadata.typed_count],
           ["Duration", metadata.visit_duration_microseconds ? metadata.visit_duration_microseconds + " microseconds" : ""],
@@ -26784,6 +26908,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Chrome Last URL Visit", metadata.last_visit_time_chrome],
           ["Transition Code", metadata.transition],
           ["Hidden", metadata.hidden],
+          ["Profile", metadata.browser_profile],
           ["Source Artifact", metadata.source_artifact],
           ["Source Table", metadata.source_table],
           ["Source Row", metadata.source_row],

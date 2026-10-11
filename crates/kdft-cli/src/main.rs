@@ -555,6 +555,74 @@ fn execute_deep_search(args: &DeepSearchArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+enum AddEvidenceOutcome {
+    Standard {
+        evidence_id: i64,
+        filesystem_entries: usize,
+    },
+    BrowserDatabase {
+        detected_label: String,
+        result: Box<kdft_case::BrowserHistoryImportResult>,
+        value: serde_json::Value,
+    },
+}
+
+fn execute_add_evidence(args: &AddEvidenceArgs) -> Result<AddEvidenceOutcome> {
+    let evidence_path = args.path.clone();
+    let add_result = add_evidence(
+        &args.case,
+        AddEvidenceOptions {
+            path: args.path.clone(),
+            kind: EvidenceKind::parse(&args.kind)?,
+            read_file_system_requested: args.read_file_system.unwrap_or(!args.no_read_file_system),
+            notes: args.notes.clone(),
+        },
+    );
+    match add_result {
+        Ok(id) => {
+            let filesystem_entries =
+                usize::try_from(filesystem_entry_count(&args.case)?.max(0)).unwrap_or_default();
+            Ok(AddEvidenceOutcome::Standard {
+                evidence_id: id,
+                filesystem_entries,
+            })
+        }
+        Err(error) => {
+            let Some(detected) = error.downcast_ref::<BrowserDatabaseDetected>() else {
+                return Err(error);
+            };
+            let family = detected.family;
+            let result = import_browser_history_for_family(
+                &args.case,
+                family,
+                ImportBrowserHistoryOptions {
+                    // Preserve the examiner's exact selected file. Passing only its
+                    // parent could silently import a different conventional History
+                    // database or become ambiguous when a collection folder contains
+                    // several browser databases.
+                    history_path: evidence_path,
+                    max_visits: 0,
+                    evidence_name: None,
+                },
+            )?;
+            let mut value = serde_json::to_value(&result)?;
+            let object = value
+                .as_object_mut()
+                .with_context(|| "browser history import result was not a JSON object")?;
+            object.insert(
+                "detected".to_string(),
+                serde_json::Value::String(format!("{}_history_database", family.as_str())),
+            );
+            Ok(AddEvidenceOutcome::BrowserDatabase {
+                detected_label: family.label().to_string(),
+                result: Box::new(result),
+                value,
+            })
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -611,80 +679,42 @@ fn main() -> Result<()> {
             }
         },
         Command::Evidence { command } => match command {
-            EvidenceCommand::Add(args) => {
-                let evidence_path = args.path.clone();
-                let add_result = add_evidence(
-                    &args.case,
-                    AddEvidenceOptions {
-                        path: args.path,
-                        kind: EvidenceKind::parse(&args.kind)?,
-                        read_file_system_requested: args
-                            .read_file_system
-                            .unwrap_or(!args.no_read_file_system),
-                        notes: args.notes,
-                    },
-                );
-                match add_result {
-                    Ok(id) => {
-                        let entry_count = filesystem_entry_count(&args.case)?;
-                        if args.json {
-                            println!(
-                                "{}",
-                                serde_json::json!({
-                                    "evidence_id": id,
-                                    "filesystem_entries": entry_count,
-                                    "indexed": false
-                                })
-                            );
-                        } else {
-                            println!("Attached evidence source {id}; no indexing was run.");
-                        }
-                    }
-                    Err(error) => {
-                        let Some(detected) = error.downcast_ref::<BrowserDatabaseDetected>() else {
-                            return Err(error);
-                        };
-                        let family = detected.family;
-                        let profile_root = evidence_path
-                            .parent()
-                            .filter(|path| !path.as_os_str().is_empty())
-                            .unwrap_or_else(|| Path::new("."));
-                        let result = import_browser_history_for_family(
-                            &args.case,
-                            family,
-                            ImportBrowserHistoryOptions {
-                                history_path: profile_root.to_path_buf(),
-                                max_visits: 0,
-                                evidence_name: None,
-                            },
-                        )?;
-                        if args.json {
-                            let mut value = serde_json::to_value(&result)?;
-                            let object = value.as_object_mut().with_context(|| {
-                                "browser history import result was not a JSON object"
-                            })?;
-                            object.insert(
-                                "detected".to_string(),
-                                serde_json::Value::String(format!(
-                                    "{}_history_database",
-                                    family.as_str()
-                                )),
-                            );
-                            println!("{}", serde_json::to_string_pretty(&value)?);
-                        } else {
-                            println!(
-                                "Detected {} history database at {} - parsed {} records ({} visits) from profile {}.",
-                                family.label(),
-                                evidence_path.display(),
-                                result.entries_indexed,
-                                result.visits_indexed,
-                                profile_root.display()
-                            );
-                            print_json_or_debug(false, &result)?;
-                        }
+            EvidenceCommand::Add(args) => match execute_add_evidence(&args)? {
+                AddEvidenceOutcome::Standard {
+                    evidence_id,
+                    filesystem_entries,
+                } => {
+                    if args.json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "evidence_id": evidence_id,
+                                "filesystem_entries": filesystem_entries,
+                                "indexed": false
+                            })
+                        );
+                    } else {
+                        println!("Attached evidence source {evidence_id}; no indexing was run.");
                     }
                 }
-            }
+                AddEvidenceOutcome::BrowserDatabase {
+                    detected_label,
+                    result,
+                    value,
+                } => {
+                    if args.json {
+                        println!("{}", serde_json::to_string_pretty(&value)?);
+                    } else {
+                        println!(
+                            "Detected {detected_label} history database at {} - parsed {} records ({} visits).",
+                            args.path.display(),
+                            result.entries_indexed,
+                            result.visits_indexed,
+                        );
+                        print_json_or_debug(false, &result)?;
+                    }
+                }
+            },
             EvidenceCommand::Process(args) => {
                 let tracker = cli_progress_tracker(args.evidence_id, "process");
                 let stage_count = if args.metadata_only { 2 } else { 5 };
@@ -1451,6 +1481,114 @@ mod tests {
         assert_eq!(limited.results_returned, 2);
         assert_eq!(limited.stop_reason, Some("examiner_result_limit"));
         assert!(limited.continuation.is_some());
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_exact_file_import_preserves_selected_scope_without_siblings() -> Result<()> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "kdft-cli-exact-scope-{}-{unique}",
+            std::process::id()
+        ));
+        let profile_dir = root.join("profile");
+        fs::create_dir_all(&profile_dir)?;
+        let case_path = root.join("case.kdft.sqlite");
+        create_case(
+            &case_path,
+            CreateCaseOptions {
+                name: "CLI exact scope test".to_string(),
+                examiner_name: None,
+                case_number: None,
+                case_type: None,
+                description: None,
+                default_export_folder: None,
+                temporary_folder: None,
+                index_folder: None,
+            },
+        )?;
+
+        // Renamed history database that the examiner specifically selects
+        let renamed_history = profile_dir.join("examiner-renamed.db");
+        let conn = rusqlite::Connection::open(&renamed_history)?;
+        conn.execute_batch(
+            "CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER, typed_count INTEGER, last_visit_time INTEGER, hidden INTEGER);
+             CREATE TABLE visits(id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER, from_visit INTEGER, transition INTEGER);
+             INSERT INTO urls(id, url, title, visit_count, typed_count, last_visit_time, hidden)
+             VALUES (1, 'https://renamed.example/test', 'Renamed Hit', 1, 0, 13300000000000000, 0);
+             INSERT INTO visits(id, url, visit_time, transition)
+             VALUES (1, 1, 13300000000000000, 1);",
+        )?;
+        drop(conn);
+
+        // Sibling conventional History database
+        let sibling_history = profile_dir.join("History");
+        let conn = rusqlite::Connection::open(&sibling_history)?;
+        conn.execute_batch(
+            "CREATE TABLE urls(id INTEGER PRIMARY KEY, url TEXT, title TEXT, visit_count INTEGER, typed_count INTEGER, last_visit_time INTEGER, hidden INTEGER);
+             CREATE TABLE visits(id INTEGER PRIMARY KEY, url INTEGER, visit_time INTEGER, from_visit INTEGER, transition INTEGER);
+             INSERT INTO urls(id, url, title, visit_count, typed_count, last_visit_time, hidden)
+             VALUES (1, 'https://sibling.example/page', 'Sibling Hit', 1, 0, 13300000000000000, 0);
+             INSERT INTO visits(id, url, visit_time, transition)
+             VALUES (1, 1, 13300000000000000, 1);",
+        )?;
+        drop(conn);
+
+        // Sibling Bookmarks
+        fs::write(
+            profile_dir.join("Bookmarks"),
+            r#"{"roots":{"bookmark_bar":{"children":[{"type":"url","name":"Sibling Bookmark","url":"https://sibling.example/bm"}]}}}"#,
+        )?;
+
+        // Execute CLI add evidence with exact renamed file
+        let outcome = execute_add_evidence(&AddEvidenceArgs {
+            case: case_path.clone(),
+            path: renamed_history.clone(),
+            kind: "auto".to_string(),
+            read_file_system: Some(true),
+            no_read_file_system: false,
+            notes: None,
+            json: true,
+        })?;
+
+        match outcome {
+            AddEvidenceOutcome::BrowserDatabase { result, value, .. } => {
+                assert_eq!(value["detected"], "chromium_history_database");
+                assert_eq!(result.visits_indexed, 1);
+                assert_eq!(result.bookmarks_indexed, 0);
+                assert_eq!(
+                    PathBuf::from(&result.source_path).canonicalize()?,
+                    renamed_history.canonicalize()?
+                );
+            }
+            AddEvidenceOutcome::Standard { .. } => {
+                panic!("expected browser database detection for renamed SQLite history");
+            }
+        }
+
+        // Verify that evidence source in case is the exact file, not its parent directory
+        let evidence = list_evidence(&case_path)?;
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].source_kind, "browser_history");
+        assert_eq!(
+            PathBuf::from(&evidence[0].source_path).canonicalize()?,
+            renamed_history.canonicalize()?
+        );
+
+        // Verify entries in case: only the visit from renamed_history is present
+        let entries = kdft_case::list_filesystem_entries(&case_path, Some(evidence[0].id))?;
+        assert!(entries.iter().any(|entry| {
+            entry.metadata_json["artifact_kind"].as_str() == Some("browser_history_visit")
+                && entry.metadata_json["url"].as_str() == Some("https://renamed.example/test")
+        }));
+        assert!(!entries.iter().any(|entry| {
+            entry.metadata_json["url"].as_str() == Some("https://sibling.example/page")
+        }));
+        assert!(!entries.iter().any(|entry| {
+            entry.metadata_json["artifact_kind"].as_str() == Some("browser_bookmark")
+        }));
 
         let _ = fs::remove_dir_all(root);
         Ok(())
