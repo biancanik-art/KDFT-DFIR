@@ -426,6 +426,10 @@ pub struct EvidenceSource {
     /// Per-file acquisition/container hashes. This remains separate from the
     /// decoded logical-media digest so either representation can be verified.
     pub acquisition_manifest_json: Option<AcquisitionManifest>,
+    /// Whether this evidence source is a standalone $MFT file (detected from typed
+    /// reconstruction metadata in filesystem entries or on-disk FILE record candidate).
+    #[serde(default)]
+    pub is_standalone_mft: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -676,6 +680,15 @@ pub struct BitLockerGenerationResult {
     pub canonical_generation_preserved: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMatchMode {
+    #[default]
+    Contains,
+    Exact,
+    WholeWord,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeepSearchOptions {
     /// Text to search for. A `hex:` prefix switches to byte-pattern mode
@@ -691,6 +704,23 @@ pub struct DeepSearchOptions {
     pub category: Option<String>,
     /// Restrict hits to these file extensions (without the dot).
     pub file_types: Option<Vec<String>>,
+    /// Matching rule for names and paths: contains (substring), exact, or whole-word.
+    pub match_mode: Option<SearchMatchMode>,
+}
+
+impl Default for DeepSearchOptions {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            evidence_id: None,
+            include_content: true,
+            max_results: 200,
+            max_file_bytes: 64 * 1024,
+            category: None,
+            file_types: None,
+            match_mode: None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1649,18 +1679,28 @@ pub fn list_evidence(case_path: &Path) -> Result<Vec<EvidenceSource>> {
                    AND j.status IN (
                        'completed', 'completed_with_diagnostics', 'truncated', 'cancelled', 'failed'
                    )
-                 ORDER BY j.id DESC LIMIT 1)
+                 ORDER BY j.id DESC LIMIT 1),
+                (SELECT 1 FROM filesystem_entries fe
+                 WHERE fe.case_id = e.case_id AND fe.evidence_id = e.id
+                   AND json_extract(fe.metadata_json, '$.virtual_filesystem') = 'standalone_mft_reconstruction'
+                 LIMIT 1) IS NOT NULL
          FROM evidence_sources e
          WHERE e.attach_status <> 'superseded'
          ORDER BY e.id",
     )?;
     let rows = stmt.query_map([], |row| {
+        let source_path: String = row.get(3)?;
+        let display_name: String = row.get(4)?;
+        let has_mft_entries: bool = row.get::<_, Option<i64>>(19)?.unwrap_or(0) != 0;
+        let is_candidate =
+            is_standalone_mft_evidence_candidate(Path::new(&source_path), &display_name);
+        let is_standalone_mft = has_mft_entries || is_candidate;
         Ok(EvidenceSource {
             id: row.get(0)?,
             case_id: row.get(1)?,
             source_kind: row.get(2)?,
-            source_path: row.get(3)?,
-            display_name: row.get(4)?,
+            source_path,
+            display_name,
             size_bytes: row.get(5)?,
             read_file_system_requested: row.get::<_, i64>(6)? != 0,
             attach_status: row.get(7)?,
@@ -1675,6 +1715,7 @@ pub fn list_evidence(case_path: &Path) -> Result<Vec<EvidenceSource>> {
             sha256_scope: row.get(16)?,
             acquisition_manifest_json: acquisition_manifest_from_row(row, 17)?,
             content_indexed: row.get::<_, Option<i64>>(18)?.map(|value| value != 0),
+            is_standalone_mft,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -13828,81 +13869,191 @@ fn retire_legacy_browser_evidence(
     Ok(legacy_ids.into_iter().map(|(_, path)| path).collect())
 }
 
+pub fn resolve_search_query_and_match_mode(
+    query: &str,
+    explicit_mode: Option<SearchMatchMode>,
+) -> (&str, SearchMatchMode) {
+    let trimmed = query.trim();
+    if let Some(rest) = trimmed.strip_prefix("exact:") {
+        let rest = rest.trim();
+        (strip_enclosing_quotes(rest), SearchMatchMode::Exact)
+    } else if let Some(rest) = trimmed.strip_prefix("word:") {
+        let rest = rest.trim();
+        (strip_enclosing_quotes(rest), SearchMatchMode::WholeWord)
+    } else if let Some(rest) = trimmed.strip_prefix("wholeword:") {
+        let rest = rest.trim();
+        (strip_enclosing_quotes(rest), SearchMatchMode::WholeWord)
+    } else if let Some(rest) = trimmed.strip_prefix("whole-word:") {
+        let rest = rest.trim();
+        (strip_enclosing_quotes(rest), SearchMatchMode::WholeWord)
+    } else if let Some(rest) = trimmed.strip_prefix("contains:") {
+        let rest = rest.trim();
+        (strip_enclosing_quotes(rest), SearchMatchMode::Contains)
+    } else if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
+    {
+        (
+            strip_enclosing_quotes(trimmed),
+            explicit_mode.unwrap_or(SearchMatchMode::Exact),
+        )
+    } else {
+        (trimmed, explicit_mode.unwrap_or(SearchMatchMode::Contains))
+    }
+}
+
+fn strip_enclosing_quotes(s: &str) -> &str {
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+pub fn find_whole_word_offset(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_lower = needle.to_ascii_lowercase();
+    let haystack_lower = haystack.to_ascii_lowercase();
+    if needle_lower.is_empty() {
+        return None;
+    }
+    let needle_len = needle_lower.len();
+    let haystack_bytes = haystack_lower.as_bytes();
+    let needle_bytes = needle_lower.as_bytes();
+
+    for (start, window) in haystack_bytes.windows(needle_len).enumerate() {
+        if window == needle_bytes
+            && haystack.is_char_boundary(start)
+            && haystack.is_char_boundary(start + needle_len)
+        {
+            let prev_boundary = if start == 0 {
+                true
+            } else {
+                haystack[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            };
+            let end = start + needle_len;
+            let next_boundary = if end >= haystack.len() {
+                true
+            } else {
+                haystack[end..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_')
+            };
+            if prev_boundary && next_boundary {
+                return Some(start);
+            }
+        }
+    }
+    None
+}
+
+pub fn is_whole_word_match(haystack: &str, needle: &str) -> bool {
+    find_whole_word_offset(haystack, needle).is_some()
+}
+
+pub fn matches_name_or_path(
+    name: &str,
+    logical_path: &str,
+    source_path_exact: Option<&str>,
+    needle: &str,
+    mode: SearchMatchMode,
+) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return false;
+    }
+    let needle_lower = needle.to_ascii_lowercase();
+    let needle_norm = needle_lower.replace('\\', "/");
+    match mode {
+        SearchMatchMode::Contains => {
+            let name_lower = name.to_ascii_lowercase();
+            let logical_lower = logical_path.to_ascii_lowercase();
+            let logical_norm = logical_lower.replace('\\', "/");
+            name_lower.contains(&needle_lower)
+                || logical_lower.contains(&needle_lower)
+                || logical_norm.contains(&needle_norm)
+                || source_path_exact.is_some_and(|path| {
+                    let path_lower = path.to_ascii_lowercase();
+                    let path_norm = path_lower.replace('\\', "/");
+                    path_lower.contains(&needle_lower) || path_norm.contains(&needle_norm)
+                })
+        }
+        SearchMatchMode::Exact => {
+            if name.eq_ignore_ascii_case(needle) {
+                return true;
+            }
+            let needle_norm = needle.replace('\\', "/");
+            let needle_trimmed = needle_norm.trim_start_matches('/');
+            let logical_norm = logical_path.replace('\\', "/");
+            if logical_norm.eq_ignore_ascii_case(&needle_norm)
+                || logical_norm
+                    .trim_start_matches('/')
+                    .eq_ignore_ascii_case(needle_trimmed)
+            {
+                return true;
+            }
+            if let Some(src) = source_path_exact {
+                let src_norm = src.replace('\\', "/");
+                if src_norm.eq_ignore_ascii_case(&needle_norm)
+                    || src_norm
+                        .trim_start_matches('/')
+                        .eq_ignore_ascii_case(needle_trimmed)
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        SearchMatchMode::WholeWord => {
+            let logical_norm = logical_path.replace('\\', "/");
+            let needle_norm_orig = needle.replace('\\', "/");
+            is_whole_word_match(name, needle)
+                || is_whole_word_match(logical_path, needle)
+                || is_whole_word_match(&logical_norm, &needle_norm_orig)
+                || source_path_exact.is_some_and(|path| {
+                    let path_norm = path.replace('\\', "/");
+                    is_whole_word_match(path, needle)
+                        || is_whole_word_match(&path_norm, &needle_norm_orig)
+                })
+        }
+    }
+}
+
 pub fn deep_search(case_path: &Path, options: DeepSearchOptions) -> Result<Vec<DeepSearchResult>> {
-    let query = options.query.trim();
-    if query.is_empty() {
+    let (resolved_query, _) =
+        resolve_search_query_and_match_mode(&options.query, options.match_mode);
+    if resolved_query.is_empty() {
         bail!("search query cannot be empty");
     }
-    // This remains an examiner-requested response bound, not an ingestion cap.
-    // Do not silently reduce a larger request; callers that need small pages
-    // already send a small value.
     let max_results = options.max_results.max(1);
-    // File content search only ever has CONTENT_INDEX_BYTES available per file
-    // (content_head, captured once at "Read File System" time) - clamping here
-    // to the real ceiling instead of a much larger one keeps the "Max file
-    // bytes" field honest about what it can actually do, instead of silently
-    // accepting a bigger number that can never matter. For matches beyond a
-    // file's first CONTENT_INDEX_BYTES, anywhere on disk including unallocated
-    // space and slack, use raw_disk_search instead.
-    let max_file_bytes = options.max_file_bytes.clamp(1, CONTENT_INDEX_BYTES as u64);
-    let query_lower = query.to_ascii_lowercase();
-    let scope = SearchScope::new(options.category.as_deref(), options.file_types.as_deref())?;
+    let mut results = Vec::new();
+    let mut cursor: Option<DeepSearchCursor> = None;
+    let page_size = max_results.clamp(1, SEARCH_RESPONSE_PAGE_MAX);
 
-    let conn = open_existing_case(case_path)?;
-    let case_id = active_case_id(&conn)?;
-    if let Some(evidence_id) = options.evidence_id {
-        ensure_evidence_source(&conn, case_id, evidence_id)?;
+    loop {
+        let remaining = max_results.saturating_sub(results.len());
+        if remaining == 0 {
+            break;
+        }
+        let fetch_limit = remaining.min(page_size);
+        let page = deep_search_page(case_path, options.clone(), cursor, fetch_limit)?;
+        let page_results_len = page.results.len();
+        results.extend(page.results);
+        if page.complete
+            || page.next_cursor.is_none()
+            || page_results_len == 0
+            || results.len() >= max_results
+        {
+            break;
+        }
+        cursor = page.next_cursor;
     }
-
-    // Byte-pattern mode: `hex:FF D8 FF` scans indexed content and reports
-    // byte offsets. Path/metadata text search does not apply to raw bytes.
-    if let Some(pattern_text) = strip_hex_query_prefix(query) {
-        let needle = parse_hex_pattern(pattern_text)?;
-        let mut results = Vec::new();
-        content_hex_search_results(
-            &conn,
-            case_id,
-            options.evidence_id,
-            &needle,
-            max_file_bytes,
-            max_results,
-            &scope,
-            &mut results,
-        )?;
-        return Ok(results);
-    }
-
-    let mut results = path_search_results(
-        &conn,
-        case_id,
-        options.evidence_id,
-        query,
-        &query_lower,
-        max_results,
-        &scope,
-    )?;
-    if options.include_content && results.len() < max_results {
-        parsed_text_search_results(
-            &conn,
-            case_id,
-            options.evidence_id,
-            query,
-            max_results,
-            &scope,
-            &mut results,
-        )?;
-    }
-    if options.include_content && results.len() < max_results {
-        content_search_results(
-            &conn,
-            case_id,
-            options.evidence_id,
-            query,
-            max_file_bytes,
-            max_results,
-            &scope,
-            &mut results,
-        )?;
+    if results.len() > max_results {
+        results.truncate(max_results);
     }
     Ok(results)
 }
@@ -14059,6 +14210,7 @@ fn deep_search_scope_token(options: &DeepSearchOptions, max_file_bytes: u64) -> 
         max_file_bytes,
         options.category.as_deref(),
         options.file_types.as_deref(),
+        options.match_mode,
     ))
     .context("serializing Deep Search continuation scope")
 }
@@ -14122,7 +14274,9 @@ pub fn deep_search_page(
     cursor: Option<DeepSearchCursor>,
     page_size: usize,
 ) -> Result<DeepSearchPage> {
-    let query = options.query.trim();
+    let (resolved_query, match_mode) =
+        resolve_search_query_and_match_mode(&options.query, options.match_mode);
+    let query = resolved_query.trim();
     if query.is_empty() {
         bail!("search query cannot be empty");
     }
@@ -14168,7 +14322,7 @@ pub fn deep_search_page(
         (first_deep_search_phase(hex_mode), None)
     };
 
-    let conn = open_existing_case(case_path)?;
+    let conn = open_case_read_only(case_path)?;
     let case_id = active_case_id(&conn)?;
     if let Some(evidence_id) = options.evidence_id {
         ensure_evidence_source(&conn, case_id, evidence_id)?;
@@ -14198,6 +14352,7 @@ pub fn deep_search_page(
                 options.evidence_id,
                 query,
                 &query_lower,
+                match_mode,
                 &scope,
                 after.as_ref(),
                 phase_limit,
@@ -14208,6 +14363,7 @@ pub fn deep_search_page(
                 options.evidence_id,
                 query,
                 &query_lower,
+                match_mode,
                 &scope,
                 after.as_ref(),
                 phase_limit,
@@ -14218,6 +14374,7 @@ pub fn deep_search_page(
                 options.evidence_id,
                 query,
                 max_file_bytes,
+                match_mode,
                 &scope,
                 after.as_ref(),
                 phase_limit,
@@ -14305,95 +14462,157 @@ fn path_search_page_results(
     evidence_id: Option<i64>,
     query: &str,
     query_lower: &str,
+    match_mode: SearchMatchMode,
     scope: &SearchScope,
     after: Option<&DeepSearchKey>,
     limit: usize,
 ) -> Result<DeepSearchPhaseBatch> {
-    let mut stmt = conn.prepare(&format!(
+    let mut results = Vec::new();
+    let chunk_size = limit.clamp(128, 512);
+    let (mut after_evidence, after_path, mut after_entry) = page_cursor_parts(after);
+    let mut after_path_owned = after_path.map(str::to_string);
+
+    let query_norm = query_lower.replace('\\', "/");
+    let sql = format!(
         "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind, fe.metadata_json
          FROM filesystem_entries fe
          WHERE fe.case_id = ?1
            AND (?2 IS NULL OR fe.evidence_id = ?2)
            AND (instr(lower(fe.logical_path), ?3) > 0
+                OR instr(lower(fe.logical_path), ?8) > 0
                 OR instr(lower(fe.name), ?3) > 0
-                OR instr(lower(fe.metadata_json), ?3) > 0)
+                OR instr(lower(fe.name), ?8) > 0
+                OR instr(lower(fe.metadata_json), ?3) > 0
+                OR instr(lower(fe.metadata_json), ?8) > 0)
            AND (?4 IS NULL OR fe.evidence_id > ?4
                 OR (fe.evidence_id = ?4 AND fe.logical_path > ?5)
                 OR (fe.evidence_id = ?4 AND fe.logical_path = ?5 AND fe.id > ?6)){}
          ORDER BY fe.evidence_id, fe.logical_path, fe.id
          LIMIT ?7",
         scope.sql_clause
-    ))?;
-    let (after_evidence, after_path, after_entry) = page_cursor_parts(after);
-    let rows = stmt.query_map(
-        params![
-            case_id,
-            evidence_id,
-            query_lower,
-            after_evidence,
-            after_path,
-            after_entry,
-            i64::try_from(limit).unwrap_or(i64::MAX)
-        ],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        },
-    )?;
-    let mut results = Vec::new();
-    for row in rows {
-        let (entry_id, evidence_id, logical_path, name, entry_kind, metadata_json) =
-            row.context("reading paged indexed-path result")?;
-        let metadata = serde_json::from_str::<serde_json::Value>(&metadata_json).ok();
-        let source_path_exact = metadata.as_ref().and_then(source_path_exact_from_metadata);
-        let record_context = metadata.as_ref().and_then(deep_search_record_context);
-        let matched_path_or_name = logical_path.to_ascii_lowercase().contains(query_lower)
-            || name.to_ascii_lowercase().contains(query_lower);
-        let (match_kind, preview) = if matched_path_or_name {
-            (
-                "path".to_string(),
-                source_path_exact
-                    .clone()
-                    .or_else(|| Some(logical_path.clone())),
-            )
-        } else if let Some(offset) = metadata_json.to_ascii_lowercase().find(query_lower) {
-            (
-                "metadata".to_string(),
-                Some(content_preview(&metadata_json, offset, query.len())),
-            )
-        } else {
-            (
-                "path".to_string(),
-                source_path_exact
-                    .clone()
-                    .or_else(|| Some(logical_path.clone())),
-            )
+    );
+
+    loop {
+        let chunk: Vec<(i64, i64, String, String, String, String)> = {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![
+                    case_id,
+                    evidence_id,
+                    query_lower,
+                    after_evidence,
+                    after_path_owned.as_deref(),
+                    after_entry,
+                    chunk_size as i64,
+                    query_norm,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .context("reading paged indexed-path result")?
         };
-        results.push(DeepSearchResult {
-            evidence_id,
-            entry_id,
-            internal_path_key: logical_path.clone(),
-            logical_path,
-            source_path_exact,
-            display_name: name,
-            entry_kind,
-            match_kind,
-            selection_offset: None,
-            selection_length: None,
-            data_preview: preview,
-            parsed_segment_kind: None,
-            parsed_segment_provenance: None,
-            record_context,
-        });
+
+        if chunk.is_empty() {
+            return Ok(DeepSearchPhaseBatch {
+                results,
+                exhausted: true,
+            });
+        }
+
+        let chunk_len = chunk.len();
+        if let Some(last) = chunk.last() {
+            after_evidence = Some(last.1);
+            after_path_owned = Some(last.2.clone());
+            after_entry = Some(last.0);
+        }
+
+        for (entry_id, evidence_id, logical_path, name, entry_kind, metadata_json) in chunk {
+            let metadata = serde_json::from_str::<serde_json::Value>(&metadata_json).ok();
+            let source_path_exact = metadata.as_ref().and_then(source_path_exact_from_metadata);
+            let record_context = metadata.as_ref().and_then(deep_search_record_context);
+
+            let matched_path = matches_name_or_path(
+                &name,
+                &logical_path,
+                source_path_exact.as_deref(),
+                query,
+                match_mode,
+            );
+
+            if matched_path {
+                results.push(DeepSearchResult {
+                    evidence_id,
+                    entry_id,
+                    internal_path_key: logical_path.clone(),
+                    logical_path: logical_path.clone(),
+                    source_path_exact: source_path_exact.clone(),
+                    display_name: name,
+                    entry_kind,
+                    match_kind: "path".to_string(),
+                    selection_offset: None,
+                    selection_length: None,
+                    data_preview: source_path_exact.or(Some(logical_path)),
+                    parsed_segment_kind: None,
+                    parsed_segment_provenance: None,
+                    record_context,
+                });
+                if results.len() >= limit {
+                    return Ok(DeepSearchPhaseBatch {
+                        results,
+                        exhausted: false,
+                    });
+                }
+                continue;
+            }
+
+            let metadata_offset = match match_mode {
+                SearchMatchMode::Contains => metadata_json.to_ascii_lowercase().find(query_lower),
+                SearchMatchMode::WholeWord => find_whole_word_offset(&metadata_json, query),
+                SearchMatchMode::Exact => None,
+            };
+
+            if let Some(offset) = metadata_offset {
+                results.push(DeepSearchResult {
+                    evidence_id,
+                    entry_id,
+                    internal_path_key: logical_path.clone(),
+                    logical_path,
+                    source_path_exact,
+                    display_name: name,
+                    entry_kind,
+                    match_kind: "metadata".to_string(),
+                    selection_offset: None,
+                    selection_length: None,
+                    data_preview: Some(content_preview(&metadata_json, offset, query.len())),
+                    parsed_segment_kind: None,
+                    parsed_segment_provenance: None,
+                    record_context,
+                });
+                if results.len() >= limit {
+                    return Ok(DeepSearchPhaseBatch {
+                        results,
+                        exhausted: false,
+                    });
+                }
+            }
+        }
+
+        if chunk_len < chunk_size {
+            return Ok(DeepSearchPhaseBatch {
+                results,
+                exhausted: true,
+            });
+        }
     }
-    let exhausted = results.len() < limit;
-    Ok(DeepSearchPhaseBatch { results, exhausted })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14402,138 +14621,197 @@ fn parsed_text_search_page_results(
     case_id: i64,
     evidence_id: Option<i64>,
     query: &str,
-    query_lower: &str,
+    _query_lower: &str,
+    match_mode: SearchMatchMode,
     scope: &SearchScope,
     after: Option<&DeepSearchKey>,
     limit: usize,
 ) -> Result<DeepSearchPhaseBatch> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
-                fe.metadata_json, segments.parser_name, segments.part_name,
-                segments.segment_kind, segments.provenance_json, segments.content
-         FROM filesystem_entry_text_segments segments
-         JOIN filesystem_entries fe ON fe.id = segments.entry_id
+    let mut results = Vec::new();
+    let chunk_size = limit.clamp(128, 512);
+    let (mut after_evidence, after_path, mut after_entry) = page_cursor_parts(after);
+    let mut after_path_owned = after_path.map(str::to_string);
+
+    let not_matched_clause = if match_mode == SearchMatchMode::Contains {
+        "AND NOT (instr(lower(fe.logical_path), ?3) > 0
+                  OR instr(lower(fe.name), ?3) > 0
+                  OR instr(lower(fe.metadata_json), ?3) > 0)"
+    } else {
+        ""
+    };
+
+    let candidate_sql = format!(
+        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind, fe.metadata_json
+         FROM filesystem_entries fe
          WHERE fe.case_id = ?1
            AND (?2 IS NULL OR fe.evidence_id = ?2)
            AND fe.entry_kind IN ('file', 'record')
-           AND NOT (instr(lower(fe.logical_path), ?3) > 0
-                    OR instr(lower(fe.name), ?3) > 0
-                    OR instr(lower(fe.metadata_json), ?3) > 0)
+           {not_matched_clause}
+           AND EXISTS (SELECT 1 FROM filesystem_entry_text_segments WHERE entry_id = fe.id)
            AND (?4 IS NULL OR fe.evidence_id > ?4
                 OR (fe.evidence_id = ?4 AND fe.logical_path > ?5)
-                OR (fe.evidence_id = ?4 AND fe.logical_path = ?5 AND fe.id > ?6)){}
-         ORDER BY fe.evidence_id, fe.logical_path, fe.id,
-                  segments.parser_name, segments.segment_index",
-        scope.sql_clause
-    ))?;
-    let (after_evidence, after_path, after_entry) = page_cursor_parts(after);
-    let rows = stmt.query_map(
-        params![
-            case_id,
-            evidence_id,
-            query_lower,
-            after_evidence,
-            after_path,
-            after_entry
-        ],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, Vec<u8>>(10)?,
-            ))
-        },
-    )?;
-    let mut results = Vec::new();
-    let mut matched_entry = None;
-    let mut previous_entry_id = None;
-    let mut previous_parser = String::new();
-    let mut previous_part = String::new();
-    let mut previous_kind = String::new();
-    let mut previous_provenance = String::new();
-    let mut previous_tail = Vec::new();
-    let mut exhausted = true;
-    for row in rows {
-        let (
-            entry_id,
-            evidence_id,
-            logical_path,
-            display_name,
-            entry_kind,
-            metadata_json,
-            parser_name,
-            part_name,
-            segment_kind,
-            segment_provenance,
-            segment_content,
-        ) = row.context("reading paged parser-derived search candidate")?;
-        if previous_entry_id != Some(entry_id) {
-            previous_entry_id = Some(entry_id);
-            matched_entry = None;
-            previous_parser.clear();
-            previous_part.clear();
-            previous_kind.clear();
-            previous_provenance.clear();
-            previous_tail.clear();
-        }
-        if matched_entry == Some(entry_id) {
-            continue;
-        }
-        let mut searchable =
-            Vec::with_capacity(previous_tail.len().saturating_add(segment_content.len()));
-        if previous_parser == parser_name
-            && previous_part == part_name
-            && previous_kind == segment_kind
-            && previous_provenance == segment_provenance
-        {
-            searchable.extend_from_slice(&previous_tail);
-        }
-        searchable.extend_from_slice(&segment_content);
-        if let Some(hit) = content_search_hit(&searchable, query) {
-            results.push(DeepSearchResult {
-                evidence_id,
-                entry_id,
-                internal_path_key: logical_path.clone(),
-                logical_path,
-                source_path_exact: serde_json::from_str::<serde_json::Value>(&metadata_json)
-                    .ok()
-                    .and_then(|metadata| source_path_exact_from_metadata(&metadata)),
-                display_name,
-                entry_kind,
-                match_kind: "parsed_content".to_string(),
-                selection_offset: None,
-                selection_length: None,
-                data_preview: Some(format!(
-                    "{} [{}]: {}",
-                    part_name, segment_kind, hit.data_preview
-                )),
-                parsed_segment_kind: Some(segment_kind),
-                parsed_segment_provenance: serde_json::from_str(&segment_provenance).ok(),
-                record_context: deep_search_record_context_json(&metadata_json),
+                OR (fe.evidence_id = ?4 AND fe.logical_path = ?5 AND fe.id > ?6)){scope_clause}
+         ORDER BY fe.evidence_id, fe.logical_path, fe.id
+         LIMIT ?7",
+        not_matched_clause = not_matched_clause,
+        scope_clause = scope.sql_clause
+    );
+
+    let query_lower = query.to_ascii_lowercase();
+
+    loop {
+        let chunk: Vec<(i64, i64, String, String, String, String)> = {
+            let mut stmt = conn.prepare(&candidate_sql)?;
+            let rows = stmt.query_map(
+                params![
+                    case_id,
+                    evidence_id,
+                    query_lower,
+                    after_evidence,
+                    after_path_owned.as_deref(),
+                    after_entry,
+                    chunk_size as i64,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .context("reading paged parser-derived candidates")?
+        };
+
+        if chunk.is_empty() {
+            return Ok(DeepSearchPhaseBatch {
+                results,
+                exhausted: true,
             });
-            matched_entry = Some(entry_id);
-            if results.len() >= limit {
-                exhausted = false;
-                break;
-            }
-            continue;
         }
-        previous_parser = parser_name;
-        previous_part = part_name;
-        previous_kind = segment_kind;
-        previous_provenance = segment_provenance;
-        previous_tail = byte_tail(&searchable, content_search_overlap_bytes(query));
+
+        let chunk_len = chunk.len();
+        if let Some(last) = chunk.last() {
+            after_evidence = Some(last.1);
+            after_path_owned = Some(last.2.clone());
+            after_entry = Some(last.0);
+        }
+
+        for (entry_id, evidence_id, logical_path, display_name, entry_kind, metadata_json) in chunk
+        {
+            let metadata = serde_json::from_str::<serde_json::Value>(&metadata_json).ok();
+            let source_path_exact = metadata.as_ref().and_then(source_path_exact_from_metadata);
+
+            if match_mode != SearchMatchMode::Contains {
+                if matches_name_or_path(
+                    &display_name,
+                    &logical_path,
+                    source_path_exact.as_deref(),
+                    query,
+                    match_mode,
+                ) {
+                    continue;
+                }
+                if match_mode == SearchMatchMode::WholeWord
+                    && find_whole_word_offset(&metadata_json, query).is_some()
+                {
+                    continue;
+                }
+            }
+
+            let segments: Vec<(String, String, String, String, Vec<u8>)> = {
+                let mut seg_stmt = conn.prepare(
+                    "SELECT parser_name, part_name, segment_kind, provenance_json, content
+                     FROM filesystem_entry_text_segments
+                     WHERE entry_id = ?1
+                     ORDER BY parser_name, segment_index",
+                )?;
+                let seg_rows = seg_stmt.query_map([entry_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                })?;
+                seg_rows
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .context("reading text segments for candidate")?
+            };
+
+            let mut previous_parser = String::new();
+            let mut previous_part = String::new();
+            let mut previous_kind = String::new();
+            let mut previous_provenance = String::new();
+            let mut previous_tail = Vec::new();
+            let mut matched = false;
+
+            for (parser_name, part_name, segment_kind, segment_provenance, segment_content) in
+                segments
+            {
+                let mut searchable =
+                    Vec::with_capacity(previous_tail.len().saturating_add(segment_content.len()));
+                if previous_parser == parser_name
+                    && previous_part == part_name
+                    && previous_kind == segment_kind
+                    && previous_provenance == segment_provenance
+                {
+                    searchable.extend_from_slice(&previous_tail);
+                }
+                searchable.extend_from_slice(&segment_content);
+                if let Some(hit) = content_search_hit(&searchable, query, match_mode) {
+                    results.push(DeepSearchResult {
+                        evidence_id,
+                        entry_id,
+                        internal_path_key: logical_path.clone(),
+                        logical_path: logical_path.clone(),
+                        source_path_exact: source_path_exact.clone(),
+                        display_name: display_name.clone(),
+                        entry_kind: entry_kind.clone(),
+                        match_kind: "parsed_content".to_string(),
+                        selection_offset: None,
+                        selection_length: None,
+                        data_preview: Some(format!(
+                            "{} [{}]: {}",
+                            part_name, segment_kind, hit.data_preview
+                        )),
+                        parsed_segment_kind: Some(segment_kind),
+                        parsed_segment_provenance: serde_json::from_str(&segment_provenance).ok(),
+                        record_context: deep_search_record_context_json(&metadata_json),
+                    });
+                    matched = true;
+                    break;
+                }
+                previous_parser = parser_name;
+                previous_part = part_name;
+                previous_kind = segment_kind;
+                previous_provenance = segment_provenance;
+                previous_tail = byte_tail(&searchable, content_search_overlap_bytes(query));
+            }
+
+            if matched && results.len() >= limit {
+                return Ok(DeepSearchPhaseBatch {
+                    results,
+                    exhausted: false,
+                });
+            }
+        }
+
+        if chunk_len < chunk_size {
+            return Ok(DeepSearchPhaseBatch {
+                results,
+                exhausted: true,
+            });
+        }
     }
-    Ok(DeepSearchPhaseBatch { results, exhausted })
 }
+
+type PagedContentCandidateRow = (i64, i64, String, String, String, Vec<u8>, String);
 
 #[allow(clippy::too_many_arguments)]
 fn content_search_page_results(
@@ -14542,59 +14820,94 @@ fn content_search_page_results(
     evidence_id: Option<i64>,
     query: &str,
     max_file_bytes: u64,
+    match_mode: SearchMatchMode,
     scope: &SearchScope,
     after: Option<&DeepSearchKey>,
     limit: usize,
 ) -> Result<DeepSearchPhaseBatch> {
     let query_lower = query.to_ascii_lowercase();
-    let mut stmt = conn.prepare(&format!(
+    let mut results = Vec::new();
+    let chunk_size = limit.clamp(128, 512);
+    let (mut after_evidence, after_path, mut after_entry) = page_cursor_parts(after);
+    let mut after_path_owned = after_path.map(str::to_string);
+
+    let not_matched_clause = if match_mode == SearchMatchMode::Contains {
+        "AND NOT (instr(lower(fe.logical_path), ?3) > 0
+                  OR instr(lower(fe.name), ?3) > 0
+                  OR instr(lower(fe.metadata_json), ?3) > 0)"
+    } else {
+        ""
+    };
+
+    let sql = format!(
         "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
                 fe.content_head, fe.metadata_json
          FROM filesystem_entries fe
          WHERE fe.case_id = ?1
            AND (?2 IS NULL OR fe.evidence_id = ?2)
            AND fe.entry_kind = 'file'
-           AND NOT (instr(lower(fe.logical_path), ?3) > 0
-                    OR instr(lower(fe.name), ?3) > 0
-                    OR instr(lower(fe.metadata_json), ?3) > 0)
+           AND fe.content_head IS NOT NULL
+           {not_matched_clause}
            AND (?4 IS NULL OR fe.evidence_id > ?4
                 OR (fe.evidence_id = ?4 AND fe.logical_path > ?5)
-                OR (fe.evidence_id = ?4 AND fe.logical_path = ?5 AND fe.id > ?6)){}
-         ORDER BY fe.evidence_id, fe.logical_path, fe.id",
-        scope.sql_clause
-    ))?;
-    let (after_evidence, after_path, after_entry) = page_cursor_parts(after);
-    let rows = stmt.query_map(
-        params![
-            case_id,
-            evidence_id,
-            query_lower,
-            after_evidence,
-            after_path,
-            after_entry
-        ],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<Vec<u8>>>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        },
-    )?;
-    let mut parsed_match_stmt = conn.prepare(
-        "SELECT parser_name, part_name, segment_kind, provenance_json, content
-         FROM filesystem_entry_text_segments
-         WHERE entry_id = ?1
-         ORDER BY parser_name, segment_index",
-    )?;
-    let mut results = Vec::new();
-    let mut exhausted = true;
-    for row in rows {
-        let (
+                OR (fe.evidence_id = ?4 AND fe.logical_path = ?5 AND fe.id > ?6)){scope_clause}
+         ORDER BY fe.evidence_id, fe.logical_path, fe.id
+         LIMIT ?7",
+        not_matched_clause = not_matched_clause,
+        scope_clause = scope.sql_clause
+    );
+
+    loop {
+        let chunk: Vec<PagedContentCandidateRow> = {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![
+                    case_id,
+                    evidence_id,
+                    query_lower,
+                    after_evidence,
+                    after_path_owned.as_deref(),
+                    after_entry,
+                    chunk_size as i64,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .context("reading paged content-search candidates")?
+        };
+
+        if chunk.is_empty() {
+            return Ok(DeepSearchPhaseBatch {
+                results,
+                exhausted: true,
+            });
+        }
+
+        let chunk_len = chunk.len();
+        if let Some(last) = chunk.last() {
+            after_evidence = Some(last.1);
+            after_path_owned = Some(last.2.clone());
+            after_entry = Some(last.0);
+        }
+
+        let mut parsed_match_stmt = conn.prepare(
+            "SELECT parser_name, part_name, segment_kind, provenance_json, content
+             FROM filesystem_entry_text_segments
+             WHERE entry_id = ?1
+             ORDER BY parser_name, segment_index",
+        )?;
+
+        for (
             entry_id,
             evidence_id,
             logical_path,
@@ -14602,42 +14915,68 @@ fn content_search_page_results(
             entry_kind,
             content_head,
             metadata_json,
-        ) = row.context("reading paged content-search candidate")?;
-        let Some(content_head) = content_head else {
-            continue;
-        };
-        let read_len = usize::try_from(max_file_bytes)
-            .unwrap_or(usize::MAX)
-            .min(content_head.len());
-        if let Some(hit) = content_search_hit(&content_head[..read_len], query) {
-            if parsed_text_entry_matches(&mut parsed_match_stmt, entry_id, query)? {
-                continue;
+        ) in chunk
+        {
+            let metadata = serde_json::from_str::<serde_json::Value>(&metadata_json).ok();
+            let source_path_exact = metadata.as_ref().and_then(source_path_exact_from_metadata);
+
+            if match_mode != SearchMatchMode::Contains {
+                if matches_name_or_path(
+                    &display_name,
+                    &logical_path,
+                    source_path_exact.as_deref(),
+                    query,
+                    match_mode,
+                ) {
+                    continue;
+                }
+                if match_mode == SearchMatchMode::WholeWord
+                    && find_whole_word_offset(&metadata_json, query).is_some()
+                {
+                    continue;
+                }
             }
-            push_content_search_result(
-                evidence_id,
-                entry_id,
-                &logical_path,
-                &display_name,
-                &entry_kind,
-                serde_json::from_str::<serde_json::Value>(&metadata_json)
-                    .ok()
-                    .and_then(|metadata| source_path_exact_from_metadata(&metadata)),
-                hit,
-                &mut results,
-            );
-            if results.len() >= limit {
-                exhausted = false;
-                break;
+
+            let read_len = usize::try_from(max_file_bytes)
+                .unwrap_or(usize::MAX)
+                .min(content_head.len());
+            if let Some(hit) = content_search_hit(&content_head[..read_len], query, match_mode) {
+                if parsed_text_entry_matches(&mut parsed_match_stmt, entry_id, query, match_mode)? {
+                    continue;
+                }
+                push_content_search_result(
+                    evidence_id,
+                    entry_id,
+                    &logical_path,
+                    &display_name,
+                    &entry_kind,
+                    source_path_exact,
+                    hit,
+                    &mut results,
+                );
+                if results.len() >= limit {
+                    return Ok(DeepSearchPhaseBatch {
+                        results,
+                        exhausted: false,
+                    });
+                }
             }
         }
+
+        if chunk_len < chunk_size {
+            return Ok(DeepSearchPhaseBatch {
+                results,
+                exhausted: true,
+            });
+        }
     }
-    Ok(DeepSearchPhaseBatch { results, exhausted })
 }
 
 fn parsed_text_entry_matches(
     stmt: &mut rusqlite::Statement<'_>,
     entry_id: i64,
     query: &str,
+    match_mode: SearchMatchMode,
 ) -> Result<bool> {
     let rows = stmt.query_map([entry_id], |row| {
         Ok((
@@ -14665,7 +15004,7 @@ fn parsed_text_entry_matches(
             searchable.extend_from_slice(&previous_tail);
         }
         searchable.extend_from_slice(&content);
-        if content_search_hit(&searchable, query).is_some() {
+        if content_search_hit(&searchable, query, match_mode).is_some() {
             return Ok(true);
         }
         previous_parser = parser_name;
@@ -14688,7 +15027,12 @@ fn content_hex_search_page_results(
     after: Option<&DeepSearchKey>,
     limit: usize,
 ) -> Result<DeepSearchPhaseBatch> {
-    let mut stmt = conn.prepare(&format!(
+    let mut results = Vec::new();
+    let chunk_size = limit.clamp(128, 512);
+    let (mut after_evidence, after_path, mut after_entry) = page_cursor_parts(after);
+    let mut after_path_owned = after_path.map(str::to_string);
+
+    let sql = format!(
         "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
                 fe.content_head, fe.metadata_json
          FROM filesystem_entries fe
@@ -14699,192 +15043,98 @@ fn content_hex_search_page_results(
            AND (?3 IS NULL OR fe.evidence_id > ?3
                 OR (fe.evidence_id = ?3 AND fe.logical_path > ?4)
                 OR (fe.evidence_id = ?3 AND fe.logical_path = ?4 AND fe.id > ?5)){}
-         ORDER BY fe.evidence_id, fe.logical_path, fe.id",
+         ORDER BY fe.evidence_id, fe.logical_path, fe.id
+         LIMIT ?6",
         scope.sql_clause
-    ))?;
-    let (after_evidence, after_path, after_entry) = page_cursor_parts(after);
-    let rows = stmt.query_map(
-        params![
-            case_id,
-            evidence_id,
-            after_evidence,
-            after_path,
-            after_entry
-        ],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Vec<u8>>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        },
-    )?;
-    let mut results = Vec::new();
-    let mut exhausted = true;
-    for row in rows {
-        let (entry_id, evidence_id, logical_path, display_name, entry_kind, content, metadata) =
-            row.context("reading paged hex-search candidate")?;
-        let read_len = usize::try_from(max_file_bytes)
-            .unwrap_or(usize::MAX)
-            .min(content.len());
-        if let Some(offset) = find_bytes(&content[..read_len], needle) {
-            results.push(DeepSearchResult {
-                evidence_id,
-                entry_id,
-                internal_path_key: logical_path.clone(),
-                logical_path,
-                source_path_exact: serde_json::from_str::<serde_json::Value>(&metadata)
-                    .ok()
-                    .and_then(|value| source_path_exact_from_metadata(&value)),
-                display_name,
-                entry_kind,
-                match_kind: "content".to_string(),
-                selection_offset: Some(offset as i64),
-                selection_length: Some(needle.len() as i64),
-                data_preview: Some(hex_match_preview(
-                    &content[..read_len],
-                    offset,
-                    needle.len(),
-                )),
-                parsed_segment_kind: None,
-                parsed_segment_provenance: None,
-                record_context: None,
+    );
+
+    loop {
+        let chunk: Vec<PagedContentCandidateRow> = {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params![
+                    case_id,
+                    evidence_id,
+                    after_evidence,
+                    after_path_owned.as_deref(),
+                    after_entry,
+                    chunk_size as i64,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .context("reading paged hex-search candidates")?
+        };
+
+        if chunk.is_empty() {
+            return Ok(DeepSearchPhaseBatch {
+                results,
+                exhausted: true,
             });
-            if results.len() >= limit {
-                exhausted = false;
-                break;
+        }
+
+        let chunk_len = chunk.len();
+        if let Some(last) = chunk.last() {
+            after_evidence = Some(last.1);
+            after_path_owned = Some(last.2.clone());
+            after_entry = Some(last.0);
+        }
+
+        for (entry_id, evidence_id, logical_path, display_name, entry_kind, content, metadata) in
+            chunk
+        {
+            let read_len = usize::try_from(max_file_bytes)
+                .unwrap_or(usize::MAX)
+                .min(content.len());
+            if let Some(offset) = find_bytes(&content[..read_len], needle) {
+                results.push(DeepSearchResult {
+                    evidence_id,
+                    entry_id,
+                    internal_path_key: logical_path.clone(),
+                    logical_path,
+                    source_path_exact: serde_json::from_str::<serde_json::Value>(&metadata)
+                        .ok()
+                        .and_then(|value| source_path_exact_from_metadata(&value)),
+                    display_name,
+                    entry_kind,
+                    match_kind: "content".to_string(),
+                    selection_offset: Some(offset as i64),
+                    selection_length: Some(needle.len() as i64),
+                    data_preview: Some(hex_match_preview(
+                        &content[..read_len],
+                        offset,
+                        needle.len(),
+                    )),
+                    parsed_segment_kind: None,
+                    parsed_segment_provenance: None,
+                    record_context: None,
+                });
+                if results.len() >= limit {
+                    return Ok(DeepSearchPhaseBatch {
+                        results,
+                        exhausted: false,
+                    });
+                }
             }
         }
-    }
-    Ok(DeepSearchPhaseBatch { results, exhausted })
-}
 
-fn parsed_text_search_results(
-    conn: &Connection,
-    case_id: i64,
-    evidence_id: Option<i64>,
-    query: &str,
-    max_results: usize,
-    scope: &SearchScope,
-    results: &mut Vec<DeepSearchResult>,
-) -> Result<()> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
-                fe.metadata_json, segments.parser_name, segments.part_name,
-                segments.segment_kind, segments.provenance_json, segments.content
-         FROM filesystem_entry_text_segments segments
-         JOIN filesystem_entries fe ON fe.id = segments.entry_id
-         WHERE fe.case_id = ?1
-           AND (?2 IS NULL OR fe.evidence_id = ?2)
-           AND fe.entry_kind IN ('file', 'record'){}
-         ORDER BY fe.evidence_id, fe.logical_path, fe.id,
-                  segments.parser_name, segments.segment_index",
-        scope.sql_clause
-    ))?;
-    let rows = stmt.query_map(params![case_id, evidence_id], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, String>(7)?,
-            row.get::<_, String>(8)?,
-            row.get::<_, String>(9)?,
-            row.get::<_, Vec<u8>>(10)?,
-        ))
-    })?;
-
-    let already_matched = results
-        .iter()
-        .map(|result| result.entry_id)
-        .collect::<HashSet<_>>();
-    let mut parsed_matched = HashSet::new();
-    let mut previous_entry_id = None;
-    let mut previous_parser = String::new();
-    let mut previous_part = String::new();
-    let mut previous_kind = String::new();
-    let mut previous_provenance = String::new();
-    let mut previous_tail = Vec::new();
-    for row in rows {
-        if results.len() >= max_results {
-            break;
-        }
-        let (
-            entry_id,
-            evidence_id,
-            logical_path,
-            display_name,
-            entry_kind,
-            metadata_json,
-            parser_name,
-            part_name,
-            segment_kind,
-            segment_provenance,
-            segment_content,
-        ) = row.context("reading parser-derived text search candidate")?;
-        if previous_entry_id != Some(entry_id) {
-            previous_entry_id = Some(entry_id);
-            previous_parser.clear();
-            previous_part.clear();
-            previous_kind.clear();
-            previous_provenance.clear();
-            previous_tail.clear();
-        }
-        if already_matched.contains(&entry_id) || parsed_matched.contains(&entry_id) {
-            continue;
-        }
-
-        let mut searchable =
-            Vec::with_capacity(previous_tail.len().saturating_add(segment_content.len()));
-        if previous_parser == parser_name
-            && previous_part == part_name
-            && previous_kind == segment_kind
-            && previous_provenance == segment_provenance
-        {
-            searchable.extend_from_slice(&previous_tail);
-        }
-        searchable.extend_from_slice(&segment_content);
-        if let Some(hit) = content_search_hit(&searchable, query) {
-            let preview = format!("{} [{}]: {}", part_name, segment_kind, hit.data_preview);
-            results.push(DeepSearchResult {
-                evidence_id,
-                entry_id,
-                internal_path_key: logical_path.clone(),
-                logical_path,
-                source_path_exact: serde_json::from_str::<serde_json::Value>(&metadata_json)
-                    .ok()
-                    .and_then(|metadata| source_path_exact_from_metadata(&metadata)),
-                display_name,
-                entry_kind,
-                match_kind: "parsed_content".to_string(),
-                // Parsed XML character positions are not byte offsets in the
-                // original DOCX ZIP. Never present them as source offsets.
-                selection_offset: None,
-                selection_length: None,
-                data_preview: Some(preview),
-                parsed_segment_kind: Some(segment_kind),
-                parsed_segment_provenance: serde_json::from_str(&segment_provenance).ok(),
-                record_context: deep_search_record_context_json(&metadata_json),
+        if chunk_len < chunk_size {
+            return Ok(DeepSearchPhaseBatch {
+                results,
+                exhausted: true,
             });
-            parsed_matched.insert(entry_id);
-            continue;
         }
-
-        previous_parser = parser_name;
-        previous_part = part_name;
-        previous_kind = segment_kind;
-        previous_provenance = segment_provenance;
-        let tail_bytes = content_search_overlap_bytes(query);
-        previous_tail = byte_tail(&searchable, tail_bytes);
     }
-    Ok(())
 }
 
 fn byte_tail(bytes: &[u8], max_bytes: usize) -> Vec<u8> {
@@ -15115,8 +15365,14 @@ pub struct RawSearchCoverage {
     pub folder_evidence_supported: bool,
 }
 
-fn raw_search_coverage(source_kind: &str) -> RawSearchCoverage {
-    if source_kind == "file" {
+fn raw_search_coverage(source_kind: &str, is_standalone_mft: bool) -> RawSearchCoverage {
+    if is_standalone_mft {
+        RawSearchCoverage {
+            source_scope: "standalone $MFT metadata stream from offset zero through EOF (or an explicitly reported examiner byte budget); this is not a whole-volume or whole-disk bitwise scan",
+            hit_attribution: "absolute offset within the standalone $MFT metadata stream; no volume-relative or physical evidence-media offset is inferred",
+            folder_evidence_supported: false,
+        }
+    } else if source_kind == "file" {
         RawSearchCoverage {
             source_scope: "attached file byte stream from offset zero through EOF (or an explicitly reported examiner byte budget)",
             hit_attribution: "absolute offset within the attached file source; no partition or filesystem-file ownership is inferred",
@@ -15322,6 +15578,21 @@ pub fn raw_disk_search_page(
             bail!("raw search continuation encoding does not match this query");
         }
     }
+    let has_mft_entries: bool = conn
+        .query_row(
+            "SELECT 1 FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_extract(metadata_json, '$.virtual_filesystem') = 'standalone_mft_reconstruction'
+             LIMIT 1",
+            params![case_id, options.evidence_id],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    let is_standalone_mft = has_mft_entries
+        || is_standalone_mft_evidence_candidate(Path::new(&source_path), &evidence_display_name);
+    if is_standalone_mft {
+        bail!("raw search is not supported for standalone $MFT evidence; indexed reconstructed MFT records are the authoritative search surface");
+    }
     let volumes = if source_kind == "image" {
         list_image_volumes(Path::new(&source_path))
             .context("mapping image volumes for raw search")?
@@ -15336,14 +15607,69 @@ pub fn raw_disk_search_page(
                 (opened.reader, opened.decoded_size)
             }
             "file" | "browser_history" => {
-                let metadata = fs::metadata(&source_path)
-                    .with_context(|| format!("reading evidence metadata {source_path}"))?;
-                if !metadata.is_file() {
-                    bail!("raw disk search supports image, file, and browser_history evidence; this evidence path is not a file");
+                match fs::metadata(&source_path) {
+                    Ok(metadata) if metadata.is_file() => match fs::File::open(&source_path) {
+                        Ok(file) => (Box::new(file), metadata.len()),
+                        Err(err) => {
+                            let read_error = format!("opening evidence file {source_path}: {err}");
+                            return Ok(RawSearchResult {
+                                evidence_id: options.evidence_id,
+                                evidence_display_name,
+                                source_path,
+                                evidence_sha256_hex,
+                                evidence_hashed_at,
+                                sector_size: RAW_SEARCH_SECTOR_SIZE,
+                                searched_at: Utc::now()
+                                    .to_rfc3339_opts(SecondsFormat::Millis, true),
+                                actor,
+                                query: query.to_string(),
+                                encodings,
+                                scan_start: 0,
+                                max_scan_bytes: options.max_scan_bytes,
+                                max_results,
+                                total_size: 0,
+                                bytes_scanned: 0,
+                                stop_reason: RawSearchStopReason::ReadError,
+                                read_error: Some(read_error),
+                                next_cursor: None,
+                                complete: false,
+                                coverage: raw_search_coverage(&source_kind, is_standalone_mft),
+                                truncated: false,
+                                hits: Vec::new(),
+                            });
+                        }
+                    },
+                    Ok(_) => bail!(
+                        "raw disk search supports image, file, and browser_history evidence; this evidence path is not a file"
+                    ),
+                    Err(err) => {
+                        let read_error = format!("reading evidence metadata {source_path}: {err}");
+                        return Ok(RawSearchResult {
+                            evidence_id: options.evidence_id,
+                            evidence_display_name,
+                            source_path,
+                            evidence_sha256_hex,
+                            evidence_hashed_at,
+                            sector_size: RAW_SEARCH_SECTOR_SIZE,
+                            searched_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                            actor,
+                            query: query.to_string(),
+                            encodings,
+                            scan_start: 0,
+                            max_scan_bytes: options.max_scan_bytes,
+                            max_results,
+                            total_size: 0,
+                            bytes_scanned: 0,
+                            stop_reason: RawSearchStopReason::ReadError,
+                            read_error: Some(read_error),
+                            next_cursor: None,
+                            complete: false,
+                            coverage: raw_search_coverage(&source_kind, is_standalone_mft),
+                            truncated: false,
+                            hits: Vec::new(),
+                        });
+                    }
                 }
-                let file = fs::File::open(&source_path)
-                    .with_context(|| format!("opening evidence {source_path}"))?;
-                (Box::new(file), metadata.len())
             }
             _ => bail!(
                 "raw disk search supports image, file, and browser_history evidence; {source_kind} evidence has no single raw byte stream to scan"
@@ -15535,7 +15861,7 @@ pub fn raw_disk_search_page(
         read_error: None,
         next_cursor,
         complete: stop_reason == RawSearchStopReason::Eof,
-        coverage: raw_search_coverage(&source_kind),
+        coverage: raw_search_coverage(&source_kind, is_standalone_mft),
         truncated,
         hits,
     })
@@ -18877,6 +19203,7 @@ pub fn list_entries_by_category_filtered(
         .map(str::trim)
         .unwrap_or("")
         .to_lowercase();
+    let name_filter_norm = name_filter.replace('\\', "/");
     let extension_filter = filters
         .extension
         .as_deref()
@@ -18947,7 +19274,11 @@ pub fn list_entries_by_category_filtered(
         .context("counting entries in category")?;
 
     let filtered_predicate = format!(
-        "AND (:name_filter = '' OR instr(lower(name), :name_filter) > 0 OR instr(lower(logical_path), :name_filter) > 0)
+        "AND (:name_filter = ''
+              OR instr(lower(name), :name_filter) > 0
+              OR instr(lower(name), :name_filter_norm) > 0
+              OR instr(lower(logical_path), :name_filter) > 0
+              OR instr(lower(logical_path), :name_filter_norm) > 0)
          AND (:extension_filter = ''
               OR instr(lower(COALESCE(json_extract(metadata_json, '$.file_extension'), '')), :extension_filter) > 0
               OR instr(lower(name), '.' || :extension_filter) > 0)
@@ -18987,6 +19318,7 @@ pub fn list_entries_by_category_filtered(
                 ":category_main": category_main,
                 ":category_sub": category_sub,
                 ":name_filter": name_filter,
+                ":name_filter_norm": name_filter_norm,
                 ":extension_filter": extension_filter,
                 ":type_filter": type_filter,
                 ":flags_filter": flags_filter,
@@ -19030,6 +19362,7 @@ pub fn list_entries_by_category_filtered(
             ":category_main": category_main,
             ":category_sub": category_sub,
             ":name_filter": name_filter,
+            ":name_filter_norm": name_filter_norm,
             ":extension_filter": extension_filter,
             ":type_filter": type_filter,
             ":flags_filter": flags_filter,
@@ -26134,7 +26467,7 @@ fn is_registry_hive_evidence_candidate(path: &Path, display_name: &str) -> bool 
     registry_hive_candidate(path.to_string_lossy().as_ref(), display_name, true)
 }
 
-fn is_standalone_mft_evidence_candidate(path: &Path, display_name: &str) -> bool {
+pub fn is_standalone_mft_evidence_candidate(path: &Path, display_name: &str) -> bool {
     let is_named_mft = [
         display_name,
         path.file_name().and_then(|v| v.to_str()).unwrap_or(""),
@@ -26144,9 +26477,26 @@ fn is_standalone_mft_evidence_candidate(path: &Path, display_name: &str) -> bool
         let name = name.to_ascii_lowercase();
         name == "$mft"
             || name == "mft"
+            || name.starts_with("$mft.")
+            || name.starts_with("mft.")
             || name.ends_with("-$mft")
             || name.ends_with("_$mft")
             || name.ends_with(".mft")
+            || name.ends_with("-$mft.bin")
+            || name.ends_with("_$mft.bin")
+            || name.ends_with(".mft.bin")
+            || name.ends_with("-$mft.raw")
+            || name.ends_with("_$mft.raw")
+            || name.ends_with(".mft.raw")
+            || name.ends_with("-$mft.dmp")
+            || name.ends_with("_$mft.dmp")
+            || name.ends_with(".mft.dmp")
+            || name == "$mft.bin"
+            || name == "mft.bin"
+            || name == "$mft.raw"
+            || name == "mft.raw"
+            || name == "$mft.dmp"
+            || name == "mft.dmp"
     });
     if !is_named_mft {
         return false;
@@ -26161,9 +26511,17 @@ fn is_standalone_mft_evidence_candidate(path: &Path, display_name: &str) -> bool
     }
     let first_attribute_offset = u16::from_le_bytes([header[20], header[21]]);
     let record_size = u32::from_le_bytes(header[28..32].try_into().unwrap_or_default());
-    matches!(record_size, 1024 | 2048 | 4096)
-        && usize::from(first_attribute_offset) >= 48
-        && usize::from(first_attribute_offset) < record_size as usize
+    if !matches!(record_size, 1024 | 2048 | 4096)
+        || usize::from(first_attribute_offset) < 48
+        || usize::from(first_attribute_offset) >= record_size as usize
+    {
+        return false;
+    }
+    let usa_offset = u16::from_le_bytes([header[4], header[5]]) as u32;
+    let usa_count = u16::from_le_bytes([header[6], header[7]]) as u32;
+    let expected_usa_count = (record_size / 512) + 1;
+    let usa_end = usa_offset.saturating_add(usa_count.saturating_mul(2));
+    usa_count == expected_usa_count && usa_end <= record_size
 }
 
 fn registry_hive_candidate(
@@ -30955,6 +31313,94 @@ fn process_file_evidence(
     Ok((1, truncated))
 }
 
+fn validate_standalone_mft_ancestor_chain<R: Read + Seek>(
+    parser: &mut mft::MftParser<R>,
+    record_number: u64,
+    direct_parent_entry: u64,
+    direct_parent_sequence: u16,
+) -> &'static str {
+    if record_number == 5 {
+        return "resolved";
+    }
+    let mut current_ref_entry = direct_parent_entry;
+    let mut current_ref_seq = direct_parent_sequence;
+    let mut visited = HashSet::from([record_number]);
+    let mut is_direct = true;
+
+    for _ in 0..1024 {
+        if current_ref_entry == 0 {
+            return if is_direct {
+                "missing parent"
+            } else {
+                "ancestor sequence mismatch"
+            };
+        }
+        if !visited.insert(current_ref_entry) {
+            return "ancestor cycle";
+        }
+        let parent = match parser.get_entry(current_ref_entry) {
+            Ok(p) => p,
+            Err(_) => {
+                return if is_direct {
+                    "missing parent"
+                } else {
+                    "missing ancestor"
+                };
+            }
+        };
+        if !parent.header.is_valid() {
+            return if is_direct {
+                "missing parent"
+            } else {
+                "missing ancestor"
+            };
+        }
+        if parent.valid_fixup == Some(false) {
+            return if is_direct {
+                "parent fixup failed"
+            } else {
+                "ancestor fixup failed"
+            };
+        }
+        if parent.header.sequence != current_ref_seq {
+            return if is_direct {
+                "parent sequence mismatch"
+            } else {
+                "ancestor sequence mismatch"
+            };
+        }
+        if !parent.is_allocated() {
+            return if is_direct {
+                "unallocated parent"
+            } else {
+                "unallocated ancestor"
+            };
+        }
+        if current_ref_entry == 5 {
+            return "resolved";
+        }
+        if !parent.is_dir() {
+            return if is_direct {
+                "parent not directory"
+            } else {
+                "ancestor not directory"
+            };
+        }
+        let parent_name = parent.find_best_name_attribute();
+        if let Some(name_attr) = parent_name {
+            if name_attr.parent.entry == current_ref_entry {
+                return "ancestor cycle";
+            }
+            current_ref_entry = name_attr.parent.entry;
+            current_ref_seq = name_attr.parent.sequence;
+            is_direct = false;
+        } else {
+            return "ancestor missing file name";
+        }
+    }
+    "ancestor depth exceeded"
+}
+
 fn process_standalone_mft_evidence(
     conn: &Connection,
     case_id: i64,
@@ -31082,11 +31528,12 @@ fn process_standalone_mft_evidence(
                 }
             };
         let parent_status = if let Some(file_name) = best_name.as_ref() {
-            match parser.get_entry(file_name.parent.entry) {
-                Ok(parent) if parent.header.sequence == file_name.parent.sequence => "resolved",
-                Ok(_) => "parent sequence mismatch",
-                Err(_) => "missing parent",
-            }
+            validate_standalone_mft_ancestor_chain(
+                &mut parser,
+                record_number,
+                file_name.parent.entry,
+                file_name.parent.sequence,
+            )
         } else {
             "missing file name"
         };
@@ -31107,7 +31554,7 @@ fn process_standalone_mft_evidence(
         } else {
             reconstructed_text
                 .as_ref()
-                .filter(|value| !value.is_empty() && parent_status == "resolved")
+                .filter(|value| !value.is_empty() && path_reconstruction_status == "resolved")
                 .map(|value| {
                     format!(
                         "/Reconstructed filesystem/{}",
@@ -31229,7 +31676,46 @@ fn process_standalone_mft_evidence(
             .collect::<Vec<_>>();
         let source_path_exact = reconstructed_text
             .as_deref()
-            .filter(|value| !value.is_empty() && parent_status == "resolved");
+            .filter(|value| !value.is_empty() && path_reconstruction_status == "resolved");
+        let file_name_attrs = attributes
+            .iter()
+            .filter_map(|attribute| attribute.data.clone().into_file_name())
+            .collect::<Vec<_>>();
+        let hard_link_aliases = file_name_attrs
+            .iter()
+            .map(|fn_attr| {
+                serde_json::json!({
+                    "name": fn_attr.name,
+                    "namespace": format!("{:?}", fn_attr.namespace),
+                    "parent_record_number": fn_attr.parent.entry,
+                    "parent_sequence_number": fn_attr.parent.sequence,
+                })
+            })
+            .collect::<Vec<_>>();
+        let hard_link_summary = file_name_attrs
+            .iter()
+            .map(|fn_attr| fn_attr.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let data_instance = default_data.map(|attr| attr.header.instance);
+        let data_identity = if default_data.is_some() {
+            if data_resident {
+                format!("$DATA:{} (resident)", data_instance.unwrap_or(0))
+            } else {
+                format!("$DATA:{} (non-resident)", data_instance.unwrap_or(0))
+            }
+        } else {
+            "none".to_string()
+        };
+        let recovery_limitations = if is_directory {
+            "Directory entry; no file payload to recover"
+        } else if default_resident_payload.is_some() {
+            "Resident $DATA payload is available in this standalone $MFT record (complete)"
+        } else if data_resident {
+            "Resident $DATA payload could not be verified from this standalone $MFT record"
+        } else {
+            "Non-resident $DATA payload requires the parent volume / raw disk image; file content cannot be recovered from a standalone $MFT alone"
+        };
         let mut metadata = serde_json::json!({
             "artifact_kind": if in_use { "ntfs_mft_record" } else { "deleted_file_record" },
             "filesystem_parser": "mft crate 0.7.0",
@@ -31239,10 +31725,23 @@ fn process_standalone_mft_evidence(
             "evidence_source_path": evidence.source_path,
             "source_display_name": evidence.display_name,
             "ntfs_file_record_number": record_number,
+            "mft_record_number": record_number,
             "ntfs_parent_record_number": best_name.as_ref().map(|v| v.parent.entry),
             "ntfs_parent_sequence_number": best_name.as_ref().map(|v| v.parent.sequence),
+            "ntfs_parent_reference": best_name.as_ref().map(|v| format!("{}:{}", v.parent.entry, v.parent.sequence)),
             "ntfs_sequence_number": sequence_number,
+            "mft_sequence_number": sequence_number,
+            "allocated": in_use,
+            "is_deleted": !in_use,
+            "ntfs_allocated_state": if in_use { "allocated" } else { "deleted" },
             "ntfs_hard_link_count": entry.header.hard_link_count,
+            "ntfs_hard_link_aliases": hard_link_aliases,
+            "ntfs_hard_link_summary": hard_link_summary,
+            "ntfs_data_attribute_identity": data_identity,
+            "ntfs_data_attribute_id": data_instance,
+            "ntfs_data_attribute_instance": data_instance,
+            "mft_recovery_limitations": recovery_limitations,
+            "recovery_limitations": recovery_limitations,
             "mft_record_logical_offset": record_source_offset,
             "mft_record_source_offset": record_source_offset,
             "mft_record_physical_offset": serde_json::Value::Null,
@@ -46962,281 +47461,12 @@ fn persist_rfc822_generation(
     Ok(())
 }
 
-fn path_search_results(
-    conn: &Connection,
-    case_id: i64,
-    evidence_id: Option<i64>,
+fn content_search_hit(
+    bytes: &[u8],
     query: &str,
-    query_lower: &str,
-    max_results: usize,
-    scope: &SearchScope,
-) -> Result<Vec<DeepSearchResult>> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind, fe.metadata_json
-         FROM filesystem_entries fe
-         WHERE fe.case_id = ?1
-           AND (?2 IS NULL OR fe.evidence_id = ?2)
-           AND (
-                instr(lower(fe.logical_path), ?3) > 0
-                OR instr(lower(fe.name), ?3) > 0
-                OR instr(lower(fe.metadata_json), ?3) > 0
-           ){}
-         ORDER BY fe.evidence_id, fe.logical_path, fe.id
-         LIMIT ?4",
-        scope.sql_clause
-    ))?;
-    let rows = stmt.query_map(
-        params![case_id, evidence_id, query_lower, max_results as i64],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        },
-    )?;
-    let results = rows
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("searching indexed paths")?
-        .into_iter()
-        .map(
-            |(entry_id, evidence_id, logical_path, name, entry_kind, metadata_json)| {
-                let metadata = serde_json::from_str::<serde_json::Value>(&metadata_json).ok();
-                let source_path_exact = metadata.as_ref().and_then(source_path_exact_from_metadata);
-                let record_context = metadata.as_ref().and_then(deep_search_record_context);
-                // A hit can come from the path/name text or from parsed metadata (e.g. an email
-                // subject/body a parser extracted). Report which one actually matched instead of
-                // always labeling it "path", and show the real matching text for metadata hits
-                // instead of just repeating the file path.
-                let matched_path_or_name = logical_path.to_ascii_lowercase().contains(query_lower)
-                    || name.to_ascii_lowercase().contains(query_lower);
-                if matched_path_or_name {
-                    return DeepSearchResult {
-                        evidence_id,
-                        entry_id,
-                        internal_path_key: logical_path.clone(),
-                        logical_path: logical_path.clone(),
-                        source_path_exact: source_path_exact.clone(),
-                        display_name: name,
-                        entry_kind,
-                        match_kind: "path".to_string(),
-                        selection_offset: None,
-                        selection_length: None,
-                        data_preview: source_path_exact.or(Some(logical_path)),
-                        parsed_segment_kind: None,
-                        parsed_segment_provenance: None,
-                        record_context,
-                    };
-                }
-                if let Some(offset) = metadata_json.to_ascii_lowercase().find(query_lower) {
-                    return DeepSearchResult {
-                        evidence_id,
-                        entry_id,
-                        internal_path_key: logical_path.clone(),
-                        logical_path,
-                        source_path_exact,
-                        display_name: name,
-                        entry_kind,
-                        match_kind: "metadata".to_string(),
-                        selection_offset: None,
-                        selection_length: None,
-                        data_preview: Some(content_preview(&metadata_json, offset, query.len())),
-                        parsed_segment_kind: None,
-                        parsed_segment_provenance: None,
-                        record_context,
-                    };
-                }
-                // The SQL WHERE clause guarantees one of the three fields matched; fall back to a
-                // path-style result if the classification above somehow finds none (should not
-                // happen in practice).
-                DeepSearchResult {
-                    evidence_id,
-                    entry_id,
-                    internal_path_key: logical_path.clone(),
-                    logical_path: logical_path.clone(),
-                    source_path_exact: source_path_exact.clone(),
-                    display_name: name,
-                    entry_kind,
-                    match_kind: "path".to_string(),
-                    selection_offset: None,
-                    selection_length: None,
-                    data_preview: source_path_exact.or(Some(logical_path)),
-                    parsed_segment_kind: None,
-                    parsed_segment_provenance: None,
-                    record_context,
-                }
-            },
-        )
-        .collect();
-    Ok(results)
-}
-
-fn content_search_results(
-    conn: &Connection,
-    case_id: i64,
-    evidence_id: Option<i64>,
-    query: &str,
-    max_file_bytes: u64,
-    max_results: usize,
-    scope: &SearchScope,
-    results: &mut Vec<DeepSearchResult>,
-) -> Result<()> {
-    // Content Deep Search is an index lookup over the first CONTENT_INDEX_BYTES of each processed
-    // non-media file. Matches beyond that window, media files, and entries from existing cases that
-    // have not been reprocessed are not indexed and therefore keep content_head NULL.
-    // Examine every indexed file in scope while streaming rows to bound memory.
-    let mut stmt = conn.prepare(&format!(
-        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
-                fe.content_head, fe.metadata_json
-         FROM filesystem_entries fe
-         WHERE fe.case_id = ?1
-           AND (?2 IS NULL OR fe.evidence_id = ?2)
-           AND fe.entry_kind = 'file'{}
-         ORDER BY fe.evidence_id, fe.logical_path, fe.id",
-        scope.sql_clause
-    ))?;
-    let rows = stmt.query_map(params![case_id, evidence_id], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<Vec<u8>>>(5)?,
-            row.get::<_, String>(6)?,
-        ))
-    })?;
-    let already_matched = results
-        .iter()
-        .map(|result| result.entry_id)
-        .collect::<HashSet<_>>();
-    for row in rows {
-        if results.len() >= max_results {
-            break;
-        }
-        let (
-            entry_id,
-            evidence_id,
-            logical_path,
-            display_name,
-            entry_kind,
-            content_head,
-            metadata_json,
-        ) = row.context("reading content search candidate")?;
-        if already_matched.contains(&entry_id) {
-            continue;
-        }
-        let Some(content_head) = content_head else {
-            continue;
-        };
-        let read_len = usize::try_from(max_file_bytes)
-            .unwrap_or(usize::MAX)
-            .min(content_head.len());
-        let bytes = &content_head[..read_len];
-        if let Some(hit) = content_search_hit(bytes, query) {
-            push_content_search_result(
-                evidence_id,
-                entry_id,
-                &logical_path,
-                &display_name,
-                &entry_kind,
-                serde_json::from_str::<serde_json::Value>(&metadata_json)
-                    .ok()
-                    .and_then(|metadata| source_path_exact_from_metadata(&metadata)),
-                hit,
-                results,
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Byte-pattern Deep Search over the same indexed content windows the text
-/// content search uses. Reports the byte offset and length of each match.
-#[allow(clippy::too_many_arguments)]
-fn content_hex_search_results(
-    conn: &Connection,
-    case_id: i64,
-    evidence_id: Option<i64>,
-    needle: &[u8],
-    max_file_bytes: u64,
-    max_results: usize,
-    scope: &SearchScope,
-    results: &mut Vec<DeepSearchResult>,
-) -> Result<()> {
-    // Examine every content-indexed file in scope while streaming rows to
-    // bound memory.
-    let mut stmt = conn.prepare(&format!(
-        "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind,
-                fe.content_head, fe.metadata_json
-         FROM filesystem_entries fe
-         WHERE fe.case_id = ?1
-           AND (?2 IS NULL OR fe.evidence_id = ?2)
-           AND fe.entry_kind = 'file'
-           AND fe.content_head IS NOT NULL{}
-         ORDER BY fe.evidence_id, fe.logical_path, fe.id",
-        scope.sql_clause
-    ))?;
-    let rows = stmt.query_map(params![case_id, evidence_id], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<Vec<u8>>>(5)?,
-            row.get::<_, String>(6)?,
-        ))
-    })?;
-    for row in rows {
-        if results.len() >= max_results {
-            break;
-        }
-        let (
-            entry_id,
-            evidence_id,
-            logical_path,
-            display_name,
-            entry_kind,
-            content_head,
-            metadata_json,
-        ) = row.context("reading hex search candidate")?;
-        let Some(content_head) = content_head else {
-            continue;
-        };
-        let read_len = usize::try_from(max_file_bytes)
-            .unwrap_or(usize::MAX)
-            .min(content_head.len());
-        let bytes = &content_head[..read_len];
-        if let Some(offset) = find_bytes(bytes, needle) {
-            results.push(DeepSearchResult {
-                evidence_id,
-                entry_id,
-                internal_path_key: logical_path.clone(),
-                logical_path,
-                source_path_exact: serde_json::from_str::<serde_json::Value>(&metadata_json)
-                    .ok()
-                    .and_then(|metadata| source_path_exact_from_metadata(&metadata)),
-                display_name,
-                entry_kind,
-                match_kind: "content".to_string(),
-                selection_offset: Some(offset as i64),
-                selection_length: Some(needle.len() as i64),
-                data_preview: Some(hex_match_preview(bytes, offset, needle.len())),
-                parsed_segment_kind: None,
-                parsed_segment_provenance: None,
-                record_context: deep_search_record_context_json(&metadata_json),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn content_search_hit(bytes: &[u8], query: &str) -> Option<ContentSearchHit> {
-    let content_match = find_content_search_match(bytes, query)?;
+    match_mode: SearchMatchMode,
+) -> Option<ContentSearchHit> {
+    let content_match = find_content_search_match(bytes, query, match_mode)?;
     Some(ContentSearchHit {
         offset: content_match.offset,
         length: content_match.length,
@@ -47277,38 +47507,273 @@ struct ContentSearchMatch {
     length: usize,
 }
 
-fn find_content_search_match(bytes: &[u8], query: &str) -> Option<ContentSearchMatch> {
-    if let Some(hex_bytes) = parse_hex_search_query(query) {
-        return find_exact_bytes(bytes, &hex_bytes).map(|offset| ContentSearchMatch {
-            offset,
-            length: hex_bytes.len(),
-        });
+fn is_ascii_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn is_utf16_word_char(val: u16) -> bool {
+    char::from_u32(val as u32).is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+}
+
+fn trim_ascii_content(bytes: &[u8]) -> (usize, &[u8]) {
+    let mut start = 0;
+    while start < bytes.len() && (bytes[start].is_ascii_whitespace() || bytes[start] == 0) {
+        start += 1;
     }
+    let mut end = bytes.len();
+    while end > start && (bytes[end - 1].is_ascii_whitespace() || bytes[end - 1] == 0) {
+        end -= 1;
+    }
+    (start, &bytes[start..end])
+}
 
-    let mut best: Option<ContentSearchMatch> = None;
-    let query_bytes = query.as_bytes();
-    maybe_keep_earliest_match(
-        &mut best,
-        find_ascii_case_insensitive_bytes(bytes, query_bytes),
-        query_bytes.len(),
-    );
-
-    let utf16_units = query.encode_utf16().collect::<Vec<_>>();
-    let utf16_len = utf16_units.len().saturating_mul(2);
-    let le_offset = find_utf16_ascii_case_insensitive_bytes(bytes, &utf16_units, true);
-    let mut be_offset = find_utf16_ascii_case_insensitive_bytes(bytes, &utf16_units, false);
-    // For ASCII text, a UTF-16LE string at offset N preceded by a 0x00 byte also scans as a
-    // valid UTF-16BE match at N-1 (its 1-byte shadow). Windows/NTFS evidence is UTF-16LE in
-    // practice, so when the BE candidate is exactly the shadow of the LE candidate, keep LE.
-    if let (Some(le), Some(be)) = (le_offset, be_offset) {
-        if be + 1 == le {
-            be_offset = None;
+fn exact_utf16_match(bytes: &[u8], needle: &[u16], little_endian: bool) -> Option<usize> {
+    let needle_byte_len = needle.len().checked_mul(2)?;
+    if needle_byte_len == 0 || bytes.len() < needle_byte_len {
+        return None;
+    }
+    let mut start = 0;
+    while start + 1 < bytes.len() {
+        let u = if little_endian {
+            u16::from_le_bytes([bytes[start], bytes[start + 1]])
+        } else {
+            u16::from_be_bytes([bytes[start], bytes[start + 1]])
+        };
+        if u == 0 || (u <= 127 && (u as u8).is_ascii_whitespace()) {
+            start += 2;
+        } else {
+            break;
         }
     }
-    maybe_keep_earliest_match(&mut best, le_offset, utf16_len);
-    maybe_keep_earliest_match(&mut best, be_offset, utf16_len);
+    let mut end = bytes.len();
+    if !(end - start).is_multiple_of(2) {
+        end -= 1;
+    }
+    while end >= start + 2 {
+        let u = if little_endian {
+            u16::from_le_bytes([bytes[end - 2], bytes[end - 1]])
+        } else {
+            u16::from_be_bytes([bytes[end - 2], bytes[end - 1]])
+        };
+        if u == 0 || (u <= 127 && (u as u8).is_ascii_whitespace()) {
+            end -= 2;
+        } else {
+            break;
+        }
+    }
+    if end.saturating_sub(start) == needle_byte_len {
+        let trimmed_slice = &bytes[start..end];
+        for (index, expected) in needle.iter().enumerate() {
+            let pos = index * 2;
+            let actual = if little_endian {
+                u16::from_le_bytes([trimmed_slice[pos], trimmed_slice[pos + 1]])
+            } else {
+                u16::from_be_bytes([trimmed_slice[pos], trimmed_slice[pos + 1]])
+            };
+            if ascii_fold_u16(actual) != ascii_fold_u16(*expected) {
+                return None;
+            }
+        }
+        Some(start)
+    } else {
+        None
+    }
+}
 
-    best
+fn find_ascii_case_insensitive_whole_word(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let needle_len = needle.len();
+    for offset in 0..=haystack.len() - needle_len {
+        let window = &haystack[offset..offset + needle_len];
+        let matches = window
+            .iter()
+            .zip(needle)
+            .all(|(l, r)| ascii_fold_byte(*l) == ascii_fold_byte(*r));
+        if matches {
+            let prev_boundary = if offset == 0 {
+                true
+            } else {
+                !is_ascii_word_byte(haystack[offset - 1])
+            };
+            let end = offset + needle_len;
+            let next_boundary = if end >= haystack.len() {
+                true
+            } else {
+                !is_ascii_word_byte(haystack[end])
+            };
+            if prev_boundary && next_boundary {
+                return Some(offset);
+            }
+        }
+    }
+    None
+}
+
+fn find_utf16_ascii_case_insensitive_whole_word(
+    haystack: &[u8],
+    needle: &[u16],
+    little_endian: bool,
+) -> Option<usize> {
+    let byte_len = needle.len().checked_mul(2)?;
+    if byte_len == 0 || byte_len > haystack.len() {
+        return None;
+    }
+    for offset in 0..=haystack.len() - byte_len {
+        let mut matched = true;
+        for (index, expected) in needle.iter().enumerate() {
+            let position = offset + (index * 2);
+            let actual = if little_endian {
+                u16::from_le_bytes([haystack[position], haystack[position + 1]])
+            } else {
+                u16::from_be_bytes([haystack[position], haystack[position + 1]])
+            };
+            if ascii_fold_u16(actual) != ascii_fold_u16(*expected) {
+                matched = false;
+                break;
+            }
+        }
+        if matched {
+            let prev_boundary = if offset == 0 {
+                true
+            } else if offset >= 2 {
+                let prev = if little_endian {
+                    u16::from_le_bytes([haystack[offset - 2], haystack[offset - 1]])
+                } else {
+                    u16::from_be_bytes([haystack[offset - 2], haystack[offset - 1]])
+                };
+                !is_utf16_word_char(prev)
+            } else {
+                !is_ascii_word_byte(haystack[0])
+            };
+
+            let end = offset + byte_len;
+            let next_boundary = if end >= haystack.len() {
+                true
+            } else if end + 2 <= haystack.len() {
+                let next = if little_endian {
+                    u16::from_le_bytes([haystack[end], haystack[end + 1]])
+                } else {
+                    u16::from_be_bytes([haystack[end], haystack[end + 1]])
+                };
+                !is_utf16_word_char(next)
+            } else {
+                !is_ascii_word_byte(haystack[end])
+            };
+
+            if prev_boundary && next_boundary {
+                return Some(offset);
+            }
+        }
+    }
+    None
+}
+
+fn find_content_search_match(
+    bytes: &[u8],
+    query: &str,
+    match_mode: SearchMatchMode,
+) -> Option<ContentSearchMatch> {
+    if let Some(hex_bytes) = parse_hex_search_query(query) {
+        return match match_mode {
+            SearchMatchMode::Exact => {
+                let (start, trimmed) = trim_ascii_content(bytes);
+                if trimmed == hex_bytes.as_slice() {
+                    Some(ContentSearchMatch {
+                        offset: start,
+                        length: hex_bytes.len(),
+                    })
+                } else {
+                    None
+                }
+            }
+            SearchMatchMode::Contains | SearchMatchMode::WholeWord => {
+                find_exact_bytes(bytes, &hex_bytes).map(|offset| ContentSearchMatch {
+                    offset,
+                    length: hex_bytes.len(),
+                })
+            }
+        };
+    }
+
+    match match_mode {
+        SearchMatchMode::Exact => {
+            let (start, trimmed) = trim_ascii_content(bytes);
+            if trimmed.len() == query.len()
+                && trimmed
+                    .iter()
+                    .zip(query.as_bytes())
+                    .all(|(left, right)| ascii_fold_byte(*left) == ascii_fold_byte(*right))
+            {
+                return Some(ContentSearchMatch {
+                    offset: start,
+                    length: trimmed.len(),
+                });
+            }
+
+            let utf16_units = query.encode_utf16().collect::<Vec<_>>();
+            let utf16_len = utf16_units.len().saturating_mul(2);
+            if let Some(offset) = exact_utf16_match(bytes, &utf16_units, true) {
+                return Some(ContentSearchMatch {
+                    offset,
+                    length: utf16_len,
+                });
+            }
+            if let Some(offset) = exact_utf16_match(bytes, &utf16_units, false) {
+                return Some(ContentSearchMatch {
+                    offset,
+                    length: utf16_len,
+                });
+            }
+            None
+        }
+        SearchMatchMode::WholeWord => {
+            let mut best: Option<ContentSearchMatch> = None;
+            let query_bytes = query.as_bytes();
+            maybe_keep_earliest_match(
+                &mut best,
+                find_ascii_case_insensitive_whole_word(bytes, query_bytes),
+                query_bytes.len(),
+            );
+
+            let utf16_units = query.encode_utf16().collect::<Vec<_>>();
+            let utf16_len = utf16_units.len().saturating_mul(2);
+            let le_offset = find_utf16_ascii_case_insensitive_whole_word(bytes, &utf16_units, true);
+            let mut be_offset =
+                find_utf16_ascii_case_insensitive_whole_word(bytes, &utf16_units, false);
+            if let (Some(le), Some(be)) = (le_offset, be_offset) {
+                if be + 1 == le {
+                    be_offset = None;
+                }
+            }
+            maybe_keep_earliest_match(&mut best, le_offset, utf16_len);
+            maybe_keep_earliest_match(&mut best, be_offset, utf16_len);
+            best
+        }
+        SearchMatchMode::Contains => {
+            let mut best: Option<ContentSearchMatch> = None;
+            let query_bytes = query.as_bytes();
+            maybe_keep_earliest_match(
+                &mut best,
+                find_ascii_case_insensitive_bytes(bytes, query_bytes),
+                query_bytes.len(),
+            );
+
+            let utf16_units = query.encode_utf16().collect::<Vec<_>>();
+            let utf16_len = utf16_units.len().saturating_mul(2);
+            let le_offset = find_utf16_ascii_case_insensitive_bytes(bytes, &utf16_units, true);
+            let mut be_offset = find_utf16_ascii_case_insensitive_bytes(bytes, &utf16_units, false);
+            if let (Some(le), Some(be)) = (le_offset, be_offset) {
+                if be + 1 == le {
+                    be_offset = None;
+                }
+            }
+            maybe_keep_earliest_match(&mut best, le_offset, utf16_len);
+            maybe_keep_earliest_match(&mut best, be_offset, utf16_len);
+            best
+        }
+    }
 }
 
 fn maybe_keep_earliest_match(
@@ -49285,6 +49750,18 @@ fn open_existing_case(case_path: &Path) -> Result<Connection> {
         .context("configuring SQLite busy timeout")?;
     let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
     apply_schema_migrations(&conn)?;
+    Ok(conn)
+}
+
+fn open_case_read_only(case_path: &Path) -> Result<Connection> {
+    if !case_path.exists() {
+        bail!("case does not exist: {}", case_path.display());
+    }
+    let conn = Connection::open_with_flags(case_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("opening case database read-only {}", case_path.display()))?;
+    validate_kdft_case_identity(&conn, case_path)?;
+    conn.execute_batch("PRAGMA busy_timeout = 15000; PRAGMA query_only = ON;")
+        .context("configuring SQLite read-only connection")?;
     Ok(conn)
 }
 
@@ -51405,7 +51882,15 @@ fn logical_path_from_relative(path: &Path) -> String {
 
 fn actual_file_path(source_kind: &str, source_path: &str, logical_path: &str) -> Option<PathBuf> {
     match source_kind {
-        "file" => Some(PathBuf::from(source_path)),
+        "file" => {
+            if logical_path.starts_with("/Reconstructed filesystem/")
+                || logical_path.starts_with("/Deleted records/")
+                || logical_path.starts_with("/Orphaned records/")
+            {
+                return None;
+            }
+            Some(PathBuf::from(source_path))
+        }
         "folder" => {
             let relative = logical_path.trim_start_matches('/');
             if relative.is_empty() {
@@ -52606,6 +53091,7 @@ mod tests {
                 max_file_bytes: CONTENT_INDEX_BYTES as u64,
                 category: None,
                 file_types: None,
+                match_mode: None,
             },
         )?;
         assert!(doc_hits.iter().any(|hit| {
@@ -52623,6 +53109,7 @@ mod tests {
                 max_file_bytes: CONTENT_INDEX_BYTES as u64,
                 category: None,
                 file_types: None,
+                match_mode: None,
             },
         )?;
         assert!(archive_hits.iter().any(|hit| {
@@ -52720,6 +53207,7 @@ mod tests {
                 max_file_bytes: CONTENT_INDEX_BYTES as u64,
                 category: None,
                 file_types: None,
+                match_mode: None,
             },
         )?;
         let hit = hits
@@ -52876,6 +53364,7 @@ mod tests {
                 max_file_bytes: CONTENT_INDEX_BYTES as u64,
                 category: None,
                 file_types: None,
+                match_mode: None,
             },
         )?;
         let hit = hits
@@ -55603,6 +56092,1795 @@ mod tests {
             },
         )?;
         assert_eq!(deleted_read.bytes, DELETED_BYTES);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_mft_deep_search_bounded_and_paged() -> Result<()> {
+        let case_path = unique_case_path("standalone-mft-paged-search");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("standalone-mft-paged-search-source");
+        let path = dir.join("search-$MFT");
+
+        let mut bytes = synthetic_mft_record_with_streams(
+            0,
+            "$MFT",
+            5,
+            1,
+            1,
+            true,
+            false,
+            0,
+            0,
+            Some(&[]),
+            &[],
+        );
+        for _ in 1..5 {
+            bytes.extend(vec![0_u8; 1024]);
+        }
+        bytes.extend(synthetic_mft_record_with_streams(
+            5,
+            ".",
+            5,
+            1,
+            1,
+            true,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+        let names = [
+            "audit_alpha.txt",
+            "audit_beta.log",
+            "audit_gamma.csv",
+            "audit_delta.json",
+            "audit_epsilon.bin",
+        ];
+        for (i, name) in names.iter().enumerate() {
+            let record_num = 6 + i as u32;
+            let payload = format!("payload for {name}");
+            bytes.extend(synthetic_mft_record_with_streams(
+                record_num,
+                name,
+                5,
+                1,
+                1,
+                true,
+                false,
+                payload.len() as u64,
+                payload.len() as u64,
+                Some(payload.as_bytes()),
+                &[],
+            ));
+        }
+        fs::write(&path, bytes)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+
+        // Paged search with limit 2
+        let search_opts = DeepSearchOptions {
+            category: None,
+            file_types: None,
+            query: "audit".to_string(),
+            evidence_id: Some(evidence_id),
+            include_content: false,
+            max_results: 10,
+            max_file_bytes: 64 * 1024,
+            match_mode: None,
+        };
+        let mut cursor = None;
+        let mut collected_hits = Vec::new();
+        let mut page_sizes = Vec::new();
+        loop {
+            let page = deep_search_page(&case_path, search_opts.clone(), cursor, 2)?;
+            page_sizes.push(page.results.len());
+            for hit in page.results {
+                collected_hits.push(hit.logical_path);
+            }
+            if page.complete {
+                assert!(page.next_cursor.is_none());
+                break;
+            }
+            cursor = Some(
+                page.next_cursor
+                    .context("expected cursor for incomplete page")?,
+            );
+        }
+        assert_eq!(page_sizes, vec![2, 2, 1]);
+        assert_eq!(collected_hits.len(), 5);
+        let unique_hits: HashSet<_> = collected_hits.iter().collect();
+        assert_eq!(unique_hits.len(), 5);
+
+        // Bounded deep_search with max_results 3
+        let bounded_opts = DeepSearchOptions {
+            category: None,
+            file_types: None,
+            query: "audit".to_string(),
+            evidence_id: Some(evidence_id),
+            include_content: false,
+            max_results: 3,
+            max_file_bytes: 64 * 1024,
+            match_mode: None,
+        };
+        let bounded_hits = deep_search(&case_path, bounded_opts)?;
+        assert_eq!(bounded_hits.len(), 3);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_mft_deep_search_lock_regression() -> Result<()> {
+        let case_path = unique_case_path("standalone-mft-lock-regression");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("standalone-mft-lock-regression-source");
+        let path = dir.join("test-$MFT");
+
+        let mut bytes = synthetic_mft_record_with_streams(
+            0,
+            "$MFT",
+            5,
+            1,
+            1,
+            true,
+            false,
+            0,
+            0,
+            Some(&[]),
+            &[],
+        );
+        for _ in 1..5 {
+            bytes.extend(vec![0_u8; 1024]);
+        }
+        bytes.extend(synthetic_mft_record_with_streams(
+            5,
+            ".",
+            5,
+            1,
+            1,
+            true,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+        bytes.extend(synthetic_mft_record_with_streams(
+            6,
+            "evidence_file.txt",
+            5,
+            1,
+            1,
+            true,
+            false,
+            12,
+            12,
+            Some(b"hello world!"),
+            &[],
+        ));
+        fs::write(&path, bytes)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+
+        // Spawn a background thread that performs write transactions on the case
+        let case_path_clone = case_path.clone();
+        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        let writer_handle = std::thread::spawn(move || -> Result<()> {
+            let mut conn = open_existing_case(&case_path_clone)?;
+            let mut counter = 0_i64;
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) && counter < 50 {
+                counter += 1;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "UPDATE cases SET description = ? WHERE id = 1",
+                    rusqlite::params![format!("desc-{counter}")],
+                )?;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                tx.commit()?;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(())
+        });
+
+        // Run deep search multiple times concurrently while writer is actively writing
+        let options = DeepSearchOptions {
+            category: None,
+            file_types: None,
+            query: "evidence_file.txt".to_string(),
+            evidence_id: Some(evidence_id),
+            include_content: false,
+            max_results: 10,
+            max_file_bytes: 64 * 1024,
+            match_mode: None,
+        };
+        for _ in 0..15 {
+            let page = deep_search_page(&case_path, options.clone(), None, 5);
+            assert!(
+                page.is_ok(),
+                "deep_search_page failed with: {:?}",
+                page.err()
+            );
+            let hits = page.unwrap();
+            assert_eq!(hits.results.len(), 1);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let writer_result = writer_handle.join().expect("writer thread panicked");
+        assert!(
+            writer_result.is_ok(),
+            "writer thread failed: {:?}",
+            writer_result.err()
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_mft_raw_disk_search_rejected() -> Result<()> {
+        let case_path = unique_case_path("standalone-mft-raw-search-rejected");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("standalone-mft-raw-search-source");
+        let path = dir.join("evidence-$MFT");
+
+        let mut bytes = synthetic_mft_record_with_streams(
+            0,
+            "$MFT",
+            5,
+            1,
+            1,
+            true,
+            false,
+            0,
+            0,
+            Some(&[]),
+            &[],
+        );
+        for _ in 1..5 {
+            bytes.extend(vec![0_u8; 1024]);
+        }
+        bytes.extend(synthetic_mft_record_with_streams(
+            5,
+            ".",
+            5,
+            1,
+            1,
+            true,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+        bytes.extend(synthetic_mft_record_with_streams(
+            6,
+            "secret.txt",
+            5,
+            1,
+            1,
+            true,
+            false,
+            12,
+            12,
+            Some(b"top_secret"),
+            &[],
+        ));
+        fs::write(&path, bytes)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+
+        // Raw disk search must be rejected on standalone MFT evidence
+        let raw_options = RawDiskSearchOptions {
+            evidence_id,
+            query: "top_secret".to_string(),
+            max_results: 10,
+            max_scan_bytes: 0,
+        };
+        let err = raw_disk_search_page(&case_path, raw_options, None)
+            .expect_err("raw search should be rejected for standalone MFT evidence");
+        assert!(
+            err.to_string().contains("raw search is not supported for standalone $MFT evidence; indexed reconstructed MFT records are the authoritative search surface"),
+            "unexpected error message: {err}"
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_mft_duplicate_name_and_hardlink_identity() -> Result<()> {
+        let case_path = unique_case_path("standalone-mft-dup-name");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("standalone-mft-dup-name-source");
+        let path = dir.join("collision-$MFT");
+
+        let mut bytes = synthetic_mft_record_with_streams(
+            0,
+            "$MFT",
+            5,
+            1,
+            1,
+            true,
+            false,
+            0,
+            0,
+            Some(&[]),
+            &[],
+        );
+        for _ in 1..5 {
+            bytes.extend(vec![0_u8; 1024]);
+        }
+        // Root directory record 5
+        bytes.extend(synthetic_mft_record_with_streams(
+            5,
+            ".",
+            5,
+            1,
+            1,
+            true,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+        // Record 6: collision.txt in dir 5, seq 1, resident
+        bytes.extend(synthetic_mft_record_with_streams(
+            6,
+            "collision.txt",
+            5,
+            1,
+            1,
+            true,
+            false,
+            8,
+            8,
+            Some(b"first---"),
+            &[],
+        ));
+        // Record 7: collision.txt in dir 5, seq 2, resident (collision!)
+        bytes.extend(synthetic_mft_record_with_streams(
+            7,
+            "collision.txt",
+            5,
+            1,
+            2,
+            true,
+            false,
+            8,
+            8,
+            Some(b"second--"),
+            &[],
+        ));
+        fs::write(&path, bytes)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let entry1 = entries
+            .iter()
+            .find(|e| e.metadata_json["mft_record_number"].as_u64() == Some(6))
+            .expect("record 6 should exist");
+        let entry2 = entries
+            .iter()
+            .find(|e| e.metadata_json["mft_record_number"].as_u64() == Some(7))
+            .expect("record 7 should exist");
+
+        // The first file must preserve the canonical reconstructed path without suffix
+        assert_eq!(
+            entry1.logical_path,
+            "/Reconstructed filesystem/collision.txt"
+        );
+        // The colliding second file must be disambiguated with ~mft-7-2
+        assert_eq!(
+            entry2.logical_path,
+            "/Reconstructed filesystem/collision.txt~mft-7-2"
+        );
+
+        // Verify structured metadata fields
+        assert_eq!(entry1.metadata_json["mft_record_number"].as_u64(), Some(6));
+        assert_eq!(
+            entry1.metadata_json["mft_sequence_number"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            entry1.metadata_json["ntfs_parent_reference"].as_str(),
+            Some("5:1")
+        );
+        assert_eq!(
+            entry1.metadata_json["ntfs_allocated_state"].as_str(),
+            Some("allocated")
+        );
+        assert!(entry1.metadata_json["ntfs_data_attribute_identity"]
+            .as_str()
+            .is_some_and(|id| id.contains("$DATA") && id.contains("resident")));
+        assert!(entry1.metadata_json["ntfs_filename_namespace"].is_string());
+        assert_eq!(
+            entry1.metadata_json["ntfs_hard_link_summary"].as_str(),
+            Some("collision.txt")
+        );
+        assert!(entry1.metadata_json["source_path_exact"].is_null());
+
+        assert_eq!(entry2.metadata_json["mft_record_number"].as_u64(), Some(7));
+        assert_eq!(
+            entry2.metadata_json["mft_sequence_number"].as_u64(),
+            Some(2)
+        );
+        assert_eq!(
+            entry2.metadata_json["ntfs_parent_reference"].as_str(),
+            Some("5:1")
+        );
+        assert_eq!(
+            entry2.metadata_json["ntfs_allocated_state"].as_str(),
+            Some("allocated")
+        );
+        assert!(entry2.metadata_json["ntfs_data_attribute_identity"]
+            .as_str()
+            .is_some_and(|id| id.contains("$DATA") && id.contains("resident")));
+        assert!(entry2.metadata_json["ntfs_filename_namespace"].is_string());
+        assert_eq!(
+            entry2.metadata_json["ntfs_hard_link_summary"].as_str(),
+            Some("collision.txt")
+        );
+        assert!(entry2.metadata_json["source_path_exact"].is_null());
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_mft_no_fake_payload_on_nonresident_or_dir() -> Result<()> {
+        let case_path = unique_case_path("standalone-mft-no-fake-payload");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("standalone-mft-no-fake-payload-source");
+        let path = dir.join("nofake-$MFT");
+
+        let mut bytes = synthetic_mft_record_with_streams(
+            0,
+            "$MFT",
+            5,
+            1,
+            1,
+            true,
+            false,
+            0,
+            0,
+            Some(&[]),
+            &[],
+        );
+        for _ in 1..5 {
+            bytes.extend(vec![0_u8; 1024]);
+        }
+        // Entry 5: Directory
+        bytes.extend(synthetic_mft_record_with_streams(
+            5,
+            ".",
+            5,
+            1,
+            1,
+            true,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+        // Entry 6: Resident file
+        const RESIDENT_CONTENT: &[u8] = b"genuine resident file payload 12345";
+        bytes.extend(synthetic_mft_record_with_streams(
+            6,
+            "resident.txt",
+            5,
+            1,
+            1,
+            true,
+            false,
+            RESIDENT_CONTENT.len() as u64,
+            RESIDENT_CONTENT.len() as u64,
+            Some(RESIDENT_CONTENT),
+            &[],
+        ));
+        // Entry 7: Non-resident file (no resident default data stream)
+        bytes.extend(synthetic_mft_record_with_streams(
+            7,
+            "nonresident.bin",
+            5,
+            1,
+            1,
+            true,
+            false,
+            65536,
+            65536,
+            None,
+            &[],
+        ));
+        fs::write(&path, bytes)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let dir_entry = entries
+            .iter()
+            .find(|e| e.name == "." || e.entry_kind == "directory")
+            .expect("directory entry should exist");
+        let resident_entry = entries
+            .iter()
+            .find(|e| e.name == "resident.txt")
+            .expect("resident file should exist");
+        let nonresident_entry = entries
+            .iter()
+            .find(|e| e.name == "nonresident.bin")
+            .expect("nonresident file should exist");
+
+        // 1. Directory entry must truthfully fail on byte read and recovery
+        let dir_read = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: dir_entry.id,
+                offset: 0,
+                length: 1024,
+            },
+        );
+        assert!(dir_read.is_err());
+        assert!(dir_read
+            .unwrap_err()
+            .to_string()
+            .contains("not a readable file"));
+
+        let dir_out = dir.join("recovered-dir.bin");
+        let dir_recover = recover_filesystem_entry(
+            &case_path,
+            RecoverEntryOptions {
+                entry_id: dir_entry.id,
+                output_path: dir_out.clone(),
+            },
+        );
+        assert!(dir_recover.is_err());
+        assert!(dir_recover
+            .unwrap_err()
+            .to_string()
+            .contains("not a readable file"));
+        assert!(!dir_out.exists());
+
+        // 2. Non-resident file must truthfully fail and NEVER return 1024-byte record or fake payload
+        let nonres_read = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: nonresident_entry.id,
+                offset: 0,
+                length: 1024,
+            },
+        );
+        assert!(nonres_read.is_err());
+        let nonres_read_err = nonres_read.unwrap_err().to_string();
+        assert!(
+            nonres_read_err.contains(
+                "standalone $MFT entry has no verified readable resident default $DATA stream"
+            ),
+            "unexpected error: {nonres_read_err}"
+        );
+
+        let nonres_out = dir.join("recovered-nonres.bin");
+        let nonres_recover = recover_filesystem_entry(
+            &case_path,
+            RecoverEntryOptions {
+                entry_id: nonresident_entry.id,
+                output_path: nonres_out.clone(),
+            },
+        );
+        assert!(nonres_recover.is_err());
+        let nonres_recover_err = nonres_recover.unwrap_err().to_string();
+        assert!(
+            nonres_recover_err.contains(
+                "standalone $MFT entry has no verified readable resident default $DATA stream"
+            ),
+            "unexpected error: {nonres_recover_err}"
+        );
+        assert!(
+            !nonres_out.exists(),
+            "nonresident recovery must not create output file"
+        );
+
+        // 3. Resident file recovers truthfully
+        let res_read = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: resident_entry.id,
+                offset: 0,
+                length: 1024,
+            },
+        )?;
+        assert_eq!(res_read.bytes, RESIDENT_CONTENT);
+        assert!(
+            !res_read.bytes.starts_with(b"FILE"),
+            "must not be raw FILE record header"
+        );
+
+        let res_out = dir.join("recovered-res.bin");
+        let res_recover = recover_filesystem_entry(
+            &case_path,
+            RecoverEntryOptions {
+                entry_id: resident_entry.id,
+                output_path: res_out.clone(),
+            },
+        )?;
+        assert_eq!(res_recover.bytes_written, RESIDENT_CONTENT.len() as u64);
+        assert_eq!(fs::read(&res_out)?, RESIDENT_CONTENT);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn search_match_modes_contains_exact_whole_word() -> Result<()> {
+        // Query prefix resolution
+        let (q, mode) = resolve_search_query_and_match_mode("contains:myfile.txt", None);
+        assert_eq!(q, "myfile.txt");
+        assert_eq!(mode, SearchMatchMode::Contains);
+
+        let (q, mode) = resolve_search_query_and_match_mode("exact:report.doc", None);
+        assert_eq!(q, "report.doc");
+        assert_eq!(mode, SearchMatchMode::Exact);
+
+        let (q, mode) = resolve_search_query_and_match_mode("word:invoice", None);
+        assert_eq!(q, "invoice");
+        assert_eq!(mode, SearchMatchMode::WholeWord);
+
+        let (q, mode) = resolve_search_query_and_match_mode("\"quoted query\"", None);
+        assert_eq!(q, "quoted query");
+        assert_eq!(mode, SearchMatchMode::Exact);
+
+        let (q, mode) =
+            resolve_search_query_and_match_mode("plain query", Some(SearchMatchMode::Exact));
+        assert_eq!(q, "plain query");
+        assert_eq!(mode, SearchMatchMode::Exact);
+
+        let (q, mode) =
+            resolve_search_query_and_match_mode("plain query", Some(SearchMatchMode::WholeWord));
+        assert_eq!(q, "plain query");
+        assert_eq!(mode, SearchMatchMode::WholeWord);
+
+        let (q, mode) = resolve_search_query_and_match_mode("plain query", None);
+        assert_eq!(q, "plain query");
+        assert_eq!(mode, SearchMatchMode::Contains);
+
+        // Whole word matching helper
+        assert!(is_whole_word_match("the quick brown fox", "quick"));
+        assert!(!is_whole_word_match("the quickest fox", "quick"));
+        assert!(is_whole_word_match("C:/docs/report.pdf", "report"));
+        assert!(!is_whole_word_match("C:/docs/reporter.pdf", "report"));
+        assert!(!is_whole_word_match("prepayment_reportage.txt", "report"));
+
+        // Name or path matching
+        assert!(matches_name_or_path(
+            "report.pdf",
+            "/docs/report.pdf",
+            None,
+            "report.pdf",
+            SearchMatchMode::Exact
+        ));
+        assert!(!matches_name_or_path(
+            "my_report.pdf",
+            "/docs/my_report.pdf",
+            None,
+            "report.pdf",
+            SearchMatchMode::Exact
+        ));
+        assert!(matches_name_or_path(
+            "reporter.doc",
+            "/docs/reporter.doc",
+            None,
+            "report",
+            SearchMatchMode::Contains
+        ));
+        assert!(!matches_name_or_path(
+            "reporter.doc",
+            "/docs/reporter.doc",
+            None,
+            "report",
+            SearchMatchMode::WholeWord
+        ));
+        assert!(matches_name_or_path(
+            "report.doc",
+            "/docs/report.doc",
+            None,
+            "report",
+            SearchMatchMode::WholeWord
+        ));
+
+        // Deep search integration
+        let case_path = unique_case_path("search-match-modes");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("search-match-modes-source");
+        fs::write(evidence_dir.join("report.txt"), b"annual report data")?;
+        fs::write(
+            evidence_dir.join("reporter.txt"),
+            b"reporter journalist notes",
+        )?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+
+        // Contains mode: matches both report.txt and reporter.txt
+        let contains_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: "report".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: false,
+                max_results: 10,
+                max_file_bytes: 64 * 1024,
+                match_mode: Some(SearchMatchMode::Contains),
+            },
+        )?;
+        assert_eq!(contains_hits.len(), 2);
+
+        // Exact mode: matches only report.txt
+        let exact_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: "report.txt".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: false,
+                max_results: 10,
+                max_file_bytes: 64 * 1024,
+                match_mode: Some(SearchMatchMode::Exact),
+            },
+        )?;
+        assert_eq!(exact_hits.len(), 1);
+        assert_eq!(exact_hits[0].display_name, "report.txt");
+
+        // WholeWord mode: matches report.txt because "report" is delimited by '.'
+        let word_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: "report".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: false,
+                max_results: 10,
+                max_file_bytes: 64 * 1024,
+                match_mode: Some(SearchMatchMode::WholeWord),
+            },
+        )?;
+        assert_eq!(word_hits.len(), 1);
+        assert_eq!(word_hits[0].display_name, "report.txt");
+
+        // Prefix query "exact:report.txt"
+        let prefix_exact = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: "exact:report.txt".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: false,
+                max_results: 10,
+                max_file_bytes: 64 * 1024,
+                match_mode: None,
+            },
+        )?;
+        assert_eq!(prefix_exact.len(), 1);
+        assert_eq!(prefix_exact[0].display_name, "report.txt");
+
+        // Prefix query "word:report"
+        let prefix_word = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: "word:report".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: false,
+                max_results: 10,
+                max_file_bytes: 64 * 1024,
+                match_mode: None,
+            },
+        )?;
+        assert_eq!(prefix_word.len(), 1);
+        assert_eq!(prefix_word[0].display_name, "report.txt");
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_mft_candidate_extension_and_usa_detection() -> Result<()> {
+        let dir = unique_temp_dir("mft-candidate-detection");
+        let valid_record = synthetic_mft_record(0, "$MFT", true);
+
+        // Standard and forensic acquisition filenames that must be recognized
+        let candidate_names = [
+            "$MFT",
+            "mft",
+            "vol1-$MFT",
+            "drive_c_$mft",
+            "export.mft",
+            "$MFT.bin",
+            "C_$MFT.bin",
+            "host-$mft.bin",
+            "image.mft.bin",
+            "mft.raw",
+            "live-$mft.raw",
+            "mft.dmp",
+            "evidence-$mft.dmp",
+        ];
+
+        for name in candidate_names {
+            let file_path = dir.join(name);
+            fs::write(&file_path, &valid_record)?;
+            assert!(
+                is_standalone_mft_evidence_candidate(&file_path, name),
+                "expected {name} to be recognized as standalone MFT candidate"
+            );
+        }
+
+        // Non-MFT files should be rejected
+        let non_candidates = ["report.bin", "image.raw", "data.dmp", "regular.txt"];
+        for name in non_candidates {
+            let file_path = dir.join(name);
+            fs::write(&file_path, &valid_record)?;
+            assert!(
+                !is_standalone_mft_evidence_candidate(&file_path, name),
+                "expected {name} to be rejected"
+            );
+        }
+
+        // Invalid USA count should be rejected even with a valid candidate name
+        let mut corrupt_usa_record = valid_record;
+        // Byte 6-8 is usa_count. Corrupt it from 3 to 1.
+        corrupt_usa_record[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        let corrupt_path = dir.join("corrupt_usa_$MFT.bin");
+        fs::write(&corrupt_path, &corrupt_usa_record)?;
+        assert!(
+            !is_standalone_mft_evidence_candidate(&corrupt_path, "corrupt_usa_$MFT.bin"),
+            "candidate with corrupt USA count must be rejected"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_mft_ancestor_sequence_validation() -> Result<()> {
+        let case_path = unique_case_path("mft-ancestor-validation");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("mft-ancestor-validation-source");
+        let mft_path = dir.join("$MFT.bin");
+
+        // Records 0..=4: header records
+        let mut bytes = synthetic_mft_record_with_streams(
+            0,
+            "$MFT",
+            0,
+            0,
+            1,
+            true,
+            false,
+            15 * 1024,
+            15 * 1024,
+            None,
+            &[],
+        );
+        for i in 1..=4 {
+            bytes.extend(synthetic_mft_record_with_streams(
+                i,
+                &format!("dummy_{i}"),
+                0,
+                0,
+                1,
+                true,
+                false,
+                0,
+                0,
+                None,
+                &[],
+            ));
+        }
+
+        // Record 5: Root directory (sequence 5, parent 5)
+        bytes.extend(synthetic_mft_record_with_streams(
+            5,
+            ".",
+            5,
+            5,
+            5,
+            true,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+
+        // Record 6: Valid subfolder (sequence 1, parent 5 seq 5)
+        bytes.extend(synthetic_mft_record_with_streams(
+            6,
+            "subfolder",
+            5,
+            5,
+            1,
+            true,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+
+        // Record 7: Valid child (parent 6 seq 1) -> resolved
+        bytes.extend(synthetic_mft_record_with_streams(
+            7,
+            "valid_child.txt",
+            6,
+            1,
+            1,
+            true,
+            false,
+            10,
+            10,
+            None,
+            &[],
+        ));
+
+        // Record 8: Direct parent sequence mismatch (parent 6 declared seq 99 != 1) -> parent sequence mismatch
+        bytes.extend(synthetic_mft_record_with_streams(
+            8,
+            "mismatched_parent.txt",
+            6,
+            99,
+            1,
+            true,
+            false,
+            10,
+            10,
+            None,
+            &[],
+        ));
+
+        // Record 9: Grandparent folder pointing to root with wrong seq (parent 5 declared seq 999 != 5)
+        bytes.extend(synthetic_mft_record_with_streams(
+            9,
+            "bad_grandparent",
+            5,
+            999,
+            1,
+            true,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+
+        // Record 10: Child pointing to record 9 with correct direct sequence (parent 9 seq 1) -> ancestor sequence mismatch!
+        bytes.extend(synthetic_mft_record_with_streams(
+            10,
+            "mismatched_ancestor.txt",
+            9,
+            1,
+            1,
+            true,
+            false,
+            10,
+            10,
+            None,
+            &[],
+        ));
+
+        // Record 11: Unallocated folder (in_use = false)
+        bytes.extend(synthetic_mft_record_with_streams(
+            11,
+            "unallocated_dir",
+            5,
+            5,
+            1,
+            false,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+
+        // Record 12: Child pointing to unallocated directory 11 -> unallocated parent!
+        bytes.extend(synthetic_mft_record_with_streams(
+            12,
+            "unallocated_parent.txt",
+            11,
+            1,
+            1,
+            true,
+            false,
+            10,
+            10,
+            None,
+            &[],
+        ));
+
+        // Record 13: Subfolder pointing to unallocated directory 11 (parent 11 seq 1)
+        bytes.extend(synthetic_mft_record_with_streams(
+            13,
+            "intermediate_folder",
+            11,
+            1,
+            1,
+            true,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+
+        // Record 14: Child pointing to record 13 -> record 13's parent is unallocated record 11 -> unallocated ancestor!
+        bytes.extend(synthetic_mft_record_with_streams(
+            14,
+            "unallocated_ancestor.txt",
+            13,
+            1,
+            1,
+            true,
+            false,
+            10,
+            10,
+            None,
+            &[],
+        ));
+
+        fs::write(&mft_path, bytes)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: mft_path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+
+        // 1. Valid child should be resolved in Reconstructed filesystem
+        let valid_child = entries
+            .iter()
+            .find(|e| e.name == "valid_child.txt")
+            .expect("valid_child.txt present");
+        assert!(
+            valid_child
+                .logical_path
+                .starts_with("/Reconstructed filesystem/"),
+            "valid_child logical path: {}",
+            valid_child.logical_path
+        );
+        assert_eq!(
+            valid_child.metadata_json["mft_path_reconstruction_status"].as_str(),
+            Some("resolved")
+        );
+
+        // 2. Direct parent sequence mismatch should route to Orphaned records
+        let direct_mismatch = entries
+            .iter()
+            .find(|e| e.name == "mismatched_parent.txt")
+            .expect("mismatched_parent.txt present");
+        assert!(
+            direct_mismatch
+                .logical_path
+                .starts_with("/Orphaned records/8-mismatched_parent.txt"),
+            "direct mismatch logical path: {}",
+            direct_mismatch.logical_path
+        );
+        assert_eq!(
+            direct_mismatch.metadata_json["mft_path_reconstruction_status"].as_str(),
+            Some("parent sequence mismatch")
+        );
+
+        // 3. Grandparent (ancestor) sequence mismatch should route to Orphaned records
+        let ancestor_mismatch = entries
+            .iter()
+            .find(|e| e.name == "mismatched_ancestor.txt")
+            .expect("mismatched_ancestor.txt present");
+        assert!(
+            ancestor_mismatch
+                .logical_path
+                .starts_with("/Orphaned records/10-mismatched_ancestor.txt"),
+            "ancestor mismatch logical path: {}",
+            ancestor_mismatch.logical_path
+        );
+        assert_eq!(
+            ancestor_mismatch.metadata_json["mft_path_reconstruction_status"].as_str(),
+            Some("ancestor sequence mismatch")
+        );
+
+        // 4. Unallocated parent should route to Orphaned records
+        let unallocated_parent = entries
+            .iter()
+            .find(|e| e.name == "unallocated_parent.txt")
+            .expect("unallocated_parent.txt present");
+        assert!(
+            unallocated_parent
+                .logical_path
+                .starts_with("/Orphaned records/12-unallocated_parent.txt"),
+            "unallocated parent logical path: {}",
+            unallocated_parent.logical_path
+        );
+        assert_eq!(
+            unallocated_parent.metadata_json["mft_path_reconstruction_status"].as_str(),
+            Some("unallocated parent")
+        );
+
+        // 5. Unallocated ancestor should route to Orphaned records
+        let unallocated_ancestor = entries
+            .iter()
+            .find(|e| e.name == "unallocated_ancestor.txt")
+            .expect("unallocated_ancestor.txt present");
+        assert!(
+            unallocated_ancestor
+                .logical_path
+                .starts_with("/Orphaned records/14-unallocated_ancestor.txt"),
+            "unallocated ancestor logical path: {}",
+            unallocated_ancestor.logical_path
+        );
+        assert_eq!(
+            unallocated_ancestor.metadata_json["mft_path_reconstruction_status"].as_str(),
+            Some("unallocated ancestor")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn deep_search_whole_word_content_and_exact_match_modes() -> Result<()> {
+        let case_path = unique_case_path("deep-search-modes-parity");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("deep-search-modes-parity-source");
+
+        // configure_tool.txt contains "figure" as a whole word in its content,
+        // but has "figure" as a SUBSTRING in its name ("configure").
+        fs::write(
+            evidence_dir.join("configure_tool.txt"),
+            b"the figure is displayed in chart 1",
+        )?;
+        // other_tool.txt contains only "configure" (not "figure" as whole word)
+        fs::write(
+            evidence_dir.join("other_tool.txt"),
+            b"only configure options are here",
+        )?;
+        // exact_only.txt contains exact "figure"
+        fs::write(evidence_dir.join("exact_only.txt"), b"figure")?;
+
+        // utf16_word.txt contains UTF-16LE whole-word "figure"
+        let utf16_text = "the figure in unicode"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect::<Vec<u8>>();
+        fs::write(evidence_dir.join("utf16_word.txt"), &utf16_text)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+
+        // 1. WholeWord content search:
+        // - configure_tool.txt MUST match (whole word figure in content, and NOT excluded by name)
+        // - exact_only.txt MUST match
+        // - utf16_word.txt MUST match
+        // - other_tool.txt MUST NOT match (only substring "configure" in content)
+        let word_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: "figure".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: true,
+                max_results: 10,
+                max_file_bytes: 64 * 1024,
+                match_mode: Some(SearchMatchMode::WholeWord),
+            },
+        )?;
+        let hit_names = word_hits
+            .iter()
+            .map(|h| h.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            hit_names.contains(&"configure_tool.txt"),
+            "configure_tool.txt must match whole word 'figure' in content; hits: {hit_names:?}"
+        );
+        assert!(
+            hit_names.contains(&"exact_only.txt"),
+            "exact_only.txt must match; hits: {hit_names:?}"
+        );
+        assert!(
+            hit_names.contains(&"utf16_word.txt"),
+            "utf16_word.txt must match; hits: {hit_names:?}"
+        );
+        assert!(
+            !hit_names.contains(&"other_tool.txt"),
+            "other_tool.txt must not match whole word 'figure'; hits: {hit_names:?}"
+        );
+
+        // 2. Exact content search:
+        // - exact_only.txt MUST match
+        // - configure_tool.txt MUST NOT match (contains more words than just "figure")
+        // - other_tool.txt MUST NOT match
+        let exact_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: "figure".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: true,
+                max_results: 10,
+                max_file_bytes: 64 * 1024,
+                match_mode: Some(SearchMatchMode::Exact),
+            },
+        )?;
+        let exact_hit_names = exact_hits
+            .iter()
+            .map(|h| h.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exact_hit_names,
+            vec!["exact_only.txt"],
+            "only exact_only.txt should match exact 'figure'; hits: {exact_hit_names:?}"
+        );
+
+        // 3. Contains content search:
+        // Matches all files since they all contain substring "figure" (including "configure")
+        let contains_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: "figure".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: true,
+                max_results: 10,
+                max_file_bytes: 64 * 1024,
+                match_mode: Some(SearchMatchMode::Contains),
+            },
+        )?;
+        assert_eq!(contains_hits.len(), 4);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn deep_search_filename_and_path_paging_figures_zip() -> Result<()> {
+        let case_path = unique_case_path("figures-zip-path-paging");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("figures-zip-source");
+
+        let zip_dir = evidence_dir.join("Figures.zip");
+        fs::create_dir_all(zip_dir.join("sub"))?;
+        fs::write(zip_dir.join("figure.png"), b"png image")?;
+        fs::write(zip_dir.join("sub").join("figure_data.dat"), b"figure data")?;
+        fs::write(zip_dir.join("configure_script.py"), b"config script")?;
+        let other_dir = evidence_dir.join("Other");
+        fs::create_dir_all(&other_dir)?;
+        fs::write(other_dir.join("figure.txt"), b"other figure")?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+
+        // 1. Search with forward slash: "Figures.zip/figure"
+        let slash_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: "Figures.zip/figure".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: false,
+                max_results: 10,
+                max_file_bytes: 64 * 1024,
+                match_mode: Some(SearchMatchMode::Contains),
+            },
+        )?;
+        assert_eq!(slash_hits.len(), 1);
+        assert_eq!(slash_hits[0].display_name, "figure.png");
+
+        // 2. Search with Windows backslash: "Figures.zip\figure"
+        let backslash_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: r"Figures.zip\figure".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: false,
+                max_results: 10,
+                max_file_bytes: 64 * 1024,
+                match_mode: Some(SearchMatchMode::Contains),
+            },
+        )?;
+        assert_eq!(backslash_hits.len(), 1);
+        assert_eq!(backslash_hits[0].display_name, "figure.png");
+
+        // 3. Paging search for "figure" with limit 2 across all pages
+        let search_opts = DeepSearchOptions {
+            category: None,
+            file_types: None,
+            query: "figure".to_string(),
+            evidence_id: Some(evidence_id),
+            include_content: false,
+            max_results: 10,
+            max_file_bytes: 64 * 1024,
+            match_mode: Some(SearchMatchMode::Contains),
+        };
+        let mut cursor = None;
+        let mut paged_hits = Vec::new();
+        let mut page_counts = Vec::new();
+        loop {
+            let page = deep_search_page(&case_path, search_opts.clone(), cursor, 2)?;
+            page_counts.push(page.results.len());
+            for r in page.results {
+                paged_hits.push(r.display_name);
+            }
+            if page.complete {
+                break;
+            }
+            cursor = Some(page.next_cursor.context("expected cursor")?);
+        }
+        // Total matching containing "figure" in name or path:
+        // Figures.zip (dir), Figures.zip/sub (dir), figure.png, figure_data.dat,
+        // configure_script.py (contains figure), figure.txt = 6 total
+        assert_eq!(paged_hits.len(), 6);
+        assert_eq!(page_counts, vec![2, 2, 2]);
+
+        // 4. WholeWord match parity: "figure" must not match "configure_script.py" or "Figures.zip"
+        let word_hits = deep_search(
+            &case_path,
+            DeepSearchOptions {
+                category: None,
+                file_types: None,
+                query: "figure".to_string(),
+                evidence_id: Some(evidence_id),
+                include_content: false,
+                max_results: 10,
+                max_file_bytes: 64 * 1024,
+                match_mode: Some(SearchMatchMode::WholeWord),
+            },
+        )?;
+        let word_names = word_hits
+            .iter()
+            .map(|h| h.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(word_names.len(), 2);
+        assert!(word_names.contains(&"figure.png"));
+        assert!(word_names.contains(&"figure.txt"));
+        assert!(!word_names.contains(&"figure_data.dat"));
+        assert!(!word_names.contains(&"configure_script.py"));
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn category_filtering_obeys_selected_evidence_and_date_with_total_semantics() -> Result<()> {
+        let case_path = unique_case_path("category-evidence-and-date-filter");
+        create_test_case(&case_path)?;
+        let dir1 = unique_temp_dir("cat-ev1-source");
+        let dir2 = unique_temp_dir("cat-ev2-source");
+
+        let doc_dir1 = dir1.join("Docs");
+        fs::create_dir_all(&doc_dir1)?;
+        fs::write(doc_dir1.join("doc_alpha.pdf"), b"%PDF-1.4 alpha")?;
+        fs::write(doc_dir1.join("doc_beta.pdf"), b"%PDF-1.4 beta")?;
+        fs::write(dir1.join("pic.png"), b"\x89PNG pic")?;
+
+        let doc_dir2 = dir2.join("Docs");
+        fs::create_dir_all(&doc_dir2)?;
+        fs::write(doc_dir2.join("doc_gamma.pdf"), b"%PDF-1.4 gamma")?;
+
+        let ev1_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: dir1.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let ev2_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: dir2.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id: ev1_id,
+                max_entries: 100,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id: ev2_id,
+                max_entries: 100,
+            },
+        )?;
+
+        // Update timestamps in case database to test date filtering deterministically
+        {
+            let conn = open_existing_case(&case_path)?;
+            conn.execute(
+                "UPDATE filesystem_entries
+                 SET metadata_json = json_set(metadata_json,
+                     '$.created_utc', '2024-05-01T10:00:00Z',
+                     '$.modified_utc', '2024-05-01T10:00:00Z',
+                     '$.accessed_utc', '2024-05-01T10:00:00Z')
+                 WHERE name = 'doc_alpha.pdf'",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE filesystem_entries
+                 SET metadata_json = json_set(metadata_json,
+                     '$.created_utc', '2026-06-01T12:00:00Z',
+                     '$.modified_utc', '2026-06-01T12:00:00Z',
+                     '$.accessed_utc', '2026-06-01T12:00:00Z')
+                 WHERE name = 'doc_beta.pdf'",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE filesystem_entries
+                 SET metadata_json = json_set(metadata_json,
+                     '$.created_utc', '2025-01-01T08:00:00Z',
+                     '$.modified_utc', '2025-01-01T08:00:00Z',
+                     '$.accessed_utc', '2025-01-01T08:00:00Z')
+                 WHERE name = 'doc_gamma.pdf'",
+                [],
+            )?;
+        }
+
+        let empty_filters = CategoryEntryFilters::default();
+
+        // 1. Unscoped (all evidence) category counts
+        let all_page = list_entries_by_category_filtered(
+            &case_path,
+            None,
+            "Documents and Office",
+            None,
+            &empty_filters,
+            None,
+            50,
+            0,
+        )?;
+        assert_eq!(all_page.total_in_category, 3);
+        assert_eq!(all_page.total_matching, 3);
+        assert_eq!(all_page.entries.len(), 3);
+
+        // 2. Scoped to Evidence 1
+        let ev1_page = list_entries_by_category_filtered(
+            &case_path,
+            Some(ev1_id),
+            "Documents and Office",
+            None,
+            &empty_filters,
+            None,
+            50,
+            0,
+        )?;
+        assert_eq!(ev1_page.total_in_category, 2);
+        assert_eq!(ev1_page.total_matching, 2);
+        assert_eq!(ev1_page.entries.len(), 2);
+
+        // 3. Scoped to Evidence 2
+        let ev2_page = list_entries_by_category_filtered(
+            &case_path,
+            Some(ev2_id),
+            "Documents and Office",
+            None,
+            &empty_filters,
+            None,
+            50,
+            0,
+        )?;
+        assert_eq!(ev2_page.total_in_category, 1);
+        assert_eq!(ev2_page.total_matching, 1);
+        assert_eq!(ev2_page.entries.len(), 1);
+
+        // 4. Date filtering: 2026 range on Evidence 1
+        let date_filters = CategoryEntryFilters {
+            from_utc: Some("2026-01-01T00:00:00Z".to_string()),
+            to_utc: Some("2026-12-31T23:59:59Z".to_string()),
+            ..Default::default()
+        };
+        let date_page = list_entries_by_category_filtered(
+            &case_path,
+            Some(ev1_id),
+            "Documents and Office",
+            None,
+            &date_filters,
+            None,
+            50,
+            0,
+        )?;
+        // Explicit total-vs-filtered semantics:
+        // total_in_category remains 2, while total_matching is 1
+        assert_eq!(date_page.total_in_category, 2);
+        assert_eq!(date_page.total_matching, 1);
+        assert_eq!(date_page.entries.len(), 1);
+        assert_eq!(date_page.entries[0].name, "doc_beta.pdf");
+
+        // 5. Backslash path filter: "Docs\doc_alpha" matches "Docs/doc_alpha"
+        let path_filter = CategoryEntryFilters {
+            name: Some(r"Docs\doc_alpha".to_string()),
+            ..Default::default()
+        };
+        let path_page = list_entries_by_category_filtered(
+            &case_path,
+            Some(ev1_id),
+            "Documents and Office",
+            None,
+            &path_filter,
+            None,
+            50,
+            0,
+        )?;
+        assert_eq!(path_page.total_in_category, 2);
+        assert_eq!(path_page.total_matching, 1);
+        assert_eq!(path_page.entries.len(), 1);
+        assert_eq!(path_page.entries[0].name, "doc_alpha.pdf");
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(dir1);
+        let _ = fs::remove_dir_all(dir2);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_mft_deep_search_over_1000_candidates_no_lock() -> Result<()> {
+        let case_path = unique_case_path("standalone-mft-1000-candidates");
+        create_test_case(&case_path)?;
+        let dir = unique_temp_dir("standalone-mft-1000-candidates-source");
+        let path = dir.join("large-$MFT");
+
+        let mut bytes = synthetic_mft_record_with_streams(
+            0,
+            "$MFT",
+            5,
+            1,
+            1,
+            true,
+            false,
+            0,
+            0,
+            Some(&[]),
+            &[],
+        );
+        for _ in 1..5 {
+            bytes.extend(vec![0_u8; 1024]);
+        }
+        bytes.extend(synthetic_mft_record_with_streams(
+            5,
+            ".",
+            5,
+            1,
+            1,
+            true,
+            true,
+            0,
+            0,
+            None,
+            &[],
+        ));
+
+        // Create 1050 records with matching query pattern "cand_file_"
+        let total_candidates = 1050_u32;
+        for i in 1..=total_candidates {
+            let record_num = 5 + i;
+            let name = format!("cand_file_{i:04}.txt");
+            let payload = format!("content_{i}");
+            bytes.extend(synthetic_mft_record_with_streams(
+                record_num,
+                &name,
+                5,
+                1,
+                1,
+                true,
+                false,
+                payload.len() as u64,
+                payload.len() as u64,
+                Some(payload.as_bytes()),
+                &[],
+            ));
+        }
+        fs::write(&path, bytes)?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path,
+                kind: EvidenceKind::File,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: (total_candidates + 20) as usize,
+            },
+        )?;
+
+        // Deep search across all pages with limit 256
+        let search_opts = DeepSearchOptions {
+            category: None,
+            file_types: None,
+            query: "cand_file".to_string(),
+            evidence_id: Some(evidence_id),
+            include_content: false,
+            max_results: (total_candidates + 100) as usize,
+            max_file_bytes: 64 * 1024,
+            match_mode: None,
+        };
+
+        let mut cursor = None;
+        let mut collected_count = 0_usize;
+        loop {
+            let page = deep_search_page(&case_path, search_opts.clone(), cursor, 256)?;
+            collected_count += page.results.len();
+            if page.complete {
+                break;
+            }
+            cursor = Some(page.next_cursor.context("expected cursor")?);
+        }
+        assert_eq!(collected_count, total_candidates as usize);
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(dir);
@@ -58623,6 +60901,7 @@ mod tests {
             include_content: true,
             max_results: 50,
             max_file_bytes: 65_536,
+            match_mode: None,
         };
         let hex_hits = deep_search(
             &case_path,
@@ -59332,6 +61611,7 @@ mod tests {
                 include_content: false,
                 max_results: 10,
                 max_file_bytes: 64,
+                match_mode: None,
             },
         )?;
         assert_eq!(nitroba_hits.len(), 2);
@@ -59483,6 +61763,7 @@ mod tests {
                 include_content: true,
                 max_results: 10,
                 max_file_bytes: 64,
+                match_mode: None,
             },
         )?;
         let content_hit = content_hits
@@ -64469,6 +66750,7 @@ mod tests {
                 include_content: false,
                 max_results: 10,
                 max_file_bytes: 64 * 1024,
+                match_mode: None,
             },
         )?;
         assert!(path_hits.iter().any(|hit| hit.match_kind == "path"));
@@ -64483,6 +66765,7 @@ mod tests {
                 include_content: true,
                 max_results: 10,
                 max_file_bytes: 64 * 1024,
+                match_mode: None,
             },
         )?;
         let content_hit = content_hits
@@ -64547,6 +66830,7 @@ mod tests {
                 include_content: true,
                 max_results: 10,
                 max_file_bytes: 64 * 1024,
+                match_mode: None,
             },
         )?;
         let hit = hits
@@ -64622,6 +66906,7 @@ mod tests {
                 include_content: true,
                 max_results: 10,
                 max_file_bytes: 64 * 1024,
+                match_mode: None,
             },
         )?;
         let large_hit = large_hits
@@ -64642,6 +66927,7 @@ mod tests {
                 include_content: true,
                 max_results: 10,
                 max_file_bytes: 64 * 1024,
+                match_mode: None,
             },
         )?;
         let utf16_hit = utf16_hits
@@ -64664,6 +66950,7 @@ mod tests {
                 include_content: true,
                 max_results: 10,
                 max_file_bytes: 64 * 1024,
+                match_mode: None,
             },
         )?;
         let odd_hit = odd_hits
@@ -64686,6 +66973,7 @@ mod tests {
                 include_content: true,
                 max_results: 10,
                 max_file_bytes: 64 * 1024,
+                match_mode: None,
             },
         )?;
         let hex_hit = hex_hits
@@ -64746,6 +67034,7 @@ mod tests {
                 include_content: true,
                 max_results: 50,
                 max_file_bytes: 1024,
+                match_mode: None,
             },
         )?;
         let target_hit = hits
@@ -64796,6 +67085,7 @@ mod tests {
             include_content: false,
             max_results: 2,
             max_file_bytes: 4096,
+            match_mode: None,
         };
         let mut cursor = None;
         let mut paths = Vec::new();
@@ -64893,6 +67183,7 @@ mod tests {
             max_file_bytes: 4096,
             category: None,
             file_types: None,
+            match_mode: None,
         };
         let mut cursor = None;
         let mut hits = Vec::new();
@@ -64929,6 +67220,7 @@ mod tests {
                 max_file_bytes: 4096,
                 category: None,
                 file_types: None,
+                match_mode: None,
             },
             None,
             10,
@@ -66099,6 +68391,7 @@ mod tests {
                 include_content: false,
                 max_results: 10,
                 max_file_bytes: 64 * 1024,
+                match_mode: None,
             },
         )?;
         assert!(hits.iter().any(|hit| hit.entry_id == target.id));
@@ -70862,6 +73155,7 @@ mod tests {
                 max_file_bytes: 4096,
                 category: None,
                 file_types: None,
+                match_mode: None,
             },
             None,
             SEARCH_RESPONSE_PAGE_MAX + 1,

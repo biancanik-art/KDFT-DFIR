@@ -270,8 +270,30 @@ struct DeepSearchArgs {
     /// Restrict hits to these file extensions, comma separated (jpg,png,zip).
     #[arg(long, value_delimiter = ',')]
     file_types: Option<Vec<String>>,
+    /// Match mode: contains, exact, or whole-word. Surrounding quotes or
+    /// syntax prefixes in query (exact:, word:) also select match mode.
+    #[arg(long, value_enum)]
+    match_mode: Option<CliSearchMatchMode>,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum CliSearchMatchMode {
+    Contains,
+    Exact,
+    WholeWord,
+}
+
+impl From<CliSearchMatchMode> for kdft_case::SearchMatchMode {
+    fn from(mode: CliSearchMatchMode) -> Self {
+        match mode {
+            CliSearchMatchMode::Contains => kdft_case::SearchMatchMode::Contains,
+            CliSearchMatchMode::Exact => kdft_case::SearchMatchMode::Exact,
+            CliSearchMatchMode::WholeWord => kdft_case::SearchMatchMode::WholeWord,
+        }
+    }
 }
 
 const CLI_DEEP_SEARCH_PAGE_SIZE: usize = 500;
@@ -440,6 +462,7 @@ fn run_deep_search_pages(
                 max_file_bytes: args.max_file_bytes,
                 category: args.category.clone(),
                 file_types: args.file_types.clone(),
+                match_mode: args.match_mode.map(Into::into),
             },
             cursor,
             page_size,
@@ -480,6 +503,7 @@ fn run_deep_search_pages(
                     max_file_bytes: args.max_file_bytes,
                     category: args.category.clone(),
                     file_types: args.file_types.clone(),
+                    match_mode: args.match_mode.map(Into::into),
                 },
                 Some(next_cursor.clone()),
                 1,
@@ -1462,6 +1486,7 @@ mod tests {
             max_file_bytes: 4096,
             category: None,
             file_types: None,
+            match_mode: None,
             json: false,
         };
         let mut names = Vec::new();

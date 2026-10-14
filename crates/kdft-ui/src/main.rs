@@ -527,6 +527,8 @@ struct DeepSearchRequest {
     category: Option<String>,
     /// Comma-separated extensions, e.g. "jpg,png,zip".
     file_types: Option<String>,
+    #[serde(default)]
+    match_mode: Option<kdft_case::SearchMatchMode>,
 }
 
 #[derive(Deserialize)]
@@ -4981,6 +4983,7 @@ fn api_deep_search(body: &mut [u8]) -> Result<kdft_case::DeepSearchPage> {
                         .collect::<Vec<_>>()
                 })
                 .filter(|list| !list.is_empty()),
+            match_mode: request.match_mode,
         },
         request.cursor,
         page_size,
@@ -8984,6 +8987,264 @@ mod tests {
         assert!(!INDEX_HTML.contains("url.searchParams.append(\"unlock\""));
         assert!(!INDEX_HTML.contains("localStorage.setItem(\"kdft.unlock\""));
     }
+
+    #[test]
+    fn standalone_mft_ui_elements_and_inspector_guards() {
+        assert!(INDEX_HTML.contains("id=\"searchMatchMode\""));
+        assert!(INDEX_HTML.contains("\"searchMatchMode\","));
+        assert!(INDEX_HTML.contains("{ key: \"mft_record_number\", label: \"MFT record\""));
+        assert!(INDEX_HTML.contains("{ key: \"ntfs_parent_reference\", label: \"Parent ref\""));
+        assert!(INDEX_HTML.contains("{ key: \"ntfs_allocated_state\", label: \"Allocated state\""));
+        assert!(INDEX_HTML
+            .contains("{ key: \"mft_recovery_limitations\", label: \"Recovery limitation\""));
+        assert!(INDEX_HTML.contains("function canRecoverEntryData(entry)"));
+        assert!(
+            INDEX_HTML.contains("meta.virtual_filesystem === \"standalone_mft_reconstruction\"")
+        );
+        assert!(INDEX_HTML.contains("meta.ntfs_default_data_content_available === true"));
+        assert!(INDEX_HTML.contains("NTFS MFT Record & Reconstruction"));
+        assert!(INDEX_HTML.contains("raw.recovery_limitations || raw.mft_recovery_limitations"));
+    }
+
+    #[test]
+    fn standalone_mft_deep_search_skips_raw_scan_with_disclosure() {
+        assert!(INDEX_HTML.contains("function isStandaloneMftEvidence(item)"));
+        assert!(INDEX_HTML.contains("!isStandaloneMftEvidence(item)"));
+        assert!(INDEX_HTML.contains("merged.attempt_error = \"standalone $MFT evidence has no raw disk byte stream; indexed reconstructed MFT records are the authoritative search surface\""));
+        assert!(INDEX_HTML.contains("Bitwise pass skipped: standalone $MFT evidence has no raw disk byte stream; indexed reconstructed MFT records are the authoritative search surface."));
+
+        let test_js = r#"
+function isStandaloneMftEvidence(item) {
+  if (!item) return false;
+  if (item.is_standalone_mft) return true;
+  if (item.virtual_filesystem === "standalone_mft_reconstruction") return true;
+  const name = String(item.display_name || item.source_path || "").toLowerCase();
+  return name === "$mft" || name === "mft" || name.endsWith(".mft") || name.endsWith("/$mft") || name.endsWith("\\$mft");
+}
+function bitwiseEvidenceTargets(evidenceValue, evidenceList) {
+  const isScannable = (item) => (item.source_kind === "image" || item.source_kind === "file") && !isStandaloneMftEvidence(item);
+  if (evidenceValue) {
+    const id = Number(evidenceValue);
+    const item = evidenceList.find((entry) => entry.id === id);
+    return item && isScannable(item) ? [{ id: item.id, name: item.display_name }] : [];
+  }
+  return evidenceList.filter(isScannable).map((item) => ({ id: item.id, name: item.display_name }));
+}
+const evidence = [
+  { id: 1, display_name: "evidence.E01", source_kind: "image", is_standalone_mft: false },
+  { id: 2, display_name: "$MFT", source_kind: "file", is_standalone_mft: true },
+  { id: 3, display_name: "test.mft", source_kind: "file", virtual_filesystem: "standalone_mft_reconstruction" }
+];
+const targets = bitwiseEvidenceTargets("", evidence);
+if (targets.length !== 1 || targets[0].id !== 1) throw new Error("standalone MFT not filtered: " + JSON.stringify(targets));
+const singleMft = bitwiseEvidenceTargets("2", evidence);
+if (singleMft.length !== 0) throw new Error("single MFT evidence was not filtered");
+console.log("PASS");
+"#;
+        let temp_path =
+            std::env::temp_dir().join(format!("test_mft_scan_guard_{}.js", std::process::id()));
+        if std::fs::write(&temp_path, test_js).is_ok() {
+            if let Ok(output) = std::process::Command::new("node").arg(&temp_path).output() {
+                assert!(
+                    output.status.success(),
+                    "node test failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let _ = std::fs::remove_file(&temp_path);
+        }
+    }
+
+    #[test]
+    fn deep_search_exact_and_word_match_modes_disable_raw_pass_with_disclosure() {
+        assert!(INDEX_HTML.contains("function resolvedSearchMatchMode(query, explicitMatchMode)"));
+        assert!(INDEX_HTML.contains("exact and whole-word matching are evaluated only across indexed record and metadata structures (bitwise whole-disk search only supports substring matching)"));
+        assert!(INDEX_HTML.contains("Bitwise pass skipped: exact and whole-word matching are evaluated only across indexed record and metadata structures."));
+
+        let test_js = r#"
+function resolvedSearchMatchMode(query, explicitMatchMode) {
+  const trimmed = String(query || "").trim();
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith("exact:")) return "exact";
+  if (lower.startsWith("word:") || lower.startsWith("wholeword:") || lower.startsWith("whole-word:")) return "word";
+  if (lower.startsWith("contains:")) return "contains";
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) || (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)) {
+    return (explicitMatchMode && explicitMatchMode !== "contains") ? explicitMatchMode : "exact";
+  }
+  return explicitMatchMode || "contains";
+}
+if (resolvedSearchMatchMode("foo", "exact") !== "exact") throw new Error("exact mode failed");
+if (resolvedSearchMatchMode("foo", "word") !== "word") throw new Error("word mode failed");
+if (resolvedSearchMatchMode("exact:foo", "contains") !== "exact") throw new Error("prefix exact failed");
+if (resolvedSearchMatchMode("word:foo", "contains") !== "word") throw new Error("prefix word failed");
+if (resolvedSearchMatchMode('"foo"', "contains") !== "exact") throw new Error("quoted exact failed");
+if (resolvedSearchMatchMode("foo", "contains") !== "contains") throw new Error("contains mode failed");
+console.log("PASS");
+"#;
+        let temp_path =
+            std::env::temp_dir().join(format!("test_match_modes_{}.js", std::process::id()));
+        if std::fs::write(&temp_path, test_js).is_ok() {
+            if let Ok(output) = std::process::Command::new("node").arg(&temp_path).output() {
+                assert!(
+                    output.status.success(),
+                    "node test failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let _ = std::fs::remove_file(&temp_path);
+        }
+    }
+
+    #[test]
+    fn deep_search_cancellable_via_abort_controller() {
+        assert!(INDEX_HTML.contains("searchAbortController: null"));
+        assert!(
+            INDEX_HTML.contains("function abortActiveSearchRequest(reason = \"Search cancelled\")")
+        );
+        assert!(INDEX_HTML.contains("abortActiveSearchRequest(\"Search criteria edited\")"));
+        assert!(INDEX_HTML.contains("abortActiveSearchRequest(\"New search started\")"));
+        assert!(INDEX_HTML.contains("abortActiveSearchRequest(\"Revision changed\")"));
+        assert!(INDEX_HTML.contains("abortActiveSearchRequest(\"Case switched\")"));
+        assert!(INDEX_HTML.contains("abortActiveSearchRequest(\"Page hidden\")"));
+        assert!(INDEX_HTML.contains("abortActiveSearchRequest(\"Page unloading\")"));
+        assert!(INDEX_HTML.contains("state.searchAbortController = new AbortController()"));
+        assert!(INDEX_HTML.contains("path.startsWith(\"/api/search/deep\") && state.searchAbortController ? state.searchAbortController.signal : undefined"));
+        assert!(INDEX_HTML.contains("if (signal && signal.aborted) {"));
+    }
+
+    #[test]
+    fn mft_row_selection_behavior_reopens_inspector_and_renders_metadata() {
+        assert!(INDEX_HTML.contains("[\"MFT Record Number\", metadata.mft_record_number ?? metadata.ntfs_file_record_number]"));
+        assert!(INDEX_HTML.contains("[\"MFT Sequence Number\", metadata.mft_sequence_number ?? metadata.ntfs_sequence_number]"));
+        assert!(INDEX_HTML.contains("[\"Filename Namespace\", metadata.ntfs_filename_namespace]"));
+        assert!(INDEX_HTML.contains("[\"Hard Links\", metadata.ntfs_hard_link_summary]"));
+        assert!(INDEX_HTML.contains("[\"Provenance\", metadata.provenance || metadata.mft_provenance || metadata.mft_record_offset_basis || metadata.source_path_availability || metadata.filesystem_parser]"));
+
+        let script = INDEX_HTML
+            .split_once("<script>")
+            .expect("embedded script start")
+            .1
+            .split_once("</script>")
+            .expect("embedded script end")
+            .0;
+
+        let node_runner = format!(
+            r#"
+const vm = require('vm');
+let script = {script_json};
+script = script.replace('__KDFT_BOOTSTRAP__', '{{}}');
+const lastRefresh = script.lastIndexOf('refresh();');
+if (lastRefresh !== -1) {{
+  script = script.substring(0, lastRefresh) + '// refresh();' + script.substring(lastRefresh + 10);
+}}
+
+function makeElement(id) {{
+  return {{
+    id,
+    value: '',
+    options: [],
+    add: () => {{}},
+    style: {{}},
+    classList: {{ add: () => {{}}, remove: () => {{}}, toggle: () => {{}}, contains: () => false }},
+    dataset: {{}},
+    addEventListener: () => {{}},
+    setAttribute: () => {{}},
+    getAttribute: () => null,
+    appendChild: () => {{}},
+    querySelector: () => makeElement('sub'),
+    querySelectorAll: () => [],
+    innerHTML: '',
+    textContent: '',
+    hidden: false,
+    disabled: false
+  }};
+}}
+const elements = new Map();
+function getEl(id) {{
+  if (!elements.has(id)) elements.set(id, makeElement(id));
+  return elements.get(id);
+}}
+
+global.window = {{
+  addEventListener: () => {{}},
+  removeEventListener: () => {{}},
+  location: {{ href: 'http://localhost/', search: '' }},
+  history: {{ pushState: () => {{}}, replaceState: () => {{}}, state: null }},
+  matchMedia: () => ({{ matches: false, addEventListener: () => {{}} }}),
+  setTimeout: setTimeout,
+  clearTimeout: clearTimeout
+}};
+global.history = global.window.history;
+global.document = {{
+  addEventListener: () => {{}},
+  getElementById: getEl,
+  querySelector: getEl,
+  querySelectorAll: () => [],
+  documentElement: makeElement('html'),
+  body: makeElement('body')
+}};
+global.$ = getEl;
+global.localStorage = {{ getItem: () => null, setItem: () => {{}}, removeItem: () => {{}} }};
+global.sessionStorage = {{ getItem: () => null, setItem: () => {{}}, removeItem: () => {{}} }};
+global.fetch = () => Promise.resolve({{}});
+global.ANALYSIS_MODE = false;
+global.MutationObserver = class {{ observe() {{}} disconnect() {{}} }};
+global.ResizeObserver = class {{ observe() {{}} disconnect() {{}} }};
+global.Option = class {{ constructor(text, value) {{ this.text = text; this.value = value; }} }};
+
+const ctx = vm.createContext(global);
+vm.runInContext(script, ctx);
+
+const testCode = `
+  state.inspectorCollapsed = true;
+  const mftEntry = {{
+    id: 42,
+    logical_path: '/Reconstructed filesystem/test.txt',
+    name: 'test.txt',
+    entry_kind: 'file',
+    metadata_json: {{
+      virtual_filesystem: 'standalone_mft_reconstruction',
+      mft_record_number: 1234,
+      mft_sequence_number: 5,
+      ntfs_filename_namespace: 'Win32',
+      ntfs_hard_link_summary: '2 links',
+      mft_record_offset_basis: 'byte offset within the standalone $MFT source stream; not an evidence-media physical offset'
+    }}
+  }};
+  state.data = {{ entries: [mftEntry], evidence: [] }};
+  state.lookupEntries.set(42, mftEntry);
+
+  selectBrowserEntry(42);
+
+  if (state.inspectorCollapsed !== false) throw new Error('inspector was not reopened: ' + state.inspectorCollapsed);
+  if (state.hex.entryId !== 42) throw new Error('exact record was not selected: ' + state.hex.entryId);
+  const details = recordDetails(mftEntry);
+  if (!details.includes('NTFS MFT Record &amp; Reconstruction') && !details.includes('NTFS MFT Record & Reconstruction')) throw new Error('missing MFT section');
+  if (!details.includes('1234')) throw new Error('missing record number');
+  if (!details.includes('5')) throw new Error('missing sequence number');
+  if (!details.includes('Win32')) throw new Error('missing namespace');
+  if (!details.includes('2 links')) throw new Error('missing hard links');
+  if (!details.includes('byte offset within the standalone $MFT source stream')) throw new Error('missing provenance');
+  console.log('SUCCESS: All MFT row selection assertions passed!');
+`;
+vm.runInContext(testCode, ctx);
+"#,
+            script_json = serde_json::to_string(script).expect("json script")
+        );
+
+        let temp_path =
+            std::env::temp_dir().join(format!("test_mft_row_sel_{}.js", std::process::id()));
+        if std::fs::write(&temp_path, node_runner).is_ok() {
+            if let Ok(output) = std::process::Command::new("node").arg(&temp_path).output() {
+                assert!(
+                    output.status.success(),
+                    "node script failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let _ = std::fs::remove_file(&temp_path);
+        }
+    }
 }
 
 fn query_i64(query: &HashMap<String, String>, field: &str) -> Result<i64> {
@@ -12196,10 +12457,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
             <div class="panel-head"><h2>Deep Search</h2><span class="pill">Indexed + bitwise</span></div>
             <div class="panel-body form-grid">
               <label>Query<input id="searchQuery" placeholder="keyword, file name, URL, hex:50 4B"></label>
-              <label>Search mode<select id="searchMode" title="Indexed is a fast lookup over the processed case database. All also scans the raw evidence byte-for-byte (unallocated space and file slack included) for the same query.">
-                <option value="indexed">Indexed (fast)</option>
-                <option value="all">All - indexed + bitwise (whole disk)</option>
-              </select></label>
+              <div class="row">
+                <label>Search mode<select id="searchMode" title="Indexed is a fast lookup over the processed case database. All also scans the raw evidence byte-for-byte (unallocated space and file slack included) for the same query.">
+                  <option value="indexed">Indexed (fast)</option>
+                  <option value="all">All - indexed + bitwise (whole disk)</option>
+                </select></label>
+                <label>Match mode<select id="searchMatchMode" title="Matching behavior: contains (default substring match), exact (match full name/path or enclosed quotes), or whole-word (isolated token boundaries). Syntax prefixes in the query (exact:, word:, contains:) also override this.">
+                  <option value="contains">Contains (substring)</option>
+                  <option value="exact">Exact (full name/path)</option>
+                  <option value="whole_word">Whole word</option>
+                </select></label>
+              </div>
               <label>Evidence<select id="searchEvidence"><option value="">All evidence</option></select></label>
               <div class="row">
                 <label>Include content<select id="includeContent"><option value="true">yes</option><option value="false">no</option></select></label>
@@ -12410,6 +12678,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       searchRunning: false,
       searchError: null,
       searchPageError: null,
+      searchAbortController: null,
       rawSearchResult: null,
       rawSearchRunning: false,
       rawSearchAttempted: false,
@@ -12612,6 +12881,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return {
         query: value("searchQuery"),
         mode: currentSearchMode(),
+        matchMode: value("searchMatchMode", "contains"),
         evidence: value("searchEvidence"),
         includeContent: value("includeContent", "true"),
         maxResults: value("maxResults", "200"),
@@ -12694,6 +12964,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const form = snapshot.form;
       $("searchQuery").value = String(form.query || "");
       $("searchMode").value = form.mode === "all" ? "all" : "indexed";
+      if ($("searchMatchMode")) {
+        $("searchMatchMode").value = form.matchMode || "contains";
+      }
       $("searchEvidence").value = String(form.evidence || "");
       $("includeContent").value = form.includeContent === "false" ? "false" : "true";
       $("maxResults").value = String(form.maxResults || "200");
@@ -12803,7 +13076,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
       ]);
     }
 
+    function abortActiveSearchRequest(reason = "Search cancelled") {
+      if (state.searchAbortController) {
+        try {
+          state.searchAbortController.abort(reason);
+        } catch (_) {}
+        state.searchAbortController = null;
+      }
+    }
+
     function clearDeepSearchResultsForRevisionChange() {
+      abortActiveSearchRequest("Revision changed");
       state.searchGeneration += 1;
       state.searchResults = [];
       state.searchCursor = null;
@@ -12996,6 +13279,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       // state.data, and otherwise retain rows belonging to removed evidence.
       state.lookupEntries = new Map();
       state.searchResults = [];
+      abortActiveSearchRequest("Case switched");
       state.searchGeneration += 1;
       state.searchScope = null;
       state.searchPageError = null;
@@ -13173,16 +13457,20 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return readApiResponse(response);
     }
 
-    async function apiPost(path, body) {
+    async function apiPost(path, body, options = {}) {
       const payloadStr = JSON.stringify(body);
       const encodedBody = new TextEncoder().encode(payloadStr);
       let response;
+      const signal = options.signal !== undefined
+        ? options.signal
+        : (path.startsWith("/api/search/deep") && state.searchAbortController ? state.searchAbortController.signal : undefined);
       try {
         response = await fetchWithLocalAuthRetry(() => fetch(path, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             credentials: "same-origin",
-            body: encodedBody
+            body: encodedBody,
+            signal
           }));
       } finally {
         encodedBody.fill(0);
@@ -13190,10 +13478,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return readApiResponse(response);
     }
 
-    async function apiPostReadOnlyWithNetworkRetry(path, body) {
+    async function apiPostReadOnlyWithNetworkRetry(path, body, options = {}) {
+      const signal = options.signal || (path.startsWith("/api/search/deep") && state.searchAbortController ? state.searchAbortController.signal : undefined);
       try {
-        return await apiPost(path, body);
+        return await apiPost(path, body, { ...options, signal });
       } catch (err) {
+        if ((signal && signal.aborted) || err.name === "AbortError") {
+          throw err;
+        }
         // A tab can survive a local server rebuild/restart while its pooled
         // keep-alive connection does not. Chromium reports that stale-socket
         // failure only as TypeError: Failed to fetch and does not necessarily
@@ -13204,7 +13496,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
           throw err;
         }
         await new Promise((resolve) => window.setTimeout(resolve, 250));
-        return apiPost(path, body);
+        if (signal && signal.aborted) {
+          throw new DOMException("The user aborted a request.", "AbortError");
+        }
+        return apiPost(path, body, { ...options, signal });
       }
     }
 
@@ -13362,6 +13657,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.searchCoverage = null;
       state.searchError = null;
       state.searchPageError = null;
+      abortActiveSearchRequest("Case unloaded");
       state.searchRunning = false;
       state.searchGeneration += 1;
       state.searchScope = null;
@@ -14865,6 +15161,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Entry is not loaded.", true);
         return;
       }
+      if (!canRecoverEntryData(entry)) {
+        const meta = entry.metadata_json || {};
+        const limitation = meta.recovery_limitations || meta.mft_recovery_limitations || "File content is not recoverable for this entry.";
+        setNotice(limitation, true);
+        return;
+      }
       const labels = recoveryActionText(entry);
       const defaultPath = defaultRecoveryPath(entry);
       const outputPath = window.prompt(labels.prompt + " to:", defaultPath);
@@ -15956,6 +16258,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         selectFolder(entry.logical_path);
         return;
       }
+      setInspectorCollapsed(false);
       state.hex = makeHexState(entry.id, 0, numberValue("hexLength", 512));
       $("viewerMode").value = "metadata";
       loadEntryDiskLocation(entry.id);
@@ -16112,8 +16415,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
       "wav", "mp3", "mp4", "mov", "avi"
     ]);
 
+    function canRecoverEntryData(entry) {
+      if (!entry || !entry.id || entry.entry_kind !== "file") {
+        return false;
+      }
+      const meta = entry.metadata_json || {};
+      if (meta.virtual_filesystem === "standalone_mft_reconstruction") {
+        return meta.ntfs_default_data_content_available === true;
+      }
+      return true;
+    }
+
     function canOpenEntryExternally(entry) {
-      return Boolean(entry && entry.id && entry.entry_kind === "file" && EXTERNAL_OPEN_EXTENSIONS.has(filesystemFileExtension(entry)));
+      return Boolean(entry && entry.id && entry.entry_kind === "file" && canRecoverEntryData(entry) && EXTERNAL_OPEN_EXTENSIONS.has(filesystemFileExtension(entry)));
     }
 
     function externalOpenWarning(entry) {
@@ -16132,6 +16446,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const entry = entryId ? findLoadedEntry(entryId) : currentHexEntry();
       if (!entry || !entry.id || entry.entry_kind !== "file") {
         setNotice("Select an indexed file before opening it.", true);
+        return;
+      }
+      if (!canRecoverEntryData(entry)) {
+        const meta = entry.metadata_json || {};
+        const limitation = meta.recovery_limitations || meta.mft_recovery_limitations || "File content is not recoverable for this entry.";
+        setNotice(limitation, true);
         return;
       }
       if (!canOpenEntryExternally(entry)) {
@@ -16509,6 +16829,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         category: $("searchCategory").value || null,
         fileTypes: $("searchFileTypes").value || null,
         mode: currentSearchMode(),
+        matchMode: $("searchMatchMode") ? $("searchMatchMode").value : "contains",
         batchSize: normalizeSearchBatchSizeInput({ announce: announceBatch, persist: false })
       });
     }
@@ -16535,6 +16856,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         && ($("searchCategory").value || null) === scope.category
         && ($("searchFileTypes").value || null) === scope.fileTypes
         && currentSearchMode() === scope.mode
+        && ($("searchMatchMode") ? $("searchMatchMode").value : "contains") === (scope.matchMode || "contains")
         && normalizedSearchBatchSizeValue($("maxResults").value) === scope.batchSize;
     }
 
@@ -16569,9 +16891,45 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return true;
     }
 
+    function isStandaloneMftEvidence(item) {
+      if (!item) {
+        return false;
+      }
+      if (item.is_standalone_mft) {
+        return true;
+      }
+      if (item.virtual_filesystem === "standalone_mft_reconstruction") {
+        return true;
+      }
+      const name = String(item.display_name || item.source_path || "").toLowerCase();
+      return name === "$mft" || name === "mft" || name.endsWith(".mft") || name.endsWith("/$mft") || name.endsWith("\\$mft");
+    }
+
+    function resolvedSearchMatchMode(query, explicitMatchMode) {
+      const trimmed = String(query || "").trim();
+      const lower = trimmed.toLowerCase();
+      if (lower.startsWith("exact:")) {
+        return "exact";
+      }
+      if (lower.startsWith("word:") || lower.startsWith("wholeword:") || lower.startsWith("whole-word:")) {
+        return "word";
+      }
+      if (lower.startsWith("contains:")) {
+        return "contains";
+      }
+      if (
+        (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
+        (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+      ) {
+        return (explicitMatchMode && explicitMatchMode !== "contains") ? explicitMatchMode : "exact";
+      }
+      return explicitMatchMode || "contains";
+    }
+
     function handleDeepSearchCriteriaEdited({ persist = false } = {}) {
       const scope = state.searchScope;
       if (scope && !deepSearchFormMatchesScope(scope)) {
+        abortActiveSearchRequest("Search criteria edited");
         if (scope.generation === state.searchGeneration) {
           state.searchGeneration += 1;
         }
@@ -16605,7 +16963,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         cursor,
         max_file_bytes: scope.maxFileBytes,
         category: scope.category,
-        file_types: scope.fileTypes
+        file_types: scope.fileTypes,
+        match_mode: scope.matchMode || null
       };
     }
 
@@ -16618,23 +16977,29 @@ const INDEX_HTML: &str = r###"<!doctype html>
         pagesFetched: 0,
         error: null
       };
+      const currentController = state.searchAbortController;
+      const signal = currentController ? currentController.signal : undefined;
       while (batch.results.length < requestedCount && !batch.complete) {
+        if ((signal && signal.aborted) || !searchRunIsCurrent(scope, generation)) {
+          throw staleSearchError();
+        }
         const remaining = requestedCount - batch.results.length;
         const requestCursor = batch.next_cursor;
         let page;
         try {
           page = await apiPostReadOnlyWithNetworkRetry(
             "/api/search/deep",
-            deepSearchApiRequest(scope, Math.min(SEARCH_API_PAGE_MAX, remaining), requestCursor)
+            deepSearchApiRequest(scope, Math.min(SEARCH_API_PAGE_MAX, remaining), requestCursor),
+            { signal }
           );
         } catch (err) {
-          if (!searchRunIsCurrent(scope, generation)) {
+          if ((signal && signal.aborted) || err.name === "AbortError" || !searchRunIsCurrent(scope, generation)) {
             throw staleSearchError();
           }
           batch.error = err.message || String(err);
           break;
         }
-        if (!searchRunIsCurrent(scope, generation)) {
+        if ((signal && signal.aborted) || !searchRunIsCurrent(scope, generation)) {
           throw staleSearchError();
         }
         const nextCursor = page.next_cursor || null;
@@ -16670,6 +17035,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       state.searchPageLoading = true;
       state.searchPageError = null;
+      if (!state.searchAbortController || state.searchAbortController.signal.aborted) {
+        state.searchAbortController = new AbortController();
+      }
       renderSearchResults();
       try {
         const page = await fetchIndexedSearchBatch(
@@ -16704,9 +17072,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     async function runSearch() {
       if (state.searchRunning) {
-        setNotice("A search is already running.");
-        return;
+        abortActiveSearchRequest("New search started");
+        state.searchRunning = false;
       }
+      abortActiveSearchRequest("New search started");
+      state.searchAbortController = new AbortController();
       state.searchRunning = true;
       const generation = ++state.searchGeneration;
       const scope = captureDeepSearchScope({ generation });
@@ -16802,7 +17172,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
         persistDeepSearchSession();
         return;
       }
-      setNotice(indexedPassSummary() + ". Running bitwise whole-disk scan...", Boolean(state.searchError || state.searchPageError));
+      const matchMode = resolvedSearchMatchMode(scope.query, scope.matchMode);
+      if (matchMode !== "contains") {
+        setNotice(
+          indexedPassSummary() + ". Bitwise pass skipped: exact and whole-word matching are evaluated only across indexed record and metadata structures.",
+          Boolean(state.searchError || state.searchPageError)
+        );
+      } else {
+        setNotice(indexedPassSummary() + ". Running bitwise whole-disk scan...", Boolean(state.searchError || state.searchPageError));
+      }
       try {
         await runBitwiseForUnifiedSearch(scope, generation);
       } catch (err) {
@@ -16832,7 +17210,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!state.data) {
         return [];
       }
-      const isScannable = (item) => item.source_kind === "image" || item.source_kind === "file";
+      const isScannable = (item) =>
+        (item.source_kind === "image" || item.source_kind === "file") &&
+        !isStandaloneMftEvidence(item);
       if (evidenceValue) {
         const id = Number(evidenceValue);
         const item = state.data.evidence.find((entry) => entry.id === id);
@@ -17016,9 +17396,39 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Enter a query to run the bitwise pass.", true);
         return;
       }
+      const matchMode = resolvedSearchMatchMode(scope.query, scope.matchMode);
+      if (matchMode !== "contains") {
+        merged.complete = false;
+        merged.truncated = false;
+        merged.attempt_error = "exact and whole-word matching are evaluated only across indexed record and metadata structures (bitwise whole-disk search only supports substring matching)";
+        state.rawSearchResult = merged;
+        persistDeepSearchSession();
+        renderRawSearchResults();
+        setNotice(
+          indexedPassSummary() + ". Bitwise pass skipped: exact and whole-word matching are evaluated only across indexed record and metadata structures.",
+          Boolean(state.searchError || state.searchPageError)
+        );
+        return;
+      }
       if (!targets.length) {
         merged.complete = false;
         merged.truncated = true;
+        const selectedItem = scope.evidenceId != null && state.data
+          ? state.data.evidence.find((e) => e.id === Number(scope.evidenceId))
+          : null;
+        const allMft = state.data && state.data.evidence.length > 0 &&
+          state.data.evidence.every(isStandaloneMftEvidence);
+        if (isStandaloneMftEvidence(selectedItem) || allMft) {
+          merged.attempt_error = "standalone $MFT evidence has no raw disk byte stream; indexed reconstructed MFT records are the authoritative search surface";
+          state.rawSearchResult = merged;
+          persistDeepSearchSession();
+          renderRawSearchResults();
+          setNotice(
+            indexedPassSummary() + ". Bitwise pass skipped: standalone $MFT evidence has no raw disk byte stream; indexed reconstructed MFT records are the authoritative search surface.",
+            Boolean(state.searchError || state.searchPageError)
+          );
+          return;
+        }
         merged.attempt_error = "the selected evidence has no raw byte stream (only image/file sources can be scanned byte-for-byte)";
         state.rawSearchResult = merged;
         persistDeepSearchSession();
@@ -17164,6 +17574,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.selectedEntryIds = new Set([entry.id]);
       state.hex = makeHexState(entry.id, 0, numberValue("hexLength", 512));
       $("viewerMode").value = "metadata";
+      setInspectorCollapsed(false);
       switchView("analyzeView");
       // Large lazily-browsed cases keep their own folder cache (state.idx),
       // separate from state.browserState. renderEvidenceBrowserEntries()
@@ -19379,7 +19790,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           rows.push(ctxItem("Analyze image", `analyzeDiskImageEntry(${entryId})`));
         }
         rows.push(ctxItem("Bookmark", `bookmarkEntry(${entryId})`));
-        if (entry.entry_kind === "file") {
+        if (entry.entry_kind === "file" && canRecoverEntryData(entry)) {
           rows.push(ctxItem(recoveryActionText(entry).button, `recoverEntry(${entryId})`));
         }
         rows.push(ctxItem("Go to folder", `goToEntryFolder(${entryId})`));
@@ -21531,7 +21942,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
       { key: "originator_sync_guid_full", label: "Originator Sync Client GUID (full)", sortable: true, filterable: true, sortType: "text", meta: "originator_sync_guid_full" },
       { key: "browser_profile", label: "Profile", sortable: true, filterable: true, sortType: "text", meta: "browser_profile" },
       { key: "account_name", label: "Account", sortable: true, filterable: true, sortType: "text", meta: "account_name" },
-      { key: "network_name", label: "Network", sortable: true, filterable: true, sortType: "text", meta: "network_name" }
+      { key: "network_name", label: "Network", sortable: true, filterable: true, sortType: "text", meta: "network_name" },
+      { key: "mft_record_number", label: "MFT record", sortable: true, filterable: true, sortType: "number", meta: "mft_record_number" },
+      { key: "mft_sequence_number", label: "MFT sequence", sortable: true, filterable: true, sortType: "number", meta: "mft_sequence_number" },
+      { key: "ntfs_parent_reference", label: "Parent ref", sortable: true, filterable: true, sortType: "text", meta: "ntfs_parent_reference" },
+      { key: "ntfs_allocated_state", label: "Allocated state", sortable: true, filterable: true, sortType: "text", meta: "ntfs_allocated_state" },
+      { key: "ntfs_data_attribute_identity", label: "Data attribute", sortable: true, filterable: true, sortType: "text", meta: "ntfs_data_attribute_identity" },
+      { key: "ntfs_filename_namespace", label: "Namespace", sortable: true, filterable: true, sortType: "text", meta: "ntfs_filename_namespace" },
+      { key: "ntfs_hard_link_summary", label: "Hard links", sortable: true, filterable: true, sortType: "text", meta: "ntfs_hard_link_summary" },
+      { key: "mft_recovery_limitations", label: "Recovery limitation", sortable: true, filterable: true, sortType: "text", meta: "mft_recovery_limitations" }
     ];
 
     function toggleCategoryColumn(key, visible) {
@@ -26441,7 +26860,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Filesystem", raw.filesystem],
           ["Decoded-media Volume Start", formatOffsetValue(firstDefined(raw.partition_start_offset, raw.start_offset))],
           ["Partition Size", formatByteCountValue(firstDefined(raw.partition_size_bytes, raw.size_bytes))],
-          ["MFT Record", raw.mft_file_record_number || raw.ntfs_file_record_number],
+          ["MFT Record", raw.mft_file_record_number || raw.ntfs_file_record_number || raw.mft_record_number],
           ["MFT Sequence", raw.mft_sequence_number],
           ["NTFS Path", raw.ntfs_path],
           ["FAT Path", raw.fat_path],
@@ -26778,11 +27197,15 @@ const INDEX_HTML: &str = r###"<!doctype html>
         raw.filesystem_parser ? inspectorBadge("parser: " + raw.filesystem_parser) : "",
         raw.category_confidence ? inspectorBadge("confidence: " + raw.category_confidence) : ""
       ].filter(Boolean).join("");
+      const limitation = raw.recovery_limitations || raw.mft_recovery_limitations;
+      const limitationNotice = limitation
+        ? `<div class="analysis-status" style="color:var(--warn, #9a6700); margin-top:8px;">${escapeHtml(limitation)}</div>`
+        : "";
       const actions = [
         canViewBytes ? `<button class="secondary" onclick="openEntry(${entry.id})">View bytes</button>` : "",
         canOpenEntryExternally(entry) ? `<button class="ghost" onclick="openSelectedEntryExternal(${entry.id})">Open file</button>` : "",
         canAnalyze ? `<button class="secondary" onclick="analyzeDiskImageEntry(${entry.id})">Analyze image</button>` : "",
-        entry.entry_kind === "file" && !synthetic ? `<button class="ghost" onclick="recoverEntry(${entry.id})">${escapeHtml(recoveryActionText(entry).button)}</button>` : "",
+        entry.entry_kind === "file" && !synthetic && canRecoverEntryData(entry) ? `<button class="ghost" onclick="recoverEntry(${entry.id})">${escapeHtml(recoveryActionText(entry).button)}</button>` : "",
         !synthetic ? `<button class="ghost" onclick="bookmarkEntry(${entry.id})">Bookmark</button>` : ""
       ].filter(Boolean).join("");
       return `
@@ -26791,6 +27214,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           <div class="inspector-path">${escapeHtml(entry.logical_path)}</div>
           <div class="inspector-badges">${badges}</div>
           <div class="inspector-actions">${actions}</div>
+          ${limitationNotice}
         </section>`;
     }
 
@@ -26829,6 +27253,21 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function recordDetails(entry) {
       const metadata = entry.metadata_json || {};
+      if (metadata.virtual_filesystem === "standalone_mft_reconstruction" || metadata.mft_record_number !== undefined) {
+        return detailSection("NTFS MFT Record & Reconstruction", [
+          ["MFT Record Number", metadata.mft_record_number ?? metadata.ntfs_file_record_number],
+          ["MFT Sequence Number", metadata.mft_sequence_number ?? metadata.ntfs_sequence_number],
+          ["Parent Reference", metadata.ntfs_parent_reference],
+          ["Allocated State", metadata.ntfs_allocated_state],
+          ["Data Attribute Identity", metadata.ntfs_data_attribute_identity],
+          ["Filename Namespace", metadata.ntfs_filename_namespace],
+          ["Hard Links", metadata.ntfs_hard_link_summary],
+          ["Provenance", metadata.provenance || metadata.mft_provenance || metadata.mft_record_offset_basis || metadata.source_path_availability || metadata.filesystem_parser],
+          ["Reconstructed Path", metadata.mft_reconstructed_path],
+          ["Path Reconstruction Status", metadata.mft_path_reconstruction_status],
+          ["Recovery Limitations", metadata.mft_recovery_limitations || metadata.recovery_limitations]
+        ]);
+      }
       if (metadata.artifact_kind === "email_message") {
         return detailSection("Email", [
           ["Format", metadata.email_format],
@@ -28366,6 +28805,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     [
       "searchQuery",
       "searchEvidence",
+      "searchMatchMode",
       "includeContent",
       "maxResults",
       "maxFileBytes",
@@ -28406,6 +28846,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
     });
     document.addEventListener("keydown", handleGlobalKeydown);
     window.addEventListener("pagehide", persistDeepSearchSession);
+    window.addEventListener("pagehide", () => abortActiveSearchRequest("Page hidden"));
+    window.addEventListener("beforeunload", () => abortActiveSearchRequest("Page unloading"));
     window.addEventListener("pagehide", resetBitlockerRasterPreview);
     window.addEventListener("popstate", (event) => {
       state.viewerFullscreenHistoryPending = false;
