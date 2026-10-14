@@ -14131,7 +14131,10 @@ fn deep_search_metadata_text(metadata: &serde_json::Value, keys: &[&str]) -> Opt
 
 fn deep_search_record_context(metadata: &serde_json::Value) -> Option<DeepSearchRecordContext> {
     let artifact_kind = deep_search_metadata_text(metadata, &["artifact_kind"])?;
-    if !artifact_kind.starts_with("browser_") {
+    if !artifact_kind.starts_with("browser_")
+        && !artifact_kind.starts_with("registry_")
+        && !artifact_kind.starts_with("windows_")
+    {
         return None;
     }
 
@@ -14145,7 +14148,15 @@ fn deep_search_record_context(metadata: &serde_json::Value) -> Option<DeepSearch
             "site_url",
             "hostname",
         ],
-    );
+    )
+    .or_else(|| {
+        let val_data = deep_search_metadata_text(metadata, &["registry_value_data", "data"])?;
+        if val_data.starts_with("http://") || val_data.starts_with("https://") {
+            Some(val_data)
+        } else {
+            None
+        }
+    });
     let host = deep_search_metadata_text(metadata, &["host", "hostname"]).or_else(|| {
         url.as_deref().and_then(|value| {
             let host = host_from_url(value);
@@ -14157,7 +14168,16 @@ fn deep_search_record_context(metadata: &serde_json::Value) -> Option<DeepSearch
         browser_family: deep_search_metadata_text(metadata, &["browser_family", "browser_brand"]),
         title: deep_search_metadata_text(
             metadata,
-            &["title", "name", "file_name", "search_term", "cookie_name"],
+            &[
+                "title",
+                "name",
+                "file_name",
+                "search_term",
+                "cookie_name",
+                "registry_value_name",
+                "registry_key_name",
+                "registry_key_path",
+            ],
         ),
         url,
         host,
@@ -14182,6 +14202,9 @@ fn deep_search_record_context(metadata: &serde_json::Value) -> Option<DeepSearch
                 "last_access_utc",
                 "creation_utc",
                 "time_created_utc",
+                "registry_key_last_write_utc",
+                "artifact_time_utc",
+                "modified_utc",
             ],
         ),
         source_artifact: deep_search_metadata_text(
@@ -14190,6 +14213,7 @@ fn deep_search_record_context(metadata: &serde_json::Value) -> Option<DeepSearch
                 "source_artifact",
                 "source_artifact_path",
                 "source_path_exact",
+                "registry_hive",
             ],
         ),
     })
@@ -14473,6 +14497,15 @@ fn path_search_page_results(
     let mut after_path_owned = after_path.map(str::to_string);
 
     let query_norm = query_lower.replace('\\', "/");
+    // Registry key paths live inside JSON strings, where every Windows path
+    // separator is escaped. Keep the normalized filesystem-path lookup and
+    // also search the serialized JSON representation so a query such as
+    // `Policies\\Microsoft\\Windows` finds the parsed Registry value record.
+    let query_json_escaped = if query_lower.contains('\\') {
+        query_lower.replace('\\', "\\\\")
+    } else {
+        String::new()
+    };
     let sql = format!(
         "SELECT fe.id, fe.evidence_id, fe.logical_path, fe.name, fe.entry_kind, fe.metadata_json
          FROM filesystem_entries fe
@@ -14483,7 +14516,8 @@ fn path_search_page_results(
                 OR instr(lower(fe.name), ?3) > 0
                 OR instr(lower(fe.name), ?8) > 0
                 OR instr(lower(fe.metadata_json), ?3) > 0
-                OR instr(lower(fe.metadata_json), ?8) > 0)
+                OR instr(lower(fe.metadata_json), ?8) > 0
+                OR (?9 != '' AND instr(lower(fe.metadata_json), ?9) > 0))
            AND (?4 IS NULL OR fe.evidence_id > ?4
                 OR (fe.evidence_id = ?4 AND fe.logical_path > ?5)
                 OR (fe.evidence_id = ?4 AND fe.logical_path = ?5 AND fe.id > ?6)){}
@@ -14505,6 +14539,7 @@ fn path_search_page_results(
                     after_entry,
                     chunk_size as i64,
                     query_norm,
+                    query_json_escaped,
                 ],
                 |row| {
                     Ok((
@@ -14575,8 +14610,24 @@ fn path_search_page_results(
             }
 
             let metadata_offset = match match_mode {
-                SearchMatchMode::Contains => metadata_json.to_ascii_lowercase().find(query_lower),
-                SearchMatchMode::WholeWord => find_whole_word_offset(&metadata_json, query),
+                SearchMatchMode::Contains => {
+                    let metadata_lower = metadata_json.to_ascii_lowercase();
+                    metadata_lower
+                        .find(query_lower)
+                        .or_else(|| metadata_lower.find(&query_norm))
+                        .or_else(|| {
+                            (!query_json_escaped.is_empty())
+                                .then(|| metadata_lower.find(&query_json_escaped))
+                                .flatten()
+                        })
+                }
+                SearchMatchMode::WholeWord => find_whole_word_offset(&metadata_json, query)
+                    .or_else(|| find_whole_word_offset(&metadata_json, &query_norm))
+                    .or_else(|| {
+                        (!query_json_escaped.is_empty())
+                            .then(|| find_whole_word_offset(&metadata_json, &query_json_escaped))
+                            .flatten()
+                    }),
                 SearchMatchMode::Exact => None,
             };
 
@@ -16185,6 +16236,14 @@ fn list_indexed_directory_inner(
         i64::try_from(limit).unwrap_or(i64::MAX)
     };
     let requested_offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    // Registry values are stored as `record` rows, which the generic lazy tree
+    // used to skip entirely - a large case could therefore browse hive keys but
+    // never the value records underneath them, so column filters and Deep
+    // Search selection had no row to select. Registry values are still listed
+    // here because every other record class (browser activity, email, EVTX)
+    // belongs to its own category view, while registry keys and values are one
+    // browsable hive tree. The json_extract term only runs for record rows, so
+    // the directory scan stays as cheap as before for ordinary files.
     let mut stmt = conn.prepare(
         "WITH candidates AS (
              SELECT id, name, entry_kind, size_bytes, is_deleted,
@@ -16196,7 +16255,8 @@ fn list_indexed_directory_inner(
               FROM filesystem_entries
               WHERE case_id = ?1 AND evidence_id = ?2
                 AND logical_path LIKE ?3 ESCAPE '\\'
-                AND entry_kind != 'record'
+                AND (entry_kind != 'record'
+                     OR json_extract(metadata_json, '$.artifact_kind') = 'registry_value')
           ),
          grouped AS (
              SELECT segment,
@@ -26464,7 +26524,12 @@ fn is_registry_hive_candidate(logical_path: &str, name: &str) -> bool {
 }
 
 fn is_registry_hive_evidence_candidate(path: &Path, display_name: &str) -> bool {
-    registry_hive_candidate(path.to_string_lossy().as_ref(), display_name, true)
+    if registry_hive_candidate(path.to_string_lossy().as_ref(), display_name, true) {
+        return true;
+    }
+    detect_registry_hive_header(path)
+        .map(|h| h.kind == RegistryHiveHeaderKind::Regf)
+        .unwrap_or(false)
 }
 
 pub fn is_standalone_mft_evidence_candidate(path: &Path, display_name: &str) -> bool {
@@ -27538,27 +27603,27 @@ struct RegistryHiveHeaderStatus {
     reason: Option<String>,
 }
 
-#[derive(Debug)]
-struct RegistryImportEntry {
-    logical_path: String,
-    display_name: String,
-    entry_kind: &'static str,
-    size_bytes: Option<i64>,
-    metadata: serde_json::Value,
+#[derive(Debug, Clone)]
+pub(crate) struct RegistryImportEntry {
+    pub(crate) logical_path: String,
+    pub(crate) display_name: String,
+    pub(crate) entry_kind: &'static str,
+    pub(crate) size_bytes: Option<i64>,
+    pub(crate) metadata: serde_json::Value,
     /// Retained only for exact Windows structured-artifact keys. Generic
     /// Registry imports remain preview-only so a large hive cannot duplicate
     /// every binary value in memory.
-    raw_value_bytes: Option<Vec<u8>>,
+    pub(crate) raw_value_bytes: Option<Vec<u8>>,
 }
 
-#[derive(Debug)]
-struct RegistryImportData {
-    entries: Vec<RegistryImportEntry>,
-    keys_indexed: usize,
-    values_indexed: usize,
-    total_entries_seen: usize,
-    truncated: bool,
-    root_logical_path: String,
+#[derive(Debug, Clone)]
+pub(crate) struct RegistryImportData {
+    pub(crate) entries: Vec<RegistryImportEntry>,
+    pub(crate) keys_indexed: usize,
+    pub(crate) values_indexed: usize,
+    pub(crate) total_entries_seen: usize,
+    pub(crate) truncated: bool,
+    pub(crate) root_logical_path: String,
 }
 
 fn detect_registry_hive_header(path: &Path) -> Result<RegistryHiveHeaderStatus> {
@@ -27620,9 +27685,15 @@ fn process_registry_hive_evidence(
     }
 
     match collect_registry_hive_import(&path, &evidence.display_name, max_entries) {
-        Ok(import_data) => {
-            persist_registry_hive_import(conn, case_id, evidence, job_id, import_data)
-        }
+        Ok(import_data) => process_registry_hive_import_orchestration(
+            conn,
+            case_id,
+            evidence,
+            job_id,
+            metadata.len(),
+            import_data,
+            max_entries,
+        ),
         Err(err) => persist_unsupported_registry_status(
             conn,
             case_id,
@@ -27632,6 +27703,49 @@ fn process_registry_hive_evidence(
             &format!("registry hive was detected, but the parser could not read it: {err}"),
         ),
     }
+}
+
+fn process_registry_hive_import_orchestration(
+    conn: &Connection,
+    case_id: i64,
+    evidence: &EvidenceForProcessing,
+    job_id: i64,
+    size_bytes: u64,
+    import_data: RegistryImportData,
+    max_entries: usize,
+) -> Result<(usize, bool)> {
+    let truncated = import_data.truncated;
+    let root_logical_path = import_data.root_logical_path.clone();
+    let (generic_count, _) =
+        persist_registry_hive_import(conn, case_id, evidence, job_id, &import_data)?;
+
+    let root_entry_id: i64 = conn.query_row(
+        "SELECT id FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2 AND logical_path = ?3",
+        params![case_id, evidence.id, root_logical_path],
+        |row| row.get(0),
+    )?;
+
+    let candidate = crate::windows_registry_artifacts::HiveCandidate {
+        entry_id: root_entry_id,
+        source_job_id: job_id,
+        logical_path: root_logical_path,
+        exact_path: evidence.source_path.clone(),
+        name: evidence.display_name.clone(),
+        size: Some(size_bytes),
+    };
+
+    let (specialized_count, _counts) =
+        crate::windows_registry_artifacts::process_standalone_registry_derived_records(
+            conn,
+            case_id,
+            evidence.id,
+            job_id,
+            &candidate,
+            &import_data,
+            max_entries,
+        )?;
+
+    Ok((generic_count + specialized_count, truncated))
 }
 
 fn persist_unsupported_registry_status(
@@ -27653,20 +27767,29 @@ fn persist_unsupported_registry_status(
         "registry_parser_status": "unsupported",
         "registry_parser_error": reason,
         "registry_parser_scope": registry_parser_scope_text(),
+        "registry_key_last_write_semantics": "LastWrite belongs to the containing key; Windows Registry does not track an individual value modification time",
         "registry_deleted_recovery": "not attempted",
         "registry_transaction_log_replay": "not attempted",
+        "windows_registry_limitations": "Allocated keys and values only; transaction-log replay and deleted/slack recovery were not attempted",
         "source_artifact_path": evidence.source_path,
+        "source_file_size_bytes": size_bytes,
     });
-    add_entry_category(&mut metadata, &logical_path, &evidence.display_name, "file");
+    add_entry_category(
+        &mut metadata,
+        &logical_path,
+        &evidence.display_name,
+        "directory",
+    );
+    let metadata_text = metadata.to_string();
     upsert_filesystem_entry(
         conn,
         case_id,
         evidence.id,
         &logical_path,
         &evidence.display_name,
-        "file",
-        Some(i64::try_from(size_bytes).context("registry hive size exceeds i64")?),
-        &metadata.to_string(),
+        "directory",
+        None,
+        &metadata_text,
         job_id,
     )?;
     Ok((1, false))
@@ -27677,34 +27800,32 @@ fn persist_registry_hive_import(
     case_id: i64,
     evidence: &EvidenceForProcessing,
     job_id: i64,
-    mut import_data: RegistryImportData,
+    import_data: &RegistryImportData,
 ) -> Result<(usize, bool)> {
     conn.execute(
         "DELETE FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2",
         params![case_id, evidence.id],
     )?;
-    if let Some(root) = import_data
-        .entries
-        .iter_mut()
-        .find(|entry| entry.logical_path == import_data.root_logical_path)
-    {
-        if let Some(object) = root.metadata.as_object_mut() {
-            object.insert(
-                "registry_keys_indexed".to_string(),
-                serde_json::json!(import_data.keys_indexed),
-            );
-            object.insert(
-                "registry_values_indexed".to_string(),
-                serde_json::json!(import_data.values_indexed),
-            );
-            object.insert(
-                "registry_entries_seen".to_string(),
-                serde_json::json!(import_data.total_entries_seen),
-            );
-        }
-    }
     let entries_indexed = import_data.entries.len();
-    for entry in import_data.entries {
+    for entry in &import_data.entries {
+        let mut metadata = entry.metadata.clone();
+        if entry.logical_path == import_data.root_logical_path {
+            if let Some(object) = metadata.as_object_mut() {
+                object.insert(
+                    "registry_keys_indexed".to_string(),
+                    serde_json::json!(import_data.keys_indexed),
+                );
+                object.insert(
+                    "registry_values_indexed".to_string(),
+                    serde_json::json!(import_data.values_indexed),
+                );
+                object.insert(
+                    "registry_entries_seen".to_string(),
+                    serde_json::json!(import_data.total_entries_seen),
+                );
+            }
+        }
+        let metadata_text = metadata.to_string();
         upsert_filesystem_entry(
             conn,
             case_id,
@@ -27713,7 +27834,7 @@ fn persist_registry_hive_import(
             &entry.display_name,
             entry.entry_kind,
             entry.size_bytes,
-            &entry.metadata.to_string(),
+            &metadata_text,
             job_id,
         )?;
     }
@@ -27804,8 +27925,10 @@ impl RegistryImportCollector {
             "registry_parser": REGISTRY_PARSER_NAME,
             "registry_parser_status": "parsed",
             "registry_parser_scope": registry_parser_scope_text(),
+            "registry_key_last_write_semantics": "LastWrite belongs to the containing key; Windows Registry does not track an individual value modification time",
             "registry_deleted_recovery": "not attempted",
             "registry_transaction_log_replay": "not attempted",
+            "windows_registry_limitations": "Allocated keys and values only; transaction-log replay and deleted/slack recovery were not attempted",
             "source_artifact_path": self.source_path.as_str(),
         });
         add_entry_category(
@@ -27854,8 +27977,11 @@ impl RegistryImportCollector {
             "registry_key_path": key_path,
             "registry_key_name": display_name,
             "registry_key_last_write_utc": last_write,
+            "registry_key_last_write_semantics": "LastWrite belongs to the containing key; Windows Registry does not track an individual value modification time",
             "modified_utc": last_write,
             "registry_key_offset": key.file_offset_absolute,
+            "registry_key_file_relative_offset": key.file_offset_absolute,
+            "registry_key_offset_basis": "byte offset within the recovered Registry hive file; not a decoded-media or acquisition-container physical offset",
             "registry_deleted_recovery": "not attempted",
             "registry_transaction_log_replay": "not attempted",
             "source_artifact_path": self.source_path.as_str(),
@@ -27920,11 +28046,14 @@ impl RegistryImportCollector {
             "registry_hive": self.hive_display_name.as_str(),
             "registry_key_path": key_path,
             "registry_key_last_write_utc": last_write,
+            "registry_key_last_write_semantics": "LastWrite belongs to the containing key; Windows Registry does not track an individual value modification time",
             "registry_value_name": value_name,
             "registry_value_type": value_type,
             "registry_value_data": rendered.text,
             "registry_value_data_truncated": rendered.truncated,
             "registry_value_offset": value.file_offset_absolute,
+            "registry_value_file_relative_offset": value.file_offset_absolute,
+            "registry_value_offset_basis": "byte offset within the recovered Registry hive file; not a decoded-media or acquisition-container physical offset",
             "registry_deleted_recovery": "not attempted",
             "registry_transaction_log_replay": "not attempted",
             "source_artifact_path": self.source_path.as_str(),
@@ -27934,6 +28063,26 @@ impl RegistryImportCollector {
                 object.insert(
                     "registry_value_data_size".to_string(),
                     serde_json::json!(size),
+                );
+                object.insert(
+                    "registry_value_data_original_size_bytes".to_string(),
+                    serde_json::json!(size),
+                );
+            }
+            object.insert(
+                "registry_value_data_preview_characters_captured".to_string(),
+                serde_json::json!(rendered.text.chars().count()),
+            );
+            object.insert(
+                "registry_value_data_preview_measurement".to_string(),
+                serde_json::json!(
+                    "decoded Unicode scalar values retained in registry_value_data; this is not a raw-byte count"
+                ),
+            );
+            if let RegistryCellValue::Binary(bytes) = &content {
+                object.insert(
+                    "registry_value_data_preview_bytes_captured".to_string(),
+                    serde_json::json!(bytes.len().min(REGISTRY_BINARY_PREVIEW_BYTES)),
                 );
             }
             if let Some(items) = rendered.items {
@@ -50426,6 +50575,19 @@ fn render_report_item_preview_html(
         }
         return;
     }
+    if let Some(kind) = registry_record_artifact_kind(&item.item_ref_json) {
+        render_registry_record_details_html(html, item, &item.item_ref_json, kind);
+        if let Some(preview) = item
+            .data_preview
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            html.push_str("<p class=\"meta\">Preview: ");
+            html.push_str(&escape_html(preview));
+            html.push_str("</p>");
+        }
+        return;
+    }
     if render_forensic_context_details_html(html, item, evidence) {
         if let Some(preview) = item
             .data_preview
@@ -50449,6 +50611,10 @@ fn render_report_item_reference_html(html: &mut String, item: &BookmarkItem) {
     if render_browser_activity_reference_html(html, item) {
         return;
     }
+    if let Some(kind) = registry_record_artifact_kind(&item.item_ref_json) {
+        render_registry_record_reference_html(html, &item.item_ref_json, kind);
+        return;
+    }
     if item
         .item_ref_json
         .get("kind")
@@ -50467,21 +50633,7 @@ fn render_report_item_reference_html(html: &mut String, item: &BookmarkItem) {
         html.push_str("<span class=\"meta\">highlighted_bytes</span>");
         return;
     }
-    html.push_str("<pre>");
-    let mut item_ref_value = item.item_ref_json.clone();
-    if let Some(object) = item_ref_value.as_object_mut() {
-        for key in ["logical_path", "path", "relative_path"] {
-            if let Some(value) = object.get_mut(key) {
-                if let Some(text) = value.as_str() {
-                    *value = serde_json::Value::String(display_entry_path(text));
-                }
-            }
-        }
-    }
-    let item_ref =
-        serde_json::to_string_pretty(&item_ref_value).unwrap_or_else(|_| "{}".to_string());
-    html.push_str(&escape_html(&item_ref));
-    html.push_str("</pre>");
+    push_item_ref_json_pre(html, &item.item_ref_json);
 }
 
 fn render_browser_activity_reference_html(html: &mut String, item: &BookmarkItem) -> bool {
@@ -50494,6 +50646,363 @@ fn render_browser_activity_reference_html(html: &mut String, item: &BookmarkItem
     html.push_str("</dd>");
     push_browser_source_details(html, item_ref);
     html.push_str("</dl>");
+    true
+}
+
+/// Registry records form one browsable hive tree in the Entries view, so a
+/// bookmarked key, value, or hive has to render as an examiner-readable table.
+/// The full metadata JSON is deliberately kept in the Reference column instead
+/// of being the only presentation of the finding.
+fn registry_record_artifact_kind(item_ref: &serde_json::Value) -> Option<&'static str> {
+    let kind = item_ref
+        .get("artifact_kind")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            item_ref
+                .get("metadata")
+                .and_then(|value| value.get("artifact_kind"))
+                .and_then(|value| value.as_str())
+        })?;
+    matches!(kind, "registry_hive" | "registry_key" | "registry_value").then_some(match kind {
+        "registry_hive" => "registry_hive",
+        "registry_key" => "registry_key",
+        _ => "registry_value",
+    })
+}
+
+fn registry_record_label(kind: &str) -> &'static str {
+    match kind {
+        "registry_hive" => "Registry Hive",
+        "registry_key" => "Registry Key",
+        _ => "Registry Value",
+    }
+}
+
+/// The Windows Registry stores one timestamp per key, never per value. Any
+/// registry finding that quotes it has to carry this limitation with it.
+const REGISTRY_LASTWRITE_SEMANTICS: &str =
+    "LastWrite is a property of the containing key; the Windows Registry does not record individual value modification times.";
+
+const REGISTRY_LASTWRITE_CAUTION: &str =
+    "A key LastWrite timestamp alone does not prove execution. It shows only that the key was modified, not that a value was written, that a program ran, or that a user was present. Corroborate it with program-execution artifacts (Prefetch, Amcache, Shimcache, UserAssist, SRUM) or event logs before asserting execution.";
+
+fn push_activity_detail_bounded(
+    html: &mut String,
+    item_ref: &serde_json::Value,
+    label: &str,
+    keys: &[&str],
+    max_len: usize,
+) {
+    if let Some(value) = activity_value_string(item_ref, keys) {
+        let char_count = value.chars().count();
+        if char_count > max_len {
+            let truncated: String = value.chars().take(max_len).collect();
+            let bounded_text = format!("{truncated}... [bounded parser preview]");
+            push_detail_value(html, label, &bounded_text);
+        } else {
+            push_detail_value(html, label, &value);
+        }
+    }
+}
+
+fn push_registry_interpretation_html(html: &mut String, item_ref: &serde_json::Value, kind: &str) {
+    let hive = activity_value_string(item_ref, &["registry_hive"]).unwrap_or_default();
+    let key_path = activity_value_string(item_ref, &["registry_key_path", "registry_key_name"])
+        .unwrap_or_default();
+    let value_name = activity_value_string(item_ref, &["registry_value_name"]).unwrap_or_default();
+    let value_type = activity_value_string(item_ref, &["registry_value_type"]).unwrap_or_default();
+    let last_write = activity_value_string(item_ref, &["registry_key_last_write_utc"]);
+    let subject = match kind {
+        "registry_hive" => {
+            if hive.is_empty() {
+                "This registry hive".to_string()
+            } else {
+                format!("Registry hive {hive}")
+            }
+        }
+        "registry_key" => {
+            if key_path.is_empty() {
+                "This registry key".to_string()
+            } else {
+                format!("Registry key {key_path}")
+            }
+        }
+        _ => {
+            let display_name = if value_name.is_empty() {
+                "(Default)"
+            } else {
+                &value_name
+            };
+            let typed_value = if value_type.is_empty() {
+                display_name.to_string()
+            } else {
+                format!("{display_name} ({value_type})")
+            };
+            if key_path.is_empty() {
+                format!("Registry value {typed_value}")
+            } else {
+                format!("Registry value {typed_value} in key {key_path}")
+            }
+        }
+    };
+    let last_write_note = match last_write {
+        Some(timestamp) => format!(" The containing key was last written at {timestamp}."),
+        None => String::new(),
+    };
+    push_detail_value(
+        html,
+        "Interpretation",
+        &format!(
+            "{subject} was decoded from the hive's own cell structures by the KDFT registry parser at the cited hive-relative offset, so the key path, value name, value type, and decoded value data are the parser's reading of that record and not a filename guess.{last_write_note}"
+        ),
+    );
+    let semantics = activity_value_string(item_ref, &["registry_key_last_write_semantics"])
+        .unwrap_or_else(|| REGISTRY_LASTWRITE_SEMANTICS.to_string());
+    push_detail_value(html, "LastWrite Semantics", &semantics);
+    push_detail_value(html, "Caution (LastWrite)", REGISTRY_LASTWRITE_CAUTION);
+}
+
+fn render_registry_record_details_html(
+    html: &mut String,
+    item: &BookmarkItem,
+    item_ref: &serde_json::Value,
+    kind: &str,
+) -> bool {
+    html.push_str("<dl class=\"activity-details\"><dt>Artifact</dt><dd>");
+    html.push_str(registry_record_label(kind));
+    html.push_str("</dd>");
+    push_activity_detail(html, item_ref, "Registry Hive", &["registry_hive"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "Registry Key Path",
+        &["registry_key_path", "registry_key_name"],
+    );
+    if kind == "registry_value" {
+        push_activity_detail(html, item_ref, "Value Name", &["registry_value_name"]);
+        push_activity_detail(html, item_ref, "Value Type", &["registry_value_type"]);
+        push_activity_detail_bounded(
+            html,
+            item_ref,
+            "Value Data (decoded)",
+            &["registry_value_data"],
+            4096,
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Original Value Data Size (bytes)",
+            &[
+                "registry_value_data_original_size_bytes",
+                "registry_value_data_size",
+            ],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Decoded Preview Captured (characters)",
+            &["registry_value_data_preview_characters_captured"],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Raw Preview Captured (bytes)",
+            &["registry_value_data_preview_bytes_captured"],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Value Data Items Retained",
+            &["registry_value_data_items_retained"],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Value Data Items Total",
+            &["registry_value_data_items_total"],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Value Data Preview Truncated",
+            &["registry_value_data_truncated"],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Value Warnings",
+            &["registry_value_warnings"],
+        );
+        push_dec_hex_detail(
+            html,
+            item_ref,
+            "Hive-relative Value Offset",
+            &[
+                "registry_value_offset",
+                "registry_value_file_relative_offset",
+            ],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Value Offset Basis",
+            &["registry_value_offset_basis"],
+        );
+    } else if kind == "registry_key" {
+        push_dec_hex_detail(
+            html,
+            item_ref,
+            "Hive-relative Key Offset",
+            &["registry_key_offset"],
+        );
+    } else {
+        push_activity_detail(
+            html,
+            item_ref,
+            "Parser Keys Indexed",
+            &["windows_registry_keys_indexed"],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Parser Values Indexed",
+            &["windows_registry_values_indexed"],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Parser Entries Seen",
+            &["windows_registry_entries_seen"],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Parser Scope Limit",
+            &["windows_registry_entry_limit"],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Parser Truncated",
+            &["windows_registry_truncated"],
+        );
+        push_activity_detail(
+            html,
+            item_ref,
+            "Parser Limitations",
+            &["windows_registry_limitations"],
+        );
+    }
+    push_activity_detail(
+        html,
+        item_ref,
+        "Key LastWrite (UTC)",
+        &["registry_key_last_write_utc"],
+    );
+    push_activity_detail(html, item_ref, "Registry Parser", &["registry_parser"]);
+    push_activity_detail(
+        html,
+        item_ref,
+        "Registry Parser Status",
+        &["registry_parser_status"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Registry Parser Scope",
+        &["registry_parser_scope"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Deleted Value Recovery",
+        &["registry_deleted_recovery"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Transaction Log Replay",
+        &["registry_transaction_log_replay"],
+    );
+    push_activity_detail(
+        html,
+        item_ref,
+        "Source Hive Path (exact)",
+        &[
+            "source_path_exact",
+            "source_artifact_path",
+            "source_artifact_path_exact",
+        ],
+    );
+    push_activity_detail(html, item_ref, "Size", &["size_bytes"]);
+    if item_ref
+        .get("is_deleted")
+        .and_then(|value| value.as_bool())
+        .or_else(|| {
+            item_ref
+                .get("metadata")
+                .and_then(|m| m.get("is_deleted"))
+                .and_then(|v| v.as_bool())
+        })
+        .unwrap_or(false)
+    {
+        push_detail_value(html, "Deleted", "yes");
+    }
+    if let Some(path) = item.logical_path.as_deref() {
+        push_detail_value(html, "KDFT Internal Path", &display_entry_path(path));
+    }
+    push_registry_interpretation_html(html, item_ref, kind);
+    html.push_str("</dl>");
+    true
+}
+
+fn push_item_ref_json_pre(html: &mut String, item_ref: &serde_json::Value) {
+    html.push_str("<pre>");
+    let mut item_ref_value = item_ref.clone();
+    if let Some(object) = item_ref_value.as_object_mut() {
+        for key in ["logical_path", "path", "relative_path"] {
+            if let Some(value) = object.get_mut(key) {
+                if let Some(text) = value.as_str() {
+                    *value = serde_json::Value::String(display_entry_path(text));
+                }
+            }
+        }
+        if let Some(metadata) = object.get_mut("metadata").and_then(|v| v.as_object_mut()) {
+            for key in ["logical_path", "path", "relative_path"] {
+                if let Some(value) = metadata.get_mut(key) {
+                    if let Some(text) = value.as_str() {
+                        *value = serde_json::Value::String(display_entry_path(text));
+                    }
+                }
+            }
+        }
+    }
+    const MAX_REPORT_METADATA_CHARS: usize = 32_768;
+    let rendered =
+        serde_json::to_string_pretty(&item_ref_value).unwrap_or_else(|_| "{}".to_string());
+    if rendered.chars().count() > MAX_REPORT_METADATA_CHARS {
+        let truncated: String = rendered.chars().take(MAX_REPORT_METADATA_CHARS).collect();
+        html.push_str(&escape_html(&truncated));
+        html.push_str("\n... [bounded preview; metadata display truncated]");
+    } else {
+        html.push_str(&escape_html(&rendered));
+    }
+    html.push_str("</pre>");
+}
+
+fn render_registry_record_reference_html(
+    html: &mut String,
+    item_ref: &serde_json::Value,
+    kind: &str,
+) -> bool {
+    html.push_str("<span class=\"meta\">");
+    html.push_str(&escape_html(kind));
+    html.push_str("</span>");
+    // The readable fields live in the Artifact column above; the complete
+    // metadata stays here, collapsed, so a report page stays scannable.
+    html.push_str("<details><summary>Metadata JSON (bounded preview)</summary>");
+    push_item_ref_json_pre(html, item_ref);
+    html.push_str("</details>");
     true
 }
 
@@ -51705,6 +52214,9 @@ fn push_time_detail(
 fn activity_value_string(item_ref: &serde_json::Value, keys: &[&str]) -> Option<String> {
     for key in keys {
         if let Some(value) = item_ref.get(*key).and_then(json_report_value) {
+            if *key != "registry_value_data" && value.eq_ignore_ascii_case("null") {
+                continue;
+            }
             return Some(value);
         }
         if let Some(value) = item_ref
@@ -51712,6 +52224,9 @@ fn activity_value_string(item_ref: &serde_json::Value, keys: &[&str]) -> Option<
             .and_then(|metadata| metadata.get(*key))
             .and_then(json_report_value)
         {
+            if *key != "registry_value_data" && value.eq_ignore_ascii_case("null") {
+                continue;
+            }
             return Some(value);
         }
     }
@@ -61320,6 +61835,164 @@ mod tests {
     }
 
     #[test]
+    fn indexed_directory_lists_registry_value_records_for_filtering() -> Result<()> {
+        let case_path = unique_case_path("idx-registry-values");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("idx-registry-values-source");
+        fs::write(evidence_dir.join("seed.txt"), b"seed")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let processed = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        let mut conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A hive key and the value records underneath it, plus one record of a
+        // different class that must keep staying out of the directory listing.
+        upsert_filesystem_entry(
+            &tx,
+            case_id,
+            evidence_id,
+            "/Registry/NTUSER.DAT/Software/Vendor/Tool",
+            "Tool",
+            "directory",
+            None,
+            "{}",
+            processed.job_id,
+        )?;
+        upsert_filesystem_entry(
+            &tx,
+            case_id,
+            evidence_id,
+            "/Registry/NTUSER.DAT/Software/Vendor/Tool/Enabled.value",
+            "Enabled.value",
+            "record",
+            Some(4),
+            r#"{"artifact_kind":"registry_value","registry_hive":"NTUSER.DAT","registry_key_path":"Software\\Vendor\\Tool","registry_value_name":"Enabled","registry_value_type":"REG_DWORD","registry_value_data":"1","registry_key_last_write_utc":"2026-06-28T10:15:30Z"}"#,
+            processed.job_id,
+        )?;
+        upsert_filesystem_entry(
+            &tx,
+            case_id,
+            evidence_id,
+            "/Registry/NTUSER.DAT/Software/Vendor/Tool/Path.value",
+            "Path.value",
+            "record",
+            Some(12),
+            r#"{"artifact_kind":"registry_value","registry_hive":"NTUSER.DAT","registry_key_path":"Software\\Vendor\\Tool","registry_value_name":"Path","registry_value_type":"REG_SZ","registry_value_data":"tool.exe"}"#,
+            processed.job_id,
+        )?;
+        upsert_filesystem_entry(
+            &tx,
+            case_id,
+            evidence_id,
+            "/Registry/NTUSER.DAT/Software/Vendor/Tool/deeper/child.value",
+            "child.value",
+            "record",
+            Some(1),
+            r#"{"artifact_kind":"registry_value"}"#,
+            processed.job_id,
+        )?;
+        upsert_filesystem_entry(
+            &tx,
+            case_id,
+            evidence_id,
+            "/Browser Activity/Visits/example.com/1.record",
+            "1.record",
+            "record",
+            Some(1),
+            r#"{"artifact_kind":"browser_history_visit"}"#,
+            processed.job_id,
+        )?;
+        tx.commit()?;
+
+        let key_dir = list_indexed_directory_page(
+            &case_path,
+            evidence_id,
+            "/Registry/NTUSER.DAT/Software/Vendor/Tool",
+            0,
+            1000,
+        )?;
+        let key_children = key_dir
+            .children
+            .iter()
+            .map(|child| {
+                (
+                    child.logical_path.clone(),
+                    child.is_dir,
+                    child.entry_kind.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            key_children,
+            vec![
+                (
+                    "/Registry/NTUSER.DAT/Software/Vendor/Tool/deeper".to_string(),
+                    true,
+                    None
+                ),
+                (
+                    "/Registry/NTUSER.DAT/Software/Vendor/Tool/Enabled.value".to_string(),
+                    false,
+                    Some("record".to_string())
+                ),
+                (
+                    "/Registry/NTUSER.DAT/Software/Vendor/Tool/Path.value".to_string(),
+                    false,
+                    Some("record".to_string())
+                )
+            ]
+        );
+        // The registry value rows carry their metadata so grid column filters
+        // can match on hive, key path, value name, value type, and value data.
+        let enabled = key_dir
+            .children
+            .iter()
+            .find(|child| child.name == "Enabled.value")
+            .expect("registry value record is listed");
+        assert_eq!(
+            enabled.metadata_json["registry_hive"].as_str(),
+            Some("NTUSER.DAT")
+        );
+        assert_eq!(
+            enabled.metadata_json["registry_value_type"].as_str(),
+            Some("REG_DWORD")
+        );
+        assert_eq!(
+            enabled.metadata_json["registry_value_data"].as_str(),
+            Some("1")
+        );
+        assert_eq!(enabled.size_bytes, Some(4));
+
+        // Non-registry records stay out of the directory listing.
+        let browser_dir = list_indexed_directory_page(
+            &case_path,
+            evidence_id,
+            "/Browser Activity/Visits",
+            0,
+            1000,
+        )?;
+        assert!(browser_dir.children.is_empty());
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
     fn indexed_directory_pages_every_direct_child_without_subtree_scan_cap() -> Result<()> {
         let case_path = unique_case_path("idx-pagination");
         create_test_case(&case_path)?;
@@ -69126,6 +69799,7 @@ mod tests {
                 max_file_bytes: 4096,
                 category: None,
                 file_types: None,
+                match_mode: Some(SearchMatchMode::Contains),
             },
         )?;
         assert!(
@@ -74224,6 +74898,358 @@ mod tests {
         Ok(())
     }
 
+    fn registry_bookmark_item(
+        case_path: &Path,
+        bookmark_id: i64,
+        item_order: i64,
+        item_ref_json: serde_json::Value,
+    ) -> Result<()> {
+        add_bookmark_item(
+            case_path,
+            CreateBookmarkItemOptions {
+                bookmark_id,
+                evidence_id: None,
+                entry_id: None,
+                item_order: Some(item_order),
+                display_name: Some("Registry record".to_string()),
+                logical_path: Some(
+                    "/Windows Artifacts/Registry/12/Hive/Software/Vendor/Tool/Enabled.value"
+                        .to_string(),
+                ),
+                selection_offset: None,
+                selection_length: None,
+                data_preview: None,
+                item_ref_json,
+            },
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn render_report_html_formats_registry_key_value_and_hive_items() -> Result<()> {
+        let case_path = unique_case_path("report-registry-records");
+        create_test_case(&case_path)?;
+        let folder_id = create_bookmark_folder(&case_path, None, "Registry Findings", None, true)?;
+        let bookmark_id = create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::Record,
+                data_type: Some("Registry".to_string()),
+                title: Some("Run key enables Tool.exe".to_string()),
+                examiner_comment: None,
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+        registry_bookmark_item(
+            &case_path,
+            bookmark_id,
+            10,
+            serde_json::json!({
+                "kind": "category_entry",
+                "artifact_kind": "registry_value",
+                "entry_kind": "record",
+                "registry_parser": "notatin 1.0.1",
+                "registry_parser_status": "parsed",
+                "registry_hive": "NTUSER.DAT",
+                "registry_key_path": "Software\\Vendor\\Tool",
+                "registry_key_last_write_utc": "2026-06-28T10:15:30Z",
+                "registry_value_name": "Enabled",
+                "registry_value_type": "REG_DWORD",
+                "registry_value_data": "1",
+                "registry_value_data_size": 4,
+                "registry_value_offset": 4128,
+                "registry_deleted_recovery": "not attempted",
+                "registry_transaction_log_replay": "not attempted",
+                "source_path_exact": "E:\\evidence\\Users\\Examiner\\NTUSER.DAT"
+            }),
+        )?;
+        registry_bookmark_item(
+            &case_path,
+            bookmark_id,
+            20,
+            serde_json::json!({
+                "artifact_kind": "registry_key",
+                "entry_kind": "directory",
+                "registry_hive": "NTUSER.DAT",
+                "registry_key_path": "Software\\Vendor\\Tool",
+                "registry_key_last_write_utc": "2026-06-28T10:15:30Z",
+                "registry_key_offset": 2048,
+                "registry_parser": "notatin 1.0.1",
+                "registry_parser_status": "parsed"
+            }),
+        )?;
+        registry_bookmark_item(
+            &case_path,
+            bookmark_id,
+            30,
+            serde_json::json!({
+                "artifact_kind": "registry_hive",
+                "entry_kind": "directory",
+                "registry_hive": "NTUSER.DAT",
+                "windows_registry_keys_indexed": 1284,
+                "windows_registry_values_indexed": 5320,
+                "windows_registry_entries_seen": 6604,
+                "windows_registry_entry_limit": 5000000,
+                "windows_registry_truncated": false,
+                "registry_parser": "notatin 1.0.1",
+                "registry_parser_status": "parsed"
+            }),
+        )?;
+
+        let html = render_report_html(&report_data(&case_path)?);
+        // Registry findings read as a table, not as a JSON dump.
+        assert!(html.contains("<dt>Artifact</dt><dd>Registry Value</dd>"));
+        assert!(html.contains("<dt>Registry Hive</dt><dd>NTUSER.DAT</dd>"));
+        assert!(html.contains("<dt>Registry Key Path</dt><dd>Software\\Vendor\\Tool</dd>"));
+        assert!(html.contains("<dt>Value Name</dt><dd>Enabled</dd>"));
+        assert!(html.contains("<dt>Value Type</dt><dd>REG_DWORD</dd>"));
+        assert!(html.contains("<dt>Value Data (decoded)</dt><dd>1</dd>"));
+        assert!(html.contains("<dt>Original Value Data Size (bytes)</dt><dd>4</dd>"));
+        assert!(html.contains("<dt>Key LastWrite (UTC)</dt><dd>2026-06-28T10:15:30Z</dd>"));
+        assert!(html.contains("<dt>Registry Parser</dt><dd>notatin 1.0.1</dd>"));
+        assert!(html.contains("<dt>Registry Parser Status</dt><dd>parsed</dd>"));
+        assert!(html.contains("<dt>Source Hive Path (exact)</dt>"));
+        assert!(html.contains("<dt>Hive-relative Value Offset</dt><dd>4128 (0x1020)</dd>"));
+        assert!(html.contains("<dt>Artifact</dt><dd>Registry Key</dd>"));
+        assert!(html.contains("<dt>Hive-relative Key Offset</dt><dd>2048 (0x800)</dd>"));
+        assert!(html.contains("<dt>Artifact</dt><dd>Registry Hive</dd>"));
+        assert!(html.contains("<dt>Parser Values Indexed</dt><dd>5320</dd>"));
+        // Concise interpretation, and an explicit caution that a key
+        // LastWrite timestamp alone does not prove execution.
+        assert!(html.contains("<dt>Interpretation</dt>"));
+        assert!(html.contains("<dt>LastWrite Semantics</dt>"));
+        assert!(html.contains(
+            "<dt>Caution (LastWrite)</dt><dd>A key LastWrite timestamp alone does not prove execution."
+        ));
+        // Metadata JSON is retained separately from the readable table.
+        assert!(html.contains("<summary>Metadata JSON (bounded preview)</summary>"));
+        assert!(html.contains("<span class=\"meta\">registry_value</span>"));
+        assert!(html.contains("<span class=\"meta\">registry_key</span>"));
+        assert!(html.contains("<span class=\"meta\">registry_hive</span>"));
+        // The JSON block is collapsed so the findings table stays readable.
+        assert_eq!(
+            html.matches("<details><summary>Metadata JSON (bounded preview)</summary>")
+                .count(),
+            3
+        );
+
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn render_report_html_formats_usrclass_and_ntuser_records_with_escaping_and_null_suppression(
+    ) -> Result<()> {
+        let case_path = unique_case_path("report-usrclass-ntuser");
+        create_test_case(&case_path)?;
+        let folder_id = create_bookmark_folder(&case_path, None, "Registry Findings", None, true)?;
+        let bookmark_id = create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::Record,
+                data_type: Some("Registry".to_string()),
+                title: Some("UsrClass.dat and NTUSER.DAT findings".to_string()),
+                examiner_comment: None,
+                in_report: true,
+                source_ref_json: serde_json::json!({}),
+                content_ref_json: serde_json::json!({}),
+            },
+        )?;
+
+        // 1. UsrClass.dat record with URL value and special characters to test HTML escaping.
+        registry_bookmark_item(
+            &case_path,
+            bookmark_id,
+            1,
+            serde_json::json!({
+                "kind": "category_entry",
+                "artifact_kind": "registry_value",
+                "entry_kind": "record",
+                "registry_parser": "notatin 1.0.1",
+                "registry_parser_status": "parsed",
+                "registry_hive": "UsrClass.dat",
+                "registry_key_path": "Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages",
+                "registry_key_last_write_utc": "2026-07-01T12:00:00Z",
+                "registry_value_name": "Package<Target>&Payload",
+                "registry_value_type": "REG_SZ",
+                "registry_value_data": "https://example.com/app?pkg=test&ver=1.0<script>alert('xss')</script>",
+                "registry_value_data_size": 71,
+                "registry_value_offset": 8200,
+                "source_path_exact": "C:\\Users\\Examiner\\AppData\\Local\\Microsoft\\Windows\\UsrClass.dat"
+            }),
+        )?;
+
+        // 2. A legacy/synthetic record with a long value (5,000 characters). Production
+        // parser metadata is already bounded and carries explicit original/captured/truncated
+        // measurements; report rendering must independently bound older case data too.
+        let long_payload = "A".repeat(5000);
+        registry_bookmark_item(
+            &case_path,
+            bookmark_id,
+            2,
+            serde_json::json!({
+                "artifact_kind": "registry_value",
+                "entry_kind": "record",
+                "registry_parser": "notatin 1.0.1",
+                "registry_parser_status": "parsed",
+                "registry_hive": "NTUSER.DAT",
+                "registry_key_path": "Software\\Vendor\\LongKey",
+                "registry_key_last_write_utc": "2026-06-28T10:15:30Z",
+                "registry_value_name": "HugeBlob",
+                "registry_value_type": "REG_BINARY",
+                "registry_value_data": long_payload,
+                "registry_value_data_size": 5000,
+                "registry_value_offset": 16384,
+                "source_path_exact": "C:\\Users\\Examiner\\NTUSER.DAT"
+            }),
+        )?;
+
+        // 3. A record with null fields, string "null" values, absent timestamps, and unnamed (Default) value.
+        registry_bookmark_item(
+            &case_path,
+            bookmark_id,
+            3,
+            serde_json::json!({
+                "artifact_kind": "registry_value",
+                "entry_kind": "record",
+                "registry_parser": "notatin 1.0.1",
+                "registry_parser_status": "null",
+                "registry_hive": "UsrClass.dat",
+                "registry_key_path": "Software\\Classes\\ExApp",
+                "registry_key_last_write_utc": null,
+                "registry_value_name": "",
+                "registry_value_type": null,
+                "registry_value_data": "ExApp.exe",
+                "registry_value_data_size": null,
+                "registry_value_offset": null,
+                "registry_deleted_recovery": null,
+                "source_path_exact": "null"
+            }),
+        )?;
+
+        let html = render_report_html(&report_data(&case_path)?);
+
+        // UsrClass.dat provenance and fields:
+        assert!(html.contains("<dt>Registry Hive</dt><dd>UsrClass.dat</dd>"));
+        assert!(html.contains("<dt>Registry Key Path</dt><dd>Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages</dd>"));
+        assert!(html.contains("<dt>Source Hive Path (exact)</dt><dd>C:\\Users\\Examiner\\AppData\\Local\\Microsoft\\Windows\\UsrClass.dat</dd>"));
+
+        // HTML escaping: URL value and special characters in value name must be properly escaped, never raw HTML:
+        assert!(html.contains("<dt>Value Name</dt><dd>Package&lt;Target&gt;&amp;Payload</dd>"));
+        assert!(html.contains("<dt>Value Data (decoded)</dt><dd>https://example.com/app?pkg=test&amp;ver=1.0&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt;</dd>"));
+        assert!(!html.contains("<script>alert('xss')</script>"));
+
+        // Boundedness: Long value table preview must be bounded with a note, not dumping all 5000 chars:
+        assert!(html.contains("... [bounded parser preview]</dd>"));
+        // Legacy metadata remains available here because this item is below the report-level
+        // 32 Ki-character guard; this must not be read as a production parser guarantee.
+        assert!(html.contains(&long_payload));
+
+        // Null suppression: literal "null" must NEVER be rendered as field values:
+        assert!(!html.contains("<dd>null</dd>"));
+        assert!(!html.contains("<dd>None</dd>"));
+
+        // Absent timestamp: when LastWrite is null, no Key LastWrite (UTC) row is rendered:
+        assert!(html.contains("<dt>Value Name</dt>"));
+        // But the Interpretation recognizes the (Default) value and retains the caution:
+        assert!(html.contains("Registry value (Default) in key Software\\Classes\\ExApp"));
+        assert!(html.contains("<dt>Caution (LastWrite)</dt><dd>A key LastWrite timestamp alone does not prove execution."));
+
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_directory_pages_usrclass_and_ntuser_registry_records_for_exact_record_selection(
+    ) -> Result<()> {
+        let case_path = unique_case_path("idx-usrclass-ntuser");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("idx-usrclass-ntuser-source");
+        fs::write(evidence_dir.join("seed.txt"), b"seed")?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        let processed = process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+        )?;
+        let mut conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Insert UsrClass.dat key and value records
+        upsert_filesystem_entry(
+            &tx,
+            case_id,
+            evidence_id,
+            "/Registry/UsrClass.dat/Software/Classes/App",
+            "App",
+            "directory",
+            None,
+            r#"{"artifact_kind":"registry_key","registry_hive":"UsrClass.dat","registry_key_path":"Software\\Classes\\App","registry_key_last_write_utc":"2026-07-01T12:00:00Z"}"#,
+            processed.job_id,
+        )?;
+        upsert_filesystem_entry(
+            &tx,
+            case_id,
+            evidence_id,
+            "/Registry/UsrClass.dat/Software/Classes/App/Url.value",
+            "Url.value",
+            "record",
+            Some(32),
+            r#"{"artifact_kind":"registry_value","registry_hive":"UsrClass.dat","registry_key_path":"Software\\Classes\\App","registry_value_name":"Url","registry_value_type":"REG_SZ","registry_value_data":"https://example.com/app"}"#,
+            processed.job_id,
+        )?;
+        tx.commit()?;
+
+        let app_dir = list_indexed_directory_page(
+            &case_path,
+            evidence_id,
+            "/Registry/UsrClass.dat/Software/Classes/App",
+            0,
+            100,
+        )?;
+        assert_eq!(app_dir.children.len(), 1);
+        let val_child = &app_dir.children[0];
+        assert_eq!(val_child.name, "Url.value");
+        assert_eq!(val_child.entry_kind.as_deref(), Some("record"));
+        assert!(!val_child.is_dir);
+        assert_eq!(val_child.size_bytes, Some(32));
+        assert_eq!(
+            val_child.metadata_json["registry_hive"].as_str(),
+            Some("UsrClass.dat")
+        );
+        assert_eq!(
+            val_child.metadata_json["registry_value_name"].as_str(),
+            Some("Url")
+        );
+        assert_eq!(
+            val_child.metadata_json["registry_value_type"].as_str(),
+            Some("REG_SZ")
+        );
+        assert_eq!(
+            val_child.metadata_json["registry_value_data"].as_str(),
+            Some("https://example.com/app")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
     fn create_identity_test_evidence(case_path: &Path, source_root: &Path) -> Result<(i64, i64)> {
         let conn = open_existing_case(case_path)?;
         let case_id = active_case_id(&conn)?;
@@ -76717,6 +77743,518 @@ mod tests {
         assert_eq!(result.source_path, stable_path_string(&evidence_path));
 
         let _ = fs::remove_dir_all(evidence_dir);
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn push_activity_detail_bounded_handles_large_multibyte_cjk_without_panic() {
+        let mut html = String::new();
+        // 5000 Chinese characters. In UTF-8, each '测' is 3 bytes (0xE6, 0xB5, 0x8B).
+        // Byte slicing at index 4096 would split 4096 / 3 = 1365.33, right inside a char!
+        let cjk_string = "测".repeat(5000);
+        let item_ref = serde_json::json!({
+            "registry_value_data": cjk_string,
+        });
+        push_activity_detail_bounded(
+            &mut html,
+            &item_ref,
+            "Value Data (decoded)",
+            &["registry_value_data"],
+            4096,
+        );
+        assert!(!html.is_empty());
+        assert!(html.contains("... [bounded parser preview]"));
+        let expected_prefix = "测".repeat(4096);
+        assert!(html.contains(&expected_prefix));
+        assert!(!html.contains(&"测".repeat(4097)));
+    }
+
+    #[test]
+    fn report_bounds_legacy_unbounded_metadata_json() {
+        let mut html = String::new();
+        let large_string = "X".repeat(40_000);
+        let item_ref = serde_json::json!({
+            "kind": "registry_value",
+            "logical_path": "/Registry/Test/Value",
+            "metadata": {
+                "huge_field": large_string,
+            }
+        });
+        render_registry_record_reference_html(&mut html, &item_ref, "registry_value");
+        assert!(html.contains("<details><summary>Metadata JSON (bounded preview)</summary>"));
+        assert!(html.contains("... [bounded preview; metadata display truncated]"));
+        assert!(!html.contains(&large_string));
+    }
+
+    #[test]
+    fn deep_search_registry_include_content_semantics() -> Result<()> {
+        let case_path = unique_case_path("registry-search-semantics");
+        create_test_case(&case_path)?;
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        let evidence_id = 1;
+        conn.execute(
+            "INSERT INTO evidence_sources(id, case_id, source_kind, source_path, display_name)
+             VALUES (?1, ?2, 'file', 'C:\\Evidence\\NTUSER.DAT', 'NTUSER.DAT')",
+            params![evidence_id, case_id],
+        )?;
+
+        let metadata = serde_json::json!({
+            "artifact_kind": "registry_value",
+            "registry_parser": "notatin 1.0.1",
+            "registry_hive": "NTUSER.DAT",
+            "registry_key_path": "Software\\Policies\\Microsoft\\Windows\\System",
+            "registry_key_last_write_utc": "2026-10-05T12:00:00Z",
+            "registry_key_last_write_semantics": "LastWrite belongs to the containing key; Windows Registry does not track an individual value modification time",
+            "registry_value_name": "TargetExecutableSetting",
+            "registry_value_type": "REG_SZ",
+            "registry_value_data": "https://malicious-command-control.org/payload.exe",
+            "registry_value_data_truncated": false,
+            "registry_value_offset": 4096,
+            "registry_value_file_relative_offset": 4096,
+            "registry_value_offset_basis": "byte offset within the recovered Registry hive file; not a decoded-media or acquisition-container physical offset",
+            "source_artifact_path": "Users/Alice/NTUSER.DAT",
+            "windows_registry_derived": true,
+        });
+        let metadata_str = metadata.to_string();
+        conn.execute(
+            "INSERT INTO filesystem_entries(
+                 case_id, evidence_id, logical_path, name, entry_kind, metadata_json)
+             VALUES (?1, ?2, '/Registry/NTUSER.DAT/Software/Policies/TargetExecutableSetting.value', 'TargetExecutableSetting', 'record', ?3)",
+            params![case_id, evidence_id, metadata_str],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+
+        // 1. Search by key path: both include_content=false and include_content=true must find it
+        for include_content in [false, true] {
+            let page = deep_search_page(
+                &case_path,
+                DeepSearchOptions {
+                    category: None,
+                    file_types: None,
+                    query: "Policies\\Microsoft\\Windows".to_string(),
+                    evidence_id: Some(evidence_id),
+                    include_content,
+                    max_results: 10,
+                    max_file_bytes: 4096,
+                    match_mode: Some(SearchMatchMode::Contains),
+                },
+                None,
+                10,
+            )?;
+            assert_eq!(
+                page.results.len(),
+                1,
+                "key path search with include_content={include_content}"
+            );
+            assert_eq!(page.results[0].entry_id, entry_id);
+            assert_eq!(page.results[0].entry_kind, "record");
+        }
+
+        // 2. Search by value name: both include_content=false and include_content=true must find it
+        for include_content in [false, true] {
+            let page = deep_search_page(
+                &case_path,
+                DeepSearchOptions {
+                    category: None,
+                    file_types: None,
+                    query: "TargetExecutableSetting".to_string(),
+                    evidence_id: Some(evidence_id),
+                    include_content,
+                    max_results: 10,
+                    max_file_bytes: 4096,
+                    match_mode: Some(SearchMatchMode::Contains),
+                },
+                None,
+                10,
+            )?;
+            assert_eq!(
+                page.results.len(),
+                1,
+                "value name search with include_content={include_content}"
+            );
+            assert_eq!(page.results[0].entry_id, entry_id);
+        }
+
+        // 3. Search by bounded decoded value (URL domain): both include_content=false and include_content=true must find it
+        for include_content in [false, true] {
+            let page = deep_search_page(
+                &case_path,
+                DeepSearchOptions {
+                    category: None,
+                    file_types: None,
+                    query: "malicious-command-control.org".to_string(),
+                    evidence_id: Some(evidence_id),
+                    include_content,
+                    max_results: 10,
+                    max_file_bytes: 4096,
+                    match_mode: Some(SearchMatchMode::Contains),
+                },
+                None,
+                10,
+            )?;
+            assert_eq!(
+                page.results.len(),
+                1,
+                "decoded value search with include_content={include_content}"
+            );
+            assert_eq!(page.results[0].entry_id, entry_id);
+            let ctx = page.results[0]
+                .record_context
+                .as_ref()
+                .expect("record_context");
+            assert_eq!(
+                ctx.url.as_deref(),
+                Some("https://malicious-command-control.org/payload.exe")
+            );
+            assert_eq!(ctx.host.as_deref(), Some("malicious-command-control.org"));
+        }
+
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn standalone_registry_hive_orchestration_e2e() -> Result<()> {
+        let case_path = unique_case_path("standalone-registry-orchestration");
+        create_test_case(&case_path)?;
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        let evidence_id = 1;
+        conn.execute(
+            "INSERT INTO evidence_sources(id, case_id, source_kind, source_path, display_name)
+             VALUES (?1, ?2, 'file', 'C:\\Evidence\\NTUSER.DAT', 'NTUSER.DAT')",
+            params![evidence_id, case_id],
+        )?;
+        let job_id = 10;
+        conn.execute(
+            "INSERT INTO evidence_jobs(id, case_id, evidence_id, job_type, status, parameters_json)
+             VALUES (?1, ?2, ?3, 'windows_registry_index', 'running', '{}')",
+            params![job_id, case_id, evidence_id],
+        )?;
+
+        // Build UserAssist 72-byte payload with run_count = 5 and a valid timestamp
+        let mut ua_bytes = vec![0_u8; 72];
+        ua_bytes[4..8].copy_from_slice(&5_u32.to_le_bytes());
+        ua_bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        ua_bytes[12..16].copy_from_slice(&1000_u32.to_le_bytes());
+        ua_bytes[60..68].copy_from_slice(&132456789012345678_u64.to_le_bytes());
+
+        // ShellBag 8-byte MRUListEx and a 40-byte item
+        let mru_bytes = [0_u32, u32::MAX]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<u8>>();
+        let mut shell_item_bytes = vec![0_u8; 40];
+        shell_item_bytes[0..2].copy_from_slice(&20_u16.to_le_bytes());
+        shell_item_bytes[4..14].copy_from_slice(b"TargetFold");
+
+        let import_data = RegistryImportData {
+            entries: vec![
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER.DAT".to_string(),
+                    display_name: "NTUSER.DAT".to_string(),
+                    entry_kind: "directory",
+                    size_bytes: Some(65536),
+                    metadata: serde_json::json!({
+                        "artifact_kind": "registry_hive",
+                        "registry_hive": "NTUSER.DAT",
+                        "source_artifact_path": "C:\\Evidence\\NTUSER.DAT",
+                    }),
+                    raw_value_bytes: None,
+                },
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER.DAT/UserAssist/Entry".to_string(),
+                    display_name: "Count".to_string(),
+                    entry_kind: "record",
+                    size_bytes: Some(72),
+                    metadata: serde_json::json!({
+                        "artifact_kind": "registry_value",
+                        "registry_hive": "NTUSER.DAT",
+                        "registry_key_path": "ROOT\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\UserAssist\\{CEBFF5CD-ACE2-4F4F-9170-D430C0B4269E}\\Count",
+                        "registry_key_last_write_utc": "2026-10-05T12:00:00Z",
+                        "registry_value_name": "P:\\Jvaqbjf\\abgrcnq.rkr",
+                        "registry_value_type": "REG_BINARY",
+                        "registry_value_data": "[72 bytes binary]",
+                        "registry_value_offset": 4096,
+                    }),
+                    raw_value_bytes: Some(ua_bytes),
+                },
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER.DAT/RunMRU/List".to_string(),
+                    display_name: "MRUList".to_string(),
+                    entry_kind: "record",
+                    size_bytes: Some(1),
+                    metadata: serde_json::json!({
+                        "artifact_kind": "registry_value",
+                        "registry_hive": "NTUSER.DAT",
+                        "registry_key_path": "ROOT\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU",
+                        "registry_key_last_write_utc": "2026-10-05T12:00:00Z",
+                        "registry_value_name": "MRUList",
+                        "registry_value_type": "REG_SZ",
+                        "registry_value_data": "a",
+                        "registry_value_offset": 5120,
+                    }),
+                    raw_value_bytes: None,
+                },
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER.DAT/RunMRU/a".to_string(),
+                    display_name: "a".to_string(),
+                    entry_kind: "record",
+                    size_bytes: Some(13),
+                    metadata: serde_json::json!({
+                        "artifact_kind": "registry_value",
+                        "registry_hive": "NTUSER.DAT",
+                        "registry_key_path": "ROOT\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RunMRU",
+                        "registry_key_last_write_utc": "2026-10-05T12:00:00Z",
+                        "registry_value_name": "a",
+                        "registry_value_type": "REG_SZ",
+                        "registry_value_data": "calc.exe\\1",
+                        "registry_value_offset": 5200,
+                    }),
+                    raw_value_bytes: None,
+                },
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER.DAT/TypedPaths/url1".to_string(),
+                    display_name: "url1".to_string(),
+                    entry_kind: "record",
+                    size_bytes: Some(20),
+                    metadata: serde_json::json!({
+                        "artifact_kind": "registry_value",
+                        "registry_hive": "NTUSER.DAT",
+                        "registry_key_path": "ROOT\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\TypedPaths",
+                        "registry_key_last_write_utc": "2026-10-05T12:00:00Z",
+                        "registry_value_name": "url1",
+                        "registry_value_type": "REG_SZ",
+                        "registry_value_data": "C:\\Windows\\System32",
+                        "registry_value_offset": 6144,
+                    }),
+                    raw_value_bytes: None,
+                },
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER.DAT/MountPoints/Entry".to_string(),
+                    display_name: "{12345678-1234-1234-1234-123456789abc}".to_string(),
+                    entry_kind: "directory",
+                    size_bytes: None,
+                    metadata: serde_json::json!({
+                        "artifact_kind": "registry_key",
+                        "registry_hive": "NTUSER.DAT",
+                        "registry_key_path": "ROOT\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\MountPoints2\\{12345678-1234-1234-1234-123456789abc}",
+                        "registry_key_last_write_utc": "2026-10-05T12:00:00Z",
+                    }),
+                    raw_value_bytes: None,
+                },
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER.DAT/Startup/App".to_string(),
+                    display_name: "TestApp".to_string(),
+                    entry_kind: "record",
+                    size_bytes: Some(25),
+                    metadata: serde_json::json!({
+                        "artifact_kind": "registry_value",
+                        "registry_hive": "NTUSER.DAT",
+                        "registry_key_path": "ROOT\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                        "registry_key_last_write_utc": "2026-10-05T12:00:00Z",
+                        "registry_value_name": "TestApp",
+                        "registry_value_type": "REG_SZ",
+                        "registry_value_data": "C:\\Program Files\\App\\app.exe",
+                        "registry_value_offset": 8192,
+                    }),
+                    raw_value_bytes: None,
+                },
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER.DAT/Shell/BagMRU/MRUListEx".to_string(),
+                    display_name: "MRUListEx".to_string(),
+                    entry_kind: "record",
+                    size_bytes: Some(8),
+                    metadata: serde_json::json!({
+                        "artifact_kind": "registry_value",
+                        "registry_hive": "NTUSER.DAT",
+                        "registry_key_path": "ROOT\\Software\\Microsoft\\Windows\\Shell\\BagMRU",
+                        "registry_key_last_write_utc": "2026-10-05T12:00:00Z",
+                        "registry_value_name": "MRUListEx",
+                        "registry_value_type": "REG_BINARY",
+                        "registry_value_data": "[8 bytes binary]",
+                        "registry_value_offset": 9216,
+                    }),
+                    raw_value_bytes: Some(mru_bytes),
+                },
+                RegistryImportEntry {
+                    logical_path: "/Registry/NTUSER.DAT/Shell/BagMRU/0".to_string(),
+                    display_name: "0".to_string(),
+                    entry_kind: "record",
+                    size_bytes: Some(40),
+                    metadata: serde_json::json!({
+                        "artifact_kind": "registry_value",
+                        "registry_hive": "NTUSER.DAT",
+                        "registry_key_path": "ROOT\\Software\\Microsoft\\Windows\\Shell\\BagMRU",
+                        "registry_key_last_write_utc": "2026-10-05T12:00:00Z",
+                        "registry_value_name": "0",
+                        "registry_value_type": "REG_BINARY",
+                        "registry_value_data": "[40 bytes binary]",
+                        "registry_value_offset": 9300,
+                    }),
+                    raw_value_bytes: Some(shell_item_bytes),
+                },
+            ],
+            keys_indexed: 6,
+            values_indexed: 8,
+            total_entries_seen: 9,
+            truncated: false,
+            root_logical_path: "/Registry/NTUSER.DAT".to_string(),
+        };
+
+        let evidence_info = EvidenceForProcessing {
+            id: evidence_id,
+            source_kind: "file".to_string(),
+            source_path: "C:\\Evidence\\NTUSER.DAT".to_string(),
+            display_name: "NTUSER.DAT".to_string(),
+        };
+
+        let (total_indexed, truncated) = process_registry_hive_import_orchestration(
+            &conn,
+            case_id,
+            &evidence_info,
+            10,
+            65536,
+            import_data,
+            1000,
+        )?;
+
+        assert!(!truncated);
+        assert!(
+            total_indexed > 9,
+            "should index both generic and specialized rows"
+        );
+
+        // 1. Verify root directory entry metadata
+        let (root_id, root_meta_json): (i64, String) = conn.query_row(
+            "SELECT id, metadata_json FROM filesystem_entries WHERE logical_path = '/Registry/NTUSER.DAT'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let root_meta: serde_json::Value = serde_json::from_str(&root_meta_json)?;
+        assert_eq!(root_meta["windows_registry_derived"], true);
+        assert_eq!(root_meta["source_entry_id"], root_id);
+        assert_eq!(root_meta["windows_registry_source_entry_id"], root_id);
+        assert_eq!(
+            root_meta["source_artifact_path"],
+            "C:\\Evidence\\NTUSER.DAT"
+        );
+        assert_eq!(root_meta["windows_registry_keys_indexed"], 6);
+        assert_eq!(root_meta["windows_registry_values_indexed"], 8);
+        assert_eq!(root_meta["windows_registry_entries_seen"], 9);
+        assert_eq!(root_meta["windows_registry_truncated"], false);
+        assert_eq!(root_meta["userassist_records_indexed"], 1);
+        assert_eq!(root_meta["run_mru_records_indexed"], 1);
+        assert_eq!(root_meta["typed_paths_records_indexed"], 1);
+        assert_eq!(root_meta["mount_point_records_indexed"], 1);
+        assert_eq!(root_meta["startup_records_indexed"], 1);
+        assert_eq!(root_meta["shellbag_records_indexed"], 1);
+        assert!(root_meta["windows_registry_limitations"]
+            .as_str()
+            .unwrap()
+            .contains("Allocated keys and values only"));
+
+        // 2. Verify specialized derived rows
+        let specialized_entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let ua_record = specialized_entries
+            .iter()
+            .find(|e| e.metadata_json["artifact_kind"] == "windows_userassist_record")
+            .expect("userassist record");
+        assert_eq!(
+            ua_record.metadata_json["userassist_decoded_name"],
+            "C:\\Windows\\notepad.exe"
+        );
+        assert_eq!(ua_record.metadata_json["userassist_run_count"], 5);
+        assert_eq!(ua_record.metadata_json["source_entry_id"], root_id);
+        assert_eq!(
+            ua_record.metadata_json["windows_registry_source_entry_id"],
+            root_id
+        );
+        assert_eq!(
+            ua_record.metadata_json["source_artifact_path"],
+            "C:\\Evidence\\NTUSER.DAT"
+        );
+        assert_eq!(
+            ua_record.metadata_json["windows_registry_source_job_id"],
+            10
+        );
+        assert_eq!(ua_record.metadata_json["windows_registry_derived"], true);
+        assert!(ua_record.metadata_json["artifact_time_utc"].is_string());
+
+        let run_record = specialized_entries
+            .iter()
+            .find(|e| e.metadata_json["artifact_kind"] == "windows_run_mru_record")
+            .expect("run_mru record");
+        assert_eq!(
+            run_record.metadata_json["user_activity_value"],
+            "calc.exe\\1"
+        );
+        assert_eq!(run_record.metadata_json["source_entry_id"], root_id);
+
+        let typed_record = specialized_entries
+            .iter()
+            .find(|e| e.metadata_json["artifact_kind"] == "windows_typed_path_record")
+            .expect("typed_path record");
+        assert_eq!(
+            typed_record.metadata_json["user_activity_value"],
+            "C:\\Windows\\System32"
+        );
+
+        let mount_record = specialized_entries
+            .iter()
+            .find(|e| e.metadata_json["artifact_kind"] == "windows_mount_point_record")
+            .expect("mount_point record");
+        assert!(mount_record.metadata_json["mount_point_target"]
+            .as_str()
+            .unwrap()
+            .contains("{12345678-1234-1234-1234-123456789abc}"));
+
+        let startup_record = specialized_entries
+            .iter()
+            .find(|e| e.metadata_json["artifact_kind"] == "windows_startup_record")
+            .expect("startup record");
+        assert_eq!(
+            startup_record.metadata_json["startup_value_name"],
+            "TestApp"
+        );
+        assert_eq!(
+            startup_record.metadata_json["startup_command"],
+            "C:\\Program Files\\App\\app.exe"
+        );
+
+        let shellbag_record = specialized_entries
+            .iter()
+            .find(|e| e.metadata_json["artifact_kind"] == "windows_shellbag_record")
+            .expect("shellbag record");
+        assert!(shellbag_record.metadata_json["shellbag_item_name"]
+            .as_str()
+            .unwrap()
+            .contains("TargetFold"));
+
+        // 3. Proves generic tree is NOT duplicated under /Windows Artifacts/Registry/.../Hive/...
+        let duplicate_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries WHERE logical_path LIKE '/Windows Artifacts/Registry/%/Hive%'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            duplicate_count, 0,
+            "generic hive tree must not be duplicated"
+        );
+
+        // 4. Proves no whole-metadata text segments were inserted
+        let segment_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entry_text_segments WHERE parser_name = 'notatin 1.0.1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            segment_count, 0,
+            "whole metadata text segments must not be created"
+        );
+
         cleanup_case_path(&case_path);
         Ok(())
     }

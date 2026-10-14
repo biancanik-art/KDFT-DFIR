@@ -5641,13 +5641,174 @@ mod tests {
         );
         assert!(INDEX_HTML.contains(r#"["Key LastWrite semantics", metadata.registry_key_last_write_semantics || "modification time of the key, not necessarily its child values"]"#));
         assert!(INDEX_HTML.contains(r#"["Time semantics", "LastWrite time belongs to the containing key; Windows Registry does not track individual value modification times"]"#));
-        assert!(INDEX_HTML.contains(r#"["Value byte size", metadata.registry_value_data_size]"#));
-        assert!(
-            INDEX_HTML.contains(r#"["Value truncated", metadata.registry_value_data_truncated]"#)
-        );
+        assert!(INDEX_HTML.contains(r#"["Original value byte size", metadata.registry_value_data_original_size_bytes ?? metadata.registry_value_data_size]"#));
+        assert!(INDEX_HTML
+            .contains(r#"["Value preview truncated", metadata.registry_value_data_truncated]"#));
         assert!(INDEX_HTML.contains(r#"["Offset basis", metadata.registry_value_offset_basis || "byte offset within the recovered Registry hive file; not a decoded-media or acquisition-container physical offset"]"#));
         assert!(INDEX_HTML.contains("generic key(s)"));
         assert!(INDEX_HTML.contains("generic value(s)"));
+    }
+
+    #[test]
+    fn ui_registry_records_render_compact_key_value_view_in_entries_and_inspector() {
+        // One shared registry vocabulary for the Entries grids and the Inspector.
+        assert!(INDEX_HTML.contains(
+            "const REGISTRY_ARTIFACT_KINDS = [\"registry_hive\", \"registry_key\", \"registry_value\"];"
+        ));
+        // Inspector: a dedicated registry section instead of the generic
+        // windows-artifact gate these records never matched.
+        assert!(INDEX_HTML.contains("function registryRecordRows(metadata)"));
+        assert!(INDEX_HTML.contains("function registryRecordPreviewSection(entry, metadata)"));
+        assert!(INDEX_HTML.contains(
+            "if (registryRecordArtifactKind(metadata)) {\n        return registryRecordPreviewSection(entry, metadata);"
+        ));
+        assert!(INDEX_HTML.contains(
+            "if (registryRecordArtifactKind(metadata)) {\n        return detailSection(\"Registry Key / Value Record\", registryRecordRows(metadata));"
+        ));
+        // The compact view shows hive, key path, value name/type, decoded value
+        // data, key last write, parser status and source provenance.
+        for row in [
+            r#"["Registry hive", firstText(metadata.registry_hive)]"#,
+            r#"["Key path", firstText(metadata.registry_key_path)]"#,
+            r#"["Value name", firstText(metadata.registry_value_name)]"#,
+            r#"["Value type", firstText(metadata.registry_value_type)]"#,
+            r#"["Value data (decoded)", firstText(metadata.registry_value_data)]"#,
+            r#"["Key last write (UTC)", firstText(metadata.registry_key_last_write_utc)]"#,
+            r#"["Parser status", firstText(metadata.registry_parser_status)]"#,
+            r#"["Source hive path", firstText(metadata.source_artifact_path_exact, metadata.source_artifact_path)]"#,
+            r#"["Interpretation", registryInterpretationText(metadata, kind)]"#,
+        ] {
+            assert!(INDEX_HTML.contains(row), "missing inspector row: {row}");
+        }
+        // A key LastWrite timestamp alone must never be presented as execution.
+        assert!(INDEX_HTML.contains(
+            "A key LastWrite timestamp alone does not prove execution - it shows only that the key was modified."
+        ));
+        // Entries: the same compact key/value line under the row name.
+        assert!(INDEX_HTML.contains("function registryRecordSubLabel(entry)"));
+        assert!(INDEX_HTML.contains("function registryRecordLabel(entry)"));
+    }
+
+    #[test]
+    fn ui_registry_optional_columns_exist_only_with_registry_records() {
+        assert!(INDEX_HTML.contains("const REGISTRY_OPTIONAL_COLUMNS = ["));
+        for row in [
+            r#"meta: "registry_hive""#,
+            r#"meta: "registry_key_path""#,
+            r#"meta: "registry_value_name""#,
+            r#"meta: "registry_value_type""#,
+            r#"meta: "registry_value_data""#,
+            r#"meta: "registry_key_last_write_utc""#,
+            r#"meta: "registry_parser_status""#,
+            r#"meta: "source_artifact_path""#,
+        ] {
+            assert!(INDEX_HTML.contains(row), "missing registry column: {row}");
+        }
+        // Context-aware: registry columns are only appended while the rows on
+        // screen contain registry records.
+        assert!(INDEX_HTML.contains("function registryOptionalColumnsForRows(rows)"));
+        assert!(INDEX_HTML.contains("function registryRowsPresent(rows)"));
+        assert!(INDEX_HTML.contains(
+            "if (!(rows || []).some((row) => isRegistryRecordEntry(row.entry || row))) {"
+        ));
+        // Every entry grid (Entries folder view, lazy indexed browse, and the
+        // Categories grid) builds its column set from the rows it shows.
+        assert!(INDEX_HTML.contains("function indexedGridColumns(rows)"));
+        assert!(INDEX_HTML.contains("function folderGridColumns(rows)"));
+        assert!(INDEX_HTML.contains("state.availableRegistryColumns = registryRowsPresent(rows)"));
+        // Sorting/filtering must see the columns the examiner can click.
+        assert!(INDEX_HTML.contains("function recordActiveGridColumns(gridId, columns)"));
+    }
+
+    #[test]
+    fn ui_registry_key_rows_select_the_exact_record_for_deep_search() {
+        // Registry keys are stored as directory rows; clicking one must open
+        // the record in the Inspector instead of descending into its values.
+        assert!(INDEX_HTML.contains(
+            "if (entry.entry_kind === \"directory\" && !isRegistryRecordEntry(entry)) {"
+        ));
+        assert!(INDEX_HTML.contains("const registryRecord = isRegistryRecordEntry(entry);"));
+        assert!(INDEX_HTML.contains(
+            "const selectedPath = (entry.entry_kind === \"directory\" && !registryRecord)"
+        ));
+        assert!(INDEX_HTML.contains("data-record-entry-id=\"${child.entry_id}\" data-idx-dir="));
+        assert!(
+            INDEX_HTML.contains("data-record-entry-id=\"${registryEntryId}\" data-folder-path=")
+        );
+        // Registry rows are highlighted and scrolled into view.
+        assert!(INDEX_HTML.contains("#entryTable .entry-row[data-record-entry-id]"));
+        assert!(INDEX_HTML.contains("function scrollSelectedEntryRowIntoView()"));
+        // Record actions stay available (bookmark/report) for the row.
+        assert!(INDEX_HTML.contains("function showRegistryRecordContextMenu(event, entryId)"));
+        assert!(INDEX_HTML.contains("function openRegistryKeyContents(entryId)"));
+    }
+
+    #[test]
+    fn ui_registry_handles_null_suppression_bounded_tooltips_and_fallbacks() {
+        // Null and literal "null" suppression in compact text.
+        assert!(INDEX_HTML.contains("function registryCompactText(value, limit = 80)"));
+        assert!(INDEX_HTML.contains("if (text === \"null\") return \"\";"));
+        // Bounded tooltips to avoid DOM freezing.
+        assert!(INDEX_HTML.contains("registryCompactText(label, 500)"));
+        assert!(INDEX_HTML.contains("registryCompactText(value, 500)"));
+        // Unnamed value fallback to (Default) and key name fallbacks.
+        assert!(INDEX_HTML
+            .contains(r#"const name = firstText(metadata.registry_value_name, "(Default)");"#));
+        assert!(
+            INDEX_HTML.contains(r#"raw = firstText(metadata.registry_value_name, "(Default)");"#)
+        );
+        assert!(INDEX_HTML.contains(
+            r#"const keyPath = firstText(metadata.registry_key_path, metadata.registry_key_name);"#
+        ));
+        assert!(INDEX_HTML.contains(
+            r#"raw = firstText(metadata.registry_key_path, metadata.registry_key_name);"#
+        ));
+        assert!(INDEX_HTML.contains(
+            r#"raw = firstText(metadata.source_artifact_path_exact, metadata.source_artifact_path, metadata.source_path_exact);"#
+        ));
+        // Activity label and summary support registry records.
+        assert!(INDEX_HTML.contains(
+            "if (isRegistryRecordEntry(entry)) {\n        return registryRecordTypeLabel(entry);\n      }"
+        ));
+        assert!(INDEX_HTML.contains(
+            "if (isRegistryRecordEntry(entry)) {\n        return registryRecordLabel(entry);\n      }"
+        ));
+    }
+
+    #[test]
+    fn ui_registry_navigation_preserves_lookup_and_uncollapses_inspector() {
+        // Deep Search navigation populates lookupEntries and keeps inspector open.
+        assert!(INDEX_HTML.contains("state.lookupEntries.set(Number(entry.id), entry);"));
+        assert!(INDEX_HTML.contains("setInspectorCollapsed(false);"));
+        assert!(INDEX_HTML.contains("dirPaging: {},"));
+        assert!(INDEX_HTML.contains(
+            r#"setNotice((registryRecord ? "Selected registry record " : "Opened source for ")"#
+        ));
+        // Registry record context menu dispatch.
+        assert!(INDEX_HTML.contains(
+            "if (isRegistryRecordEntry(entry)) {\n        showRegistryRecordContextMenu(event, entryId);\n        return;\n      }"
+        ));
+        // Folder rows representing registry records are recognized and highlighted.
+        assert!(INDEX_HTML.contains(
+            "const isSelected = registryEntryId != null && state.hex && state.hex.entryId != null && Number(state.hex.entryId) === Number(registryEntryId);"
+        ));
+        assert!(INDEX_HTML.contains(
+            "return (rows || []).some((row) => isRegistryRecordEntry(row.entry || row) || (row && (row.registryRecord || isRegistryRecordEntry(row.folderEntry))));"
+        ));
+    }
+
+    #[test]
+    fn ui_large_case_hint_tracks_scope_and_loaded_results() {
+        assert!(INDEX_HTML.contains("function largeCaseHintHtml(selPath, children)"));
+        // The hint is derived from the selected evidence source, so switching
+        // scope clears it instead of leaving a stale case-wide banner.
+        assert!(INDEX_HTML.contains("if (!state.data || !state.data.entries_truncated) {"));
+        assert!(INDEX_HTML.contains("const scopedTotal = evidence ? Number(evidenceIndexedEntryCount(evidence.id) || 0) : 0;"));
+        assert!(INDEX_HTML.contains("if (total <= 0 || total <= limit) {"));
+        // Loaded results update the hint (folder page counts).
+        assert!(INDEX_HTML.contains("This folder holds ${loaded.toLocaleString()} entries;"));
+        // Stale column sets from another scope must never survive a switch.
+        assert!(INDEX_HTML.contains("state.activeGridColumns = {};"));
     }
 
     #[test]
@@ -6681,18 +6842,16 @@ mod tests {
         if std::fs::write(&temp_path, script).is_err() {
             return;
         }
-        let check_result = std::process::Command::new("node")
+        let output = std::process::Command::new("node")
             .args(["--check", temp_path.to_str().unwrap_or("")])
             .output()
-            .ok();
+            .expect("Node is required on PATH to syntax-check embedded JavaScript");
         let _ = std::fs::remove_file(&temp_path);
-        if let Some(output) = check_result {
-            assert!(
-                output.status.success(),
-                "embedded JavaScript failed Node syntax check: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+        assert!(
+            output.status.success(),
+            "embedded JavaScript failed Node syntax check: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -7337,7 +7496,7 @@ mod tests {
         assert!(INDEX_HTML.contains("directoryNavigationRow(\n        \".\","));
         assert!(INDEX_HTML.contains("directoryNavigationRow(\n        \"..\","));
         assert!(INDEX_HTML.contains("liveDirectoryNavigationRows(selVolume, selPath)"));
-        assert!(INDEX_HTML.contains("indexedDirectoryNavigationRows(selPath)"));
+        assert!(INDEX_HTML.contains("indexedDirectoryNavigationRows(selPath, children)"));
         assert!(!INDEX_HTML.contains("This folder is empty."));
         assert!(!INDEX_HTML.contains("This folder has no direct children."));
     }
@@ -12689,6 +12848,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       searchSort: { column: "", direction: "asc" },
       searchColumnFilters: {},
       gridViews: {},
+      activeGridColumns: {},
       lookupEntries: new Map(),
       currentEntryGrid: { gridId: "", entries: [] },
       currentLiveGrid: { gridId: "", items: [] },
@@ -13246,6 +13406,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const id = Number(evidenceId);
       if (state.browserState.evidenceId === id) {
         state.browserState = { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" };
+        state.activeGridColumns = {};
       }
       if (state.live.evidenceId === id) {
         state.live = newLiveBrowseState();
@@ -15658,6 +15819,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     function selectEvidenceSource(id, selectedPath = "/", treeMode = null, recordNavigation = true) {
       const previous = currentAnalyzeLocation();
       resetBitlockerRasterPreview();
+      // Column sets are derived from the rows on screen, so they must not
+      // survive a scope change into a different evidence source.
+      state.activeGridColumns = {};
       if (state.live.active && state.live.evidenceId !== id) {
         state.live = newLiveBrowseState();
         setCurrentLiveGrid("", []);
@@ -16248,19 +16412,39 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
     }
 
+    // Registry keys and hive roots are stored as directory rows but are records
+    // in their own right, so browsing into them from the Inspector has to keep
+    // the lazy indexed browse in sync.
+    function openRegistryKeyContents(entryId) {
+      const entry = findLoadedEntry(entryId);
+      if (!entry) {
+        setNotice("Entry is not loaded.", true);
+        return;
+      }
+      if (state.data && state.data.entries_truncated && state.browserState.treeMode !== "categories") {
+        idxSelectDir(entry.logical_path);
+        return;
+      }
+      selectFolder(entry.logical_path);
+    }
+
     function selectBrowserEntry(entryId) {
       const entry = findLoadedEntry(entryId);
       if (!entry) {
         setNotice("Entry is not loaded.", true);
         return;
       }
-      if (entry.entry_kind === "directory") {
+      state.lookupEntries.set(Number(entry.id), entry);
+      // Registry key/hive rows are directory rows whose record is the finding,
+      // so they open in the Inspector instead of descending into child values.
+      if (entry.entry_kind === "directory" && !isRegistryRecordEntry(entry)) {
         selectFolder(entry.logical_path);
         return;
       }
       setInspectorCollapsed(false);
       state.hex = makeHexState(entry.id, 0, numberValue("hexLength", 512));
       $("viewerMode").value = "metadata";
+      setInspectorCollapsed(false);
       loadEntryDiskLocation(entry.id);
       renderHexViewer();
       const evidence = selectedEvidenceSource();
@@ -16268,7 +16452,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         setNotice("Raw container bytes - use Analyze image to browse decoded contents.");
         return;
       }
-      setNotice("Selected " + (entry.name || logicalName(entry.logical_path)) + ".");
+      setNotice((isRegistryRecordEntry(entry) ? "Selected registry record " : "Selected ")
+        + (entry.name || logicalName(entry.logical_path)) + ".");
     }
 
     async function openEntry(entryId) {
@@ -17560,8 +17745,14 @@ const INDEX_HTML: &str = r###"<!doctype html>
           setNotice("Could not load entry " + entryId + ": " + err.message, true);
           return;
         }
+      } else {
+        state.lookupEntries.set(Number(entry.id), entry);
       }
-      const selectedPath = entry.entry_kind === "directory"
+      // A registry key is stored as a directory but is itself the record the
+      // examiner searched for, so the parent folder is revealed and the key is
+      // selected in the Inspector instead of being descended into.
+      const registryRecord = isRegistryRecordEntry(entry);
+      const selectedPath = (entry.entry_kind === "directory" && !registryRecord)
         ? normalizeLogicalPath(entry.logical_path)
         : parentLogicalPath(entry.logical_path);
       state.browserState = {
@@ -17586,7 +17777,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       // silently kept showing whatever was loaded before (often just "/")
       // while the inspector on the right correctly showed the new entry.
       if (state.data && state.data.entries_truncated) {
-        state.idx = { evidenceId: entry.evidence_id, dirCache: {}, expanded: new Set(["/"]), selPath: "/" };
+        state.idx = {
+          evidenceId: entry.evidence_id,
+          dirCache: {},
+          dirPaging: {},
+          expanded: new Set(["/"]),
+          selPath: "/"
+        };
         try {
           await idxRestorePath(selectedPath);
         } catch (err) {
@@ -17597,7 +17794,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
       renderEvidenceBrowserEntries();
       const offset = entryPrimaryOffset(entry);
       const location = offset ? " File starts at " + offset + "." : "";
-      setNotice("Opened source for " + (entry.name || logicalName(entry.logical_path)) + "." + location);
+      setNotice((registryRecord ? "Selected registry record " : "Opened source for ")
+        + (entry.name || logicalName(entry.logical_path)) + "." + location);
+    }
+
+    function scrollSelectedEntryRowIntoView() {
+      const selectedId = state.hex && state.hex.entryId ? String(state.hex.entryId) : "";
+      if (!selectedId) {
+        return;
+      }
+      const row = document.querySelector("#entryTable .entry-row.selected");
+      if (row && typeof row.scrollIntoView === "function") {
+        row.scrollIntoView({ block: "nearest", inline: "nearest" });
+      }
     }
 
     async function bookmarkEvidence(index) {
@@ -17636,26 +17845,30 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function findLoadedEntry(entryId) {
-      if (!state.data) {
+      if (!state.data || entryId == null) {
         return null;
       }
-      const inState = state.data.entries.find((item) => item.id === entryId);
+      const numId = Number(entryId);
+      const inState = state.data.entries.find((item) => Number(item.id) === numId);
       if (inState) {
         return inState;
       }
-      const lookedUp = state.lookupEntries && state.lookupEntries.get(Number(entryId));
+      const lookedUp = state.lookupEntries && state.lookupEntries.get(numId);
       if (lookedUp) {
         return lookedUp;
       }
-      const inCategory = (state.cat.entries || []).find((item) => item.id === entryId);
+      const inCategory = (state.cat.entries || []).find((item) => Number(item.id) === numId);
       if (inCategory) {
+        if (state.lookupEntries) state.lookupEntries.set(numId, inCategory);
         return inCategory;
       }
       // Entry may have come from the lazy indexed browse cache instead.
-      for (const path in state.idx.dirCache) {
-        const child = state.idx.dirCache[path].find((item) => item.entry_id === entryId);
+      for (const path in (state.idx && state.idx.dirCache) || {}) {
+        const child = (state.idx.dirCache[path] || []).find((item) => Number(item.entry_id) === numId);
         if (child) {
-          return idxChildToEntry(child);
+          const entry = idxChildToEntry(child);
+          if (state.lookupEntries) state.lookupEntries.set(numId, entry);
+          return entry;
         }
       }
       return null;
@@ -18541,6 +18754,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       state.browserState = { evidenceId: null, selectedPath: "/", treeMode: "filesystem", selectedCategory: "" };
       state.expandedTreePaths = new Map();
       state.selectedEntryIds = new Set();
+      state.activeGridColumns = {};
       setCurrentEntryGrid("", []);
       setCurrentLiveGrid("", []);
       state.cat = newCategoryCache();
@@ -19772,6 +19986,10 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (!entry || !menu) {
         return;
       }
+      if (isRegistryRecordEntry(entry)) {
+        showRegistryRecordContextMenu(event, entryId);
+        return;
+      }
       event.preventDefault();
       event.stopPropagation();
       const rows = [];
@@ -19795,6 +20013,31 @@ const INDEX_HTML: &str = r###"<!doctype html>
         }
         rows.push(ctxItem("Go to folder", `goToEntryFolder(${entryId})`));
       }
+      entrySelectionCtxRows(rows);
+      openContextMenu(menu, rows, event);
+    }
+
+    // Registry key/value records are stored as directory rows (keys, hive
+    // roots) or record rows (values). Their menu offers the record actions and
+    // still lets the examiner browse into a key's values.
+    function showRegistryRecordContextMenu(event, entryId) {
+      const entry = findLoadedEntry(entryId);
+      const menu = $("ctxMenu");
+      if (!entry || !menu) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const escLogicalPath = escapeAttr(escapeJs(entry.logical_path));
+      const browse = (state.data && state.data.entries_truncated && state.browserState.treeMode !== "categories")
+        ? `idxSelectDir('${escLogicalPath}')`
+        : `selectFolder('${escLogicalPath}')`;
+      const rows = [ctxItem("Details", `selectBrowserEntry(${entryId})`)];
+      if (entry.entry_kind === "directory") {
+        rows.push(ctxItem("Open key contents", browse));
+      }
+      rows.push(ctxItem("Bookmark record", `bookmarkEntry(${entryId})`));
+      rows.push(ctxItem("Go to folder", `goToEntryFolder(${entryId})`));
       entrySelectionCtxRows(rows);
       openContextMenu(menu, rows, event);
     }
@@ -19912,6 +20155,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
         const entryId = Number(entryRow.dataset.entryId);
         if (Number.isFinite(entryId)) {
           showEntryContextMenu(event, entryId);
+        }
+        return;
+      }
+      // Registry key rows are record rows that also sit in a folder tree, so
+      // their menu has to offer both the record actions and browsing the key.
+      const recordRow = target.closest("[data-record-entry-id]");
+      if (recordRow) {
+        const entryId = Number(recordRow.dataset.recordEntryId);
+        if (Number.isFinite(entryId)) {
+          showRegistryRecordContextMenu(event, entryId);
         }
         return;
       }
@@ -21126,8 +21379,150 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return parent === "/" ? "/" + name : parent + "/" + name;
     }
 
-    function indexedGridColumns() {
-      return [
+    // Registry hive key/value records share one tree in Entries and one
+    // category, so the grids, Inspector, and Quick Report all read the same
+    // metadata the hive importer wrote. Keys and hive roots are stored as
+    // directory rows and values as record rows, so artifact_kind is the only
+    // reliable discriminator.
+    const REGISTRY_ARTIFACT_KINDS = ["registry_hive", "registry_key", "registry_value"];
+    const REGISTRY_OPTIONAL_COLUMNS = [
+      { key: "registryHive", label: "Hive", sortable: true, filterable: true, sortType: "text", meta: "registry_hive" },
+      { key: "registryKeyPath", label: "Key path", sortable: true, filterable: true, sortType: "text", meta: "registry_key_path" },
+      { key: "registryValueName", label: "Value name", sortable: true, filterable: true, sortType: "text", meta: "registry_value_name" },
+      { key: "registryValueType", label: "Value type", sortable: true, filterable: true, sortType: "text", meta: "registry_value_type" },
+      { key: "registryValueData", label: "Value data", sortable: true, filterable: true, sortType: "text", meta: "registry_value_data", compact: true },
+      { key: "registryKeyLastWrite", label: "Key last write", sortable: true, filterable: true, sortType: "time", meta: "registry_key_last_write_utc" },
+      { key: "registryParserStatus", label: "Parser status", sortable: true, filterable: true, sortType: "text", meta: "registry_parser_status" },
+      { key: "registrySourcePath", label: "Source provenance", sortable: true, filterable: true, sortType: "text", meta: "source_artifact_path", compact: true },
+      { key: "registryValueOffset", label: "Hive offset", sortable: true, filterable: true, sortType: "number", meta: "registry_value_offset" }
+    ];
+
+    function registryRecordArtifactKind(metadata) {
+      const kind = String((metadata && metadata.artifact_kind) || "");
+      return REGISTRY_ARTIFACT_KINDS.includes(kind) ? kind : "";
+    }
+
+    function isRegistryRecordEntry(entry) {
+      return Boolean(entry && registryRecordArtifactKind(entry.metadata_json || {}));
+    }
+
+    function registryRecordTypeLabel(entry) {
+      const kind = registryRecordArtifactKind((entry || {}).metadata_json || {});
+      if (kind === "registry_hive") return "Registry hive";
+      if (kind === "registry_key") return "Registry key";
+      if (kind === "registry_value") return "Registry value";
+      return "";
+    }
+
+    // Decoded value data and source paths are unbounded; the grid keeps the
+    // full text in the tooltip and in the filter value but shows a bounded cell.
+    function registryCompactText(value, limit = 80) {
+      if (value === undefined || value === null) return "";
+      const text = String(value).trim();
+      if (text === "null") return "";
+      return text.length > limit ? text.slice(0, limit) + "..." : text;
+    }
+
+    function registryRecordLabel(entry) {
+      const metadata = (entry || {}).metadata_json || {};
+      const kind = registryRecordArtifactKind(metadata);
+      if (!kind) return "";
+      const hive = firstText(metadata.registry_hive);
+      const keyPath = firstText(metadata.registry_key_path, metadata.registry_key_name);
+      if (kind === "registry_value") {
+        const name = firstText(metadata.registry_value_name, "(Default)");
+        const type = firstText(metadata.registry_value_type);
+        const data = registryCompactText(metadata.registry_value_data, 60);
+        const typed = type ? name + " (" + type + ")" : name;
+        return [hive, keyPath, data ? typed + " = " + data : typed].filter(Boolean).join(" > ");
+      }
+      if (kind === "registry_key") {
+        return [hive, keyPath || firstText(entry.name)].filter(Boolean).join(" > ");
+      }
+      return hive ? hive + " hive" : firstText(entry.name, "Registry hive");
+    }
+
+    function registryRecordSubLabel(entry) {
+      const label = registryRecordLabel(entry);
+      return label ? `<span class="entry-path" title="${escapeAttr(registryCompactText(label, 500))}">${escapeHtml(label)}</span>` : "";
+    }
+
+    function registryRowsPresent(rows) {
+      return (rows || []).some((row) => isRegistryRecordEntry(row.entry || row) || (row && (row.registryRecord || isRegistryRecordEntry(row.folderEntry))));
+    }
+
+    // Optional registry columns exist only while registry records are on
+    // screen, so a case with no hive data never grows nine empty columns.
+    function registryOptionalColumnsForRows(rows) {
+      if (!(rows || []).some((row) => isRegistryRecordEntry(row.entry || row))) {
+        if (!registryRowsPresent(rows)) {
+          return [];
+        }
+      }
+      if (!state.registryColumnVisibility) {
+        state.registryColumnVisibility = {
+          registryHive: true,
+          registryKeyPath: true,
+          registryValueName: true,
+          registryValueType: true,
+          registryValueData: true,
+          registryKeyLastWrite: true,
+          registryParserStatus: true,
+          registrySourcePath: false,
+          registryValueOffset: false
+        };
+      }
+      return REGISTRY_OPTIONAL_COLUMNS.filter((column) => state.registryColumnVisibility[column.key] !== false);
+    }
+
+    function registryGridValues(entry) {
+      const metadata = (entry || {}).metadata_json || {};
+      const values = {};
+      const sortValues = {};
+      if (!isRegistryRecordEntry(entry)) {
+        return { values, sortValues };
+      }
+      for (const column of REGISTRY_OPTIONAL_COLUMNS) {
+        let raw = metadata[column.meta];
+        if (column.key === "registrySourcePath" && (raw === undefined || raw === null || String(raw).trim() === "")) {
+          raw = firstText(metadata.source_artifact_path_exact, metadata.source_artifact_path, metadata.source_path_exact);
+        } else if (column.key === "registryKeyPath" && (raw === undefined || raw === null || String(raw).trim() === "")) {
+          raw = firstText(metadata.registry_key_path, metadata.registry_key_name);
+        } else if (column.key === "registryValueName" && (raw === undefined || raw === null || String(raw).trim() === "")) {
+          raw = firstText(metadata.registry_value_name, "(Default)");
+        }
+        if (raw === undefined || raw === null) {
+          continue;
+        }
+        const str = String(raw).trim();
+        if (str.length === 0 || str === "null") {
+          continue;
+        }
+        values[column.key] = str;
+        sortValues[column.key] = column.sortType === "number" ? gridNumericValue(raw) : str;
+      }
+      return { values, sortValues };
+    }
+
+    // Rows render their fixed columns per grid, then any optional registry
+    // column that the current rows made available.
+    function entryGridOptionalCell(col, row) {
+      const value = String((row.values || {})[col.key] || "");
+      if (value === "null" || value === "") return "<td></td>";
+      const classAttr = col.sortType === "time"
+        ? ' class="entry-time"'
+        : (col.sortType === "number" ? ' class="entry-offset"' : "");
+      const display = col.compact ? registryCompactText(value) : value;
+      const tooltip = escapeAttr(registryCompactText(value, 500));
+      return `<td${classAttr} title="${tooltip}">${escapeHtml(display)}</td>`;
+    }
+
+    const ENTRY_GRID_FIXED_COLUMN_KEYS = new Set(["select", "name", "category", "type", "ext",
+      "detectedType", "signature", "flags", "size", "offset", "artifactTime", "created", "modified",
+      "accessed", "mftModified", "sha256"]);
+
+    function indexedGridColumns(rows) {
+      const fixed = [
         { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
         { key: "name", label: "Name", sortable: true, filterable: true, sortType: "text" },
         { key: "category", label: "Category", sortable: true, filterable: true, sortType: "text" },
@@ -21145,11 +21540,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
         { key: "mftModified", label: "MFT modified", sortable: true, filterable: true, sortType: "time" },
         { key: "sha256", label: "SHA-256", sortable: true, filterable: true, sortType: "text" }
       ];
+      return fixed.concat(registryOptionalColumnsForRows(rows));
     }
 
     function indexedGridRow(child) {
       const entry = child.entry_id != null ? idxChildToEntry(child) : null;
-      const type = child.is_dir ? "Folder" : (entry ? filesystemTypeLabel(entry) : "File");
+      const registryRecord = isRegistryRecordEntry(entry) || isRegistryRecordEntry(child);
+      // Registry keys are directory rows that are still records: they open in
+      // the Inspector instead of descending into their child values.
+      const type = registryRecord
+        ? registryRecordTypeLabel(entry || child)
+        : (child.is_dir ? "Folder" : (entry ? filesystemTypeLabel(entry) : "File"));
       const size = child.size_bytes == null ? "" : formatBytes(child.size_bytes);
       const flags = child.is_deleted ? "deleted" : "";
       const artifactTime = artifactEventTime(entry);
@@ -21158,10 +21559,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const accessed = filesystemAccessedTime(entry);
       const mftModified = filesystemMftModifiedTime(entry);
       const sha256 = filesystemFileHashDisplay(entry);
+      const registry = registryGridValues(entry || child);
       return {
         child,
         entry,
-        selectable: !child.is_dir && child.entry_id != null,
+        registryRecord,
+        selectable: child.entry_id != null && (!child.is_dir || registryRecord),
         values: {
           name: compactParts([child.name, flags]),
           category: entry ? entryCategoryLabel(entry) : "",
@@ -21177,7 +21580,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           modified,
           accessed,
           mftModified,
-          sha256
+          sha256,
+          ...registry.values
         },
         sortValues: {
           size: child.size_bytes == null ? NaN : Number(child.size_bytes),
@@ -21186,28 +21590,35 @@ const INDEX_HTML: &str = r###"<!doctype html>
           created: Date.parse(created),
           modified: Date.parse(modified),
           accessed: Date.parse(accessed),
-          mftModified: Date.parse(mftModified)
+          mftModified: Date.parse(mftModified),
+          ...registry.sortValues
         }
       };
     }
 
-    function renderIndexedGridRow(row) {
+    function renderIndexedGridRow(row, columns) {
       const child = row.child;
       const entry = row.entry;
       const selectable = row.selectable;
       const isChecked = selectable && state.selectedEntryIds.has(child.entry_id);
+      const isSelected = state.hex && state.hex.entryId != null && Number(state.hex.entryId) === Number(child.entry_id);
       const checkbox = selectable
         ? `<input type="checkbox"${isChecked ? " checked" : ""} onclick="event.stopPropagation(); toggleEntrySelection(${child.entry_id}, this.checked, event)">`
         : "";
-      const nameCell = `<span class="entry-name">${escapeHtml(child.name)}</span>`;
+      const nameCell = `<span class="entry-name">${escapeHtml(child.name)}</span>`
+        + (row.registryRecord ? registryRecordSubLabel(entry || child) : "");
       // No in-lane buttons: rows are worked via selection + right-click.
       const rowClick = child.is_dir
-        ? ` style="cursor:pointer" onclick="idxSelectDir('${escapeAttr(escapeJs(child.logical_path))}')"`
+        ? (row.registryRecord
+          ? ` style="cursor:pointer" onclick="handleEntryRowClick(event, ${child.entry_id})"`
+          : ` style="cursor:pointer" onclick="idxSelectDir('${escapeAttr(escapeJs(child.logical_path))}')"`)
         : (selectable ? ` style="cursor:pointer" onclick="handleEntryRowClick(event, ${child.entry_id})"` : "");
       const ctxAttr = child.is_dir
-        ? ` data-idx-dir="${escapeAttr(child.logical_path)}"`
+        ? (row.registryRecord
+          ? ` data-record-entry-id="${child.entry_id}" data-idx-dir="${escapeAttr(child.logical_path)}"`
+          : ` data-idx-dir="${escapeAttr(child.logical_path)}"`)
         : (selectable ? ` data-entry-id="${child.entry_id}"` : "");
-      return `<tr class="entry-row${child.is_deleted ? " deleted" : ""}${isChecked ? " multi-selected" : ""}"${rowClick}${ctxAttr}>
+      let html = `<tr class="entry-row${child.is_deleted ? " deleted" : ""}${isSelected ? " selected" : ""}${isChecked ? " multi-selected" : ""}"${rowClick}${ctxAttr}>
           <td>${checkbox}</td>
           <td>${nameCell}</td>
           <td class="entry-category">${escapeHtml(row.values.category)}</td>
@@ -21223,28 +21634,36 @@ const INDEX_HTML: &str = r###"<!doctype html>
           <td class="entry-time" title="${escapeAttr(row.values.modified)}">${escapeHtml(row.values.modified)}</td>
           <td class="entry-time" title="${escapeAttr(row.values.accessed)}">${escapeHtml(row.values.accessed)}</td>
           <td class="entry-time" title="${escapeAttr(row.values.mftModified)}">${escapeHtml(row.values.mftModified)}</td>
-          <td class="entry-hash mono" title="${escapeAttr(row.values.sha256)}">${escapeHtml(row.values.sha256)}</td>
-        </tr>`;
+          <td class="entry-hash mono" title="${escapeAttr(row.values.sha256)}">${escapeHtml(row.values.sha256)}</td>`;
+      const fixedKeys = ENTRY_GRID_FIXED_COLUMN_KEYS;
+      for (const col of (columns || [])) {
+        if (fixedKeys.has(col.key)) {
+          continue;
+        }
+        html += entryGridOptionalCell(col, row);
+      }
+      html += `</tr>`;
+      return html;
     }
 
-    function indexedDirectoryNavigationRows(path) {
+    function indexedDirectoryNavigationRows(path, rows) {
       const current = normalizeLogicalPath(path || "/");
       const parent = parentLogicalPath(current);
       return directoryNavigationRow(
         ".",
         current,
         `idxSelectDir('${escapeAttr(escapeJs(current))}')`,
-        indexedGridColumns().length
+        indexedGridColumns(rows).length
       ) + directoryNavigationRow(
         "..",
         parent,
         `idxSelectDir('${escapeAttr(escapeJs(parent))}')`,
-        indexedGridColumns().length
+        indexedGridColumns(rows).length
       );
     }
 
     function visibleIndexedGridRows(children) {
-      return visibleGridRows("indexed", indexedGridColumns(), children.map(indexedGridRow));
+      return visibleGridRows("indexed", indexedGridColumns(children), children.map(indexedGridRow));
     }
 
     function renderIdxDirRows(path, depth, rows) {
@@ -21303,18 +21722,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const selPath = state.idx.selPath || "/";
       const children = state.idx.dirCache[selPath] || [];
       $("folderTitle").textContent = displayPath(selPath);
-      const columns = indexedGridColumns();
+      const columns = indexedGridColumns(children);
+      recordActiveGridColumns("indexed", columns);
       const gridRows = children.map(indexedGridRow);
       const tableResult = sortableGridTable(
         "indexed",
         columns,
         gridRows,
         "idx-table",
-        renderIndexedGridRow,
-        indexedDirectoryNavigationRows(selPath)
+        (row) => renderIndexedGridRow(row, columns),
+        indexedDirectoryNavigationRows(selPath, children)
       );
       setCurrentEntryGrid("indexed", tableResult.visibleRows.filter((row) => row.selectable).map((row) => row.entry).filter(Boolean));
-      const banner = `<div class="analysis-status">Large case (${(state.data.entry_count || 0).toLocaleString()} entries): browsing the full index folder by folder. Open folders on the left; use Deep Search to find files by name or content.</div>`;
+      const banner = largeCaseHintHtml(selPath, children);
       const paging = state.idx.dirPaging && state.idx.dirPaging[selPath];
       const pageControl = paging && paging.nextOffset != null
         ? `<div class="analysis-status">Showing ${children.length.toLocaleString()} of ${paging.totalChildren.toLocaleString()} direct children. <button class="ghost tiny" onclick="idxLoadMore('${escapeAttr(escapeJs(selPath))}')">Load next 1,000</button></div>`
@@ -21954,8 +22374,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
     ];
 
     function toggleCategoryColumn(key, visible) {
-      if (!state.categoryColumnVisibility) state.categoryColumnVisibility = {};
-      state.categoryColumnVisibility[key] = visible;
+      // Registry columns keep their own visibility state so a case without
+      // hive data never records (or restores) registry column preferences.
+      const visibility = REGISTRY_OPTIONAL_COLUMNS.some((column) => column.key === key)
+        ? (state.registryColumnVisibility = state.registryColumnVisibility || {})
+        : (state.categoryColumnVisibility = state.categoryColumnVisibility || {});
+      visibility[key] = visible;
       renderState();
     }
 
@@ -21967,13 +22391,20 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function categoryColumnChooserHtml() {
-      if (!state.availableCategoryColumns || !state.availableCategoryColumns.length) return "";
+      const availableKeys = state.availableCategoryColumns || [];
+      const availableRegistryKeys = state.availableRegistryColumns || [];
+      if (!availableKeys.length && !availableRegistryKeys.length) return "";
+      const checkbox = (c, visibility) => {
+        const checked = visibility[c.key] ? "checked" : "";
+        return `<label style="display:block; font-size:11px; margin-bottom:4px; white-space:nowrap;"><input type="checkbox" ${checked} onchange="toggleCategoryColumn('${c.key}', this.checked)"> ${escapeHtml(c.label)}</label>`;
+      };
       const checkboxes = CATEGORY_OPTIONAL_COLUMNS
-        .filter(c => state.availableCategoryColumns.includes(c.key))
-        .map(c => {
-          const checked = state.categoryColumnVisibility[c.key] ? "checked" : "";
-          return `<label style="display:block; font-size:11px; margin-bottom:4px; white-space:nowrap;"><input type="checkbox" ${checked} onchange="toggleCategoryColumn('${c.key}', this.checked)"> ${escapeHtml(c.label)}</label>`;
-        }).join("");
+        .filter(c => availableKeys.includes(c.key))
+        .map((c) => checkbox(c, state.categoryColumnVisibility))
+        .concat(REGISTRY_OPTIONAL_COLUMNS
+          .filter(c => availableRegistryKeys.includes(c.key))
+          .map((c) => checkbox(c, state.registryColumnVisibility)))
+        .join("");
       return `<details class="column-chooser" style="position:relative; display:inline-block; margin-left:8px;">
         <summary class="ghost button" style="padding:4px 8px; font-size:11px; height:auto;">Columns</summary>
         <div style="position:absolute; right:0; top:100%; background:var(--surface); border:1px solid var(--line); padding:8px; border-radius:4px; z-index:10; min-width:120px; box-shadow:0 4px 6px rgba(0,0,0,0.3);">
@@ -22012,7 +22443,12 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
       state.availableCategoryColumns = Array.from(availableKeys);
       const activeOptional = CATEGORY_OPTIONAL_COLUMNS.filter(c => availableKeys.has(c.key) && state.categoryColumnVisibility[c.key]);
-      return base.concat(activeOptional);
+      // Registry columns are offered only while the loaded rows contain
+      // registry records, so other categories never carry empty hive columns.
+      state.availableRegistryColumns = registryRowsPresent(rows)
+        ? REGISTRY_OPTIONAL_COLUMNS.map((column) => column.key)
+        : [];
+      return base.concat(activeOptional).concat(registryOptionalColumnsForRows(rows));
     }
 
     function categoryGridRow(entry) {
@@ -22032,7 +22468,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const values = {
         name: compactParts([name, displayPath(entry.logical_path)]),
         category: entryCategoryLabel(entry),
-        type: activityLabel(entry),
+        type: isRegistryRecordEntry(entry) ? registryRecordTypeLabel(entry) : activityLabel(entry),
         ext,
         size,
         flags,
@@ -22061,6 +22497,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
           sortValues[c.key] = c.sortType === "number" ? Number(meta[c.meta]) : values[c.key];
         }
       }
+      const registry = registryGridValues(entry);
+      Object.assign(values, registry.values);
+      Object.assign(sortValues, registry.sortValues);
 
       return { entry, values, sortValues };
     }
@@ -22082,7 +22521,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         if (col.key === "select") {
           html += `<td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleEntrySelection(${entry.id}, this.checked, event)"></td>`;
         } else if (col.key === "name") {
-          html += `<td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span><span class="entry-path">${escapeHtml(displayPath(entry.logical_path))}</span></td>`;
+          const subLabel = isRegistryRecordEntry(entry) ? registryRecordSubLabel(entry) : "";
+          html += `<td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span>${subLabel}</td>`;
         } else if (col.key === "category") {
           html += `<td title="${escapeAttr(entryCategoryLabel(entry) + " | " + entryCategoryDetail(entry))}">${categoryIconHtml(entryCategory(entry).main)}<span class="entry-category">${escapeHtml(entryCategoryLabel(entry))}</span></td>`;
         } else if (col.key === "type") {
@@ -22095,8 +22535,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
           html += `<td class="entry-flags" title="${escapeAttr(entryFlagsText(entry))}">${entryFlagsHtml(entry)}</td>`;
         } else {
           const val = row.values[col.key] || "";
+          const display = col.compact ? registryCompactText(val) : val;
           const classAttr = col.sortType === "time" ? ' class="entry-time"' : (col.key === "sha256" ? ' class="entry-hash mono"' : '');
-          html += `<td${classAttr} title="${escapeAttr(val)}">${escapeHtml(val)}</td>`;
+          html += `<td${classAttr} title="${escapeAttr(val)}">${escapeHtml(display)}</td>`;
         }
       }
       html += `</tr>`;
@@ -22110,6 +22551,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
 
     function renderCategoryRows(rows, prefixHtml = "", suffixHtml = "") {
       const columns = categoryGridColumns(rows);
+      recordActiveGridColumns("category", columns);
       const tableResult = sortableGridTable("category", columns, rows.map(categoryGridRow), "category-table", (row) => renderCategoryGridRow(row, columns));
       const gridToggle = rows.length > 0 && (selectedCategoryUsesPictureGallery() || rows.every((entry) => isImageEntry(entry)))
         ? `<div class="thumb-toolbar"><button class="ghost" onclick="setPictureViewMode('grid')">Gallery view</button></div>`
@@ -22704,8 +23146,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return firstText(metadata.ntfs_standard_mft_record_modification_time_utc, metadata.standard_information_mft_modified_utc, metadata.ntfs_mft_record_modification_time_utc, metadata.file_name_mft_modified_utc, metadata.mft_modified_utc);
     }
 
-    function folderGridColumns() {
-      return [
+    function folderGridColumns(rows) {
+      const fixed = [
         { key: "select", label: "", sortable: false, filterable: false, sortType: "none" },
         { key: "name", label: "Name", sortable: true, filterable: true, sortType: "text" },
         { key: "category", label: "Category", sortable: true, filterable: true, sortType: "text" },
@@ -22723,6 +23165,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         { key: "mftModified", label: "MFT modified", sortable: true, filterable: true, sortType: "time" },
         { key: "sha256", label: "SHA-256", sortable: true, filterable: true, sortType: "text" }
       ];
+      return fixed.concat(registryOptionalColumnsForRows(rows));
     }
 
     function folderGridFolderRow(path, count, countKind, folderEntry) {
@@ -22730,17 +23173,20 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const accessed = filesystemAccessedTime(folderEntry);
       const modified = filesystemModifiedTime(folderEntry);
       const mftModified = filesystemMftModifiedTime(folderEntry);
+      const registryRecord = isRegistryRecordEntry(folderEntry);
+      const registry = registryGridValues(folderEntry);
       return {
         kind: "folder",
         path,
         count,
         countKind,
         folderEntry,
+        registryRecord,
         selectable: false,
         values: {
           name: logicalName(path),
           category: folderEntry ? entryCategoryLabel(folderEntry) : "",
-          type: "Folder",
+          type: registryRecord ? registryRecordTypeLabel(folderEntry) : "Folder",
           ext: "",
           detectedType: "",
           signature: "",
@@ -22752,7 +23198,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           accessed,
           modified,
           mftModified,
-          sha256: ""
+          sha256: "",
+          ...registry.values
         },
         sortValues: {
           size: NaN,
@@ -22761,7 +23208,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           created: Date.parse(created),
           accessed: Date.parse(accessed),
           modified: Date.parse(modified),
-          mftModified: Date.parse(mftModified)
+          mftModified: Date.parse(mftModified),
+          ...registry.sortValues
         }
       };
     }
@@ -22774,14 +23222,17 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const artifactTime = artifactEventTime(entry);
       const sha256 = filesystemFileHashDisplay(entry);
       const size = entry.size_bytes == null ? "" : formatBytes(entry.size_bytes);
+      const registryRecord = isRegistryRecordEntry(entry);
+      const registry = registryGridValues(entry);
       return {
         kind: "entry",
         entry,
+        registryRecord,
         selectable: true,
         values: {
           name: entry.name || logicalName(entry.logical_path),
           category: entryCategoryLabel(entry),
-          type: filesystemTypeLabel(entry),
+          type: registryRecord ? registryRecordTypeLabel(entry) : filesystemTypeLabel(entry),
           ext: filesystemFileExtension(entry),
           detectedType: filesystemDetectedType(entry),
           signature: filesystemSignatureStatus(entry),
@@ -22793,7 +23244,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
           accessed,
           modified,
           mftModified,
-          sha256
+          sha256,
+          ...registry.values
         },
         sortValues: {
           size: entry.size_bytes == null ? NaN : Number(entry.size_bytes),
@@ -22802,20 +23254,33 @@ const INDEX_HTML: &str = r###"<!doctype html>
           created: Date.parse(created),
           accessed: Date.parse(accessed),
           modified: Date.parse(modified),
-          mftModified: Date.parse(mftModified)
+          mftModified: Date.parse(mftModified),
+          ...registry.sortValues
         }
       };
     }
 
-    function renderFolderGridRow(row) {
+    function renderFolderGridRow(row, columns) {
       if (row.kind === "folder") {
         const folderEntry = row.folderEntry;
-        return `
-          <tr class="entry-row" onclick="selectFolder('${escapeAttr(escapeJs(row.path))}')"${folderEntry ? ` data-entry-id="${folderEntry.id}"` : ` data-folder-path="${escapeAttr(row.path)}"`}>
+        const registryRecord = row.registryRecord;
+        const registryEntryId = registryRecord && folderEntry ? folderEntry.id : null;
+        // Registry key rows are records: they open in the Inspector, and the
+        // key's own values stay reachable through the tree and the context menu.
+        const rowAction = registryEntryId != null
+          ? `onclick="handleEntryRowClick(event, ${registryEntryId})"`
+          : `onclick="selectFolder('${escapeAttr(escapeJs(row.path))}')"`;
+        const identityAttr = registryEntryId != null
+          ? ` data-record-entry-id="${registryEntryId}" data-folder-path="${escapeAttr(row.path)}"`
+          : ` data-folder-path="${escapeAttr(row.path)}"`;
+        const subLabel = registryRecord ? registryRecordSubLabel(folderEntry) : "";
+        const isSelected = registryEntryId != null && state.hex && state.hex.entryId != null && Number(state.hex.entryId) === Number(registryEntryId);
+        let folderHtml = `
+          <tr class="entry-row${isSelected ? " selected" : ""}"${identityAttr} ${rowAction}>
             <td></td>
-            <td title="${escapeAttr(row.path)}">${svgIconHtml(FILE_ICON_SHAPES.folder, "file-icon file-icon-folder", "")}<span class="entry-name">${escapeHtml(logicalName(row.path))}</span></td>
+            <td title="${escapeAttr(row.path)}">${svgIconHtml(FILE_ICON_SHAPES.folder, "file-icon file-icon-folder", "")}<span class="entry-name">${escapeHtml(logicalName(row.path))}</span>${subLabel}</td>
             <td class="entry-category">${escapeHtml(row.values.category)}</td>
-            <td class="entry-kind" title="${row.count} ${escapeAttr(row.countKind)} item${row.count === 1 ? "" : "s"}">Folder</td>
+            <td class="entry-kind" title="${registryRecord ? "Registry key" : `${row.count} ${escapeAttr(row.countKind)} item${row.count === 1 ? "" : "s"}`}">${escapeHtml(row.values.type)}</td>
             <td class="entry-ext"></td>
             <td></td>
             <td></td>
@@ -22827,8 +23292,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
             <td class="entry-time" title="${escapeAttr(row.values.accessed)}">${escapeHtml(row.values.accessed)}</td>
             <td class="entry-time" title="${escapeAttr(row.values.modified)}">${escapeHtml(row.values.modified)}</td>
             <td class="entry-time" title="${escapeAttr(row.values.mftModified)}">${escapeHtml(row.values.mftModified)}</td>
-            <td class="entry-hash mono"></td>
-          </tr>`;
+            <td class="entry-hash mono"></td>`;
+        const fixedKeys = ENTRY_GRID_FIXED_COLUMN_KEYS;
+        for (const col of (columns || [])) {
+          if (fixedKeys.has(col.key)) {
+            continue;
+          }
+          folderHtml += entryGridOptionalCell(col, row);
+        }
+        folderHtml += `</tr>`;
+        return folderHtml;
       }
       const entry = row.entry;
       const selected = state.hex.entryId === entry.id ? " selected" : "";
@@ -22836,12 +23309,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const checked = isChecked ? " checked" : "";
       const multiSelected = isChecked ? " multi-selected" : "";
       const deletedRow = isDeletedRecoveryEntry(entry) ? " deleted" : "";
-      return `
+      const registryRecord = row.registryRecord;
+      let entryHtml = `
           <tr class="entry-row${deletedRow}${selected}${multiSelected}" data-entry-id="${entry.id}" onclick="handleEntryRowClick(event, ${entry.id})">
             <td><input type="checkbox"${checked} onclick="event.stopPropagation(); toggleEntrySelection(${entry.id}, this.checked, event)"></td>
-            <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span></td>
+            <td title="${escapeAttr(entry.logical_path)}">${fileIconHtml(entry)}<span class="entry-name">${escapeHtml(entry.name || logicalName(entry.logical_path))}</span>${registryRecord ? registryRecordSubLabel(entry) : ""}</td>
             <td class="entry-category">${escapeHtml(row.values.category)}</td>
-            <td class="entry-kind">${escapeHtml(filesystemTypeLabel(entry))}</td>
+            <td class="entry-kind">${escapeHtml(row.values.type)}</td>
             <td class="entry-ext">${escapeHtml(filesystemFileExtension(entry))}</td>
             <td title="${escapeAttr(row.values.detectedType)}">${escapeHtml(row.values.detectedType)}</td>
             <td>${escapeHtml(row.values.signature)}</td>
@@ -22853,8 +23327,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
             <td class="entry-time" title="${escapeAttr(row.values.accessed)}">${escapeHtml(row.values.accessed)}</td>
             <td class="entry-time" title="${escapeAttr(row.values.modified)}">${escapeHtml(row.values.modified)}</td>
             <td class="entry-time" title="${escapeAttr(row.values.mftModified)}">${escapeHtml(row.values.mftModified)}</td>
-            <td class="entry-hash mono" title="${escapeAttr(row.values.sha256)}">${escapeHtml(row.values.sha256)}</td>
-          </tr>`;
+            <td class="entry-hash mono" title="${escapeAttr(row.values.sha256)}">${escapeHtml(row.values.sha256)}</td>`;
+      const entryFixedKeys = ENTRY_GRID_FIXED_COLUMN_KEYS;
+      for (const col of (columns || [])) {
+        if (entryFixedKeys.has(col.key)) {
+          continue;
+        }
+        entryHtml += entryGridOptionalCell(col, row);
+      }
+      entryHtml += `</tr>`;
+      return entryHtml;
     }
 
     function visibleFolderGridRows(entries, knownFolders) {
@@ -22887,7 +23369,8 @@ const INDEX_HTML: &str = r###"<!doctype html>
         );
         return folderGridFolderRow(path, count, countKind, folderEntry);
       });
-      return visibleGridRows("folder", folderGridColumns(), folderRows.concat(children.map(folderGridEntryRow)));
+      const entryRows = children.map(folderGridEntryRow);
+      return visibleGridRows("folder", folderGridColumns(folderRows.concat(entryRows)), folderRows.concat(entryRows));
     }
 
     function renderFolderContents(entries, knownFolders) {
@@ -22933,22 +23416,57 @@ const INDEX_HTML: &str = r###"<!doctype html>
         );
         return folderGridFolderRow(path, count, countKind, folderEntry);
       });
-      const columns = folderGridColumns();
+      const columns = folderGridColumns(folderRows.concat(children.map(folderGridEntryRow)));
+      recordActiveGridColumns("folder", columns);
       const gridRows = folderRows.concat(children.map(folderGridEntryRow));
-      const tableResult = sortableGridTable("folder", columns, gridRows, "folder-table", renderFolderGridRow);
+      const tableResult = sortableGridTable("folder", columns, gridRows, "folder-table", (row) => renderFolderGridRow(row, columns));
       setCurrentEntryGrid("folder", tableResult.visibleRows.filter((row) => row.selectable).map((row) => row.entry));
       const filterStatus = gridFilterStatusHtml("folder", columns, tableResult.visibleRows.length, gridRows.length, "items");
       $("entryTable").innerHTML = status + filterStatus + tableResult.html + (tableResult.visibleRows.length ? "" : empty("No folder items match the column filters."));
       renderSelectionCount();
     }
 
+    // The large-case hint has to follow the scope the examiner is actually
+    // looking at. It used to be printed unconditionally from the case-wide
+    // entry count, so switching to a small evidence source (or any scope where
+    // the whole index is already in hand) left a stale "Large case" banner on
+    // screen, and it never reflected what had actually been paged in.
+    function largeCaseHintHtml(selPath, children) {
+      if (!state.data || !state.data.entries_truncated) {
+        return "";
+      }
+      const evidence = state.data.evidence.find((item) => item.id === state.browserState.evidenceId);
+      const limit = Number(state.data.entries_limit || 500);
+      const caseTotal = Number(state.data.entry_count || 0);
+      const scopedTotal = evidence ? Number(evidenceIndexedEntryCount(evidence.id) || 0) : 0;
+      const total = evidence ? scopedTotal : caseTotal;
+      // Scope changed to something that fits in the inline view: no hint.
+      if (total <= 0 || total <= limit) {
+        return "";
+      }
+      const scope = evidence ? " indexed to " + evidence.display_name : "";
+      const paging = state.idx.dirPaging && state.idx.dirPaging[selPath || "/"];
+      const loaded = paging ? Number(paging.totalChildren || 0) : (children || []).length;
+      const progress = paging && paging.nextOffset != null
+        ? ` This folder holds ${loaded.toLocaleString()} entries; ${(children || []).length.toLocaleString()} are loaded.`
+        : "";
+      return `<div class="analysis-status" id="largeCaseHint">Large case (${total.toLocaleString()} entries${scope}): browsing the full index folder by folder.${progress} Open folders on the left; use Deep Search to find files by name or content.</div>`;
+    }
+
     function truncatedEntriesNoticeHtml() {
       if (!state.data || !state.data.entries_truncated) {
         return "";
       }
-      const total = (state.data.entry_count || 0).toLocaleString();
-      const shown = (state.data.entries_limit || state.data.entries.length).toLocaleString();
-      return `<div class="analysis-status">This case has ${total} indexed entries; only the first ${shown} are loaded in this indexed view (loading all of them would hang the browser). Use <strong>Browse source</strong> to navigate the whole disk directly, or <strong>Deep Search</strong> to find specific files.</div>`;
+      const evidence = selectedEvidenceSource();
+      const limit = Number(state.data.entries_limit || 500);
+      const total = evidence != null
+        ? Number(evidenceIndexedEntryCount(evidence.id) || 0)
+        : Number(state.data.entry_count || 0);
+      if (total <= limit) {
+        return "";
+      }
+      const shown = Number(state.data.entries_limit || state.data.entries.length || 0).toLocaleString();
+      return `<div class="analysis-status">This case has ${total.toLocaleString()} indexed entries; only the first ${shown} are loaded in this indexed view (loading all of them would hang the browser). Use <strong>Browse source</strong> to navigate the whole disk directly, or <strong>Deep Search</strong> to find specific files.</div>`;
     }
 
     function imageAnalysisStatusHtml(entries) {
@@ -23045,6 +23563,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function activityLabel(entry) {
+      if (isRegistryRecordEntry(entry)) {
+        return registryRecordTypeLabel(entry);
+      }
       if (isEmailEntry(entry)) {
         return "Email";
       }
@@ -23070,6 +23591,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       if (isBrowserActivityEntry(entry)) {
         return browserActivityPreview(entry);
+      }
+      if (isRegistryRecordEntry(entry)) {
+        return registryRecordLabel(entry);
       }
       if (metadata.url) {
         return metadata.visit_time_utc ? metadata.visit_time_utc + " | " + metadata.url : metadata.url;
@@ -25658,11 +26182,16 @@ const INDEX_HTML: &str = r###"<!doctype html>
       setViewerFullscreen(!state.viewerFullscreen);
     }
 
+    // Rows that represent a record but are stored as directories (registry
+    // keys and hive roots) carry data-record-entry-id so the Inspector
+    // selection can highlight them without turning them into folder rows.
     function updateEntryRowHighlight() {
       const selectedId = state.hex && state.hex.entryId ? String(state.hex.entryId) : "";
-      document.querySelectorAll("#entryTable .entry-row[data-entry-id]").forEach((row) => {
-        row.classList.toggle("selected", row.dataset.entryId === selectedId);
+      document.querySelectorAll("#entryTable .entry-row[data-entry-id], #entryTable .entry-row[data-record-entry-id]").forEach((row) => {
+        const rowId = row.dataset.entryId || row.dataset.recordEntryId;
+        row.classList.toggle("selected", Boolean(selectedId) && rowId === selectedId);
       });
+      scrollSelectedEntryRowIntoView();
     }
 
     function clearHexSelection() {
@@ -26884,6 +27413,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
       if (metadata.artifact_kind === "browser_history_visit" || metadata.artifact_kind === "browser_bookmark" || metadata.artifact_kind === "browser_preference") {
         return browserPreviewSection(entry, metadata);
       }
+      // Registry records are directory rows (keys, hive roots) or record rows
+      // (values); both need their own preview or the Inspector stays blank.
+      if (registryRecordArtifactKind(metadata)) {
+        return registryRecordPreviewSection(entry, metadata);
+      }
       if (isWindowsStructuredArtifact(metadata)) {
         return windowsArtifactPreviewSection(entry, metadata);
       }
@@ -27003,6 +27537,74 @@ const INDEX_HTML: &str = r###"<!doctype html>
         || ["network_configuration", "wifi_profile", "host_identity"].includes(kind);
     }
 
+    // Registry key/value records: one compact, examiner-readable view of the
+    // record (hive, key path, value name/type/data, key last write, parser
+    // status, and source provenance) instead of a raw metadata dump.
+    function registryRecordRows(metadata) {
+      const kind = registryRecordArtifactKind(metadata);
+      if (!kind) return [];
+      const rows = [["Artifact", registryRecordTypeLabel({ metadata_json: metadata })]];
+      rows.push(["Registry hive", firstText(metadata.registry_hive)]);
+      rows.push(["Key path", firstText(metadata.registry_key_path)]);
+      if (kind === "registry_value") {
+        rows.push(["Value name", firstText(metadata.registry_value_name)]);
+        rows.push(["Value type", firstText(metadata.registry_value_type)]);
+        rows.push(["Value data (decoded)", firstText(metadata.registry_value_data)]);
+        rows.push(["Original value size", formatByteCountValue(metadata.registry_value_data_original_size_bytes ?? metadata.registry_value_data_size)]);
+        rows.push(["Decoded preview captured", metadata.registry_value_data_preview_characters_captured == null ? "" : `${metadata.registry_value_data_preview_characters_captured} characters`]);
+        rows.push(["Raw preview captured", metadata.registry_value_data_preview_bytes_captured == null ? "" : formatByteCountValue(metadata.registry_value_data_preview_bytes_captured)]);
+        rows.push(["Value preview truncated", metadata.registry_value_data_truncated === undefined || metadata.registry_value_data_truncated === null ? "" : String(metadata.registry_value_data_truncated)]);
+        const items = metadata.registry_value_data_items;
+        if (items != null) {
+          rows.push(["Value data items", String(items)]);
+        }
+        rows.push(["Hive-relative offset", formatOffsetValue(metadata.registry_value_offset)]);
+        rows.push(["Offset basis", firstText(metadata.registry_value_offset_basis)]);
+      } else if (kind === "registry_key") {
+        rows.push(["Hive-relative offset", formatOffsetValue(metadata.registry_key_offset)]);
+      } else {
+        rows.push(["Keys indexed", metadata.windows_registry_keys_indexed]);
+        rows.push(["Values indexed", metadata.windows_registry_values_indexed]);
+        rows.push(["Entries seen", metadata.windows_registry_entries_seen]);
+        rows.push(["Parser scope limit", metadata.windows_registry_entry_limit]);
+        rows.push(["Parser truncated", metadata.windows_registry_truncated]);
+      }
+      rows.push(["Key last write (UTC)", firstText(metadata.registry_key_last_write_utc)]);
+      rows.push(["Last write semantics", firstText(metadata.registry_key_last_write_semantics,
+        "LastWrite belongs to the containing key; the Windows Registry does not track individual value modification times")]);
+      rows.push(["Parser", firstText(metadata.registry_parser)]);
+      rows.push(["Parser status", firstText(metadata.registry_parser_status)]);
+      rows.push(["Parser scope", firstText(metadata.registry_parser_scope)]);
+      rows.push(["Deleted value recovery", firstText(metadata.registry_deleted_recovery)]);
+      rows.push(["Transaction log replay", firstText(metadata.registry_transaction_log_replay)]);
+      rows.push(["Source hive path", firstText(metadata.source_artifact_path_exact, metadata.source_artifact_path)]);
+      rows.push(["Interpretation", registryInterpretationText(metadata, kind)]);
+      return rows;
+    }
+
+    function registryInterpretationText(metadata, kind) {
+      const hive = firstText(metadata.registry_hive);
+      const keyPath = firstText(metadata.registry_key_path, metadata.registry_key_name);
+      const lastWrite = firstText(metadata.registry_key_last_write_utc);
+      const subject = kind === "registry_hive"
+        ? (hive ? `Hive ${hive}` : "This hive")
+        : (kind === "registry_key"
+          ? (keyPath ? `Key ${keyPath}` : "This key")
+          : (keyPath ? `Value ${firstText(metadata.registry_value_name, "(Default)")} under key ${keyPath}` : `Value ${firstText(metadata.registry_value_name, "(Default)")}`));
+      const timing = lastWrite
+        ? ` The containing key was last written at ${lastWrite}.`
+        : "";
+      return `${subject} was decoded from the hive's own cell structures at the cited hive-relative offset.${timing} A key LastWrite timestamp alone does not prove execution - it shows only that the key was modified. Corroborate it with program-execution artifacts (Prefetch, Amcache, Shimcache, UserAssist, SRUM) or event logs before asserting execution.`;
+    }
+
+    function registryRecordPreviewSection(entry, metadata) {
+      return `<section class="metadata-section"><h3>Preview</h3><div class="preview-card">
+        <h4 class="preview-title">${escapeHtml(registryRecordLabel(entry) || entry.name || logicalName(entry.logical_path))}</h4>
+        <div class="preview-meta"><span>${escapeHtml(registryRecordTypeLabel(entry))}</span></div>
+        <div class="preview-body">${escapeHtml(registryInterpretationText(metadata, registryRecordArtifactKind(metadata)))}</div>
+      </div></section>`;
+    }
+
     function artifactKindLabel(kind) {
       return String(kind || "Windows artifact")
         .replace(/^windows_/, "")
@@ -27059,9 +27661,11 @@ const INDEX_HTML: &str = r###"<!doctype html>
             ["Time semantics", "LastWrite time belongs to the containing key; Windows Registry does not track individual value modification times"],
             ["Value name", metadata.registry_value_name],
             ["Value type", metadata.registry_value_type],
-            ["Value byte size", metadata.registry_value_data_size],
+            ["Original value byte size", metadata.registry_value_data_original_size_bytes ?? metadata.registry_value_data_size],
+            ["Decoded preview captured", metadata.registry_value_data_preview_characters_captured == null ? "" : `${metadata.registry_value_data_preview_characters_captured} characters`],
+            ["Raw preview bytes captured", metadata.registry_value_data_preview_bytes_captured],
             ["Value preview", metadata.registry_value_data],
-            ["Value truncated", metadata.registry_value_data_truncated],
+            ["Value preview truncated", metadata.registry_value_data_truncated],
             ["Hive-relative offset", metadata.registry_value_offset],
             ["Offset basis", metadata.registry_value_offset_basis || "byte offset within the recovered Registry hive file; not a decoded-media or acquisition-container physical offset"]
           );
@@ -27195,6 +27799,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
           raw.signature_status === "mismatch" ? "bad" : (raw.signature_status === "unknown" ? "warn" : "")
         ) : "",
         raw.filesystem_parser ? inspectorBadge("parser: " + raw.filesystem_parser) : "",
+        raw.registry_parser_status ? inspectorBadge("registry parser: " + raw.registry_parser_status) : "",
         raw.category_confidence ? inspectorBadge("confidence: " + raw.category_confidence) : ""
       ].filter(Boolean).join("");
       const limitation = raw.recovery_limitations || raw.mft_recovery_limitations;
@@ -27205,6 +27810,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         canViewBytes ? `<button class="secondary" onclick="openEntry(${entry.id})">View bytes</button>` : "",
         canOpenEntryExternally(entry) ? `<button class="ghost" onclick="openSelectedEntryExternal(${entry.id})">Open file</button>` : "",
         canAnalyze ? `<button class="secondary" onclick="analyzeDiskImageEntry(${entry.id})">Analyze image</button>` : "",
+        registryRecordArtifactKind(raw) && entry.entry_kind === "directory"
+          ? `<button class="ghost" onclick="openRegistryKeyContents(${entry.id})">Open key contents</button>`
+          : "",
         entry.entry_kind === "file" && !synthetic && canRecoverEntryData(entry) ? `<button class="ghost" onclick="recoverEntry(${entry.id})">${escapeHtml(recoveryActionText(entry).button)}</button>` : "",
         !synthetic ? `<button class="ghost" onclick="bookmarkEntry(${entry.id})">Bookmark</button>` : ""
       ].filter(Boolean).join("");
@@ -27391,6 +27999,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
           ["Source Row", metadata.source_row],
           ["Source Path", metadata.source_artifact_path_exact || metadata.source_artifact_path]
         ]);
+      }
+      if (registryRecordArtifactKind(metadata)) {
+        return detailSection("Registry Key / Value Record", registryRecordRows(metadata));
       }
       if (isWindowsStructuredArtifact(metadata)) {
         return detailSection("Decoded Windows Artifact", windowsArtifactRows(metadata, true));
@@ -27841,7 +28452,19 @@ const INDEX_HTML: &str = r###"<!doctype html>
       ];
     }
 
+    // Some grids build their column set from the rows on screen (registry
+    // columns, EVTX columns). Sorting and filtering have to see the columns the
+    // examiner can actually click, so the renderer records the active set here.
+    function recordActiveGridColumns(gridId, columns) {
+      state.activeGridColumns = state.activeGridColumns || {};
+      state.activeGridColumns[gridId] = columns;
+    }
+
     function gridColumns(gridId) {
+      const active = state.activeGridColumns && state.activeGridColumns[gridId];
+      if (active && active.length) {
+        return active;
+      }
       switch (gridId) {
         case "search": return searchResultColumns();
         case "rawSearch": return rawSearchResultColumns();
