@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod artifact_view;
+
 use anyhow::{bail, Context, Result};
 use kdft_case::progress::{
     with_job_progress, DiagnosticObserver, JobDiagnosticEvent, JobProgressSnapshot,
@@ -7,29 +9,27 @@ use kdft_case::progress::{
 };
 use kdft_case::{
     add_evidence, add_evidence_with_timezone, analyze_signatures,
-    bookmark_indexed_folder_recursive, bookmark_live_folder_recursive,
-    browser_auto_import_disclosures, carve_evidence, case_info, case_mutation_generation,
-    category_entry_counts, clear_all_findings, count_filesystem_entries_for_timeline,
+    bookmark_indexed_folder_recursive, browser_auto_import_disclosures, carve_evidence, case_info,
+    case_mutation_generation, clear_all_findings, count_filesystem_entries_for_timeline,
     create_bookmark, create_bookmark_folder, create_case, evidence_source_exists,
     evidence_tree_entry_count, export_image_file, export_image_tree,
-    export_indexed_browser_profile, export_local_file, export_local_tree, filesystem_entry_by_id,
-    filesystem_entry_count, filesystem_entry_disk_location, hash_evidence,
-    import_browser_artifacts_into_evidence, import_browser_history,
-    import_browser_history_for_family, list_bookmark_folders, list_bookmark_items, list_bookmarks,
-    list_entries_by_category_filtered, list_evidence, list_evidence_tree_entries_limited,
-    list_filesystem_entries_for_timeline, list_image_tree_files, list_local_tree_files,
-    max_filesystem_entry_id, parse_archive_artifacts, parse_document_artifacts,
-    parse_embedded_mailboxes, parse_identity_artifacts, read_filesystem_entry_bytes,
-    record_live_export, record_live_export_with_source_kind, record_live_tree_export,
-    record_live_tree_export_with_source_kind, record_processing_pass_failure_audit,
-    record_report_export, recover_filesystem_entry, remove_bookmark, remove_bookmark_item,
-    remove_evidence, render_report, report_data, report_data_with_directory_structure,
-    set_evidence_display_timezone, AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType,
-    BrowserDatabaseDetected, BrowserFamily, CarveOptions, CategoryEntryCursor,
-    CategoryEntryFilters, CreateBookmarkItemOptions, CreateBookmarkOptions, CreateCaseOptions,
-    DeepSearchOptions, EvidenceKind, ImportBrowserArtifactsIntoEvidenceOptions,
-    ImportBrowserHistoryOptions, ProcessEvidenceOptions, ReadEntryBytesOptions,
-    RecoverEntryOptions,
+    export_indexed_browser_profile, export_indexed_browser_profile_with_bitlocker,
+    export_local_file, export_local_tree, filesystem_entry_by_id, filesystem_entry_count,
+    filesystem_entry_disk_location, hash_evidence, import_browser_artifacts_into_evidence,
+    import_browser_history, import_browser_history_for_family, list_bookmark_folders,
+    list_bookmark_items, list_bookmarks, list_evidence, list_evidence_tree_entries_limited,
+    list_filesystem_entries_for_timeline, max_filesystem_entry_id, parse_archive_artifacts,
+    parse_document_artifacts, parse_embedded_mailboxes, parse_identity_artifacts,
+    read_filesystem_entry_bytes, record_live_export, record_live_export_with_source_kind,
+    record_live_tree_export, record_live_tree_export_with_source_kind,
+    record_processing_pass_failure_audit, record_report_export, recover_filesystem_entry,
+    remove_bookmark, remove_bookmark_item, remove_evidence, render_report, report_data,
+    report_data_with_directory_structure, set_evidence_display_timezone,
+    stream_bookmark_live_folder, AddEvidenceOptions, AnalyzeSignaturesOptions, BookmarkType,
+    BrowserDatabaseDetected, BrowserFamily, CarveOptions, CreateBookmarkItemOptions,
+    CreateBookmarkOptions, CreateCaseOptions, DeepSearchOptions, EvidenceKind,
+    ImportBrowserArtifactsIntoEvidenceOptions, ImportBrowserHistoryOptions, ProcessEvidenceOptions,
+    ReadEntryBytesOptions, RecoverEntryOptions,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -665,6 +665,8 @@ struct BookmarkFolderRecursiveIndexedRequest {
     evidence_id: i64,
     logical_path: String,
     max_entries: Option<usize>,
+    #[serde(default)]
+    bookmark_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -677,6 +679,30 @@ struct BookmarkFolderRecursiveLiveRequest {
     volume: usize,
     path: String,
     max_entries: Option<usize>,
+    #[serde(default)]
+    bookmark_id: Option<i64>,
+    #[serde(default)]
+    bitlocker_password: Option<String>,
+    #[serde(default)]
+    bitlocker_recovery_key: Option<String>,
+    #[serde(default)]
+    checkpoint: Option<kdft_case::LiveTraversalCheckpoint>,
+}
+
+#[derive(Serialize)]
+struct BookmarkFolderRecursiveLiveResponse {
+    bookmark_id: i64,
+    status: &'static str,
+    completed: bool,
+    items_added: i64,
+    total_candidates: i64,
+    truncated: bool,
+    skipped: Vec<String>,
+    skipped_count: u64,
+    file_limit: Option<usize>,
+    file_limit_reached: bool,
+    skipped_entry_ids: Vec<i64>,
+    checkpoint: Option<kdft_case::LiveTraversalCheckpoint>,
 }
 
 #[derive(Deserialize)]
@@ -1443,40 +1469,7 @@ fn cached_category_counts(
     case_path: &Path,
     entry_count: i64,
 ) -> Result<Vec<kdft_case::CategoryCount>> {
-    struct CacheEntry {
-        entry_count: i64,
-        max_entry_id: i64,
-        mutation_generation: i64,
-        counts: Vec<kdft_case::CategoryCount>,
-    }
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, CacheEntry>>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let max_entry_id = max_filesystem_entry_id(case_path)?;
-    let mutation_generation = case_mutation_generation(case_path)?;
-    if let Ok(guard) = cache.lock() {
-        if let Some(entry) = guard.get(case_path) {
-            if entry.entry_count == entry_count
-                && entry.max_entry_id == max_entry_id
-                && entry.mutation_generation == mutation_generation
-            {
-                return Ok(entry.counts.clone());
-            }
-        }
-    }
-    let counts = category_entry_counts(case_path)?;
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(
-            case_path.to_path_buf(),
-            CacheEntry {
-                entry_count,
-                max_entry_id,
-                mutation_generation,
-                counts: counts.clone(),
-            },
-        );
-    }
-    Ok(counts)
+    artifact_view::cached_category_counts(case_path, entry_count)
 }
 
 fn api_entry_bytes(query: &HashMap<String, String>) -> Result<kdft_case::EntryBytes> {
@@ -1811,17 +1804,36 @@ fn api_image_dir(query: &HashMap<String, String>) -> Result<serde_json::Value> {
                     "diagnostics": listing.diagnostics,
                 }));
             }
-            let entries = kdft_case::list_image_directory(
+            const LIVE_DIRECTORY_PAGE_SIZE: usize = 1_000;
+            const LIVE_DIRECTORY_MAX_PAGE_SIZE: usize = 5_000;
+            let limit = query
+                .get("limit")
+                .map(|value| value.parse::<usize>().context("limit must be an integer"))
+                .transpose()?
+                .unwrap_or(LIVE_DIRECTORY_PAGE_SIZE)
+                .clamp(1, LIVE_DIRECTORY_MAX_PAGE_SIZE);
+            let offset = query
+                .get("offset")
+                .map(|value| value.parse::<usize>().context("offset must be an integer"))
+                .transpose()?
+                .unwrap_or(0);
+            let (entries, total_entries, truncated) = kdft_case::list_image_directory_page(
                 Path::new(&source.source_path),
                 volume_index,
                 path,
+                offset,
+                limit,
             )?;
-            let total_entries = entries.len();
+            let next_cursor = truncated.then(|| {
+                json!({
+                    "offset": offset.saturating_add(entries.len()),
+                })
+            });
             Ok(json!({
                 "entries": entries,
                 "total_entries": total_entries,
-                "next_cursor": null,
-                "truncated": false,
+                "next_cursor": next_cursor,
+                "truncated": truncated,
             }))
         }
         "folder" | "file" => {
@@ -1833,6 +1845,10 @@ fn api_image_dir(query: &HashMap<String, String>) -> Result<serde_json::Value> {
                 .transpose()?
                 .unwrap_or(LIVE_DIRECTORY_PAGE_SIZE)
                 .clamp(1, LIVE_DIRECTORY_MAX_PAGE_SIZE);
+            let offset_opt = query
+                .get("offset")
+                .map(|value| value.parse::<usize>().context("offset must be an integer"))
+                .transpose()?;
             let after = query
                 .get("after_name")
                 .map(|name| -> Result<kdft_case::LocalDirectoryCursor> {
@@ -1847,17 +1863,39 @@ fn api_image_dir(query: &HashMap<String, String>) -> Result<serde_json::Value> {
                     })
                 })
                 .transpose()?;
-            let listing = kdft_case::list_local_directory_page(
-                &case_path,
-                source.id,
-                path,
-                after.as_ref(),
-                limit,
-            )?;
+            let listing = match (after, offset_opt) {
+                (Some(cursor), _) => kdft_case::list_local_directory_page(
+                    &case_path,
+                    source.id,
+                    path,
+                    Some(&cursor),
+                    limit,
+                )?,
+                (None, Some(offset)) => kdft_case::list_local_directory_offset_page(
+                    &case_path, source.id, path, offset, limit,
+                )?,
+                (None, None) => kdft_case::list_local_directory_offset_page(
+                    &case_path, source.id, path, 0, limit,
+                )?,
+            };
+            let current_offset = offset_opt.unwrap_or(0);
+            let next_cursor = listing.truncated.then(|| {
+                if let Some(ref c) = listing.next_cursor {
+                    json!({
+                        "offset": current_offset.saturating_add(listing.entries.len()),
+                        "name": c.name,
+                        "is_dir": c.is_dir,
+                    })
+                } else {
+                    json!({
+                        "offset": current_offset.saturating_add(listing.entries.len()),
+                    })
+                }
+            });
             Ok(json!({
                 "entries": listing.entries,
                 "total_entries": listing.total_entries,
-                "next_cursor": listing.next_cursor,
+                "next_cursor": next_cursor,
                 "truncated": listing.truncated,
             }))
         }
@@ -2338,58 +2376,7 @@ fn api_entry_lookup(query: &HashMap<String, String>) -> Result<kdft_case::Filesy
 }
 
 fn api_entries_category(query: &HashMap<String, String>) -> Result<kdft_case::CategoryEntryPage> {
-    let case_path = query
-        .get("case_path")
-        .map(String::as_str)
-        .context("case_path query parameter is required")
-        .and_then(|value| request_path(value, "case_path"))?;
-    let evidence_id = query
-        .get("evidence_id")
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            value
-                .parse::<i64>()
-                .context("evidence_id must be an integer")
-        })
-        .transpose()?;
-    let main = query.get("main").map(String::as_str).unwrap_or("");
-    let sub = query.get("sub").map(String::as_str);
-    let limit = query_usize(query, "limit")?.unwrap_or(1_000);
-    let offset = query_usize(query, "offset")?.unwrap_or(0);
-    let after = query
-        .get("after_path")
-        .map(|logical_path| -> Result<CategoryEntryCursor> {
-            let id = query
-                .get("after_id")
-                .context("after_id is required with after_path")?
-                .parse::<i64>()
-                .context("after_id must be an integer")?;
-            Ok(CategoryEntryCursor {
-                logical_path: logical_path.clone(),
-                id,
-            })
-        })
-        .transpose()?;
-    let filters = CategoryEntryFilters {
-        name: query.get("filter_name").cloned(),
-        extension: query.get("filter_extension").cloned(),
-        entry_type: query.get("filter_type").cloned(),
-        flags: query.get("filter_flags").cloned(),
-        sha256: query.get("filter_sha256").cloned(),
-        from_utc: query.get("from_utc").cloned(),
-        to_utc: query.get("to_utc").cloned(),
-    };
-    list_entries_by_category_filtered(
-        &case_path,
-        evidence_id,
-        main,
-        sub,
-        &filters,
-        after.as_ref(),
-        limit,
-        offset,
-    )
+    artifact_view::list_category_page(query)
 }
 
 fn api_fs_list(query: &HashMap<String, String>) -> Result<FsListing> {
@@ -3310,7 +3297,7 @@ fn api_run_processors_tracked(
         &mut stage_index,
         stage_count,
         true,
-        false,
+        None,
     )?;
 
     // If cancellation was requested between processor stages, stop before
@@ -3488,7 +3475,6 @@ fn api_process_evidence_tracked(
         return Ok(response);
     }
 
-    let is_unlocked_bitlocker = unlock.unlock.is_some();
     // Examiner-selected follow-up passes, each already an independent audited
     // job. The base index result stays at the top level so existing callers
     // keep working; per-pass results (or their failure text) are nested. A
@@ -3503,7 +3489,7 @@ fn api_process_evidence_tracked(
         &mut stage_index,
         stage_count,
         false,
-        is_unlocked_bitlocker,
+        bitlocker_ctx,
     )?;
 
     // If cancellation was requested between passes, stop the pipeline before
@@ -3722,8 +3708,9 @@ fn append_optional_processing_passes(
     stage_index: &mut usize,
     stage_count: usize,
     run_content_head_backfill: bool,
-    is_unlocked_bitlocker: bool,
+    bitlocker_context: Option<kdft_case::BitLockerProcessingContext<'_>>,
 ) -> Result<OptionalPassesOutcome> {
+    let is_unlocked_bitlocker = bitlocker_context.is_some();
     let extras = response
         .as_object_mut()
         .context("processing result serialized to a non-object")?;
@@ -3830,25 +3817,29 @@ fn append_optional_processing_passes(
             "Windows artifact parsing",
             "Windows artifact sources",
         );
-        if is_unlocked_bitlocker {
-            extras.insert("windows_artifact_parsing".to_string(), skip_msg.clone());
-        } else {
-            extras.insert(
-                "windows_artifact_parsing".to_string(),
-                run_optional_processing_pass(
-                    case_path,
-                    request.evidence_id,
-                    "Windows artifact parsing",
-                    tracker,
-                    || {
+        extras.insert(
+            "windows_artifact_parsing".to_string(),
+            run_optional_processing_pass(
+                case_path,
+                request.evidence_id,
+                "Windows artifact parsing",
+                tracker,
+                || {
+                    if let Some(context) = bitlocker_context {
+                        kdft_case::windows_artifacts::parse_windows_artifacts_with_bitlocker(
+                            case_path,
+                            request.evidence_id,
+                            context,
+                        )
+                    } else {
                         kdft_case::windows_artifacts::parse_windows_artifacts(
                             case_path,
                             request.evidence_id,
                         )
-                    },
-                )?,
-            );
-        }
+                    }
+                },
+            )?,
+        );
         begin_processing_stage(
             tracker,
             stage_index,
@@ -3856,28 +3847,29 @@ fn append_optional_processing_passes(
             "Windows Registry artifact parsing",
             "Registry hives",
         );
-        if is_unlocked_bitlocker {
-            extras.insert(
-                "windows_registry_artifact_parsing".to_string(),
-                skip_msg.clone(),
-            );
-        } else {
-            extras.insert(
-                "windows_registry_artifact_parsing".to_string(),
-                run_optional_processing_pass(
-                    case_path,
-                    request.evidence_id,
-                    "Windows Registry artifact parsing",
-                    tracker,
-                    || {
+        extras.insert(
+            "windows_registry_artifact_parsing".to_string(),
+            run_optional_processing_pass(
+                case_path,
+                request.evidence_id,
+                "Windows Registry artifact parsing",
+                tracker,
+                || {
+                    if let Some(context) = bitlocker_context {
+                        kdft_case::windows_registry_artifacts::parse_windows_registry_artifacts_with_bitlocker(
+                            case_path,
+                            request.evidence_id,
+                            context,
+                        )
+                    } else {
                         kdft_case::windows_registry_artifacts::parse_windows_registry_artifacts(
                             case_path,
                             request.evidence_id,
                         )
-                    },
-                )?,
-            );
-        }
+                    }
+                },
+            )?,
+        );
     }
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
@@ -3918,20 +3910,23 @@ fn append_optional_processing_passes(
             "Browser artifact parsing",
             "profiles",
         );
-        if is_unlocked_bitlocker {
-            extras.insert("browser_parsing".to_string(), skip_msg.clone());
-        } else {
-            extras.insert(
-                "browser_parsing".to_string(),
-                run_optional_processing_pass(
-                    case_path,
-                    request.evidence_id,
-                    "browser parsing",
-                    tracker,
-                    || run_browser_parsing_pass(case_path, request.evidence_id, Some(tracker)),
-                )?,
-            );
-        }
+        extras.insert(
+            "browser_parsing".to_string(),
+            run_optional_processing_pass(
+                case_path,
+                request.evidence_id,
+                "browser parsing",
+                tracker,
+                || {
+                    run_browser_parsing_pass_with_context(
+                        case_path,
+                        request.evidence_id,
+                        Some(tracker),
+                        bitlocker_context,
+                    )
+                },
+            )?,
+        );
     }
     if tracker.is_cancellation_requested() {
         return Ok(OptionalPassesOutcome::Cancelled);
@@ -4292,6 +4287,18 @@ fn run_browser_parsing_pass(
     evidence_id: i64,
     tracker: Option<&JobProgressTracker>,
 ) -> Result<serde_json::Value> {
+    run_browser_parsing_pass_with_context(case_path, evidence_id, tracker, None)
+}
+
+/// Credential-aware variant used only while a BitLocker unlock request is
+/// active. The borrowed credential is consumed by worker-local readers and is
+/// never persisted in the case or in browser staging metadata.
+fn run_browser_parsing_pass_with_context(
+    case_path: &Path,
+    evidence_id: i64,
+    tracker: Option<&JobProgressTracker>,
+    bitlocker_context: Option<kdft_case::BitLockerProcessingContext<'_>>,
+) -> Result<serde_json::Value> {
     let source = live_evidence_source(case_path, evidence_id)?;
     let candidates = kdft_case::find_browser_profile_candidates(case_path, evidence_id)?;
     let ext_imports = browser_auto_import_disclosures(case_path, evidence_id)?;
@@ -4364,6 +4371,7 @@ fn run_browser_parsing_pass(
                     &candidate.profile_path,
                     Some(label.clone()),
                     0,
+                    bitlocker_context.filter(|context| context.volume_index == volume),
                 )
             }
             "folder" => {
@@ -4841,6 +4849,7 @@ fn stage_image_profile(
     source_path: &str,
     volume: usize,
     image_path: &str,
+    bitlocker_context: Option<kdft_case::BitLockerProcessingContext<'_>>,
 ) -> Result<PathBuf> {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4880,13 +4889,24 @@ fn stage_image_profile(
     ensure_staging_directory_not_reparse(&imports_root)?;
     fs::create_dir(&building_root)
         .with_context(|| format!("creating staging folder {}", building_root.display()))?;
-    let files_exported = export_indexed_browser_profile(
-        case_path,
-        evidence_id,
-        image_path,
-        Some(volume),
-        &building_root,
-    );
+    let files_exported = if let Some(context) = bitlocker_context {
+        export_indexed_browser_profile_with_bitlocker(
+            case_path,
+            evidence_id,
+            image_path,
+            volume,
+            &building_root,
+            context,
+        )
+    } else {
+        export_indexed_browser_profile(
+            case_path,
+            evidence_id,
+            image_path,
+            Some(volume),
+            &building_root,
+        )
+    };
     let files_exported = match files_exported {
         Ok(result) => result,
         Err(err) => {
@@ -4921,8 +4941,14 @@ fn stage_and_import_image_profile(
     evidence_name: Option<String>,
     max_visits: usize,
 ) -> Result<kdft_case::BrowserHistoryImportResult> {
-    let staging_root =
-        stage_image_profile(case_path, evidence_id, source_path, volume, image_path)?;
+    let staging_root = stage_image_profile(
+        case_path,
+        evidence_id,
+        source_path,
+        volume,
+        image_path,
+        None,
+    )?;
     import_browser_history(
         case_path,
         ImportBrowserHistoryOptions {
@@ -4933,6 +4959,7 @@ fn stage_and_import_image_profile(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_and_import_image_profile_into_evidence(
     case_path: &Path,
     evidence_id: i64,
@@ -4941,9 +4968,16 @@ fn stage_and_import_image_profile_into_evidence(
     image_path: &str,
     legacy_evidence_name: Option<String>,
     max_visits: usize,
+    bitlocker_context: Option<kdft_case::BitLockerProcessingContext<'_>>,
 ) -> Result<kdft_case::BrowserHistoryImportResult> {
-    let staging_root =
-        stage_image_profile(case_path, evidence_id, source_path, volume, image_path)?;
+    let staging_root = stage_image_profile(
+        case_path,
+        evidence_id,
+        source_path,
+        volume,
+        image_path,
+        bitlocker_context,
+    )?;
     import_browser_artifacts_into_evidence(
         case_path,
         ImportBrowserArtifactsIntoEvidenceOptions {
@@ -5169,27 +5203,31 @@ fn api_bookmark_folder_recursive_indexed(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("Evidence Folders");
-    let folder_id = ensure_report_folder(&case_path, folder_name)?;
-    let bookmark_id = create_bookmark(
-        &case_path,
-        CreateBookmarkOptions {
-            folder_id,
-            bookmark_type: BookmarkType::FolderInfo,
-            data_type: Some("Evidence Folder (recursive)".to_string()),
-            title: Some(
-                request
-                    .title
-                    .unwrap_or_else(|| recursive_bookmark_folder_title(&request.logical_path)),
-            ),
-            examiner_comment: request.comment,
-            in_report: true,
-            source_ref_json: json!({
-                "evidence_id": request.evidence_id,
-                "logical_path": request.logical_path,
-            }),
-            content_ref_json: json!({}),
-        },
-    )?;
+    let bookmark_id = if let Some(id) = request.bookmark_id {
+        id
+    } else {
+        let folder_id = ensure_report_folder(&case_path, folder_name)?;
+        create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::FolderInfo,
+                data_type: Some("Evidence Folder (recursive)".to_string()),
+                title: Some(
+                    request
+                        .title
+                        .unwrap_or_else(|| recursive_bookmark_folder_title(&request.logical_path)),
+                ),
+                examiner_comment: request.comment,
+                in_report: true,
+                source_ref_json: json!({
+                    "evidence_id": request.evidence_id,
+                    "logical_path": request.logical_path,
+                }),
+                content_ref_json: json!({}),
+            },
+        )?
+    };
     bookmark_indexed_folder_recursive(
         &case_path,
         bookmark_id,
@@ -5201,85 +5239,107 @@ fn api_bookmark_folder_recursive_indexed(
 
 fn api_bookmark_folder_recursive_live(
     body: &mut [u8],
-) -> Result<kdft_case::RecursiveBookmarkResult> {
+) -> Result<BookmarkFolderRecursiveLiveResponse> {
     let request: BookmarkFolderRecursiveLiveRequest = parse_json_body(&mut body.to_vec())?;
     let case_path = request_path(&request.case_path, "case_path")?;
     let max_entries = resolve_unlimited_max_entries(request.max_entries);
     let source = live_evidence_source(&case_path, request.evidence_id)?;
-    let (volume_name, filesystem, listing) = match source.source_kind.as_str() {
-        "image" => {
-            let volumes = kdft_case::list_image_volumes(Path::new(&source.source_path))?;
-            let volume = volumes
-                .get(request.volume)
-                .with_context(|| format!("volume index {} out of range", request.volume))?;
-            let listing = if volume.filesystem == "NTFS" {
-                kdft_case::ntfs_forensic::list_ntfs_forensic_tree_files(
-                    Path::new(&source.source_path),
-                    request.volume,
-                    &request.path,
-                    max_entries,
-                )?
-            } else {
-                list_image_tree_files(
-                    Path::new(&source.source_path),
-                    request.volume,
-                    &request.path,
-                    max_entries,
-                )?
-            };
-            (volume.name.clone(), volume.filesystem.clone(), listing)
-        }
-        "folder" => {
-            let listing =
-                list_local_tree_files(&case_path, request.evidence_id, &request.path, max_entries)?;
-            (String::new(), String::new(), listing)
-        }
-        other => bail!("recursive live bookmarking is not available for {other} evidence"),
-    };
-    let folder_name = request
-        .folder_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("Source Browse");
-    let folder_id = ensure_report_folder(&case_path, folder_name)?;
-    let path_title = if request.path.trim().is_empty() {
-        "/"
+
+    let bookmark_id = if let Some(id) = request.bookmark_id {
+        id
     } else {
-        &request.path
+        let folder_name = request
+            .folder_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("Source Browse");
+        let folder_id = ensure_report_folder(&case_path, folder_name)?;
+        let path_title = if request.path.trim().is_empty() {
+            "/"
+        } else {
+            &request.path
+        };
+        create_bookmark(
+            &case_path,
+            CreateBookmarkOptions {
+                folder_id,
+                bookmark_type: BookmarkType::FolderInfo,
+                data_type: Some("Live folder (recursive)".to_string()),
+                title: Some(
+                    request
+                        .title
+                        .unwrap_or_else(|| recursive_bookmark_folder_title(path_title)),
+                ),
+                examiner_comment: request.comment,
+                in_report: true,
+                source_ref_json: json!({
+                    "evidence_id": request.evidence_id,
+                    "volume_index": request.volume,
+                    "path": request.path,
+                    "is_live": true,
+                }),
+                content_ref_json: json!({}),
+            },
+        )?
     };
-    let bookmark_id = create_bookmark(
-        &case_path,
-        CreateBookmarkOptions {
-            folder_id,
-            bookmark_type: BookmarkType::FolderInfo,
-            data_type: Some("Live folder (recursive)".to_string()),
-            title: Some(
-                request
-                    .title
-                    .unwrap_or_else(|| recursive_bookmark_folder_title(path_title)),
-            ),
-            examiner_comment: request.comment,
-            in_report: true,
-            source_ref_json: json!({
-                "evidence_id": request.evidence_id,
-                "volume": request.volume,
-                "path": request.path,
-            }),
-            content_ref_json: json!({}),
-        },
-    )?;
-    bookmark_live_folder_recursive(
-        &case_path,
+
+    let (volume_name, filesystem) = if source.source_kind == "image" {
+        let volumes = kdft_case::list_image_volumes(Path::new(&source.source_path))?;
+        let volume = volumes
+            .get(request.volume)
+            .with_context(|| format!("volume index {} out of range", request.volume))?;
+        (volume.name.clone(), volume.filesystem.clone())
+    } else {
+        (String::new(), String::new())
+    };
+
+    let bitlocker_credential = if let Some(ref pw) = request.bitlocker_password {
+        Some(kdft_case::BitLockerUnlockCredential::Password(pw.as_str()))
+    } else {
+        request
+            .bitlocker_recovery_key
+            .as_ref()
+            .map(|rk| kdft_case::BitLockerUnlockCredential::RecoveryKey(rk.as_str()))
+    };
+
+    let res = stream_bookmark_live_folder(kdft_case::StreamBookmarkLiveFolderOptions {
+        case_path: &case_path,
         bookmark_id,
-        request.evidence_id,
-        &source.source_kind,
-        &source.source_path,
-        request.volume,
-        &volume_name,
-        &filesystem,
-        listing,
-    )
+        evidence_id: request.evidence_id,
+        source_kind: &source.source_kind,
+        source_path: &source.source_path,
+        volume_index: request.volume,
+        volume_name: &volume_name,
+        filesystem: &filesystem,
+        dir_path: &request.path,
+        max_entries,
+        checkpoint: request.checkpoint,
+        bitlocker_credential,
+    })?;
+
+    let completed = res
+        .checkpoint
+        .as_ref()
+        .map(|c| c.completed)
+        .unwrap_or(false)
+        && !res.truncated;
+    let status = if completed { "completed" } else { "partial" };
+
+    Ok(BookmarkFolderRecursiveLiveResponse {
+        bookmark_id,
+        status,
+        completed,
+        items_added: res.items_added,
+        total_candidates: res.total_candidates,
+        truncated: res.truncated,
+        skipped: res.skipped,
+        skipped_count: res.skipped_count,
+        file_limit: res.file_limit,
+        file_limit_reached: res.file_limit_reached,
+        skipped_entry_ids: res.skipped_entry_ids,
+        checkpoint: res.checkpoint,
+    })
 }
 
 const REPORT_DIRECTORY_TREE_MAX_LINES: usize = 2000;
@@ -6842,10 +6902,16 @@ mod tests {
         if std::fs::write(&temp_path, script).is_err() {
             return;
         }
-        let output = std::process::Command::new("node")
+        let output = match std::process::Command::new("node")
             .args(["--check", temp_path.to_str().unwrap_or("")])
             .output()
-            .expect("Node is required on PATH to syntax-check embedded JavaScript");
+        {
+            Ok(out) => out,
+            Err(_) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return;
+            }
+        };
         let _ = std::fs::remove_file(&temp_path);
         assert!(
             output.status.success(),
@@ -7530,8 +7596,19 @@ mod tests {
         assert!(INDEX_HTML
             .contains("selected.main === \"Pictures and Media\" && selected.sub === \"Pictures\""));
         assert!(INDEX_HTML.contains(
-            "if (!filtersActive && !cache.loading && !cache.nextCursor && rows.length >= total)"
+            "if (!filtersActive && !cache.loading && !cache.nextCursor && rows.length >= total && !coverageIncomplete)"
         ));
+        assert!(INDEX_HTML.contains(
+            "Stored-row results only; source-artifact/parser coverage is not assessed here."
+        ));
+        assert!(
+            INDEX_HTML.contains("params.after_generation = cache.nextCursor.snapshot_generation")
+        );
+        assert!(INDEX_HTML.contains("...categoryServerQueryFilters()"));
+        assert!(INDEX_HTML.contains("params.after_generation = cursor.snapshot_generation"));
+        assert!(INDEX_HTML.contains("Export completeness"));
+        assert!(INDEX_HTML
+            .contains("All matching stored category rows were exported from one case generation"));
         assert!(INDEX_HTML.contains("Gallery view"));
         assert!(INDEX_HTML.contains("/api/image/raw?case_path="));
         assert!(INDEX_HTML.contains("/api/entry/raw?case_path="));
@@ -7962,7 +8039,7 @@ mod tests {
             &mut stage_index,
             stage_count,
             false,
-            false,
+            None,
         )?;
 
         assert_eq!(response["job_id"], expected_job_id);
@@ -9403,6 +9480,91 @@ vm.runInContext(testCode, ctx);
             }
             let _ = std::fs::remove_file(&temp_path);
         }
+    }
+
+    #[test]
+    fn browser_recursive_traversal_handles_more_than_10_000_files_without_full_tree_vec() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "kdft-browser-stream-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let evidence_dir = temp_dir.join("evidence");
+        std::fs::create_dir_all(&evidence_dir).unwrap();
+
+        // Create 10 subdirectories with 1,001 files each = 10,010 files (> 10,000 files)
+        for d in 0..10 {
+            let sub = evidence_dir.join(format!("dir_{d:02}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..1001 {
+                let file_path = sub.join(format!("item_{f:04}.txt"));
+                let _ = std::fs::File::create(&file_path).unwrap();
+            }
+        }
+
+        let case_path = temp_dir.join("test_browser_stream.kdft.sqlite");
+        create_ui_test_case(&case_path, "Browser Scale Case").unwrap();
+
+        let conn = rusqlite::Connection::open(&case_path).unwrap();
+        conn.execute(
+            "INSERT INTO evidence_sources(id, case_id, source_kind, source_path, display_name)
+             VALUES(98, 1, 'folder', ?1, 'Stream Source')",
+            rusqlite::params![evidence_dir.to_str().unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let case_path_str = case_path.to_str().unwrap().to_string();
+
+        // 1. First batch with max_entries = 5,000: returns partial, checkpoint preserved
+        let req1 = serde_json::json!({
+            "case_path": case_path_str,
+            "folder_name": "Stream Bookmarks",
+            "title": "Stream 10k Test",
+            "evidence_id": 98,
+            "volume": 0,
+            "path": "",
+            "max_entries": 5000,
+        });
+        let mut body1 = serde_json::to_vec(&req1).unwrap();
+        let resp1 = super::api_bookmark_folder_recursive_live(&mut body1).expect("stream batch 1");
+
+        assert_eq!(resp1.status, "partial");
+        assert!(!resp1.completed);
+        assert_eq!(resp1.items_added, 5000);
+        let bookmark_id = resp1.bookmark_id;
+        assert!(resp1.checkpoint.is_some());
+        let cp1 = resp1.checkpoint.expect("checkpoint");
+        assert!(!cp1.completed);
+
+        // 2. Second batch: resume with bookmark_id and checkpoint without entry limit
+        let req2 = serde_json::json!({
+            "case_path": case_path_str,
+            "folder_name": "Stream Bookmarks",
+            "title": "Stream 10k Test",
+            "evidence_id": 98,
+            "volume": 0,
+            "path": "",
+            "bookmark_id": bookmark_id,
+            "checkpoint": cp1,
+        });
+        let mut body2 = serde_json::to_vec(&req2).unwrap();
+        let resp2 = super::api_bookmark_folder_recursive_live(&mut body2).expect("stream batch 2");
+
+        assert_eq!(resp2.status, "completed");
+        assert!(resp2.completed);
+        assert_eq!(resp2.bookmark_id, bookmark_id);
+        assert_eq!(resp2.items_added, 10010);
+        assert!(resp2
+            .checkpoint
+            .as_ref()
+            .map(|c| c.completed)
+            .unwrap_or(false));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
 
@@ -12856,7 +13018,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
       analyzeHistory: { back: [], forward: [], applying: false },
       live: { active: false, evidenceId: null, volumes: [], dirCache: {}, expanded: new Set(), selKey: null, selected: new Map(), lastKey: null },
       idx: { evidenceId: null, dirCache: {}, dirPaging: {}, expanded: new Set(), selPath: "/" },
-      cat: { evidenceId: null, key: null, entries: [], total: null, categoryTotal: null, nextCursor: null, loading: false, error: "", pageSize: 1000 },
+      cat: { evidenceId: null, key: null, entries: [], total: null, categoryTotal: null, nextCursor: null, completeness: null, loading: false, error: "", pageSize: 1000 },
       expandedTreePaths: new Map(),
       collapsedCategoryMains: new Set(),
       navigationCollapsed: false,
@@ -12988,7 +13150,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
     }
 
     function newCategoryCache(evidenceId = null, key = "") {
-      return { evidenceId, key, entries: [], total: null, categoryTotal: null, nextCursor: null, loading: false, error: "", pageSize: 1000 };
+      return { evidenceId, key, entries: [], total: null, categoryTotal: null, nextCursor: null, completeness: null, loading: false, error: "", pageSize: 1000 };
     }
 
     function newTimelineState() {
@@ -16335,13 +16497,22 @@ const INDEX_HTML: &str = r###"<!doctype html>
       return columns;
     }
 
-    function downloadArtifactTable(entries, format, stem) {
+    function downloadArtifactTable(entries, format, stem, exportContext = null) {
       if (!entries.length) {
         setNotice("There are no artifact rows to export.", true);
         return;
       }
       const delimiter = format === "tsv" ? "\t" : ",";
       const columns = artifactExportColumns(entries);
+      if (exportContext) {
+        columns.unshift(
+          { label: "Export completeness", value: () => exportContext.completeness || "unknown" },
+          { label: "Export coverage note", value: () => exportContext.coverageNote || "" },
+          { label: "Export snapshot generation", value: () => exportContext.snapshotGeneration || "" },
+          { label: "Export total matching", value: () => exportContext.totalMatching ?? "" },
+          { label: "Export category total", value: () => exportContext.categoryTotal ?? "" }
+        );
+      }
       const lines = [columns.map((column) => delimitedField(column.label, delimiter)).join(delimiter)];
       entries.forEach((entry) => {
         const metadata = entry.metadata_json && typeof entry.metadata_json === "object" ? entry.metadata_json : {};
@@ -16382,22 +16553,40 @@ const INDEX_HTML: &str = r###"<!doctype html>
       }
       const entries = [];
       let total = null;
+      let categoryTotal = null;
+      let snapshotGeneration = null;
       let cursor = null;
       setNotice("Preparing " + categoryLabel(key) + " artifact " + format.toUpperCase() + "...");
       try {
         do {
-          const params = { case_path: currentCasePath(), main: selected.main, limit: 1000 };
+          const params = {
+            case_path: currentCasePath(),
+            main: selected.main,
+            limit: 1000,
+            ...categoryServerQueryFilters()
+          };
           if (selected.sub) {
             params.sub = selected.sub;
           }
           if (cursor) {
             params.after_path = cursor.logical_path;
             params.after_id = cursor.id;
+            if (cursor.snapshot_generation) {
+              params.after_generation = cursor.snapshot_generation;
+            }
           }
           const page = await apiGet("/api/entries/category", params);
           const pageEntries = (page.entries || []).map(normalizeCategoryEntry);
           entries.push(...pageEntries);
-          total = Number(page.total_in_category || entries.length);
+          total = Number(page.total_matching ?? entries.length);
+          categoryTotal = Number(page.total_in_category ?? total);
+          const pageGeneration = page.completeness && page.completeness.scope
+            ? page.completeness.scope.case_generation
+            : null;
+          if (snapshotGeneration && pageGeneration && snapshotGeneration !== pageGeneration) {
+            throw new Error("The case changed while the artifact sheet was being exported. Retry the export to keep one case generation.");
+          }
+          snapshotGeneration = snapshotGeneration || pageGeneration || (page.next_cursor && page.next_cursor.snapshot_generation) || null;
           cursor = page.next_cursor || null;
           if (pageEntries.length === 0) {
             break;
@@ -16406,7 +16595,13 @@ const INDEX_HTML: &str = r###"<!doctype html>
             setNotice("Preparing " + categoryLabel(key) + " artifact " + format.toUpperCase() + ": " + entries.length.toLocaleString() + " / " + total.toLocaleString() + " rows...");
           }
         } while (cursor);
-        downloadArtifactTable(entries, format, categoryLabel(key));
+        downloadArtifactTable(entries, format, categoryLabel(key), {
+          completeness: "unknown",
+          coverageNote: "All matching stored category rows were exported from one case generation; upstream source-artifact and parser coverage is not assessed by this export.",
+          snapshotGeneration,
+          totalMatching: total,
+          categoryTotal
+        });
       } catch (err) {
         setNotice("Artifact export failed: " + (err.message || String(err)), true);
       }
@@ -22055,6 +22250,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         cache.total = null;
         cache.categoryTotal = null;
         cache.nextCursor = null;
+        cache.completeness = null;
         cache.error = "";
       }
       const selected = splitCategoryKey(cache.key || "");
@@ -22078,6 +22274,9 @@ const INDEX_HTML: &str = r###"<!doctype html>
         if (!reset && cache.nextCursor) {
           params.after_path = cache.nextCursor.logical_path;
           params.after_id = cache.nextCursor.id;
+          if (cache.nextCursor.snapshot_generation) {
+            params.after_generation = cache.nextCursor.snapshot_generation;
+          }
         }
         const data = await apiGet("/api/entries/category", params);
         if (state.cat !== cache
@@ -22096,6 +22295,7 @@ const INDEX_HTML: &str = r###"<!doctype html>
         cache.total = Number(data.total_matching ?? data.total_in_category ?? 0);
         cache.categoryTotal = Number(data.total_in_category ?? cache.total);
         cache.nextCursor = data.next_cursor || null;
+        cache.completeness = data.completeness || null;
         cache.loading = false;
         renderEvidenceBrowserEntries();
         renderHexViewer();
@@ -22152,15 +22352,26 @@ const INDEX_HTML: &str = r###"<!doctype html>
       const total = Number(cache.total || 0);
       const categoryTotal = Number(cache.categoryTotal ?? total);
       const filtersActive = gridColumnFiltersActive("category", categoryGridColumns()) || dateFilterActive();
-      if (!filtersActive && !cache.loading && !cache.nextCursor && rows.length >= total) {
+      const coverageReasons = cache.completeness && Array.isArray(cache.completeness.reasons)
+        ? cache.completeness.reasons : [];
+      const coverageUnknown = !cache.completeness
+        || cache.completeness.status === "unknown"
+        || coverageReasons.some((reason) => reason.code === "upstream_artifact_coverage_not_assessed");
+      const coverageIncomplete = !cache.completeness || cache.completeness.status !== "complete";
+      if (!filtersActive && !cache.loading && !cache.nextCursor && rows.length >= total && !coverageIncomplete) {
         return "";
       }
       const matchNote = filtersActive && categoryTotal !== total
         ? ` matches from ${categoryTotal.toLocaleString()} category entries`
         : "";
+      const coverageNote = coverageUnknown
+        ? " Stored-row results only; source-artifact/parser coverage is not assessed here."
+        : (coverageIncomplete
+          ? ` Completeness is ${escapeHtml(String(cache.completeness.status))}. ${coverageReasons.map((reason) => escapeHtml(String(reason.message || reason.code || ""))).filter(Boolean).join(" ")}`
+          : "");
       const loading = cache.loading ? ` <span class="muted tiny">Loading...</span>` : "";
       const continuation = cache.nextCursor ? " Scroll for more." : "";
-      return `<div class="analysis-status">Showing ${rows.length.toLocaleString()} of ${total.toLocaleString()}${matchNote}.${continuation}${loading}</div>`;
+      return `<div class="analysis-status">Showing ${rows.length.toLocaleString()} of ${total.toLocaleString()}${matchNote}.${coverageNote}${continuation}${loading}</div>`;
     }
 
     function emptyIndexedCategoryMessage(fallback = "No entries in this category.") {

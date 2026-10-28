@@ -1,0 +1,20 @@
+[package]
+name = "kdft-ai-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+# Experimental only. The child-process runtime is not enabled in normal or
+# forensic test builds until its isolation and resource-control gates pass.
+llama-runtime = []
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

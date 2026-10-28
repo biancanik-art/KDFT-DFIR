@@ -1193,7 +1193,15 @@ fn inventory_archive_with_limits<R: Read + Seek>(
                 format!("could not inspect archive member {index}: {error}"),
             )
         })?;
-        let name = file.name().to_string();
+        let name = file
+            .name()
+            .map_err(|error| {
+                OoxmlParseError::package(
+                    OoxmlErrorKind::InvalidZip,
+                    format!("could not decode archive member {index} name: {error}"),
+                )
+            })?
+            .into_owned();
         if name.len() > max_part_name_bytes {
             let prefix_len = utf8_prefix_len(&name, max_part_name_bytes);
             return Err(OoxmlParseError::part(
@@ -1231,6 +1239,13 @@ fn inventory_archive_with_limits<R: Read + Seek>(
                 format!("part collides with earlier package member {previous:?}"),
             ));
         }
+        let data_start = file.data_start().ok_or_else(|| {
+            OoxmlParseError::part(
+                OoxmlErrorKind::InvalidZip,
+                &name,
+                "archive member compressed-data start is unavailable",
+            )
+        })?;
         parts.push(ArchivePart {
             index,
             name,
@@ -1239,7 +1254,7 @@ fn inventory_archive_with_limits<R: Read + Seek>(
             crc32: file.crc32(),
             compression_method: file.compression().to_string(),
             header_start: file.header_start(),
-            data_start: file.data_start(),
+            data_start,
             central_header_start: file.central_header_start(),
         });
     }

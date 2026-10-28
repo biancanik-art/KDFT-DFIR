@@ -510,6 +510,198 @@ pub fn list_ntfs_forensic_tree_files(
     })
 }
 
+/// Streaming variant of `list_ntfs_forensic_tree_files` for recursive live bookmarking:
+/// traverses the transient NTFS forensic catalog, pushes directly to `StreamingLiveBookmarkSink`,
+/// checks cancellation on every directory and record, and returns the pending directory paths.
+pub fn stream_ntfs_forensic_tree_files(
+    image_path: &Path,
+    volume_index: usize,
+    dir_path: &str,
+    sink: &mut crate::StreamingLiveBookmarkSink<'_>,
+    checkpoint: Option<&crate::LiveTraversalCheckpoint>,
+) -> Result<Vec<String>> {
+    const MAX_PATH_DEPTH: usize = 256;
+    const MAX_SKIP_NOTES: usize = 128;
+
+    let cache = build_ntfs_forensic_volume_cache(image_path, volume_index, None)?;
+    let volume = list_image_volumes(image_path)?
+        .into_iter()
+        .nth(volume_index)
+        .with_context(|| format!("volume index {volume_index} out of range"))?;
+    let normalized = normalize_dir_path(dir_path);
+    let root_record = resolve_path_to_record(&cache, &normalized)
+        .with_context(|| format!("directory not found in forensic catalog: {dir_path}"))?;
+    let root = cache
+        .records
+        .get(&root_record)
+        .with_context(|| format!("directory record {root_record} missing from catalog"))?;
+    if !root.is_directory && root_record != ORPHAN_SENTINEL_RECORD {
+        bail!("path is a file, not a directory: {dir_path}");
+    }
+
+    let mut opened = open_disk_image(image_path)?;
+    let mut slice =
+        crate::PartitionSlice::new(&mut *opened.reader, volume.start_offset, volume.size_bytes);
+    let ntfs = ntfs::Ntfs::new(&mut slice).context("opening NTFS volume for forensic tree")?;
+
+    let mut seen = HashSet::new();
+    let mut stack: Vec<(u64, Vec<String>)> = if let Some(cp) = checkpoint {
+        if cp.completed {
+            return Ok(Vec::new());
+        }
+        if !cp.pending_directories.is_empty() {
+            let mut resolved = Vec::new();
+            for p in &cp.pending_directories {
+                let norm = normalize_dir_path(p);
+                if let Some(rec) = resolve_path_to_record(&cache, &norm) {
+                    let parts: Vec<String> = norm
+                        .split('/')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect();
+                    resolved.push((rec, parts));
+                }
+            }
+            if resolved.is_empty() {
+                vec![(root_record, Vec::new())]
+            } else {
+                resolved
+            }
+        } else {
+            vec![(root_record, Vec::new())]
+        }
+    } else {
+        vec![(root_record, Vec::new())]
+    };
+
+    'walk: while let Some((directory_record, relative_parts)) = stack.pop() {
+        if crate::progress::is_cancellation_requested_active() {
+            sink.truncated = true;
+            stack.push((directory_record, relative_parts));
+            break 'walk;
+        }
+
+        if !seen.insert(directory_record) {
+            sink.skipped_count = sink.skipped_count.saturating_add(1);
+            sink.truncated = true;
+            if sink.skipped.len() < MAX_SKIP_NOTES {
+                sink.skipped.push(format!(
+                    "NTFS directory record {directory_record} was already visited and was skipped to prevent a cycle"
+                ));
+            }
+            continue;
+        }
+        sink.directories_visited = sink.directories_visited.saturating_add(1);
+        let mut child_ids = cache
+            .children
+            .get(&directory_record)
+            .cloned()
+            .unwrap_or_default();
+        sort_forensic_record_ids(&cache, &mut child_ids);
+
+        let mut child_directories = Vec::new();
+        let mut dir_completed = true;
+        for child_record in child_ids {
+            if crate::progress::is_cancellation_requested_active() {
+                sink.truncated = true;
+                dir_completed = false;
+                break;
+            }
+
+            let Some(record) = cache.records.get(&child_record) else {
+                sink.skipped_count = sink.skipped_count.saturating_add(1);
+                sink.truncated = true;
+                if sink.skipped.len() < MAX_SKIP_NOTES {
+                    sink.skipped
+                        .push(format!("record {child_record} is missing from the catalog"));
+                }
+                continue;
+            };
+            let mut child_parts = relative_parts.clone();
+            child_parts.push(record.name.clone());
+            if record.is_directory {
+                if child_parts.len() > MAX_PATH_DEPTH {
+                    sink.skipped_count = sink.skipped_count.saturating_add(1);
+                    sink.truncated = true;
+                    if sink.skipped.len() < MAX_SKIP_NOTES {
+                        sink.skipped.push(format!(
+                            "{}: directory depth exceeds the {MAX_PATH_DEPTH}-component corruption/cycle guard",
+                            child_parts.join("/")
+                        ));
+                    }
+                } else {
+                    child_directories.push((child_record, child_parts));
+                }
+                continue;
+            }
+
+            match entry_for_record(
+                &cache,
+                &volume,
+                child_record,
+                &ntfs,
+                &mut slice,
+                volume.start_offset,
+            ) {
+                Ok(entry) => {
+                    let file_ref = LiveTreeFileRef {
+                        relative_path: child_parts.join("/"),
+                        name: entry.name,
+                        size_bytes: entry.size_bytes.unwrap_or(0).max(0) as u64,
+                        created_utc: entry.created_utc,
+                        modified_utc: entry.modified_utc,
+                        accessed_utc: entry.accessed_utc,
+                        is_deleted: entry.is_deleted,
+                        provenance: Some(entry.provenance),
+                        reconstruction_status: Some(entry.reconstruction_status),
+                        recovery_status: Some(entry.recovery_status),
+                        ntfs_file_record_number: Some(entry.ntfs_file_record_number),
+                        ntfs_sequence_number: Some(entry.ntfs_sequence_number),
+                        ntfs_parent_record_number: Some(entry.ntfs_parent_record_number),
+                        mft_record_logical_offset: entry.mft_record_logical_offset,
+                        mft_record_physical_offset: entry.mft_record_physical_offset,
+                        file_data_logical_offset: entry.file_data_logical_offset,
+                        file_data_physical_offset: entry.file_data_physical_offset,
+                        file_data_file_offset: entry.file_data_file_offset,
+                        file_data_contiguous_bytes: entry.file_data_contiguous_bytes,
+                        physical_offset_basis: entry.physical_offset_basis,
+                        file_data_direct_logical_mapping: entry.file_data_direct_logical_mapping,
+                        offset_coordinate_system: entry.offset_coordinate_system,
+                    };
+                    if !sink.push_file(file_ref)? {
+                        dir_completed = false;
+                        break;
+                    }
+                }
+                Err(error) => {
+                    sink.skipped_count = sink.skipped_count.saturating_add(1);
+                    sink.truncated = true;
+                    if sink.skipped.len() < MAX_SKIP_NOTES {
+                        sink.skipped
+                            .push(format!("{}: {error:#}", child_parts.join("/")));
+                    }
+                }
+            }
+        }
+
+        if dir_completed {
+            for child in child_directories.into_iter().rev() {
+                stack.push(child);
+            }
+        } else {
+            seen.remove(&directory_record);
+            stack.push((directory_record, relative_parts));
+        }
+
+        if sink.file_limit_reached || crate::progress::is_cancellation_requested_active() {
+            break 'walk;
+        }
+    }
+
+    let pending: Vec<String> = stack.iter().map(|(_, parts)| parts.join("/")).collect();
+    Ok(pending)
+}
+
 /// Read bytes from a file identified by its forensic path.
 pub fn read_ntfs_forensic_file_bytes(
     image_path: &Path,
@@ -560,6 +752,27 @@ pub fn read_ntfs_forensic_file_bytes(
     let start = (offset as usize).min(bytes.len());
     let end = start.saturating_add(length).min(bytes.len());
     Ok((bytes[start..end].to_vec(), total_size))
+}
+
+/// Read the authoritative NTFS FILE-record size from the selected volume.
+///
+/// Consumers use this for $MFT stream coordinates.  It must come from the
+/// mounted filesystem and must not be inferred from the commonly seen 1024
+/// byte default because valid NTFS volumes can use a different record size.
+pub fn ntfs_forensic_file_record_size(image_path: &Path, volume_index: usize) -> Result<u64> {
+    let volume = list_image_volumes(image_path)?
+        .into_iter()
+        .nth(volume_index)
+        .with_context(|| format!("volume index {volume_index} out of range"))?;
+    let mut opened = open_disk_image(image_path)?;
+    let mut slice =
+        crate::PartitionSlice::new(&mut *opened.reader, volume.start_offset, volume.size_bytes);
+    let ntfs = ntfs::Ntfs::new(&mut slice).context("opening NTFS volume for record geometry")?;
+    let record_size = u64::from(ntfs.file_record_size());
+    if !(24..=64 * 1024).contains(&record_size) {
+        bail!("NTFS reports an unsafe file-record size of {record_size}");
+    }
+    Ok(record_size)
 }
 
 /// Export one allocated or deleted NTFS file from the transient catalog. The

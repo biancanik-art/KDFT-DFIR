@@ -137,6 +137,17 @@ where
         .with_context(|| format!("starting external parser {}", tool_path.display()))?;
     let mut forced_status = None::<&str>;
     let exit = loop {
+        if crate::progress::active_job_progress()
+            .is_some_and(|tracker| tracker.is_cancellation_requested())
+        {
+            forced_status = Some("cancelled");
+            child
+                .kill()
+                .context("stopping external parser after examiner cancellation")?;
+            break child
+                .wait()
+                .context("waiting for cancelled external parser")?;
+        }
         if let Some(status) = child.try_wait().context("polling external parser")? {
             break status;
         }
@@ -186,4 +197,61 @@ where
         stdout_truncated,
         stderr_truncated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_parser_is_stopped_by_examiner_cancellation() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let working_directory = std::env::temp_dir().join(format!(
+            "kdft-external-cancel-{}-{stamp}",
+            std::process::id()
+        ));
+        #[cfg(windows)]
+        let (executable, arguments) = (
+            PathBuf::from(std::env::var_os("COMSPEC").expect("COMSPEC")),
+            vec![
+                OsString::from("/C"),
+                OsString::from("ping -n 30 127.0.0.1 >NUL"),
+            ],
+        );
+        #[cfg(unix)]
+        let (executable, arguments) = (
+            PathBuf::from("/bin/sh"),
+            vec![OsString::from("-c"), OsString::from("sleep 30")],
+        );
+        let tracker = crate::progress::JobProgressTracker::new(
+            "external-parser-cancel",
+            "forensic_analysis",
+            None,
+        );
+        tracker.request_cancellation();
+
+        let result = crate::progress::with_job_progress(&tracker, || {
+            run_bounded(&executable, arguments, &working_directory)
+        })
+        .expect("cancelled external process returns a truthful run record");
+
+        assert_eq!(result.status, "cancelled");
+        assert!(
+            result.elapsed_ms < 5_000,
+            "cancellation must not wait for timeout"
+        );
+
+        for file_name in ["kdft-external.stdout", "kdft-external.stderr"] {
+            let path = working_directory.join(file_name);
+            if path.exists() {
+                std::fs::remove_file(path).expect("remove generated test output");
+            }
+        }
+        if working_directory.exists() {
+            std::fs::remove_dir(&working_directory).expect("remove generated test directory");
+        }
+    }
 }

@@ -29,6 +29,9 @@ use zip::{CompressionMethod, ZipArchive};
 /// Maximum uncompressed payload in one text event.
 pub const TEXT_SEGMENT_BYTES: usize = 64 * 1024;
 
+/// ZIP general-purpose bit 11 declares UTF-8 filenames and comments.
+const ZIP_LANGUAGE_ENCODING_FLAG: u16 = 1 << 11;
+
 /// Maximum number of representative member diagnostics retained in memory.
 /// Every affected member is still counted and emitted through [`ZipEvent`].
 pub const RETAINED_MEMBER_DIAGNOSTICS: usize = 128;
@@ -404,13 +407,16 @@ where
     let mut summary = ZipParseSummary {
         archive_stream_offset: archive.offset(),
         central_directory_offset: archive.central_directory_start(),
-        archive_uses_zip64: archive.zip64_comment().is_some(),
+        archive_uses_zip64: archive.raw_zip64_extensible_data_sector().is_some(),
         member_count,
         ..ZipParseSummary::default()
     };
 
     for archive_index in 0..member_count {
-        let known_name = archive.name_for_index(archive_index).map(str::to_owned);
+        let known_name = archive
+            .name_for_index(archive_index)
+            .and_then(Result::ok)
+            .map(|name| name.into_owned());
         let raw_member = match archive.by_index_raw(archive_index) {
             Ok(member) => member,
             Err(error) => {
@@ -426,11 +432,35 @@ where
         };
 
         let compression_method = raw_member.compression();
-        let compressed_data_offset = raw_member.data_start();
+        let name = match raw_member.name() {
+            Ok(name) => name.into_owned(),
+            Err(error) => {
+                let diagnostic =
+                    classify_member_zip_error(archive_index, None, Some(compression_method), error);
+                drop(raw_member);
+                let unavailable = unavailable_member(archive_index, None, diagnostic);
+                emit_unavailable_member(&mut on_event, &unavailable)?;
+                record_unavailable_member(&mut summary, unavailable);
+                continue;
+            }
+        };
+        let Some(compressed_data_offset) = raw_member.data_start() else {
+            let diagnostic = ZipParserError::member(
+                ZipParserErrorKind::CorruptMember,
+                archive_index,
+                Some(name.clone()),
+                Some(compression_method),
+                "compressed member data start is unavailable",
+            );
+            drop(raw_member);
+            let unavailable = unavailable_member(archive_index, Some(name), diagnostic);
+            emit_unavailable_member(&mut on_event, &unavailable)?;
+            record_unavailable_member(&mut summary, unavailable);
+            continue;
+        };
         let Some(compressed_data_end) =
             compressed_data_offset.checked_add(raw_member.compressed_size())
         else {
-            let name = raw_member.name().to_owned();
             let diagnostic = ZipParserError::member(
                 ZipParserErrorKind::CounterOverflow,
                 archive_index,
@@ -447,26 +477,26 @@ where
         let zip_metadata = raw_member.get_metadata();
         let metadata = ZipMemberMetadata {
             archive_index,
-            name: raw_member.name().to_owned(),
+            name: name.clone(),
             name_reader_bytes: raw_member.name_raw().to_vec(),
-            name_is_utf8: zip_metadata.is_utf8,
+            name_is_utf8: raw_member.flags().as_u16() & ZIP_LANGUAGE_ENCODING_FLAG != 0,
             is_directory: raw_member.is_dir(),
             is_symlink: raw_member.is_symlink(),
             unix_mode: raw_member.unix_mode(),
             encrypted: raw_member.encrypted(),
-            uses_data_descriptor: zip_metadata.using_data_descriptor,
+            uses_data_descriptor: raw_member.flags().is_using_data_descriptor(),
             uses_zip64: zip_metadata.large_file,
             compressed_size: raw_member.compressed_size(),
             uncompressed_size: raw_member.size(),
             crc32: raw_member.crc32(),
             compression_method,
-            is_textual: !raw_member.is_dir() && has_text_extension(raw_member.name()),
+            is_textual: !raw_member.is_dir() && has_text_extension(&name),
             archive_stream_offset: summary.archive_stream_offset,
             local_header_offset: raw_member.header_start(),
             compressed_data_offset,
             compressed_data_end,
             central_directory_header_offset: raw_member.central_header_start(),
-            path_risk_codes: path_risk_codes(raw_member.name()),
+            path_risk_codes: path_risk_codes(&name),
         };
         drop(raw_member);
 

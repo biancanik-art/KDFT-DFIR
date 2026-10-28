@@ -1,0 +1,28 @@
+[package]
+name = "kdft-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+arboard = "3.7.0"
+chrono.workspace = true
+chrono-tz.workspace = true
+eframe = { version = "0.37.0", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "glow",
+    "system_fonts",
+    "wayland",
+    "x11",
+] }
+kdft-case = { path = "../kdft-case" }
+kdft-desktop-core = { path = "../kdft-desktop-core" }
+rfd = "0.17.2"
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true

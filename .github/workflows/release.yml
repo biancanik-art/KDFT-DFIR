@@ -42,14 +42,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build
-        run: cargo build --release --locked -p kdft-ui -p kdft-cli
+        run: cargo build --release --locked -p kdft-desktop -p kdft-ui -p kdft-cli
       - name: Package
         shell: pwsh
         run: |
           $tag = $env:RELEASE_TAG
           New-Item -ItemType Directory pkg | Out-Null
-          Copy-Item target/release/kdft-ui.exe, target/release/kdft.exe, README.md, LICENSE, NOTICE, THIRD_PARTY_NOTICES pkg/
+          Copy-Item target/release/kdft-desktop.exe, target/release/kdft-ui.exe, target/release/kdft.exe, README.md, LICENSE, NOTICE, THIRD_PARTY_NOTICES pkg/
           Compress-Archive -Path pkg/* -DestinationPath "kdft-$tag-windows-x64.zip"
+          Copy-Item target/release/kdft-desktop.exe "kdft-desktop-$tag-windows-x64.exe"
           Copy-Item target/release/kdft-ui.exe "kdft-ui-$tag-windows-x64.exe"
           Copy-Item target/release/kdft.exe "kdft-$tag-windows-x64.exe"
       - name: Upload build products
@@ -58,6 +59,7 @@ jobs:
           name: release-windows-x64
           path: |
             kdft-${{ env.RELEASE_TAG }}-windows-x64.zip
+            kdft-desktop-${{ env.RELEASE_TAG }}-windows-x64.exe
             kdft-ui-${{ env.RELEASE_TAG }}-windows-x64.exe
             kdft-${{ env.RELEASE_TAG }}-windows-x64.exe
           if-no-files-found: error
@@ -136,7 +138,7 @@ jobs:
         run: |
           tag="$RELEASE_TAG"
           title="KDFT $tag"
-          notes="KDFT builds for Windows, macOS, and Linux. Unpack and run kdft-ui (--port 8780 --open) for the local-only workbench; kdft is the command-line interface. The macOS binaries are ad-hoc signed, not notarized. Verify every download against SHA256SUMS.txt."
+          notes="KDFT builds for Windows, macOS, and Linux. On Windows, kdft-desktop is the primary native forensic workbench; kdft-ui remains the optional local browser-assisted workbench and kdft is the command-line interface. The macOS binaries are ad-hoc signed, not notarized. Verify every download against SHA256SUMS.txt."
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release edit "$tag" --title "$title" --notes "$notes"
             gh release upload "$tag" kdft-* SHA256SUMS.txt --clobber

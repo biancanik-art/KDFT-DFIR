@@ -8,6 +8,10 @@ mod identity_network;
 mod ntfs_compression;
 mod wof;
 
+pub mod parser_adapters;
+pub mod result_completeness;
+pub mod semantic_artifacts;
+
 pub(crate) use browser_history::{
     chromium_download_danger_type_label, chromium_download_interrupt_reason_label,
     chromium_download_state_label, chromium_originator_sync_guid_full,
@@ -224,6 +228,10 @@ pub mod ntfs_forensic;
 pub mod ooxml;
 pub mod prefetch;
 pub mod progress;
+pub mod progress_registry;
+pub use progress_registry::{
+    validate_progress_id, ProgressRegistry, DEFAULT_MAX_RETAINED_PROGRESS_JOBS,
+};
 pub mod pst;
 pub mod rfc822;
 pub mod scheduled_task;
@@ -552,6 +560,54 @@ pub struct ClearStaleFindingsResult {
     pub removed_folders: i64,
     pub removed_bookmarks: i64,
     pub removed_items: i64,
+}
+
+/// Explicit target volume/partition for forensic processing.
+///
+/// Prevents cross-volume contamination (e.g. indexing EFI FAT or Recovery NTFS
+/// when an examiner specifically selected the Windows OS partition).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeTarget {
+    pub evidence_id: i64,
+    pub discovered_volume_id: String,
+    pub partition_table_index: Option<u32>,
+    pub partition_start_offset: u64,
+    pub partition_length: u64,
+    pub partition_type: Option<String>,
+    pub partition_guid: Option<String>,
+    pub filesystem_kind: Option<String>,
+    pub filesystem_label: Option<String>,
+    pub encryption_kind: String,
+    pub encryption_state: String,
+    #[serde(default)]
+    pub unlocked_for_session: bool,
+    pub discovery_generation: i64,
+}
+
+impl VolumeTarget {
+    pub fn new(
+        evidence_id: i64,
+        discovered_volume_id: impl Into<String>,
+        partition_table_index: Option<u32>,
+        partition_start_offset: u64,
+        partition_length: u64,
+    ) -> Self {
+        Self {
+            evidence_id,
+            discovered_volume_id: discovered_volume_id.into(),
+            partition_table_index,
+            partition_start_offset,
+            partition_length,
+            partition_type: None,
+            partition_guid: None,
+            filesystem_kind: None,
+            filesystem_label: None,
+            encryption_kind: "none".to_string(),
+            encryption_state: "unencrypted".to_string(),
+            unlocked_for_session: false,
+            discovery_generation: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1029,7 +1085,8 @@ pub struct BookmarkFolder {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BookmarkType {
     NotableFile,
     FileGroup,
@@ -1485,7 +1542,7 @@ pub fn add_evidence_with_timezone(
     add_evidence_internal(case_path, options, Some(timezone))
 }
 
-fn normalized_timezone(value: &str) -> Result<String> {
+pub fn normalized_timezone(value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         bail!("timezone cannot be empty");
@@ -1638,6 +1695,101 @@ pub fn set_evidence_display_timezone(
     Ok(())
 }
 
+/// Change the case display timezone without modifying canonical UTC storage.
+/// Records an authoritative audit event with old value, new value, examiner,
+/// and UTC change time.
+pub fn set_case_display_timezone(case_path: &Path, timezone: &str) -> Result<()> {
+    let normalized = normalized_timezone(timezone)?;
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let old_timezone = stored_case_timezone(&conn, case_id)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+
+    tx.execute(
+        "UPDATE case_options SET timezone = ?1 WHERE case_id = ?2",
+        params![&normalized, case_id],
+    )?;
+
+    let now_utc = chrono::Utc::now().to_rfc3339();
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'case.display_timezone', ?2, 'case', ?1,
+                 json_object('old_timezone', ?3, 'new_timezone', ?4, 'canonical_timestamps', 'UTC', 'changed_at_utc', ?5))",
+        params![case_id, actor, &old_timezone, &normalized, &now_utc],
+    )?;
+
+    tx.commit()?;
+    Ok(())
+}
+
+/// Update evidence intake metadata including custom label, initial integrity status,
+/// expected hash, and integrity details, recording an audit event.
+pub fn update_evidence_intake_metadata(
+    case_path: &Path,
+    evidence_id: i64,
+    display_name: Option<&str>,
+    integrity_status: Option<&str>,
+    expected_sha256: Option<&str>,
+    integrity_details_json: Option<&str>,
+) -> Result<()> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+
+    if let Some(name) = display_name {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            tx.execute(
+                "UPDATE evidence_sources SET display_name = ?1 WHERE case_id = ?2 AND id = ?3",
+                params![trimmed, case_id, evidence_id],
+            )?;
+        }
+    }
+
+    if let Some(status) = integrity_status {
+        tx.execute(
+            "UPDATE evidence_sources SET integrity_status = ?1 WHERE case_id = ?2 AND id = ?3",
+            params![status, case_id, evidence_id],
+        )?;
+    }
+
+    if let Some(expected) = expected_sha256 {
+        let trimmed = expected.trim().to_lowercase();
+        if !trimmed.is_empty() {
+            tx.execute(
+                "UPDATE evidence_sources SET expected_sha256 = ?1 WHERE case_id = ?2 AND id = ?3",
+                params![trimmed, case_id, evidence_id],
+            )?;
+        }
+    }
+
+    if let Some(details) = integrity_details_json {
+        tx.execute(
+            "UPDATE evidence_sources SET integrity_details_json = ?1 WHERE case_id = ?2 AND id = ?3",
+            params![details, case_id, evidence_id],
+        )?;
+    }
+
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'evidence.intake_metadata', ?2, 'evidence', ?3,
+                 json_object('display_name', ?4, 'integrity_status', ?5, 'expected_sha256', ?6))",
+        params![
+            case_id,
+            actor,
+            evidence_id,
+            display_name,
+            integrity_status,
+            expected_sha256
+        ],
+    )?;
+
+    tx.commit()?;
+    Ok(())
+}
+
 fn acquisition_manifest_from_row(
     row: &rusqlite::Row<'_>,
     column: usize,
@@ -1768,14 +1920,14 @@ pub fn record_processing_pass_failure_audit(
     Ok(())
 }
 
-#[derive(Debug)]
-struct AcquisitionSegmentSet {
-    scheme: String,
-    paths: Vec<PathBuf>,
-    complete: bool,
-    completeness_state: String,
-    enumeration_basis: String,
-    note: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcquisitionSegmentSet {
+    pub scheme: String,
+    pub paths: Vec<PathBuf>,
+    pub complete: bool,
+    pub completeness_state: String,
+    pub enumeration_basis: String,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2346,6 +2498,10 @@ fn acquisition_segment_set(path: &Path) -> Result<AcquisitionSegmentSet> {
         note: "The acquisition consists of one container file; every byte of that file was hashed."
             .to_string(),
     })
+}
+
+pub fn detect_acquisition_segments(path: &Path) -> Result<AcquisitionSegmentSet> {
+    acquisition_segment_set(path)
 }
 
 fn sha256_reader(reader: &mut dyn Read, description: &str) -> Result<(String, u64)> {
@@ -2925,6 +3081,8 @@ struct IndexedFileHashOutcome {
     disposition: IndexedFileHashDisposition,
 }
 
+// EvidenceReadSession intentionally stays inline for one-owner worker reuse.
+#[allow(clippy::large_enum_variant)]
 enum HashWorkerReadSession {
     Ready(EvidenceReadSession),
     Failed(String),
@@ -4037,6 +4195,12 @@ pub struct IdentityParseResult {
     pub network_artifacts_indexed: usize,
     pub wifi_profiles_indexed: usize,
     pub credential_stores_indexed: usize,
+    /// Protected key/credential infrastructure identified by layout but not
+    /// decoded into a credential or secret value.
+    pub protected_credential_material_indexed: usize,
+    /// Values successfully recovered by a dedicated decryption/decoding
+    /// operation.  Source recognition alone never increments this count.
+    pub recovered_secret_values_indexed: usize,
     /// Retained for JSON/API compatibility. Sensitive values are no longer
     /// copied into derived metadata, so this is always zero.
     pub plaintext_secrets_indexed: usize,
@@ -4342,6 +4506,8 @@ pub fn parse_identity_artifacts(case_path: &Path, evidence_id: i64) -> Result<Id
         network_artifacts_indexed: 0,
         wifi_profiles_indexed: 0,
         credential_stores_indexed: 0,
+        protected_credential_material_indexed: 0,
+        recovered_secret_values_indexed: 0,
         plaintext_secrets_indexed: 0,
         structured_secret_findings_indexed: 0,
         parse_error_count: 0,
@@ -4452,6 +4618,14 @@ pub fn parse_identity_artifacts(case_path: &Path, evidence_id: i64) -> Result<Id
         .unwrap_or(0);
     result.wifi_profiles_indexed = visible_counts.get("wifi_profile").copied().unwrap_or(0);
     result.credential_stores_indexed = visible_counts.get("credential_store").copied().unwrap_or(0);
+    result.protected_credential_material_indexed = visible_counts
+        .get("protected_credential_material")
+        .copied()
+        .unwrap_or(0);
+    // Recognition and hashing of protected material are not recovery.  This
+    // remains zero until a dedicated decoder emits a separately proven
+    // recovered-secret artifact kind.
+    result.recovered_secret_values_indexed = 0;
     result.structured_secret_findings_indexed = visible_counts
         .get("structured_secret")
         .copied()
@@ -4478,6 +4652,7 @@ const IDENTITY_DERIVED_ARTIFACT_KINDS: &[&str] = &[
     "network_configuration",
     "wifi_profile",
     "credential_store",
+    "protected_credential_material",
     "structured_secret",
     // Legacy kind retained only so old unsafe rows can be sanitized and
     // replaced by the redacted structured-secret representation.
@@ -4651,7 +4826,9 @@ fn identity_entry_semantic_key(entry: &DerivedIdentityEntry) -> String {
             "encryption",
             "wifi_key_value_sha256",
         ],
-        "credential_store" => &["credential_store_type", "source_artifact_path"],
+        "credential_store" | "protected_credential_material" => {
+            &["credential_store_type", "source_artifact_path"]
+        }
         "structured_secret" | "plaintext_secret" => &[
             "derived_from_entry_id",
             "secret_source_location",
@@ -4728,7 +4905,7 @@ fn existing_identity_generation_rows(case_path: &Path, evidence_id: i64) -> Resu
            AND json_extract(metadata_json, '$.artifact_kind') IN
                ('windows_local_account','windows_domain_account','windows_user_profile',
                 'browser_account','host_identity','network_configuration','wifi_profile',
-                'credential_store','structured_secret','plaintext_secret')
+                'credential_store','protected_credential_material','structured_secret','plaintext_secret')
            AND json_extract(metadata_json, '$.identity_generation_complete') = 1
            AND COALESCE(json_extract(metadata_json, '$.identity_generation_canonical'), 1) = 1",
         params![case_id, evidence_id],
@@ -4794,7 +4971,7 @@ fn commit_identity_generation(
            AND json_extract(metadata_json, '$.artifact_kind') IN
                ('windows_local_account','windows_domain_account','windows_user_profile',
                 'browser_account','host_identity','network_configuration','wifi_profile',
-                'credential_store','structured_secret','plaintext_secret')
+                'credential_store','protected_credential_material','structured_secret','plaintext_secret')
            AND COALESCE(json_extract(metadata_json, '$.identity_generation_id'), '') <> ?3
            AND EXISTS (SELECT 1 FROM bookmark_items WHERE bookmark_items.entry_id = filesystem_entries.id)",
         params![case_id, evidence_id, generation_id],
@@ -4805,7 +4982,7 @@ fn commit_identity_generation(
            AND json_extract(metadata_json, '$.artifact_kind') IN
                ('windows_local_account','windows_domain_account','windows_user_profile',
                 'browser_account','host_identity','network_configuration','wifi_profile',
-                'credential_store','structured_secret','plaintext_secret')
+                'credential_store','protected_credential_material','structured_secret','plaintext_secret')
            AND COALESCE(json_extract(metadata_json, '$.identity_generation_id'), '') <> ?3
            AND NOT EXISTS (SELECT 1 FROM bookmark_items WHERE bookmark_items.entry_id = filesystem_entries.id)",
         params![case_id, evidence_id, generation_id],
@@ -4825,7 +5002,7 @@ fn identity_visible_counts(case_path: &Path, evidence_id: i64) -> Result<HashMap
            AND json_extract(metadata_json, '$.artifact_kind') IN
                ('windows_local_account','windows_domain_account','windows_user_profile',
                 'browser_account','host_identity','network_configuration','wifi_profile',
-                'credential_store','structured_secret')
+                'credential_store','protected_credential_material','structured_secret')
          GROUP BY json_extract(metadata_json, '$.artifact_kind')",
     )?;
     let rows = statement.query_map(params![case_id, evidence_id], |row| {
@@ -4864,6 +5041,8 @@ fn record_identity_parse_audit(
         "canonical_generation_preserved": result.canonical_generation_preserved,
         "sensitive_metadata_rows_sanitized": result.sensitive_metadata_rows_sanitized,
         "structured_secret_findings": result.structured_secret_findings_indexed,
+        "protected_credential_material_candidates": result.protected_credential_material_indexed,
+        "recovered_secret_values": result.recovered_secret_values_indexed,
         "plaintext_secret_values_copied_to_metadata": 0,
     });
     conn.execute(
@@ -5399,18 +5578,23 @@ fn derive_credential_store_leads(
             continue;
         };
         let store_type = recognition.store_type;
+        let artifact_kind = recognition.artifact_kind;
         let derived_path = format!(
-            "/Parsed identities/Credential stores/{entry_id:08}-{}.record",
+            "/Parsed identities/Credential material/{entry_id:08}-{}.record",
             sanitize_logical_segment(&name)
         );
         let mut metadata = serde_json::json!({
-            "artifact_kind": "credential_store",
+            "artifact_kind": artifact_kind,
             "credential_store_type": store_type,
             "source_artifact_path": exact_path,
             "source_entry_id": entry_id,
             "derived_from_entry_id": entry_id,
             "contains_sensitive_material": true,
             "values_extracted": false,
+            "material_state": recognition.material_state,
+            "recovered_secret_count": recognition.recovered_secret_count,
+            "decryption_attempted": false,
+            "decryption_status": "not_attempted",
             "encrypted_material_not_presented_as_plaintext": true,
             "recognition_basis": recognition.recognition_basis,
             "recognition_confidence": recognition.confidence,
@@ -5420,7 +5604,11 @@ fn derive_credential_store_leads(
         add_entry_category(&mut metadata, &derived_path, &name, "record");
         derived.push(DerivedIdentityEntry {
             logical_path: derived_path,
-            display_name: format!("{store_type}: {name}"),
+            display_name: if artifact_kind == "protected_credential_material" {
+                format!("Protected material (not decoded): {name}")
+            } else {
+                format!("{store_type}: {name}")
+            },
             metadata,
             source_job_id,
         });
@@ -10618,10 +10806,36 @@ pub fn record_job_progress_summary(
     Ok(())
 }
 
-pub fn process_evidence_with_profile(
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ForensicJobContext {
+    pub existing_job_id: Option<i64>,
+    pub retain_job_running: bool,
+}
+
+pub fn process_evidence_with_targets(
     case_path: &Path,
     options: ProcessEvidenceOptions,
     profile: ProcessingProfile,
+    bitlocker_ctx: Option<BitLockerProcessingContext<'_>>,
+    targets: Option<&[VolumeTarget]>,
+) -> Result<ProcessEvidenceResult> {
+    process_evidence_with_targets_and_job_context(
+        case_path,
+        options,
+        profile,
+        bitlocker_ctx,
+        targets,
+        None,
+    )
+}
+
+pub fn process_evidence_with_targets_and_job_context(
+    case_path: &Path,
+    options: ProcessEvidenceOptions,
+    profile: ProcessingProfile,
+    bitlocker_ctx: Option<BitLockerProcessingContext<'_>>,
+    targets: Option<&[VolumeTarget]>,
+    job_context: Option<ForensicJobContext>,
 ) -> Result<ProcessEvidenceResult> {
     if !progress::has_active_progress() {
         let tracker = progress::JobProgressTracker::new(
@@ -10630,10 +10844,32 @@ pub fn process_evidence_with_profile(
             None,
         );
         return progress::with_job_progress(&tracker, || {
-            process_evidence_with_profile_inner(case_path, options, profile, None)
+            process_evidence_with_profile_inner(
+                case_path,
+                options,
+                profile,
+                bitlocker_ctx,
+                targets,
+                job_context,
+            )
         });
     }
-    process_evidence_with_profile_inner(case_path, options, profile, None)
+    process_evidence_with_profile_inner(
+        case_path,
+        options,
+        profile,
+        bitlocker_ctx,
+        targets,
+        job_context,
+    )
+}
+
+pub fn process_evidence_with_profile(
+    case_path: &Path,
+    options: ProcessEvidenceOptions,
+    profile: ProcessingProfile,
+) -> Result<ProcessEvidenceResult> {
+    process_evidence_with_targets(case_path, options, profile, None, None)
 }
 
 pub fn process_evidence_with_profile_and_bitlocker(
@@ -10642,17 +10878,7 @@ pub fn process_evidence_with_profile_and_bitlocker(
     profile: ProcessingProfile,
     bitlocker_ctx: Option<BitLockerProcessingContext<'_>>,
 ) -> Result<ProcessEvidenceResult> {
-    if !progress::has_active_progress() {
-        let tracker = progress::JobProgressTracker::new(
-            format!("process-evidence-{}", options.evidence_id),
-            "process",
-            None,
-        );
-        return progress::with_job_progress(&tracker, || {
-            process_evidence_with_profile_inner(case_path, options, profile, bitlocker_ctx)
-        });
-    }
-    process_evidence_with_profile_inner(case_path, options, profile, bitlocker_ctx)
+    process_evidence_with_targets(case_path, options, profile, bitlocker_ctx, None)
 }
 
 fn process_evidence_with_profile_inner(
@@ -10660,6 +10886,8 @@ fn process_evidence_with_profile_inner(
     options: ProcessEvidenceOptions,
     profile: ProcessingProfile,
     bitlocker_ctx: Option<BitLockerProcessingContext<'_>>,
+    targets: Option<&[VolumeTarget]>,
+    job_context: Option<ForensicJobContext>,
 ) -> Result<ProcessEvidenceResult> {
     // 0 means "index everything"; there is no examiner-facing entry cap.
     let max_entries = unlimited_if_zero(options.max_entries);
@@ -10708,25 +10936,67 @@ fn process_evidence_with_profile_inner(
     } else {
         0
     };
+    let master_job_type = if targets.is_some() {
+        "forensic_analysis"
+    } else {
+        "filesystem_index"
+    };
     let job_tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    job_tx.execute(
-        "INSERT INTO evidence_jobs(
-             case_id, evidence_id, job_type, status, parameters_json,
-             parser_schema_version, generation_fingerprint, started_at
-         ) VALUES (
-             ?1, ?2, 'filesystem_index', 'running', ?3, ?4, ?5,
-             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         )",
-        params![
-            case_id,
-            evidence.id,
-            parameters_json,
-            FILESYSTEM_INDEX_PARSER_SCHEMA_VERSION,
-            context_fingerprint,
-        ],
-    )?;
-    let job_id = job_tx.last_insert_rowid();
+    let job_id = if let Some(existing_id) = job_context.and_then(|c| c.existing_job_id) {
+        job_tx.execute(
+            "UPDATE evidence_jobs
+             SET parameters_json = ?1,
+                 parser_schema_version = ?2,
+                 generation_fingerprint = ?3
+             WHERE id = ?4",
+            params![
+                parameters_json,
+                FILESYSTEM_INDEX_PARSER_SCHEMA_VERSION,
+                context_fingerprint,
+                existing_id,
+            ],
+        )?;
+        existing_id
+    } else {
+        job_tx.execute(
+            "INSERT INTO evidence_jobs(
+                 case_id, evidence_id, job_type, status, parameters_json,
+                 parser_schema_version, generation_fingerprint, started_at
+             ) VALUES (
+                 ?1, ?2, ?3, 'running', ?4, ?5, ?6,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             )",
+            params![
+                case_id,
+                evidence.id,
+                master_job_type,
+                parameters_json,
+                FILESYSTEM_INDEX_PARSER_SCHEMA_VERSION,
+                context_fingerprint,
+            ],
+        )?;
+        job_tx.last_insert_rowid()
+    };
     progress::progress_set_job_id(job_id);
+    if let Some(target_list) = targets {
+        for target in target_list {
+            job_tx.execute(
+                "INSERT INTO processing_job_targets (
+                     job_id, evidence_id, discovered_volume_id, partition_table_index,
+                     partition_start_offset, partition_length, target_role, unlocked_for_session
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'primary', ?7)",
+                params![
+                    job_id,
+                    evidence.id,
+                    &target.discovered_volume_id,
+                    target.partition_table_index,
+                    target.partition_start_offset as i64,
+                    target.partition_length as i64,
+                    if target.unlocked_for_session { 1 } else { 0 },
+                ],
+            )?;
+        }
+    }
     job_tx.commit()?;
 
     // Image processing is destructive inside the transaction because its
@@ -10759,9 +11029,15 @@ fn process_evidence_with_profile_inner(
     let processing_result = match evidence.source_kind.as_str() {
         "file" => process_file_evidence(&tx, case_id, &evidence, job_id, max_entries),
         "folder" => process_folder_evidence(&tx, case_id, &evidence, job_id, max_entries),
-        "image" => {
-            process_image_evidence(&tx, case_id, &evidence, job_id, max_entries, bitlocker_ctx)
-        }
+        "image" => process_image_evidence(
+            &tx,
+            case_id,
+            &evidence,
+            job_id,
+            max_entries,
+            bitlocker_ctx,
+            targets,
+        ),
         other => Err(anyhow!(
             "unsupported evidence source kind for processing: {other}"
         )),
@@ -10958,47 +11234,86 @@ fn process_evidence_with_profile_inner(
     } else {
         0
     };
-    tx.execute(
-        "UPDATE evidence_jobs
-         SET status = ?1,
-             finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-             error = ?2,
-             checkpoint_json = ?3,
-             parameters_json = json_set(
-                 parameters_json,
-                 '$.entries_indexed', ?4,
-                 '$.attempt_entries_indexed', ?5,
-                 '$.replacement_committed', json(?6),
-                 '$.canonical_generation_preserved', json(?7),
-                 '$.retained_entry_count', ?8,
-                 '$.canonical_generation_complete', json(?9)
-             )
-         WHERE id = ?10",
-        params![
-            status,
-            truncation_reason,
-            finalized_checkpoint_json(status, source_processing_complete),
-            i64::try_from(entries_indexed).unwrap_or(i64::MAX),
-            i64::try_from(attempt_entries_indexed).unwrap_or(i64::MAX),
-            if replacement_committed {
-                "true"
-            } else {
-                "false"
-            },
-            if canonical_generation_preserved {
-                "true"
-            } else {
-                "false"
-            },
-            i64::try_from(retained_entry_count).unwrap_or(i64::MAX),
-            if source_processing_complete {
-                "true"
-            } else {
-                "false"
-            },
-            job_id
-        ],
-    )?;
+    if job_context.is_some_and(|c| c.retain_job_running) {
+        tx.execute(
+            "UPDATE evidence_jobs
+             SET checkpoint_json = ?1,
+                 parameters_json = json_set(
+                     parameters_json,
+                     '$.entries_indexed', ?2,
+                     '$.attempt_entries_indexed', ?3,
+                     '$.replacement_committed', json(?4),
+                     '$.canonical_generation_preserved', json(?5),
+                     '$.retained_entry_count', ?6,
+                     '$.canonical_generation_complete', json(?7)
+                 )
+             WHERE id = ?8",
+            params![
+                finalized_checkpoint_json(status, source_processing_complete),
+                i64::try_from(entries_indexed).unwrap_or(i64::MAX),
+                i64::try_from(attempt_entries_indexed).unwrap_or(i64::MAX),
+                if replacement_committed {
+                    "true"
+                } else {
+                    "false"
+                },
+                if canonical_generation_preserved {
+                    "true"
+                } else {
+                    "false"
+                },
+                i64::try_from(retained_entry_count).unwrap_or(i64::MAX),
+                if source_processing_complete {
+                    "true"
+                } else {
+                    "false"
+                },
+                job_id
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "UPDATE evidence_jobs
+             SET status = ?1,
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 error = ?2,
+                 checkpoint_json = ?3,
+                 parameters_json = json_set(
+                     parameters_json,
+                     '$.entries_indexed', ?4,
+                     '$.attempt_entries_indexed', ?5,
+                     '$.replacement_committed', json(?6),
+                     '$.canonical_generation_preserved', json(?7),
+                     '$.retained_entry_count', ?8,
+                     '$.canonical_generation_complete', json(?9)
+                 )
+             WHERE id = ?10",
+            params![
+                status,
+                truncation_reason,
+                finalized_checkpoint_json(status, source_processing_complete),
+                i64::try_from(entries_indexed).unwrap_or(i64::MAX),
+                i64::try_from(attempt_entries_indexed).unwrap_or(i64::MAX),
+                if replacement_committed {
+                    "true"
+                } else {
+                    "false"
+                },
+                if canonical_generation_preserved {
+                    "true"
+                } else {
+                    "false"
+                },
+                i64::try_from(retained_entry_count).unwrap_or(i64::MAX),
+                if source_processing_complete {
+                    "true"
+                } else {
+                    "false"
+                },
+                job_id
+            ],
+        )?;
+    }
     if let Some(generation) = bitlocker_generation.as_ref() {
         tx.execute(
             "UPDATE evidence_jobs
@@ -11987,6 +12302,8 @@ struct SignatureHeaderReadOutcome {
     disposition: SignatureHeaderReadDisposition,
 }
 
+// EvidenceReadSession intentionally stays inline for one-owner worker reuse.
+#[allow(clippy::large_enum_variant)]
 enum SignatureWorkerReadSession {
     Ready(EvidenceReadSession),
     Failed(String),
@@ -16853,14 +17170,10 @@ fn resolve_browser_source_file_with_containment(
 }
 
 /// For a browser-history "record" entry, resolves and reads real bytes from
-/// the actual source database file on disk (rather than the record's own
-/// JSON metadata - see the fallback in read_filesystem_entry_bytes). Returns
-/// `Ok(None)` (not an error) whenever the source can't be identified or
-/// reached, so the caller can fall back to the JSON rendering instead of
-/// failing the whole request - e.g. a single-file import (examiner pointed
-/// the importer at exactly one History/places.sqlite file, not a whole
-/// profile folder) never had companion files like logins/cookies available,
-/// so those specific artifact kinds have nothing to resolve to here.
+/// the actual source database file on disk (rather than the record's JSON
+/// metadata). Returns `Ok(None)` whenever the source cannot be identified or
+/// reached. The caller then reports that no raw logical-file byte stream is
+/// available; it must never disguise stored metadata as evidence bytes.
 fn read_browser_history_record_source_bytes(
     entry: &EntryForBytes,
     offset: u64,
@@ -16988,6 +17301,93 @@ fn read_parser_binary_blob_bytes(
     }))
 }
 
+fn read_archive_member_text_bytes(
+    conn: &Connection,
+    entry: &EntryForBytes,
+    offset: u64,
+    length: usize,
+) -> Result<Option<EntryBytes>> {
+    if entry.metadata_json["artifact_kind"].as_str() != Some("archive_member") {
+        return Ok(None);
+    }
+    if entry.metadata_json["archive_member_content_complete"].as_bool() != Some(true)
+        || entry.metadata_json["archive_member_crc32_validated"].as_bool() != Some(true)
+    {
+        bail!(
+            "archive member has no complete CRC-validated logical byte stream: {}",
+            entry.logical_path
+        );
+    }
+    if entry.metadata_json["archive_member_is_textual"].as_bool() != Some(true) {
+        bail!(
+            "decoded bytes for this archive member were not retained; its metadata is available in Inspector/Properties: {}",
+            entry.logical_path
+        );
+    }
+
+    let expected_size =
+        metadata_u64_or_i64(&entry.metadata_json, "archive_member_uncompressed_size")
+            .or_else(|| entry.size_bytes.and_then(|value| u64::try_from(value).ok()))
+            .with_context(|| {
+                format!(
+                    "archive member has no verified uncompressed size: {}",
+                    entry.logical_path
+                )
+            })?;
+    let mut stmt = conn.prepare(
+        "SELECT content
+         FROM filesystem_entry_text_segments
+         WHERE entry_id = ?1
+           AND parser_name = ?2
+           AND content_encoding = 'archive-member-bytes'
+         ORDER BY segment_index",
+    )?;
+    let mut rows = stmt.query(params![entry.entry_id, ZIP_PARSER_NAME])?;
+    let requested_end = offset.saturating_add(length as u64);
+    let mut decoded_offset = 0_u64;
+    let mut bytes =
+        Vec::with_capacity(length.min(usize::try_from(expected_size).unwrap_or(usize::MAX)));
+    while let Some(row) = rows.next()? {
+        let segment = row.get::<_, Vec<u8>>(0)?;
+        let segment_start = decoded_offset;
+        let segment_end = segment_start
+            .checked_add(segment.len() as u64)
+            .context("archive member segment length overflow")?;
+        if offset < segment_end && requested_end > segment_start && bytes.len() < length {
+            let start = usize::try_from(offset.saturating_sub(segment_start))
+                .unwrap_or(usize::MAX)
+                .min(segment.len());
+            let end = usize::try_from(requested_end.saturating_sub(segment_start))
+                .unwrap_or(usize::MAX)
+                .min(segment.len());
+            if start < end {
+                bytes.extend_from_slice(&segment[start..end]);
+            }
+        }
+        decoded_offset = segment_end;
+    }
+    if decoded_offset != expected_size {
+        bail!(
+            "retained archive member byte count {} does not match verified uncompressed size {} for {}",
+            decoded_offset,
+            expected_size,
+            entry.logical_path
+        );
+    }
+    let bytes_read = bytes.len();
+    Ok(Some(EntryBytes {
+        entry_id: entry.entry_id,
+        evidence_id: entry.evidence_id,
+        logical_path: entry.logical_path.clone(),
+        offset,
+        requested_length: length,
+        bytes_read,
+        total_size: expected_size,
+        eof: offset.saturating_add(bytes_read as u64) >= expected_size,
+        bytes,
+    }))
+}
+
 pub fn read_filesystem_entry_bytes(
     case_path: &Path,
     options: ReadEntryBytesOptions,
@@ -16997,6 +17397,20 @@ pub fn read_filesystem_entry_bytes(
 }
 
 pub(crate) fn read_filesystem_entry_bytes_in_session(
+    session: &mut EvidenceReadSession,
+    options: ReadEntryBytesOptions,
+) -> Result<EntryBytes> {
+    let result = read_filesystem_entry_bytes_in_session_inner(session, options);
+    if let Ok(ref bytes) = result {
+        session.bytes_read_total = session
+            .bytes_read_total
+            .saturating_add(bytes.bytes_read as u64);
+        session.read_operations_total = session.read_operations_total.saturating_add(1);
+    }
+    result
+}
+
+fn read_filesystem_entry_bytes_in_session_inner(
     session: &mut EvidenceReadSession,
     options: ReadEntryBytesOptions,
 ) -> Result<EntryBytes> {
@@ -17017,36 +17431,21 @@ pub(crate) fn read_filesystem_entry_bytes_in_session(
     if let Some(bytes) = read_chrome_cache_entry_body_bytes(&entry, options.offset, length)? {
         return Ok(bytes);
     }
+    if let Some(bytes) =
+        read_archive_member_text_bytes(&session.conn, &entry, options.offset, length)?
+    {
+        return Ok(bytes);
+    }
     if entry.entry_kind == "record" {
         if let Some(bytes) =
             read_browser_history_record_source_bytes(&entry, options.offset, length)?
         {
             return Ok(bytes);
         }
-        // Records without a resolvable source file (registry values, EVTX
-        // events, email messages, or a browser-history record whose source
-        // database can no longer be found) have no backing file to show
-        // instead; their content is the stored record metadata, so the
-        // viewer gets that rendered as text.
-        let rendered = serde_json::to_string_pretty(&entry.metadata_json)
-            .context("rendering record metadata")?;
-        let data = rendered.as_bytes();
-        let total_size = data.len() as u64;
-        let start = options.offset.min(total_size) as usize;
-        let end = options.offset.saturating_add(length as u64).min(total_size) as usize;
-        let bytes = data[start..end].to_vec();
-        let bytes_read = bytes.len();
-        return Ok(EntryBytes {
-            entry_id: entry.entry_id,
-            evidence_id: entry.evidence_id,
-            logical_path: entry.logical_path,
-            offset: options.offset,
-            requested_length: length,
-            bytes_read,
-            total_size,
-            eof: options.offset.saturating_add(bytes_read as u64) >= total_size,
-            bytes,
-        });
+        bail!(
+            "derived artifact has no raw logical-file byte stream; view its metadata in Inspector/Properties: {}",
+            entry.logical_path
+        );
     }
     if entry.entry_kind != "file" {
         bail!(
@@ -17069,6 +17468,47 @@ pub(crate) fn read_filesystem_entry_bytes_in_session(
     if entry.source_kind == "image"
         && entry.metadata_json["filesystem_parser"].as_str() == Some("ntfs")
     {
+        if entry.metadata_json["offset_coordinate_system"].as_str()
+            == Some("decrypted_bitlocker_volume_logical_bytes")
+        {
+            let entry_volume_index = entry.metadata_json["bitlocker_volume_index_zero_based"]
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .with_context(|| {
+                    format!(
+                        "decrypted BitLocker NTFS entry is missing a valid volume index: {}",
+                        entry.logical_path
+                    )
+                })?;
+            let cached = session.cached_bitlocker.as_mut().with_context(|| {
+                format!(
+                    "decrypted BitLocker NTFS bytes require the memory-only unlock context: {}",
+                    entry.logical_path
+                )
+            })?;
+            if cached.source_path != entry.source_path || cached.volume_index != entry_volume_index
+            {
+                bail!(
+                    "decrypted BitLocker reader scope does not match entry {}",
+                    entry.logical_path
+                );
+            }
+            let mut plaintext_volume =
+                PartitionSlice::new(&mut *cached.reader, 0, cached.volume_size);
+            let ntfs = ntfs::Ntfs::new(&mut plaintext_volume).with_context(|| {
+                format!(
+                    "opening decrypted BitLocker NTFS filesystem for {}",
+                    entry.logical_path
+                )
+            })?;
+            return read_mounted_ntfs_entry_bytes(
+                &ntfs,
+                &mut plaintext_volume,
+                &entry,
+                options.offset,
+                length,
+            );
+        }
         let opened = session.cached_disk_image(&entry.source_path)?;
         if let Some(bytes) =
             read_image_ntfs_entry_bytes_from_opened(&entry, options.offset, length, opened)?
@@ -17570,14 +18010,582 @@ fn deleted_recovery_output_status(entry: &EntryForBytes) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecoverySafetyBounds {
+    pub max_bytes: Option<u64>,
+    pub deadline: Option<std::time::Instant>,
+}
+
 pub(crate) fn recover_filesystem_entry_in_session(
     session: &mut EvidenceReadSession,
     options: RecoverEntryOptions,
+) -> Result<RecoverEntryResult> {
+    recover_filesystem_entry_in_session_bounded(session, options, RecoverySafetyBounds::default())
+}
+
+fn stream_mounted_ntfs_to_output<T: Read + Seek>(
+    ntfs: &ntfs::Ntfs,
+    fs: &mut T,
+    entry: &EntryForBytes,
+    output: &mut AtomicOutput,
+    bounds: RecoverySafetyBounds,
+    bytes_read_counter: &mut u64,
+    read_operations_counter: &mut u64,
+) -> Result<(u64, u64, bool)> {
+    let file_record_number = entry.metadata_json["ntfs_file_record_number"]
+        .as_u64()
+        .with_context(|| {
+            format!(
+                "NTFS entry is missing ntfs_file_record_number: {}",
+                entry.logical_path
+            )
+        })?;
+    let data_stream_name = entry.metadata_json["ntfs_data_stream_name"]
+        .as_str()
+        .unwrap_or("");
+    let file = ntfs
+        .file(fs, file_record_number)
+        .with_context(|| format!("opening NTFS entry {}", entry.logical_path))?;
+    if file.is_directory() {
+        bail!(
+            "NTFS entry is a directory, not a readable file: {}",
+            entry.logical_path
+        );
+    }
+    if data_stream_name.is_empty() {
+        if let Some(descriptor) = inspect_ntfs_wof_file(&file, fs)? {
+            let mut iter = file.attributes();
+            while let Some(item_res) = iter.next(fs) {
+                let item = item_res.context("opening NTFS WOF backing-stream attribute")?;
+                let attribute = item
+                    .to_attribute()
+                    .context("opening NTFS WOF backing-stream attribute")?;
+                if attribute.ty().ok() != Some(ntfs::NtfsAttributeType::Data) {
+                    continue;
+                }
+                let name = attribute
+                    .name()
+                    .context("reading NTFS WOF backing-stream name")?
+                    .to_string_lossy();
+                if !name.eq_ignore_ascii_case("WofCompressedData") {
+                    continue;
+                }
+                let value = attribute
+                    .value(fs)
+                    .context("opening WofCompressedData value")?;
+                if value.len() != descriptor.backing_length {
+                    bail!(
+                        "WofCompressedData length changed from {} to {} during the bounded read",
+                        descriptor.backing_length,
+                        value.len()
+                    );
+                }
+                let mut reader = value.attach(fs);
+                let total_size = descriptor.logical_length;
+                let mut offset = 0_u64;
+                let mut is_partial = false;
+                const CHUNK_SIZE: usize = 1024 * 1024;
+
+                while offset < total_size {
+                    if let Some(tracker) = progress::active_job_progress() {
+                        if tracker.is_cancellation_requested() {
+                            bail!("recovery cancelled by request");
+                        }
+                    }
+                    if let Some(deadline) = bounds.deadline {
+                        if std::time::Instant::now() >= deadline {
+                            is_partial = true;
+                            break;
+                        }
+                    }
+                    let to_read = ((total_size - offset).min(CHUNK_SIZE as u64)) as usize;
+                    if let Some(max_bytes) = bounds.max_bytes {
+                        if offset.saturating_add(to_read as u64) > max_bytes {
+                            let allowed = max_bytes.saturating_sub(offset) as usize;
+                            if allowed > 0 {
+                                let decoded = wof::decode_range(
+                                    &mut reader,
+                                    descriptor.backing_length,
+                                    descriptor.logical_length,
+                                    descriptor.info,
+                                    offset,
+                                    allowed,
+                                    wof::WofDecodeLimits::for_output(allowed),
+                                )
+                                .context("decoding bounded WOF logical file range")?;
+                                output.write_all(&decoded.bytes).with_context(|| {
+                                    format!("writing recovered output {}", entry.logical_path)
+                                })?;
+                                offset = offset.saturating_add(allowed as u64);
+                                *bytes_read_counter =
+                                    bytes_read_counter.saturating_add(decoded.bytes.len() as u64);
+                                *read_operations_counter =
+                                    read_operations_counter.saturating_add(1);
+                                progress::progress_recovery_io(decoded.bytes.len() as u64, 1);
+                            }
+                            is_partial = true;
+                            break;
+                        }
+                    }
+
+                    let decoded = wof::decode_range(
+                        &mut reader,
+                        descriptor.backing_length,
+                        descriptor.logical_length,
+                        descriptor.info,
+                        offset,
+                        to_read,
+                        wof::WofDecodeLimits::for_output(to_read),
+                    )
+                    .context("decoding bounded WOF logical file range")?;
+                    output.write_all(&decoded.bytes).with_context(|| {
+                        format!("writing recovered output {}", entry.logical_path)
+                    })?;
+                    offset = offset.saturating_add(to_read as u64);
+                    *bytes_read_counter =
+                        bytes_read_counter.saturating_add(decoded.bytes.len() as u64);
+                    *read_operations_counter = read_operations_counter.saturating_add(1);
+                    progress::progress_recovery_io(decoded.bytes.len() as u64, 1);
+                }
+                return Ok((offset, total_size, is_partial));
+            }
+            bail!("validated WOF descriptor lost its WofCompressedData stream during bounded read");
+        }
+    }
+
+    let mut iter = file.attributes();
+    while let Some(item_res) = iter.next(fs) {
+        let item =
+            item_res.with_context(|| format!("opening NTFS attribute {}", entry.logical_path))?;
+        let data_attribute = item
+            .to_attribute()
+            .with_context(|| format!("opening NTFS data attribute {}", entry.logical_path))?;
+        if data_attribute.ty().ok() != Some(ntfs::NtfsAttributeType::Data) {
+            continue;
+        }
+        let attr_name = data_attribute
+            .name()
+            .with_context(|| format!("reading NTFS data stream name {}", entry.logical_path))?
+            .to_string_lossy();
+        if attr_name != data_stream_name {
+            continue;
+        }
+
+        let data_flags = data_attribute.flags();
+        if data_flags.contains(ntfs::NtfsAttributeFlags::ENCRYPTED) {
+            bail!(
+                "NTFS data stream is encrypted and cannot be decoded safely: {}",
+                entry.logical_path
+            );
+        }
+
+        if data_flags.contains(ntfs::NtfsAttributeFlags::COMPRESSED)
+            && !data_attribute.is_resident()
+        {
+            let header =
+                read_ntfs_compression_header(ntfs, fs, &data_attribute, &entry.logical_path)?;
+            let total_size = header.data_size;
+            let mut offset = 0_u64;
+            let mut is_partial = false;
+            const CHUNK_SIZE: usize = 1024 * 1024;
+
+            while offset < total_size {
+                if let Some(tracker) = progress::active_job_progress() {
+                    if tracker.is_cancellation_requested() {
+                        bail!("recovery cancelled by request");
+                    }
+                }
+                if let Some(deadline) = bounds.deadline {
+                    if std::time::Instant::now() >= deadline {
+                        is_partial = true;
+                        break;
+                    }
+                }
+                let to_read = ((total_size - offset).min(CHUNK_SIZE as u64)) as usize;
+                if let Some(max_bytes) = bounds.max_bytes {
+                    if offset.saturating_add(to_read as u64) > max_bytes {
+                        let allowed = max_bytes.saturating_sub(offset) as usize;
+                        if allowed > 0 {
+                            let (bytes, _) = read_ntfs_compressed_attribute_range(
+                                ntfs,
+                                fs,
+                                &data_attribute,
+                                &entry.logical_path,
+                                offset,
+                                allowed,
+                            )?;
+                            output.write_all(&bytes).with_context(|| {
+                                format!("writing recovered output {}", entry.logical_path)
+                            })?;
+                            offset = offset.saturating_add(bytes.len() as u64);
+                            *bytes_read_counter =
+                                bytes_read_counter.saturating_add(bytes.len() as u64);
+                            *read_operations_counter = read_operations_counter.saturating_add(1);
+                            progress::progress_recovery_io(bytes.len() as u64, 1);
+                        }
+                        is_partial = true;
+                        break;
+                    }
+                }
+                let (bytes, _) = read_ntfs_compressed_attribute_range(
+                    ntfs,
+                    fs,
+                    &data_attribute,
+                    &entry.logical_path,
+                    offset,
+                    to_read,
+                )?;
+                if bytes.is_empty() {
+                    break;
+                }
+                output
+                    .write_all(&bytes)
+                    .with_context(|| format!("writing recovered output {}", entry.logical_path))?;
+                let bytes_len = bytes.len() as u64;
+                offset = offset.saturating_add(bytes_len);
+                *bytes_read_counter = bytes_read_counter.saturating_add(bytes_len);
+                *read_operations_counter = read_operations_counter.saturating_add(1);
+                progress::progress_recovery_io(bytes_len, 1);
+            }
+            return Ok((offset, total_size, is_partial));
+        }
+
+        let data_value = data_attribute
+            .value(fs)
+            .with_context(|| format!("opening NTFS data value {}", entry.logical_path))?;
+        let total_size = data_value.len();
+        let mut data_reader = data_value.attach(fs);
+        let mut offset = 0_u64;
+        let mut is_partial = false;
+        let mut buf = vec![0_u8; 1024 * 1024];
+
+        while offset < total_size {
+            if let Some(tracker) = progress::active_job_progress() {
+                if tracker.is_cancellation_requested() {
+                    bail!("recovery cancelled by request");
+                }
+            }
+            if let Some(deadline) = bounds.deadline {
+                if std::time::Instant::now() >= deadline {
+                    is_partial = true;
+                    break;
+                }
+            }
+            let to_read = (total_size - offset).min(buf.len() as u64) as usize;
+            if let Some(max_bytes) = bounds.max_bytes {
+                if offset.saturating_add(to_read as u64) > max_bytes {
+                    let allowed = max_bytes.saturating_sub(offset) as usize;
+                    if allowed > 0 {
+                        let n = data_reader.read(&mut buf[..allowed]).with_context(|| {
+                            format!("reading NTFS entry {}", entry.logical_path)
+                        })?;
+                        output.write_all(&buf[..n]).with_context(|| {
+                            format!("writing recovered output {}", entry.logical_path)
+                        })?;
+                        offset = offset.saturating_add(n as u64);
+                        *bytes_read_counter = bytes_read_counter.saturating_add(n as u64);
+                        *read_operations_counter = read_operations_counter.saturating_add(1);
+                        progress::progress_recovery_io(n as u64, 1);
+                    }
+                    is_partial = true;
+                    break;
+                }
+            }
+            let n = data_reader
+                .read(&mut buf[..to_read])
+                .with_context(|| format!("reading NTFS entry {}", entry.logical_path))?;
+            if n == 0 {
+                break;
+            }
+            output
+                .write_all(&buf[..n])
+                .with_context(|| format!("writing recovered output {}", entry.logical_path))?;
+            offset = offset.saturating_add(n as u64);
+            *bytes_read_counter = bytes_read_counter.saturating_add(n as u64);
+            *read_operations_counter = read_operations_counter.saturating_add(1);
+            progress::progress_recovery_io(n as u64, 1);
+        }
+        return Ok((offset, total_size, is_partial));
+    }
+
+    if data_stream_name.is_empty() {
+        bail!(
+            "NTFS entry has no unnamed data stream: {}",
+            entry.logical_path
+        );
+    } else {
+        bail!(
+            "NTFS entry has no data stream named {}: {}",
+            data_stream_name,
+            entry.logical_path
+        );
+    }
+}
+
+fn recover_image_ntfs_entry_stream(
+    session: &mut EvidenceReadSession,
+    entry: &EntryForBytes,
+    output_path: &Path,
+    bounds: RecoverySafetyBounds,
+) -> Result<RecoverEntryResult> {
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating recovery directory {}", parent.display()))?;
+    }
+    let mut output = AtomicOutput::create(output_path)
+        .with_context(|| format!("creating recovered output {}", output_path.display()))?;
+
+    let mut bytes_read_count = 0_u64;
+    let mut read_ops_count = 0_u64;
+
+    let (offset, total_size, is_partial) = if entry.metadata_json["offset_coordinate_system"]
+        .as_str()
+        == Some("decrypted_bitlocker_volume_logical_bytes")
+    {
+        let entry_volume_index = entry.metadata_json["bitlocker_volume_index_zero_based"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .with_context(|| {
+                format!(
+                    "decrypted BitLocker NTFS entry is missing a valid volume index: {}",
+                    entry.logical_path
+                )
+            })?;
+        let cached = session.cached_bitlocker.as_mut().with_context(|| {
+            format!(
+                "decrypted BitLocker NTFS bytes require the memory-only unlock context: {}",
+                entry.logical_path
+            )
+        })?;
+        if cached.source_path != entry.source_path || cached.volume_index != entry_volume_index {
+            bail!(
+                "decrypted BitLocker reader scope does not match entry {}",
+                entry.logical_path
+            );
+        }
+        let mut plaintext_volume = PartitionSlice::new(&mut *cached.reader, 0, cached.volume_size);
+        let ntfs = ntfs::Ntfs::new(&mut plaintext_volume).with_context(|| {
+            format!(
+                "opening decrypted BitLocker NTFS filesystem for {}",
+                entry.logical_path
+            )
+        })?;
+        stream_mounted_ntfs_to_output(
+            &ntfs,
+            &mut plaintext_volume,
+            entry,
+            &mut output,
+            bounds,
+            &mut bytes_read_count,
+            &mut read_ops_count,
+        )?
+    } else {
+        let start_offset = image_partition_start_offset(entry, "NTFS")?;
+        let partition_size = require_image_partition_size_bytes(entry, "NTFS")?;
+        let opened = session.cached_disk_image(&entry.source_path)?;
+        validate_partition_range(
+            opened.decoded_size,
+            start_offset,
+            partition_size,
+            "indexed NTFS partition",
+        )?;
+        let mut slice = PartitionSlice::new(&mut *opened.reader, start_offset, partition_size);
+        let ntfs = ntfs::Ntfs::new(&mut slice)
+            .with_context(|| format!("opening NTFS filesystem for {}", entry.logical_path))?;
+        stream_mounted_ntfs_to_output(
+            &ntfs,
+            &mut slice,
+            entry,
+            &mut output,
+            bounds,
+            &mut bytes_read_count,
+            &mut read_ops_count,
+        )?
+    };
+
+    session.bytes_read_total = session.bytes_read_total.saturating_add(bytes_read_count);
+    session.read_operations_total = session.read_operations_total.saturating_add(read_ops_count);
+
+    if !is_partial && offset != total_size {
+        bail!("recovery ended after {offset} of {total_size} bytes; no final output was published");
+    }
+    let filesystem_declared_size = entry.size_bytes.and_then(|value| u64::try_from(value).ok());
+    if !is_partial
+        && entry.is_deleted
+        && filesystem_declared_size.is_some_and(|declared| declared != total_size)
+    {
+        bail!(
+            "deleted-file readable stream is {total_size} bytes but its filesystem-declared logical size is {} bytes; no ambiguous output was published",
+            filesystem_declared_size.unwrap_or_default()
+        );
+    }
+    output
+        .commit()
+        .with_context(|| format!("publishing recovered output {}", output_path.display()))?;
+    Ok(RecoverEntryResult {
+        entry_id: entry.entry_id,
+        evidence_id: entry.evidence_id,
+        output_path: output_path.to_string_lossy().into_owned(),
+        bytes_written: offset,
+        total_size,
+        status: if is_partial {
+            "partial".to_string()
+        } else if entry.is_deleted {
+            deleted_recovery_output_status(entry).to_string()
+        } else {
+            "completed".to_string()
+        },
+    })
+}
+
+fn recover_local_file_entry_stream(
+    session: &mut EvidenceReadSession,
+    entry: &EntryForBytes,
+    source_path: &Path,
+    output_path: &Path,
+    bounds: RecoverySafetyBounds,
+) -> Result<RecoverEntryResult> {
+    if let Some(parent) = output_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating recovery directory {}", parent.display()))?;
+    }
+    let mut output = AtomicOutput::create(output_path)
+        .with_context(|| format!("creating recovered output {}", output_path.display()))?;
+    let metadata = fs::metadata(source_path)
+        .with_context(|| format!("reading entry metadata {}", source_path.display()))?;
+    if !metadata.is_file() {
+        bail!("entry path is no longer a file: {}", source_path.display());
+    }
+    let total_size = metadata.len();
+    let mut file = fs::File::open(source_path)
+        .with_context(|| format!("opening entry {}", source_path.display()))?;
+    let mut offset = 0_u64;
+    let mut is_partial = false;
+    let mut buf = vec![0_u8; 1024 * 1024];
+
+    while offset < total_size {
+        if let Some(tracker) = progress::active_job_progress() {
+            if tracker.is_cancellation_requested() {
+                bail!("recovery cancelled by request");
+            }
+        }
+        if let Some(deadline) = bounds.deadline {
+            if std::time::Instant::now() >= deadline {
+                is_partial = true;
+                break;
+            }
+        }
+        let to_read = (total_size - offset).min(buf.len() as u64) as usize;
+        if let Some(max_bytes) = bounds.max_bytes {
+            if offset.saturating_add(to_read as u64) > max_bytes {
+                let allowed = max_bytes.saturating_sub(offset) as usize;
+                if allowed > 0 {
+                    let n = file
+                        .read(&mut buf[..allowed])
+                        .with_context(|| format!("reading entry {}", source_path.display()))?;
+                    output.write_all(&buf[..n]).with_context(|| {
+                        format!("writing recovered output {}", output_path.display())
+                    })?;
+                    offset = offset.saturating_add(n as u64);
+                    session.bytes_read_total = session.bytes_read_total.saturating_add(n as u64);
+                    session.read_operations_total = session.read_operations_total.saturating_add(1);
+                    progress::progress_recovery_io(n as u64, 1);
+                }
+                is_partial = true;
+                break;
+            }
+        }
+        let n = file
+            .read(&mut buf[..to_read])
+            .with_context(|| format!("reading entry {}", source_path.display()))?;
+        if n == 0 {
+            break;
+        }
+        output
+            .write_all(&buf[..n])
+            .with_context(|| format!("writing recovered output {}", output_path.display()))?;
+        offset = offset.saturating_add(n as u64);
+        session.bytes_read_total = session.bytes_read_total.saturating_add(n as u64);
+        session.read_operations_total = session.read_operations_total.saturating_add(1);
+        progress::progress_recovery_io(n as u64, 1);
+    }
+
+    if !is_partial && offset != total_size {
+        bail!("recovery ended after {offset} of {total_size} bytes; no final output was published");
+    }
+    let filesystem_declared_size = entry.size_bytes.and_then(|value| u64::try_from(value).ok());
+    if !is_partial
+        && entry.is_deleted
+        && filesystem_declared_size.is_some_and(|declared| declared != total_size)
+    {
+        bail!(
+            "deleted-file readable stream is {total_size} bytes but its filesystem-declared logical size is {} bytes; no ambiguous output was published",
+            filesystem_declared_size.unwrap_or_default()
+        );
+    }
+    output
+        .commit()
+        .with_context(|| format!("publishing recovered output {}", output_path.display()))?;
+    Ok(RecoverEntryResult {
+        entry_id: entry.entry_id,
+        evidence_id: entry.evidence_id,
+        output_path: output_path.to_string_lossy().into_owned(),
+        bytes_written: offset,
+        total_size,
+        status: if is_partial {
+            "partial".to_string()
+        } else if entry.is_deleted {
+            deleted_recovery_output_status(entry).to_string()
+        } else {
+            "completed".to_string()
+        },
+    })
+}
+
+pub(crate) fn recover_filesystem_entry_in_session_bounded(
+    session: &mut EvidenceReadSession,
+    options: RecoverEntryOptions,
+    bounds: RecoverySafetyBounds,
 ) -> Result<RecoverEntryResult> {
     if options.output_path.as_os_str().is_empty() {
         bail!("output path cannot be empty");
     }
     let indexed_entry = read_entry_for_bytes(&session.conn, session.case_id, options.entry_id)?;
+
+    if indexed_entry.source_kind == "image"
+        && indexed_entry.metadata_json["filesystem_parser"].as_str() == Some("ntfs")
+        && !is_ntfs_unallocated_entry(&indexed_entry)
+    {
+        return recover_image_ntfs_entry_stream(
+            session,
+            &indexed_entry,
+            &options.output_path,
+            bounds,
+        );
+    }
+
+    if let Some(path) = actual_file_path(
+        &indexed_entry.source_kind,
+        &indexed_entry.source_path,
+        &indexed_entry.logical_path,
+    ) {
+        if path.is_file() {
+            return recover_local_file_entry_stream(
+                session,
+                &indexed_entry,
+                &path,
+                &options.output_path,
+                bounds,
+            );
+        }
+    }
+
     let mut offset = 0_u64;
     let mut bytes = read_filesystem_entry_bytes_in_session(
         session,
@@ -17605,12 +18613,47 @@ pub(crate) fn recover_filesystem_entry_in_session(
         )
     })?;
 
+    let mut is_partial = false;
     loop {
+        // Cooperative cancellation check
+        if let Some(tracker) = progress::active_job_progress() {
+            if tracker.is_cancellation_requested() {
+                bail!("recovery cancelled by request");
+            }
+        }
+
+        // Deadline check
+        if let Some(deadline) = bounds.deadline {
+            if std::time::Instant::now() >= deadline {
+                is_partial = true;
+                break;
+            }
+        }
+
         if !bytes.bytes.is_empty() {
+            // Max bytes check
+            if let Some(max_bytes) = bounds.max_bytes {
+                if offset.saturating_add(bytes.bytes_read as u64) > max_bytes {
+                    let allowed = max_bytes.saturating_sub(offset) as usize;
+                    if allowed > 0 {
+                        output.write_all(&bytes.bytes[..allowed]).with_context(|| {
+                            format!("writing recovered output {}", options.output_path.display())
+                        })?;
+                        offset = offset.saturating_add(allowed as u64);
+                    }
+                    progress::progress_recovery_io(allowed as u64, 1);
+                    is_partial = true;
+                    break;
+                }
+            }
+
             output.write_all(&bytes.bytes).with_context(|| {
                 format!("writing recovered output {}", options.output_path.display())
             })?;
             offset = offset.saturating_add(bytes.bytes_read as u64);
+            progress::progress_recovery_io(bytes.bytes_read as u64, 1);
+        } else {
+            progress::progress_recovery_io(0, 1);
         }
         if bytes.eof || bytes.bytes_read == 0 {
             break;
@@ -17624,13 +18667,15 @@ pub(crate) fn recover_filesystem_entry_in_session(
             },
         )?;
     }
-    if offset != total_size {
+
+    if !is_partial && offset != total_size {
         bail!("recovery ended after {offset} of {total_size} bytes; no final output was published");
     }
     let filesystem_declared_size = indexed_entry
         .size_bytes
         .and_then(|value| u64::try_from(value).ok());
-    if indexed_entry.is_deleted
+    if !is_partial
+        && indexed_entry.is_deleted
         && filesystem_declared_size.is_some_and(|declared| declared != total_size)
     {
         bail!(
@@ -17650,7 +18695,9 @@ pub(crate) fn recover_filesystem_entry_in_session(
         output_path: options.output_path.to_string_lossy().into_owned(),
         bytes_written: offset,
         total_size,
-        status: if indexed_entry.is_deleted {
+        status: if is_partial {
+            "partial".to_string()
+        } else if indexed_entry.is_deleted {
             deleted_recovery_output_status(&indexed_entry).to_string()
         } else {
             "completed".to_string()
@@ -17755,15 +18802,30 @@ pub fn remove_bookmark_folder(
     Ok(RemoveBookmarkFolderResult { folder_id, name })
 }
 
-pub fn list_bookmark_folders(case_path: &Path) -> Result<Vec<BookmarkFolder>> {
+pub fn list_bookmark_folders_page(
+    case_path: &Path,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<BookmarkFolder>, usize, bool)> {
     let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let total_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM bookmark_folders WHERE case_id = ?1",
+        params![case_id],
+        |row| row.get(0),
+    )?;
+    let total = usize::try_from(total_count).unwrap_or(0);
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let sql_offset = i64::try_from(offset).unwrap_or(0);
     let mut stmt = conn.prepare(
         "SELECT id, case_id, parent_id, name, folder_comment, show_in_report, report_order,
                 created_at, updated_at
          FROM bookmark_folders
-         ORDER BY parent_id IS NOT NULL, parent_id, report_order, name",
+         WHERE case_id = ?1
+         ORDER BY parent_id IS NOT NULL, parent_id, report_order, name
+         LIMIT ?2 OFFSET ?3",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![case_id, sql_limit, sql_offset], |row| {
         Ok(BookmarkFolder {
             id: row.get(0)?,
             case_id: row.get(1)?,
@@ -17776,8 +18838,16 @@ pub fn list_bookmark_folders(case_path: &Path) -> Result<Vec<BookmarkFolder>> {
             updated_at: row.get(8)?,
         })
     })?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .context("listing bookmark folders")
+    let folders = rows
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("listing bookmark folders page")?;
+    let has_more = offset.saturating_add(folders.len()) < total;
+    Ok((folders, total, has_more))
+}
+
+pub fn list_bookmark_folders(case_path: &Path) -> Result<Vec<BookmarkFolder>> {
+    let (folders, _, _) = list_bookmark_folders_page(case_path, 0, usize::MAX)?;
+    Ok(folders)
 }
 
 pub fn create_bookmark(case_path: &Path, options: CreateBookmarkOptions) -> Result<i64> {
@@ -17842,17 +18912,33 @@ fn create_bookmark_tx(
     Ok(bookmark_id)
 }
 
-pub fn list_bookmarks(case_path: &Path) -> Result<Vec<Bookmark>> {
+pub fn list_bookmarks_page(
+    case_path: &Path,
+    folder_id: Option<i64>,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<Bookmark>, usize, bool)> {
     let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let total_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM bookmarks b WHERE b.case_id = ?1 AND (?2 IS NULL OR b.folder_id = ?2)",
+        params![case_id, folder_id],
+        |row| row.get(0),
+    )?;
+    let total = usize::try_from(total_count).unwrap_or(0);
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let sql_offset = i64::try_from(offset).unwrap_or(0);
     let mut stmt = conn.prepare(
         "SELECT b.id, b.case_id, b.folder_id, b.bookmark_type, b.data_type, b.title,
                 b.examiner_comment, b.in_report, b.source_ref_json, b.content_ref_json,
                 b.created_at, b.updated_at
          FROM bookmarks b
          JOIN bookmark_folders f ON f.id = b.folder_id
-         ORDER BY f.report_order, f.name, b.id",
+         WHERE b.case_id = ?1 AND (?2 IS NULL OR b.folder_id = ?2)
+         ORDER BY f.report_order, f.name, b.id
+         LIMIT ?3 OFFSET ?4",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![case_id, folder_id, sql_limit, sql_offset], |row| {
         Ok(RawBookmark {
             id: row.get(0)?,
             case_id: row.get(1)?,
@@ -17870,9 +18956,9 @@ pub fn list_bookmarks(case_path: &Path) -> Result<Vec<Bookmark>> {
     })?;
     let raw_bookmarks = rows
         .collect::<std::result::Result<Vec<_>, _>>()
-        .context("listing bookmarks")?;
+        .context("listing bookmarks page")?;
 
-    raw_bookmarks
+    let bookmarks = raw_bookmarks
         .into_iter()
         .map(|raw| {
             let source_ref_json =
@@ -17894,7 +18980,14 @@ pub fn list_bookmarks(case_path: &Path) -> Result<Vec<Bookmark>> {
                 updated_at: raw.updated_at,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let has_more = offset.saturating_add(bookmarks.len()) < total;
+    Ok((bookmarks, total, has_more))
+}
+
+pub fn list_bookmarks(case_path: &Path) -> Result<Vec<Bookmark>> {
+    let (bookmarks, _, _) = list_bookmarks_page(case_path, None, 0, usize::MAX)?;
+    Ok(bookmarks)
 }
 
 pub fn add_bookmark_item(
@@ -18220,15 +19313,30 @@ pub fn create_bookmark_with_bulk_entries(
     Ok((folder_id, result))
 }
 
-pub fn list_bookmark_items(
+pub fn list_bookmark_items_page(
     case_path: &Path,
     bookmark_id: Option<i64>,
-) -> Result<Vec<BookmarkItem>> {
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<BookmarkItem>, usize, bool)> {
     let conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     if let Some(bookmark_id) = bookmark_id {
         ensure_bookmark(&conn, case_id, bookmark_id)?;
     }
+
+    let total_count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM bookmark_items bi
+         JOIN bookmarks b ON b.id = bi.bookmark_id
+         WHERE b.case_id = ?1
+           AND (?2 IS NULL OR bi.bookmark_id = ?2)",
+        params![case_id, bookmark_id],
+        |row| row.get(0),
+    )?;
+    let total = usize::try_from(total_count).unwrap_or(0);
+    let sql_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let sql_offset = i64::try_from(offset).unwrap_or(0);
 
     let mut stmt = conn.prepare(
         "SELECT bi.id, bi.bookmark_id, bi.evidence_id, bi.entry_id, bi.item_order,
@@ -18238,29 +19346,46 @@ pub fn list_bookmark_items(
          JOIN bookmarks b ON b.id = bi.bookmark_id
          WHERE b.case_id = ?1
            AND (?2 IS NULL OR bi.bookmark_id = ?2)
-         ORDER BY bi.bookmark_id, bi.item_order, bi.id",
+         ORDER BY bi.bookmark_id, bi.item_order, bi.id
+         LIMIT ?3 OFFSET ?4",
     )?;
-    let rows = stmt.query_map(params![case_id, bookmark_id], |row| {
-        Ok(RawBookmarkItem {
-            id: row.get(0)?,
-            bookmark_id: row.get(1)?,
-            evidence_id: row.get(2)?,
-            entry_id: row.get(3)?,
-            item_order: row.get(4)?,
-            display_name: row.get(5)?,
-            logical_path: row.get(6)?,
-            selection_offset: row.get(7)?,
-            selection_length: row.get(8)?,
-            data_preview: row.get(9)?,
-            item_ref_json: row.get(10)?,
-            created_at: row.get(11)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![case_id, bookmark_id, sql_limit, sql_offset],
+        |row| {
+            Ok(RawBookmarkItem {
+                id: row.get(0)?,
+                bookmark_id: row.get(1)?,
+                evidence_id: row.get(2)?,
+                entry_id: row.get(3)?,
+                item_order: row.get(4)?,
+                display_name: row.get(5)?,
+                logical_path: row.get(6)?,
+                selection_offset: row.get(7)?,
+                selection_length: row.get(8)?,
+                data_preview: row.get(9)?,
+                item_ref_json: row.get(10)?,
+                created_at: row.get(11)?,
+            })
+        },
+    )?;
     let raw_items = rows
         .collect::<std::result::Result<Vec<_>, _>>()
-        .context("listing bookmark items")?;
+        .context("listing bookmark items page")?;
 
-    raw_items.into_iter().map(bookmark_item_from_raw).collect()
+    let items = raw_items
+        .into_iter()
+        .map(bookmark_item_from_raw)
+        .collect::<Result<Vec<_>>>()?;
+    let has_more = offset.saturating_add(items.len()) < total;
+    Ok((items, total, has_more))
+}
+
+pub fn list_bookmark_items(
+    case_path: &Path,
+    bookmark_id: Option<i64>,
+) -> Result<Vec<BookmarkItem>> {
+    let (items, _, _) = list_bookmark_items_page(case_path, bookmark_id, 0, usize::MAX)?;
+    Ok(items)
 }
 
 pub fn report_data(case_path: &Path) -> Result<ReportData> {
@@ -19125,16 +20250,32 @@ pub fn max_filesystem_entry_id(case_path: &Path) -> Result<i64> {
     .context("reading max filesystem entry id")
 }
 
+/// Canonical helper for reading the active case generation from an open connection or transaction.
+/// Propagates database errors and never fabricates fallback generations.
+pub fn read_case_generation(conn: &Connection, case_id: Option<i64>) -> Result<i64> {
+    if let Some(cid) = case_id {
+        conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM audit_events WHERE case_id = ?1",
+            params![cid],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("reading case generation for case {cid}"))
+    } else {
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM audit_events", [], |row| {
+            row.get(0)
+        })
+        .context("reading case generation")
+    }
+}
+
 /// Monotonic case-write generation used only to invalidate derived read
 /// caches. Every supported mutation records an audit event in the same
 /// transaction, including in-place metadata updates that do not change the
 /// filesystem-entry count or maximum id.
 pub fn case_mutation_generation(case_path: &Path) -> Result<i64> {
     let conn = open_existing_case(case_path)?;
-    conn.query_row("SELECT COALESCE(MAX(id), 0) FROM audit_events", [], |row| {
-        row.get(0)
-    })
-    .context("reading case mutation generation")
+    let case_id = active_case_id(&conn).ok();
+    read_case_generation(&conn, case_id)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -19159,6 +20300,10 @@ pub struct CategoryEntryFilters {
 pub struct CategoryEntryCursor {
     pub logical_path: String,
     pub id: i64,
+    /// Optional to keep legacy path/id cursors deserializable. New cursors are
+    /// bound to the case mutation generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_generation: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -19169,9 +20314,209 @@ pub struct CategoryEntryPage {
     pub limit: usize,
     pub offset: usize,
     pub next_cursor: Option<CategoryEntryCursor>,
+    /// Exact SQLite snapshot generation from which this page was read.
+    pub case_generation: i64,
+    /// Explicit disclosure for this stored-row query.  This is additive for
+    /// API compatibility and deliberately does not claim that upstream
+    /// parsers covered every artifact in the original evidence.
+    pub completeness: result_completeness::ResultCompleteness,
 }
 
 const CATEGORY_ENTRY_PAGE_LIMIT: usize = 1_000;
+
+#[allow(clippy::too_many_arguments)]
+fn category_entry_page_completeness(
+    case_id: i64,
+    evidence_id: Option<i64>,
+    category_main: &str,
+    category_sub: Option<&str>,
+    filters: &CategoryEntryFilters,
+    after: Option<&CategoryEntryCursor>,
+    requested_limit: usize,
+    effective_limit: usize,
+    requested_offset: usize,
+    effective_offset: usize,
+    total_in_category: i64,
+    total_matching: i64,
+    emitted: usize,
+    has_more: bool,
+    next_cursor: Option<&CategoryEntryCursor>,
+    case_generation: String,
+) -> Result<result_completeness::ResultCompleteness> {
+    use result_completeness::{
+        CompletenessReason, CompletenessReasonKind, ResultCompleteness, ResultCompletenessStatus,
+        ResultContinuation, ResultCounts, ResultOperation, ResultProducer, ResultScope,
+    };
+
+    let total_in_category = u64::try_from(total_in_category)
+        .context("category row count cannot be represented as an unsigned count")?;
+    let total_matching = u64::try_from(total_matching)
+        .context("matching category row count cannot be represented as an unsigned count")?;
+    let emitted = u64::try_from(emitted)
+        .context("emitted category row count cannot be represented as an unsigned count")?;
+    let output_omitted = total_matching.saturating_sub(emitted);
+    let known_later_omitted = if after.is_none() {
+        let page_end = u64::try_from(effective_offset)
+            .unwrap_or(u64::MAX)
+            .saturating_add(emitted);
+        Some(total_matching.saturating_sub(page_end))
+    } else {
+        None
+    };
+
+    // This query can account exactly for rows already stored in the case
+    // database. It cannot, by itself, prove that every relevant source
+    // artifact was parsed into a row, so every response discloses that
+    // upstream coverage remains unknown.
+    let mut reasons = vec![CompletenessReason {
+        kind: CompletenessReasonKind::LegacyUnknown,
+        code: "upstream_artifact_coverage_not_assessed".to_string(),
+        message: "This result accounts for stored category rows only; source-artifact and parser coverage are not joined into this response.".to_string(),
+        retryable: false,
+        affected_input_count: None,
+        affected_output_count: None,
+        details: serde_json::json!({
+            "assessed_layer": "stored_category_rows",
+            "unassessed_layer": "source_artifact_and_parser_coverage"
+        }),
+    }];
+
+    if has_more {
+        reasons.push(CompletenessReason {
+            kind: CompletenessReasonKind::Limit,
+            code: "category_query_page_limit".to_string(),
+            message: "Additional matching stored rows exist after this response page.".to_string(),
+            retryable: true,
+            affected_input_count: None,
+            // With a keyset cursor the query does not know how many matching
+            // rows preceded that opaque cursor, so do not manufacture a
+            // count. Offset paging has an exact remaining count.
+            affected_output_count: known_later_omitted,
+            details: serde_json::json!({
+                "effective_limit": effective_limit,
+                "requested_limit": requested_limit
+            }),
+        });
+    }
+    if effective_offset > 0 || after.is_some() {
+        reasons.push(CompletenessReason {
+            kind: CompletenessReasonKind::Limit,
+            code: "category_query_page_window".to_string(),
+            message: "This response is a later page and excludes matching stored rows from earlier pages.".to_string(),
+            retryable: true,
+            affected_input_count: None,
+            affected_output_count: None,
+            details: serde_json::json!({
+                "cursor_supplied": after.is_some(),
+                "effective_offset": effective_offset,
+                "requested_offset": requested_offset
+            }),
+        });
+    }
+    if after.is_some_and(|cursor| cursor.snapshot_generation.is_none()) {
+        reasons.push(CompletenessReason {
+            kind: CompletenessReasonKind::LegacyUnknown,
+            code: "category_query_legacy_unbound_cursor".to_string(),
+            message: "A legacy path/id cursor was accepted without a case-generation binding; this page may not share a snapshot with earlier pages.".to_string(),
+            retryable: false,
+            affected_input_count: None,
+            affected_output_count: None,
+            details: serde_json::json!({"generation_bound": false}),
+        });
+    }
+    if requested_limit != effective_limit {
+        reasons.push(CompletenessReason {
+            kind: CompletenessReasonKind::Limit,
+            code: "category_query_limit_clamped".to_string(),
+            message:
+                "The requested page size was normalized to the supported category-query limit."
+                    .to_string(),
+            retryable: true,
+            affected_input_count: None,
+            affected_output_count: None,
+            details: serde_json::json!({
+                "requested_limit": requested_limit,
+                "effective_limit": effective_limit,
+                "maximum_limit": CATEGORY_ENTRY_PAGE_LIMIT
+            }),
+        });
+    }
+
+    let continuation = if has_more {
+        let cursor = next_cursor.context(
+            "category query reported additional rows without producing a continuation cursor",
+        )?;
+        ResultContinuation::Cursor {
+            opaque_token: serde_json::to_string(cursor)
+                .context("serializing category query continuation cursor")?,
+            snapshot_generation: case_generation.clone(),
+            remaining_estimate: known_later_omitted,
+        }
+    } else if output_omitted > 0 {
+        // The only omitted rows are from an earlier offset/keyset window. A
+        // restart is the truthful way to retrieve the complete stored set.
+        ResultContinuation::Restart
+    } else {
+        ResultContinuation::None
+    };
+
+    let status = if output_omitted > 0 {
+        ResultCompletenessStatus::Truncated
+    } else {
+        ResultCompletenessStatus::Unknown
+    };
+    ResultCompleteness::new(
+        status,
+        ResultCounts {
+            input_unit: "stored category entry".to_string(),
+            input_total: Some(total_in_category),
+            input_processed: total_in_category,
+            input_skipped: 0,
+            input_failed: 0,
+            output_unit: "entry".to_string(),
+            output_matched: Some(total_matching),
+            output_emitted: emitted,
+            output_omitted,
+        },
+        ResultScope {
+            operation: ResultOperation::Query,
+            description: "Query examiner-visible entries already stored in a forensic category"
+                .to_string(),
+            case_id: Some(case_id),
+            evidence_ids: evidence_id.into_iter().collect(),
+            case_generation: Some(case_generation),
+            canonical_request: serde_json::json!({
+                "after": after,
+                "category_main": category_main,
+                "category_sub": category_sub,
+                "evidence_id": evidence_id,
+                "filters": {
+                    "entry_type": filters.entry_type,
+                    "extension": filters.extension,
+                    "flags": filters.flags,
+                    "from_utc": filters.from_utc,
+                    "name": filters.name,
+                    "sha256": filters.sha256,
+                    "to_utc": filters.to_utc
+                },
+                "limit": requested_limit,
+                "offset": requested_offset
+            }),
+            requested_limit: Some(u64::try_from(requested_limit).unwrap_or(u64::MAX)),
+            projection_version: Some("category-entry-page-v1".to_string()),
+            output_format: Some("application/json".to_string()),
+        },
+        continuation,
+        reasons,
+        ResultProducer {
+            component: "kdft-case.category-query".to_string(),
+            component_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            parser_jobs: Vec::new(),
+        },
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    )
+    .context("building category query result-completeness disclosure")
+}
 
 /// Exact per-category entry counts computed in SQLite from the stored
 /// `category_main` / `category_sub` metadata stamped at process time. Entries
@@ -19189,10 +20534,7 @@ pub fn category_entry_counts(case_path: &Path) -> Result<Vec<CategoryCount>> {
            AND COALESCE(json_extract(metadata_json, '$.category_hidden'), 0) <> 1
            AND COALESCE(json_extract(metadata_json, '$.artifact_kind'), '')
                NOT IN ('filesystem_parser_error', 'filesystem_parser_summary')
-           AND NOT (
-               COALESCE(json_extract(metadata_json, '$.category_main'), '') = 'Operating System'
-               AND COALESCE(json_extract(metadata_json, '$.category_sub'), '') = 'System files'
-           )
+
          GROUP BY 1, 2
          ORDER BY 1, 2",
     )?;
@@ -19246,10 +20588,24 @@ pub fn list_entries_by_category_filtered(
     limit: usize,
     offset: usize,
 ) -> Result<CategoryEntryPage> {
-    let conn = open_existing_case(case_path)?;
-    let case_id = active_case_id(&conn)?;
+    let requested_limit = limit;
+    let requested_offset = offset;
+    let mut conn = open_existing_case(case_path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let case_id = active_case_id(&tx)?;
+    let audit_generation: i64 = read_case_generation(&tx, Some(case_id))
+        .context("reading category query snapshot generation")?;
+    let case_generation = format!("audit-{audit_generation}");
+    if let Some(cursor_generation) = after.and_then(|cursor| cursor.snapshot_generation.as_deref())
+    {
+        if cursor_generation != case_generation {
+            bail!(
+                "category query cursor belongs to a different case generation; restart the query"
+            );
+        }
+    }
     if let Some(evidence_id) = evidence_id {
-        ensure_evidence_source(&conn, case_id, evidence_id)?;
+        ensure_evidence_source(&tx, case_id, evidence_id)?;
     }
     let category_main = category_main.trim();
     let category_sub = category_sub.map(str::trim);
@@ -19312,20 +20668,17 @@ pub fn list_entries_by_category_filtered(
     let after_path = after.map(|cursor| cursor.logical_path.as_str());
     let after_id = after.map(|cursor| cursor.id);
 
-    let total_in_category: i64 = conn
+    let total_in_category: i64 = tx
         .query_row(
             "SELECT COUNT(*)
              FROM filesystem_entries
              WHERE case_id = ?1
                AND (?2 IS NULL OR evidence_id = ?2)
-                AND entry_kind != 'directory'
+                AND (entry_kind != 'directory' OR COALESCE(json_extract(metadata_json, '$.artifact_kind'), '') IN ('registry_hive', 'registry_key'))
                 AND COALESCE(json_extract(metadata_json, '$.category_hidden'), 0) <> 1
                 AND COALESCE(json_extract(metadata_json, '$.artifact_kind'), '')
                     NOT IN ('filesystem_parser_error', 'filesystem_parser_summary')
-                AND NOT (
-                   COALESCE(json_extract(metadata_json, '$.category_main'), '') = 'Operating System'
-                   AND COALESCE(json_extract(metadata_json, '$.category_sub'), '') = 'System files'
-               )
+
                AND (?3 = '' OR COALESCE(json_extract(metadata_json, '$.category_main'), 'Uncategorized') = ?3)
                AND (?4 IS NULL OR COALESCE(json_extract(metadata_json, '$.category_sub'), '') = ?4)",
             params![case_id, evidence_id, category_main, category_sub],
@@ -19357,19 +20710,16 @@ pub fn list_entries_by_category_filtered(
          FROM filesystem_entries
          WHERE case_id = :case_id
            AND (:evidence_id IS NULL OR evidence_id = :evidence_id)
-           AND entry_kind != 'directory'
+           AND (entry_kind != 'directory' OR COALESCE(json_extract(metadata_json, '$.artifact_kind'), '') IN ('registry_hive', 'registry_key'))
            AND COALESCE(json_extract(metadata_json, '$.category_hidden'), 0) <> 1
            AND COALESCE(json_extract(metadata_json, '$.artifact_kind'), '')
                NOT IN ('filesystem_parser_error', 'filesystem_parser_summary')
-           AND NOT (
-               COALESCE(json_extract(metadata_json, '$.category_main'), '') = 'Operating System'
-               AND COALESCE(json_extract(metadata_json, '$.category_sub'), '') = 'System files'
-           )
+
            AND (:category_main = '' OR COALESCE(json_extract(metadata_json, '$.category_main'), 'Uncategorized') = :category_main)
            AND (:category_sub IS NULL OR COALESCE(json_extract(metadata_json, '$.category_sub'), '') = :category_sub)
            {filtered_predicate}"
     );
-    let total_matching: i64 = conn
+    let total_matching: i64 = tx
         .query_row(
             &filtered_count_sql,
             named_params! {
@@ -19397,14 +20747,11 @@ pub fn list_entries_by_category_filtered(
          FROM filesystem_entries
          WHERE case_id = :case_id
            AND (:evidence_id IS NULL OR evidence_id = :evidence_id)
-           AND entry_kind != 'directory'
+           AND (entry_kind != 'directory' OR COALESCE(json_extract(metadata_json, '$.artifact_kind'), '') IN ('registry_hive', 'registry_key'))
            AND COALESCE(json_extract(metadata_json, '$.category_hidden'), 0) <> 1
            AND COALESCE(json_extract(metadata_json, '$.artifact_kind'), '')
                NOT IN ('filesystem_parser_error', 'filesystem_parser_summary')
-           AND NOT (
-               COALESCE(json_extract(metadata_json, '$.category_main'), '') = 'Operating System'
-               AND COALESCE(json_extract(metadata_json, '$.category_sub'), '') = 'System files'
-           )
+
            AND (:category_main = '' OR COALESCE(json_extract(metadata_json, '$.category_main'), 'Uncategorized') = :category_main)
            AND (:category_sub IS NULL OR COALESCE(json_extract(metadata_json, '$.category_sub'), '') = :category_sub)
            {filtered_predicate}
@@ -19414,7 +20761,7 @@ pub fn list_entries_by_category_filtered(
          ORDER BY logical_path, id
          LIMIT :fetch_limit OFFSET :offset"
     );
-    let mut stmt = conn.prepare(&page_sql)?;
+    let mut stmt = tx.prepare(&page_sql)?;
     let rows = stmt.query_map(
         named_params! {
             ":case_id": case_id,
@@ -19465,10 +20812,33 @@ pub fn list_entries_by_category_filtered(
         entries.last().map(|last| CategoryEntryCursor {
             logical_path: last.logical_path.clone(),
             id: last.id,
+            snapshot_generation: Some(case_generation.clone()),
         })
     } else {
         None
     };
+
+    let completeness = category_entry_page_completeness(
+        case_id,
+        evidence_id,
+        category_main,
+        category_sub,
+        filters,
+        after,
+        requested_limit,
+        limit,
+        requested_offset,
+        effective_offset,
+        total_in_category,
+        total_matching,
+        entries.len(),
+        has_more,
+        next_cursor.as_ref(),
+        case_generation,
+    )?;
+    drop(stmt);
+    tx.commit()
+        .context("committing category query read snapshot")?;
 
     Ok(CategoryEntryPage {
         entries,
@@ -19477,6 +20847,8 @@ pub fn list_entries_by_category_filtered(
         limit,
         offset: effective_offset,
         next_cursor,
+        case_generation: audit_generation,
+        completeness,
     })
 }
 
@@ -20438,12 +21810,30 @@ pub(crate) struct EvidenceReadSession {
     conn: Connection,
     case_id: i64,
     cached_image: Option<CachedEvidenceImage>,
+    cached_bitlocker: Option<CachedDecryptedBitLockerVolume>,
     bypass_shared_ewf_cache: bool,
+    pub(crate) bytes_read_total: u64,
+    pub(crate) read_operations_total: u64,
+    #[allow(dead_code)]
+    pub(crate) session_opens: u64,
 }
 
 struct CachedEvidenceImage {
     source_path: String,
     opened: OpenedDiskImage,
+}
+
+/// One worker-local plaintext view of an unlocked BitLocker volume.
+///
+/// The credential is consumed while this reader is created and is never kept
+/// in the case database, this session, or parser diagnostics. Offsets exposed
+/// by this reader are plaintext volume-logical offsets; they must never be
+/// combined with the encrypted partition start and presented as media offsets.
+struct CachedDecryptedBitLockerVolume {
+    source_path: String,
+    volume_index: usize,
+    volume_size: u64,
+    reader: Box<dyn disk_forensic::container::ReadSeek>,
 }
 
 impl EvidenceReadSession {
@@ -20454,7 +21844,11 @@ impl EvidenceReadSession {
             conn,
             case_id,
             cached_image: None,
+            cached_bitlocker: None,
             bypass_shared_ewf_cache: false,
+            bytes_read_total: 0,
+            read_operations_total: 0,
+            session_opens: 1,
         })
     }
 
@@ -20480,8 +21874,106 @@ impl EvidenceReadSession {
             conn,
             case_id,
             cached_image: None,
+            cached_bitlocker: None,
             bypass_shared_ewf_cache: false,
+            bytes_read_total: 0,
+            read_operations_total: 0,
+            session_opens: 1,
         })
+    }
+
+    fn open_with_bitlocker(
+        case_path: &Path,
+        evidence_id: i64,
+        context: BitLockerProcessingContext<'_>,
+    ) -> Result<Self> {
+        let mut session = Self::open(case_path)?;
+        session.initialize_bitlocker_reader(evidence_id, context)?;
+        Ok(session)
+    }
+
+    fn open_worker_read_only_with_bitlocker(
+        case_path: &Path,
+        evidence_id: i64,
+        context: BitLockerProcessingContext<'_>,
+    ) -> Result<Self> {
+        let mut session = Self::open_worker_read_only(case_path)?;
+        session.initialize_bitlocker_reader(evidence_id, context)?;
+        Ok(session)
+    }
+
+    fn initialize_bitlocker_reader(
+        &mut self,
+        evidence_id: i64,
+        context: BitLockerProcessingContext<'_>,
+    ) -> Result<()> {
+        ensure_evidence_source(&self.conn, self.case_id, evidence_id)?;
+        let source_path: String = self
+            .conn
+            .query_row(
+                "SELECT source_path FROM evidence_sources
+                 WHERE case_id = ?1 AND id = ?2 AND source_kind = 'image'",
+                params![self.case_id, evidence_id],
+                |row| row.get(0),
+            )
+            .context("BitLocker processing requires image evidence")?;
+        let volume_index = i64::try_from(context.volume_index)
+            .context("BitLocker volume index exceeds the case database range")?;
+        let (encrypted_partition_start, volume_size): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT
+                     json_extract(metadata_json, '$.encrypted_partition_decoded_media_start_offset'),
+                     json_extract(metadata_json, '$.partition_size_bytes')
+                 FROM filesystem_entries
+                 WHERE case_id = ?1 AND evidence_id = ?2
+                   AND json_extract(metadata_json, '$.offset_coordinate_system') =
+                       'decrypted_bitlocker_volume_logical_bytes'
+                   AND json_extract(metadata_json, '$.bitlocker_volume_index_zero_based') = ?3
+                   AND json_extract(metadata_json, '$.encrypted_partition_decoded_media_start_offset') IS NOT NULL
+                   AND json_extract(metadata_json, '$.partition_size_bytes') IS NOT NULL
+                 ORDER BY id
+                 LIMIT 1",
+                params![self.case_id, evidence_id, volume_index],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .with_context(|| {
+                format!(
+                    "finding indexed plaintext geometry for BitLocker volume index {}",
+                    context.volume_index
+                )
+            })?;
+        let encrypted_partition_start = u64::try_from(encrypted_partition_start)
+            .context("indexed BitLocker partition start is negative")?;
+        let volume_size =
+            u64::try_from(volume_size).context("indexed BitLocker volume size is negative")?;
+
+        let opened = open_disk_image(Path::new(&source_path))?;
+        validate_partition_range(
+            opened.decoded_size,
+            encrypted_partition_start,
+            volume_size,
+            "indexed encrypted BitLocker partition",
+        )?;
+        let encrypted_slice =
+            OwnedPartitionSlice::new(opened.reader, encrypted_partition_start, volume_size);
+        let decrypted = bitlocker_decrypt::unlock_reader(
+            encrypted_slice,
+            bitlocker_credential(context.credential)?,
+        )
+        .with_context(|| {
+            format!(
+                "unlocking indexed BitLocker volume index {} for structured processing",
+                context.volume_index
+            )
+        })?;
+        self.cached_bitlocker = Some(CachedDecryptedBitLockerVolume {
+            source_path,
+            volume_index: context.volume_index,
+            volume_size,
+            reader: Box::new(decrypted),
+        });
+        Ok(())
     }
 
     /// Hash workers bind their checkpoints to a source-generation snapshot.
@@ -24756,7 +26248,7 @@ struct EntryCategory {
 /// Version stamp written into every entry's `category_source`. Public so the
 /// UI can detect entries categorized by an older classifier and offer the
 /// DB-only category refresh only when it would actually change something.
-pub const ENTRY_CATEGORY_CLASSIFIER_VERSION: &str = "evidence_path_rules_v6";
+pub const ENTRY_CATEGORY_CLASSIFIER_VERSION: &str = "evidence_path_rules_v7";
 const RECATEGORIZE_BATCH_SIZE: i64 = 1_000;
 const NON_ARTIFACT_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "ico", "bmp", "svg", "webp", "tif", "tiff", "dll", "exe", "sys",
@@ -25222,9 +26714,24 @@ fn classify_entry(
             return category(
                 "Accounts and Identity",
                 "Credential and secret stores",
-                "Known credential, token, key, password, or secret store",
+                "Known credential, token, key, password, or secret store location; this category does not claim that a value was decoded or recovered",
                 "high",
                 &["accounts", "credentials", "secrets", "store"],
+            );
+        }
+        "protected_credential_material" => {
+            return category(
+                "Accounts and Identity",
+                "Protected credential material",
+                "Protected or encrypted credential infrastructure candidate; no credential or secret value was decoded or recovered",
+                "high",
+                &[
+                    "accounts",
+                    "dpapi",
+                    "protected-material",
+                    "encrypted-candidate",
+                    "not-decoded",
+                ],
             );
         }
         "credential_lead" | "secret_lead" => {
@@ -25393,31 +26900,58 @@ fn classify_entry(
                 &["accounts", "identity", "browser", "web"],
             );
         }
-        "registry_hive" | "registry_key" | "registry_value" => {
+        "registry_hive" => {
             return category(
-                "Operating System",
-                "Registry hives",
-                "Windows Registry hive key/value record",
-                "medium",
+                "Windows Registry",
+                "Hives",
+                "Windows Registry hive record",
+                "high",
                 &["windows", "registry", "hive"],
+            );
+        }
+        "registry_key" => {
+            return category(
+                "Windows Registry",
+                "Keys",
+                "Windows Registry key record",
+                "high",
+                &["windows", "registry", "key"],
+            );
+        }
+        "registry_value" => {
+            return category(
+                "Windows Registry",
+                "Values",
+                "Windows Registry value record",
+                "high",
+                &["windows", "registry", "value"],
             );
         }
         "external_registry_parser_run" | "external_registry_parser_line" => {
             return category(
-                "Operating System",
-                "Registry interpreted artifacts",
+                "Windows Registry",
+                "Interpreted Registry Artifacts",
                 "Examiner-supplied RegRipper adapter output retained with executable and source provenance",
                 "medium",
                 &["windows", "registry", "external-parser", "regripper"],
             );
         }
-        "evtx_log" | "evtx_event_record" | "evtx_external_record" => {
+        "evtx_log" => {
             return category(
                 "Operating System",
-                "Event logs",
-                "Windows EVTX event log record",
+                "Windows EVTX parser status",
+                "Parser status and coverage record for a Windows EVTX source",
                 "high",
-                &["windows", "event-log", "timeline"],
+                &["windows", "evtx", "parser-status"],
+            );
+        }
+        "evtx_event_record" | "evtx_external_record" => {
+            return category(
+                "Operating System",
+                "Windows EVTX records",
+                "Decoded Windows EVTX event record",
+                "high",
+                &["windows", "evtx", "event-log", "decoded", "timeline"],
             );
         }
         "deleted_file_record" => {
@@ -25556,6 +27090,10 @@ fn classify_entry(
     if let Some(category) =
         precise_forensic_artifact_category(&combined, &filename, ext.as_deref(), entry_kind)
     {
+        return category;
+    }
+
+    if let Some(category) = corroborated_mobile_backup_category(&combined, &filename, metadata) {
         return category;
     }
 
@@ -25760,17 +27298,6 @@ fn classify_entry(
             &["windows", "registry", "accounts"],
         );
     }
-    if keyword_heuristics_allowed
-        && contains_any(&combined, &[".evtx", ".etl", "event logs", "winevt/logs"])
-    {
-        return category(
-            "Operating System",
-            "Event logs",
-            "Windows event log or trace log",
-            "medium",
-            &["windows", "logs", "timeline"],
-        );
-    }
     if keyword_heuristics_allowed && contains_any(&combined, &["recycle.bin", "/trash", "/.trash"])
     {
         return category(
@@ -25795,28 +27322,6 @@ fn classify_entry(
             &["location", "maps"],
         );
     }
-    if keyword_heuristics_allowed
-        && contains_any(
-            &combined,
-            &[
-                "mobilebackup",
-                "manifest.db",
-                "android",
-                "iphone",
-                "itunes backup",
-                "mobile sync",
-            ],
-        )
-    {
-        return category(
-            "Mobile Devices",
-            "Mobile backups and app data",
-            "iOS or Android backup or mobile app artifact",
-            "medium",
-            &["mobile", "backup"],
-        );
-    }
-
     if ext_in(
         ext.as_deref(),
         &[
@@ -26105,6 +27610,72 @@ fn is_internal_diagnostic_metadata(metadata: &serde_json::Map<String, serde_json
     )
 }
 
+/// Returns a mobile-backup category only when the evidence supplies more than
+/// a generic filename.  `manifest.db` is widely used by unrelated desktop
+/// applications, so its basename alone is never evidence of an iOS backup.
+fn corroborated_mobile_backup_category(
+    normalized_full_path: &str,
+    filename: &str,
+    metadata: &serde_json::Value,
+) -> Option<EntryCategory> {
+    let schema_validated = [
+        "mobile_backup_schema_validated",
+        "ios_backup_schema_validated",
+        "ios_manifest_schema_validated",
+    ]
+    .iter()
+    .any(|key| metadata.get(*key).and_then(serde_json::Value::as_bool) == Some(true));
+    let layout_validated = [
+        "mobile_backup_layout_validated",
+        "ios_backup_layout_validated",
+    ]
+    .iter()
+    .any(|key| metadata.get(*key).and_then(serde_json::Value::as_bool) == Some(true));
+
+    let recognized_component = matches!(
+        filename,
+        "manifest.db" | "manifest.plist" | "info.plist" | "status.plist"
+    );
+    if !recognized_component {
+        return None;
+    }
+
+    // Canonical Apple backup layouts contain a per-device/per-backup
+    // directory between MobileSync/Backup and the component filename.  Merely
+    // mentioning "mobile", "iPhone", or "Manifest.db" is insufficient.
+    let canonical_layout = ["/mobilesync/backup/", "/itunes/backup/"]
+        .iter()
+        .any(|marker| {
+            normalized_full_path.find(marker).is_some_and(|position| {
+                let tail = &normalized_full_path[position + marker.len()..];
+                let mut segments = tail.split('/').filter(|segment| !segment.is_empty());
+                let backup_directory = segments.next();
+                let component = segments.next();
+                backup_directory.is_some_and(|segment| segment.len() >= 8)
+                    && component == Some(filename)
+                    && segments.next().is_none()
+            })
+        });
+
+    if !schema_validated && !layout_validated && !canonical_layout {
+        return None;
+    }
+
+    Some(category(
+        "Mobile Devices",
+        "iOS backup sources",
+        if schema_validated {
+            "iOS backup component corroborated by a validated backup database/schema"
+        } else if layout_validated {
+            "iOS backup component corroborated by validated backup layout metadata; database schema has not been decoded"
+        } else {
+            "iOS backup component in a canonical MobileSync/Backup device directory; database schema has not been decoded"
+        },
+        if schema_validated { "high" } else { "medium" },
+        &["mobile", "ios", "backup", "corroborated-source"],
+    ))
+}
+
 fn precise_forensic_artifact_category(
     normalized_full_path: &str,
     filename: &str,
@@ -26131,13 +27702,40 @@ fn precise_forensic_artifact_category(
         ));
     }
 
-    if ext == Some("evtx") && normalized_full_path.contains("/windows/system32/winevt/logs/") {
+    if ext == Some("evtx") {
+        let canonical_windows_path =
+            normalized_full_path.contains("/windows/system32/winevt/logs/");
         return Some(category(
             "Operating System",
-            "Event logs",
-            "Windows EVTX event log",
-            "high",
-            &["windows", "logs", "timeline"],
+            "Windows EVTX files",
+            "Windows EVTX source file; individual events are shown only after successful record decoding",
+            if canonical_windows_path { "high" } else { "medium" },
+            &["windows", "evtx", "event-log-source", "not-a-decoded-record"],
+        ));
+    }
+
+    if ext == Some("etl") {
+        return Some(category(
+            "Operating System",
+            "ETW trace containers",
+            "Raw Event Trace Log (ETL) container; KDFT has not decoded this file into Windows Event Log records",
+            "medium",
+            &["windows", "etw", "etl", "trace-container", "not-decoded"],
+        ));
+    }
+
+    if ext == Some("log")
+        && contains_any(
+            normalized_full_path,
+            &["/windows/", "/programdata/", "/appdata/", "/logs/", "/log/"],
+        )
+    {
+        return Some(category(
+            "Operating System",
+            "Application and text logs",
+            "Application or operating-system text log; not a decoded Windows EVTX event record",
+            "medium",
+            &["logs", "application-log", "text", "not-evtx"],
         ));
     }
 
@@ -26199,12 +27797,29 @@ fn precise_forensic_artifact_category(
         ));
     }
 
-    if identity_network::known_credential_store_type(normalized_full_path, filename).is_some() {
+    if let Some(recognition) =
+        identity_network::known_credential_store_type(normalized_full_path, filename)
+    {
+        if recognition.artifact_kind == "protected_credential_material" {
+            return Some(category(
+                "Accounts and Identity",
+                "Protected credential material",
+                "Windows DPAPI protected master-key infrastructure candidate; no credential or secret value was decoded or recovered",
+                recognition.confidence,
+                &[
+                    "accounts",
+                    "dpapi",
+                    "protected-material",
+                    "encrypted-candidate",
+                    "not-decoded",
+                ],
+            ));
+        }
         return Some(category(
             "Accounts and Identity",
             "Credential and secret stores",
-            "Known credential, token, key, password, or secret store",
-            "high",
+            "Known credential, token, key, password, or secret store location; no value recovery is implied",
+            recognition.confidence,
             &["accounts", "credentials", "secrets", "store"],
         ));
     }
@@ -27694,6 +29309,7 @@ fn process_registry_hive_evidence(
             import_data,
             max_entries,
         ),
+        Err(err) if error_chain_is_job_cancelled(&err) => Err(err),
         Err(err) => persist_unsupported_registry_status(
             conn,
             case_id,
@@ -27714,10 +29330,12 @@ fn process_registry_hive_import_orchestration(
     import_data: RegistryImportData,
     max_entries: usize,
 ) -> Result<(usize, bool)> {
+    progress::check_cancellation()?;
     let truncated = import_data.truncated;
     let root_logical_path = import_data.root_logical_path.clone();
     let (generic_count, _) =
         persist_registry_hive_import(conn, case_id, evidence, job_id, &import_data)?;
+    progress::check_cancellation()?;
 
     let root_entry_id: i64 = conn.query_row(
         "SELECT id FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2 AND logical_path = ?3",
@@ -27744,6 +29362,7 @@ fn process_registry_hive_import_orchestration(
             &import_data,
             max_entries,
         )?;
+    progress::check_cancellation()?;
 
     Ok((generic_count + specialized_count, truncated))
 }
@@ -27807,7 +29426,10 @@ fn persist_registry_hive_import(
         params![case_id, evidence.id],
     )?;
     let entries_indexed = import_data.entries.len();
-    for entry in &import_data.entries {
+    for (ordinal, entry) in import_data.entries.iter().enumerate() {
+        if ordinal % 128 == 0 {
+            progress::check_cancellation()?;
+        }
         let mut metadata = entry.metadata.clone();
         if entry.logical_path == import_data.root_logical_path {
             if let Some(object) = metadata.as_object_mut() {
@@ -27846,6 +29468,24 @@ fn collect_registry_hive_import(
     display_name: &str,
     max_entries: usize,
 ) -> Result<RegistryImportData> {
+    collect_registry_hive_import_with_cancel(path, display_name, max_entries, || {
+        progress::is_cancellation_requested_active()
+    })
+}
+
+pub(crate) fn collect_registry_hive_import_with_cancel<F>(
+    path: &Path,
+    display_name: &str,
+    max_entries: usize,
+    mut cancellation_requested: F,
+) -> Result<RegistryImportData>
+where
+    F: FnMut() -> bool,
+{
+    if cancellation_requested() {
+        return Err(anyhow::Error::new(progress::JobCancelled)
+            .context("Registry hive parsing cancelled by examiner request"));
+    }
     let root_logical_path = registry_root_logical_path(display_name);
     let mut collector = RegistryImportCollector {
         entries: Vec::new(),
@@ -27869,11 +29509,19 @@ fn collect_registry_hive_import(
             .with_context(|| format!("opening registry hive {}", path.display()))?;
         let mut iter = RegistryParserIterator::new(&parser);
         for key in iter.iter() {
+            if cancellation_requested() {
+                return Err(anyhow::Error::new(progress::JobCancelled)
+                    .context("Registry hive parsing cancelled by examiner request"));
+            }
             if collector.truncated {
                 break;
             }
             let key_logical_path = collector.push_key(&key)?;
             for value in key.value_iter() {
+                if cancellation_requested() {
+                    return Err(anyhow::Error::new(progress::JobCancelled)
+                        .context("Registry hive parsing cancelled by examiner request"));
+                }
                 if collector.truncated {
                     break;
                 }
@@ -32284,6 +33932,7 @@ fn process_image_evidence(
     job_id: i64,
     max_entries: usize,
     mut bitlocker_ctx: Option<BitLockerProcessingContext<'_>>,
+    targets: Option<&[VolumeTarget]>,
 ) -> Result<(usize, bool)> {
     let path = PathBuf::from(&evidence.source_path);
     progress::progress_current(evidence.source_path.clone());
@@ -32397,6 +34046,55 @@ fn process_image_evidence(
                 return Ok((indexed, true));
             }
 
+            if let Some(target_list) = targets {
+                if !target_list.is_empty() {
+                    for target in target_list {
+                        if target.evidence_id != evidence.id {
+                            bail!(
+                                "volume target '{}' evidence ID ({}) does not match current evidence ID ({})",
+                                target.discovered_volume_id,
+                                target.evidence_id,
+                                evidence.id
+                            );
+                        }
+                        let matches_geometry =
+                            layout.partitions.iter().enumerate().any(|(p_idx, p)| {
+                                let offset_matches =
+                                    p.start_offset == target.partition_start_offset;
+                                let length_matches = p.size_bytes == target.partition_length;
+                                let index_matches = target
+                                    .partition_table_index
+                                    .is_none_or(|idx| idx == p_idx as u32);
+                                let type_matches = match (&target.partition_type, &p.partition_type)
+                                {
+                                    (Some(tt), Some(pt)) => tt.eq_ignore_ascii_case(pt),
+                                    (Some(_), None) => false,
+                                    _ => true,
+                                };
+                                let fs_matches = match (&target.filesystem_kind, &p.filesystem) {
+                                    (Some(tf), Some(pf)) => tf.eq_ignore_ascii_case(pf),
+                                    _ => true,
+                                };
+                                offset_matches
+                                    && length_matches
+                                    && index_matches
+                                    && type_matches
+                                    && fs_matches
+                            });
+                        if !matches_geometry {
+                            bail!(
+                                "volume target '{}' (evidence ID {}, index {:?}, start offset {}, exact length {}) does not match any partition in disk image layout",
+                                target.discovered_volume_id,
+                                target.evidence_id,
+                                target.partition_table_index,
+                                target.partition_start_offset,
+                                target.partition_length
+                            );
+                        }
+                    }
+                }
+            }
+
             for (index, partition) in layout.partitions.iter().enumerate() {
                 progress::check_cancellation()?;
                 if indexed >= max_entries {
@@ -32420,6 +34118,54 @@ fn process_image_evidence(
                 );
                 progress::progress_set_volume(Some(format!("Partition {}: {}", index + 1, name)));
                 progress::progress_current(logical_path.clone());
+
+                let is_targeted = match targets {
+                    Some(target_list) if !target_list.is_empty() => target_list.iter().any(|t| {
+                        let evidence_matches = t.evidence_id == evidence.id;
+                        let offset_matches = t.partition_start_offset == partition.start_offset;
+                        let length_matches = t.partition_length == partition.size_bytes;
+                        let index_matches = t
+                            .partition_table_index
+                            .is_none_or(|idx| idx == index as u32);
+                        evidence_matches && offset_matches && length_matches && index_matches
+                    }),
+                    _ => true,
+                };
+
+                if !is_targeted {
+                    let partition_end = partition
+                        .start_offset
+                        .checked_add(partition.size_bytes)
+                        .context("validated partition end offset overflow")?;
+                    insert_image_record(
+                        conn,
+                        case_id,
+                        evidence.id,
+                        &logical_path,
+                        name,
+                        Some(i64::try_from(partition.size_bytes).unwrap_or(i64::MAX)),
+                        &serde_json::json!({
+                            "artifact_kind": "disk_partition",
+                            "container_format": opened.format,
+                            "partition_scheme": scheme,
+                            "index": index + 1,
+                            "name": partition.name,
+                            "label": partition.label,
+                            "partition_type": partition.partition_type,
+                            "partition_reported_filesystem": partition.filesystem,
+                            "start_offset": partition.start_offset,
+                            "size_bytes": partition.size_bytes,
+                            "end_offset_exclusive": partition_end,
+                            "offset_coordinate_system": "decoded_media_byte_stream",
+                            "filesystem_parser": "excluded_by_target_filter",
+                            "filesystem_browsing_status": "Partition excluded from analysis by target volume filter",
+                            "target_included": false,
+                        }),
+                        job_id,
+                    )?;
+                    indexed += 1;
+                    continue;
+                }
                 let detected_filesystem = match detect_volume_filesystem_in_range(
                     &mut *opened.reader,
                     partition.start_offset,
@@ -32499,9 +34245,24 @@ fn process_image_evidence(
                     None
                 };
                 let unlock_this_partition = bitlocker_locked
-                    && bitlocker_ctx
-                        .as_ref()
-                        .is_some_and(|context| context.volume_index == index);
+                    && bitlocker_ctx.as_ref().is_some_and(|context| {
+                        context.volume_index == index
+                            || targets.is_some_and(|ts| {
+                                ts.iter()
+                                    .any(|t| t.partition_start_offset == partition.start_offset)
+                            })
+                    });
+                if bitlocker_locked
+                    && !unlock_this_partition
+                    && targets.is_some_and(|ts| !ts.is_empty())
+                {
+                    bail!(
+                        "Targeted volume #{} ('{}' at offset {}) is BitLocker-encrypted but locked: volume must be unlocked before analysis",
+                        index + 1,
+                        name,
+                        partition.start_offset
+                    );
+                }
                 let filesystem_metadata = if bitlocker_locked {
                     Some(BITLOCKER_LOCKED_FILESYSTEM)
                 } else {
@@ -33523,6 +35284,7 @@ pub struct LiveBitLockerProtector {
     pub raw_hex: String,
     pub kind: String,
 }
+#[derive(Clone, Copy)]
 pub struct BitLockerProcessingContext<'a> {
     pub volume_index: usize,
     pub credential: BitLockerUnlockCredential<'a>,
@@ -33571,6 +35333,7 @@ fn bitlocker_generation_result(
     })
 }
 
+#[derive(Clone, Copy)]
 pub enum BitLockerUnlockCredential<'a> {
     RecoveryKey(&'a str),
     Password(&'a str),
@@ -33908,6 +35671,75 @@ fn sort_live_entries(entries: &mut [LiveEntry]) {
     });
 }
 
+/// Lists a bounded page of immediate children of one directory in one volume, read live from
+/// the image. Never loads all entries or reloads earlier pages.
+pub fn list_image_directory_page(
+    image_path: &Path,
+    volume_index: usize,
+    dir_path: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<LiveEntry>, usize, bool)> {
+    let volumes = list_image_volumes(image_path)?;
+    let volume = volumes
+        .get(volume_index)
+        .with_context(|| format!("volume index {volume_index} out of range"))?;
+    let relative = dir_path.trim_matches('/');
+    match volume.filesystem.as_str() {
+        "NTFS" => {
+            let browse_options = ntfs_forensic::NtfsForensicBrowseOptions { limit, offset };
+            let listing = ntfs_forensic::list_ntfs_forensic_directory(
+                image_path,
+                volume_index,
+                dir_path,
+                &browse_options,
+                None,
+            )?;
+            let mut entries = Vec::with_capacity(listing.entries.len());
+            for e in listing.entries {
+                entries.push(LiveEntry {
+                    name: e.name,
+                    is_dir: e.is_dir,
+                    size_bytes: e.size_bytes,
+                    created_utc: e.created_utc,
+                    modified_utc: e.modified_utc,
+                    accessed_utc: e.accessed_utc,
+                    ntfs_file_record_number: Some(e.ntfs_file_record_number),
+                    mft_record_logical_offset: None,
+                    mft_record_physical_offset: None,
+                    file_data_logical_offset: None,
+                    file_data_physical_offset: e.file_data_physical_offset,
+                    file_data_file_offset: None,
+                    file_data_contiguous_bytes: None,
+                    physical_offset_basis: None,
+                    file_data_direct_logical_mapping: None,
+                    offset_coordinate_system: None,
+                    ntfs_mft_record_modification_time_utc: None,
+                    symlink: false,
+                });
+            }
+            Ok((entries, listing.total_children, listing.truncated))
+        }
+        "FAT" => list_fat_directory_page(
+            image_path,
+            volume.start_offset,
+            volume.size_bytes,
+            relative,
+            offset,
+            limit,
+        ),
+        "EXT" => list_ext_directory_page(
+            image_path,
+            volume.start_offset,
+            volume.size_bytes,
+            relative,
+            offset,
+            limit,
+        ),
+        other => bail!("live browsing is not supported for {other} volumes"),
+    }
+}
+
 /// Lists the immediate children of one directory in one volume, read live from
 /// the image. `dir_path` is volume-relative ("" or "/" is the volume root).
 pub fn list_image_directory(
@@ -33915,19 +35747,8 @@ pub fn list_image_directory(
     volume_index: usize,
     dir_path: &str,
 ) -> Result<Vec<LiveEntry>> {
-    let volumes = list_image_volumes(image_path)?;
-    let volume = volumes
-        .get(volume_index)
-        .with_context(|| format!("volume index {volume_index} out of range"))?;
-    let relative = dir_path.trim_matches('/');
-    let mut entries = match volume.filesystem.as_str() {
-        "NTFS" => {
-            list_ntfs_directory(image_path, volume.start_offset, volume.size_bytes, relative)?
-        }
-        "FAT" => list_fat_directory(image_path, volume.start_offset, volume.size_bytes, relative)?,
-        "EXT" => list_ext_directory(image_path, volume.start_offset, volume.size_bytes, relative)?,
-        other => bail!("live browsing is not supported for {other} volumes"),
-    };
+    let (mut entries, _, _) =
+        list_image_directory_page(image_path, volume_index, dir_path, 0, usize::MAX)?;
     sort_live_entries(&mut entries);
     Ok(entries)
 }
@@ -34014,7 +35835,7 @@ fn bitlocker_credential(
     }
 }
 
-fn list_ntfs_directory(
+pub fn list_ntfs_directory(
     image_path: &Path,
     start_offset: u64,
     size_bytes: u64,
@@ -34143,12 +35964,14 @@ fn ntfs_file_child_for_relative_path<T: Read + Seek>(
         .with_context(|| format!("file not found: {file_name}"))
 }
 
-fn list_fat_directory(
+pub fn list_fat_directory_page(
     image_path: &Path,
     start_offset: u64,
     size_bytes: u64,
     relative: &str,
-) -> Result<Vec<LiveEntry>> {
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<LiveEntry>, usize, bool)> {
     let mut opened = open_disk_image(image_path)?;
     let slice = PartitionSlice::new(&mut *opened.reader, start_offset, size_bytes);
     let fs = fatfs::FileSystem::new(slice, fatfs::FsOptions::new())
@@ -34160,38 +35983,61 @@ fn list_fat_directory(
         root.open_dir(relative)
             .with_context(|| format!("opening FAT directory {relative}"))?
     };
-    let mut entries = Vec::new();
+    let mut entries = Vec::with_capacity(limit.min(256));
+    let mut current_idx = 0;
     for entry in dir.iter() {
         let entry = entry.context("reading FAT directory entry")?;
         let name = entry.file_name();
         if name == "." || name == ".." {
             continue;
         }
-        entries.push(LiveEntry {
-            is_dir: entry.is_dir(),
-            size_bytes: if entry.is_dir() {
-                None
-            } else {
-                Some(i64::try_from(entry.len()).unwrap_or(i64::MAX))
-            },
-            created_utc: fat_datetime_iso(entry.created()),
-            modified_utc: fat_datetime_iso(entry.modified()),
-            accessed_utc: fat_date_iso(entry.accessed()),
-            ntfs_file_record_number: None,
-            mft_record_logical_offset: None,
-            mft_record_physical_offset: None,
-            file_data_logical_offset: None,
-            file_data_physical_offset: None,
-            file_data_file_offset: None,
-            file_data_contiguous_bytes: None,
-            physical_offset_basis: None,
-            file_data_direct_logical_mapping: None,
-            offset_coordinate_system: None,
-            ntfs_mft_record_modification_time_utc: None,
-            name,
-            symlink: false,
-        });
+        if current_idx >= offset && entries.len() < limit {
+            entries.push(LiveEntry {
+                is_dir: entry.is_dir(),
+                size_bytes: if entry.is_dir() {
+                    None
+                } else {
+                    Some(i64::try_from(entry.len()).unwrap_or(i64::MAX))
+                },
+                created_utc: fat_datetime_iso(entry.created()),
+                modified_utc: fat_datetime_iso(entry.modified()),
+                accessed_utc: fat_date_iso(entry.accessed()),
+                ntfs_file_record_number: None,
+                mft_record_logical_offset: None,
+                mft_record_physical_offset: None,
+                file_data_logical_offset: None,
+                file_data_physical_offset: None,
+                file_data_file_offset: None,
+                file_data_contiguous_bytes: None,
+                physical_offset_basis: None,
+                file_data_direct_logical_mapping: None,
+                offset_coordinate_system: None,
+                ntfs_mft_record_modification_time_utc: None,
+                name,
+                symlink: false,
+            });
+        }
+        current_idx += 1;
     }
+    let total = current_idx;
+    let has_more = offset.saturating_add(entries.len()) < total;
+    Ok((entries, total, has_more))
+}
+
+pub fn list_fat_directory(
+    image_path: &Path,
+    start_offset: u64,
+    size_bytes: u64,
+    relative: &str,
+) -> Result<Vec<LiveEntry>> {
+    let (entries, _, _) = list_fat_directory_page(
+        image_path,
+        start_offset,
+        size_bytes,
+        relative,
+        0,
+        usize::MAX,
+    )?;
     Ok(entries)
 }
 
@@ -34227,39 +36073,65 @@ fn fat_date_iso(value: fatfs::Date) -> Option<String> {
     ))
 }
 
-fn list_ext_directory(
+pub fn list_ext_directory_page(
     image_path: &Path,
     start_offset: u64,
     size_bytes: u64,
     relative: &str,
-) -> Result<Vec<LiveEntry>> {
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<LiveEntry>, usize, bool)> {
     let fs = open_ext4_superblock_bounded(image_path, start_offset, size_bytes)?;
     let path = if relative.is_empty() {
         "/".to_string()
     } else {
         format!("/{relative}")
     };
-    let children = ext4_list_dir(&fs, &path)?;
-    let mut entries = Vec::with_capacity(children.len());
-    for child in children {
-        let data_location = bounded_ext_data_location(child.data_location, size_bytes);
-        let size_bytes = i64::try_from(child.size).unwrap_or(i64::MAX);
+    let dir_inode = ext4_resolve_inode(&fs, &path)?;
+    let enhanced = fs
+        .enhance(&dir_inode)
+        .map_err(|err| anyhow!("reading ext directory {path}: {err}"))?;
+    let ext4::Enhanced::Directory(raw_entries) = enhanced else {
+        bail!("ext path {path} is not a directory");
+    };
+    let filtered: Vec<_> = raw_entries
+        .into_iter()
+        .filter(|e| e.name != "." && e.name != "..")
+        .collect();
+    let total = filtered.len();
+    let start = offset.min(total);
+    let end = start.saturating_add(limit).min(total);
+    let mut entries = Vec::with_capacity(end.saturating_sub(start));
+    for entry in &filtered[start..end] {
+        let inode = match fs.load_inode(entry.inode) {
+            Ok(inode) => inode,
+            Err(_) => continue,
+        };
+        let data_location =
+            bounded_ext_data_location(fs.first_data_location(&inode).ok().flatten(), size_bytes);
+        let stat = &inode.stat;
+        let is_dir = matches!(stat.extracted_type, ext4::FileType::Directory);
+        let size_bytes_val = i64::try_from(stat.size).unwrap_or(i64::MAX);
         entries.push(LiveEntry {
-            name: child.name,
-            is_dir: child.is_dir,
-            size_bytes: if child.is_dir { None } else { Some(size_bytes) },
-            created_utc: child.btime_utc.or(child.ctime_utc),
-            modified_utc: child.mtime_utc,
-            accessed_utc: child.atime_utc,
+            name: entry.name.clone(),
+            is_dir,
+            size_bytes: if is_dir { None } else { Some(size_bytes_val) },
+            created_utc: stat
+                .btime
+                .as_ref()
+                .and_then(ext4_time_to_rfc3339)
+                .or_else(|| ext4_time_to_rfc3339(&stat.ctime)),
+            modified_utc: ext4_time_to_rfc3339(&stat.mtime),
+            accessed_utc: ext4_time_to_rfc3339(&stat.atime),
             ntfs_file_record_number: None,
             mft_record_logical_offset: None,
             mft_record_physical_offset: None,
-            file_data_logical_offset: data_location.map(|location| location.filesystem_offset),
+            file_data_logical_offset: data_location.map(|loc| loc.filesystem_offset),
             file_data_physical_offset: data_location
-                .and_then(|location| start_offset.checked_add(location.filesystem_offset)),
-            file_data_file_offset: data_location.map(|location| location.file_offset),
-            file_data_contiguous_bytes: data_location.map(|location| location.contiguous_bytes),
-            physical_offset_basis: data_location.map(|location| match location.storage {
+                .and_then(|loc| start_offset.checked_add(loc.filesystem_offset)),
+            file_data_file_offset: data_location.map(|loc| loc.file_offset),
+            file_data_contiguous_bytes: data_location.map(|loc| loc.contiguous_bytes),
+            physical_offset_basis: data_location.map(|loc| match loc.storage {
                 ext4::DataLocationStorage::Extent => "ext first allocated extent".to_string(),
                 ext4::DataLocationStorage::InlineSymlink => {
                     "ext inline symlink target in inode record".to_string()
@@ -34267,12 +36139,30 @@ fn list_ext_directory(
             }),
             file_data_direct_logical_mapping: data_location.map(|_| true),
             offset_coordinate_system: data_location
-                .and_then(|location| start_offset.checked_add(location.filesystem_offset))
+                .and_then(|loc| start_offset.checked_add(loc.filesystem_offset))
                 .map(|_| "decoded_media_byte_stream".to_string()),
             ntfs_mft_record_modification_time_utc: None,
-            symlink: child.is_symlink,
+            symlink: matches!(stat.extracted_type, ext4::FileType::SymbolicLink),
         });
     }
+    let has_more = end < total;
+    Ok((entries, total, has_more))
+}
+
+pub fn list_ext_directory(
+    image_path: &Path,
+    start_offset: u64,
+    size_bytes: u64,
+    relative: &str,
+) -> Result<Vec<LiveEntry>> {
+    let (entries, _, _) = list_ext_directory_page(
+        image_path,
+        start_offset,
+        size_bytes,
+        relative,
+        0,
+        usize::MAX,
+    )?;
     Ok(entries)
 }
 
@@ -34632,6 +36522,91 @@ pub fn list_local_directory_page(
     entries.sort_by(local_entry_sort);
     let has_more = entries.len() > take;
     entries.truncate(take);
+    let next_cursor = if has_more {
+        entries.last().map(|last| LocalDirectoryCursor {
+            name: last.name.clone(),
+            is_dir: last.is_dir,
+        })
+    } else {
+        None
+    };
+    Ok(LocalDirectoryListing {
+        entries,
+        total_entries,
+        next_cursor,
+        truncated: has_more,
+    })
+}
+
+/// Reads one stable, sorted page of a local live directory using offset and limit.
+/// Never stats or loads earlier entries.
+pub fn list_local_directory_offset_page(
+    case_path: &Path,
+    evidence_id: i64,
+    relative_path: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<LocalDirectoryListing> {
+    let source = read_local_live_evidence(case_path, evidence_id)?;
+    if source.source_kind == "file" {
+        let file = resolve_single_file_path(&source, relative_path)?;
+        let metadata = fs::symlink_metadata(&file)
+            .with_context(|| format!("reading evidence file metadata {}", file.display()))?;
+        let name = file
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&source.display_name)
+            .to_string();
+        return Ok(LocalDirectoryListing {
+            entries: if offset == 0 {
+                vec![local_live_entry(name, metadata)?]
+            } else {
+                Vec::new()
+            },
+            total_entries: 1,
+            next_cursor: None,
+            truncated: false,
+        });
+    }
+
+    let (_root, dir_path) = resolve_local_folder_path(&source.source_path, relative_path)?;
+    let metadata = fs::symlink_metadata(&dir_path)
+        .with_context(|| format!("reading evidence directory metadata {}", dir_path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "live browse does not follow symlinks: {}",
+            dir_path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!("local live path is not a directory: {}", dir_path.display());
+    }
+
+    let read_dir = fs::read_dir(&dir_path)
+        .with_context(|| format!("reading evidence directory {}", dir_path.display()))?;
+    let mut names = Vec::new();
+    for child in read_dir {
+        let child = child.with_context(|| format!("reading entry in {}", dir_path.display()))?;
+        let is_dir = child.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let name = child
+            .file_name()
+            .to_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| child.file_name().to_string_lossy().into_owned());
+        names.push((is_dir, name));
+    }
+    names.sort_by(|a, b| local_entry_order(a.0, &a.1, b.0, &b.1));
+    let total_entries = names.len();
+    let start = offset.min(total_entries);
+    let end = start.saturating_add(limit).min(total_entries);
+    let mut entries = Vec::with_capacity(end.saturating_sub(start));
+    for (_is_dir, name) in &names[start..end] {
+        let child_path = dir_path.join(name);
+        let metadata = fs::symlink_metadata(&child_path)
+            .with_context(|| format!("reading evidence entry metadata {}", child_path.display()))?;
+        entries.push(local_live_entry(name.clone(), metadata)?);
+    }
+    let has_more = end < total_entries;
     let next_cursor = if has_more {
         entries.last().map(|last| LocalDirectoryCursor {
             name: last.name.clone(),
@@ -36407,6 +38382,15 @@ pub fn list_local_tree_files(
     Ok(sink.finish())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveTraversalCheckpoint {
+    pub pending_directories: Vec<String>,
+    pub last_relative_path: Option<String>,
+    pub items_added: i64,
+    pub total_candidates: i64,
+    pub completed: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RecursiveBookmarkResult {
     pub bookmark_id: i64,
@@ -36418,25 +38402,39 @@ pub struct RecursiveBookmarkResult {
     pub file_limit: Option<usize>,
     pub file_limit_reached: bool,
     pub skipped_entry_ids: Vec<i64>,
+    pub checkpoint: Option<LiveTraversalCheckpoint>,
 }
 
-/// Descendant (non-directory) entry ids under a folder's logical-path prefix,
-/// bounded by `max_entries`. Backs "Bookmark folder (recursive)" in the
-/// indexed Analyze view.
-fn indexed_folder_descendant_entry_ids(
-    conn: &Connection,
-    case_id: i64,
+const RECURSIVE_BOOKMARK_BATCH_SIZE: usize = 1_000;
+
+/// "Bookmark folder (recursive)" for the indexed Analyze view: bulk-adds descendant files
+/// under `folder_logical_path` to `bookmark_id` in bounded, resumable batches of 1,000 items.
+/// Bounded-memory, cancellable, and resumable while continuing to completion by default.
+pub fn bookmark_indexed_folder_recursive(
+    case_path: &Path,
+    bookmark_id: i64,
     evidence_id: i64,
     folder_logical_path: &str,
     max_entries: usize,
-) -> Result<(Vec<i64>, i64)> {
+) -> Result<RecursiveBookmarkResult> {
+    // Zero is the public unlimited sentinel. A positive limit is an explicit
+    // examiner request and is honored exactly; this function adds no ceiling.
+    let file_limit = (max_entries != 0).then_some(max_entries);
+
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    ensure_evidence_source(&conn, case_id, evidence_id)?;
+
     let trimmed = folder_logical_path.trim().trim_end_matches('/');
-    if !trimmed.is_empty() {
-        let normalized = if trimmed.starts_with('/') {
-            trimmed.to_string()
-        } else {
-            format!("/{trimmed}")
-        };
+    let normalized = if trimmed.is_empty() {
+        "/".to_string()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+
+    if normalized != "/" {
         let exists: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM filesystem_entries
@@ -36450,12 +38448,14 @@ fn indexed_folder_descendant_entry_ids(
             bail!("directory not found: {folder_logical_path}");
         }
     }
-    let prefix = if folder_logical_path.ends_with('/') {
-        folder_logical_path.to_string()
+
+    let prefix = if normalized == "/" {
+        "/".to_string()
     } else {
-        format!("{folder_logical_path}/")
+        format!("{normalized}/")
     };
-    let total: i64 = conn
+
+    let total_candidates: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM filesystem_entries
              WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind != 'directory'
@@ -36464,71 +38464,125 @@ fn indexed_folder_descendant_entry_ids(
             |row| row.get(0),
         )
         .context("counting descendant entries for recursive folder bookmark")?;
-    let mut stmt = conn.prepare(
-        "SELECT id FROM filesystem_entries
-         WHERE case_id = ?1 AND evidence_id = ?2 AND entry_kind != 'directory'
-           AND substr(logical_path, 1, length(?3)) = ?3
-         ORDER BY logical_path, id
-         LIMIT ?4",
-    )?;
-    let sql_limit = i64::try_from(max_entries).unwrap_or(i64::MAX);
-    let ids = stmt
-        .query_map(params![case_id, evidence_id, prefix, sql_limit], |row| {
-            row.get::<_, i64>(0)
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .context("listing descendant entries for recursive folder bookmark")?;
-    Ok((ids, total))
-}
 
-/// "Bookmark folder (recursive)" for the indexed Analyze view: bulk-adds every
-/// descendant file under `folder_logical_path` to `bookmark_id` in one
-/// transaction (reuses `bulk_add_bookmark_items`, so this has the same ~ms/item
-/// cost as the existing bulk-bookmark-selected fix, not the old N-HTTP-request
-/// shape).
-pub fn bookmark_indexed_folder_recursive(
-    case_path: &Path,
-    bookmark_id: i64,
-    evidence_id: i64,
-    folder_logical_path: &str,
-    max_entries: usize,
-) -> Result<RecursiveBookmarkResult> {
-    // Zero is the public unlimited sentinel. A positive limit is an explicit
-    // examiner request and is honored exactly; this function adds no ceiling.
-    let file_limit = (max_entries != 0).then_some(max_entries);
-    let max_entries = file_limit.unwrap_or(usize::MAX);
-    let (entry_ids, total_candidates) = {
-        let conn = open_existing_case(case_path)?;
-        let case_id = active_case_id(&conn)?;
-        ensure_evidence_source(&conn, case_id, evidence_id)?;
-        indexed_folder_descendant_entry_ids(
-            &conn,
-            case_id,
-            evidence_id,
-            folder_logical_path,
-            max_entries,
-        )?
+    let mut items_added: i64 = 0;
+    let mut skipped_entry_ids: Vec<i64> = Vec::new();
+    let mut file_limit_reached = false;
+    let mut cancelled = false;
+
+    loop {
+        if progress::is_cancellation_requested_active() {
+            cancelled = true;
+            break;
+        }
+
+        let remaining = match file_limit {
+            Some(limit) => {
+                let left = limit.saturating_sub(items_added as usize);
+                if left == 0 {
+                    file_limit_reached = true;
+                    break;
+                }
+                RECURSIVE_BOOKMARK_BATCH_SIZE.min(left)
+            }
+            None => RECURSIVE_BOOKMARK_BATCH_SIZE,
+        };
+
+        let batch_ids: Vec<i64> = {
+            let mut stmt = conn.prepare(
+                "SELECT fe.id
+                 FROM filesystem_entries fe
+                 LEFT JOIN bookmark_items bi ON bi.bookmark_id = ?1 AND bi.entry_id = fe.id
+                 WHERE fe.case_id = ?2
+                   AND fe.evidence_id = ?3
+                   AND fe.entry_kind != 'directory'
+                   AND substr(fe.logical_path, 1, length(?4)) = ?4
+                   AND bi.id IS NULL
+                 ORDER BY fe.logical_path, fe.id
+                 LIMIT ?5",
+            )?;
+            let rows = stmt.query_map(
+                params![bookmark_id, case_id, evidence_id, prefix, remaining as i64],
+                |row| row.get(0),
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .context("listing unbookmarked batch entries for recursive bookmark")?
+        };
+
+        if batch_ids.is_empty() {
+            break;
+        }
+
+        let batch_count = batch_ids.len();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actor = audit_actor(&tx, case_id)?;
+        let bulk = bulk_add_bookmark_items_tx(&tx, case_id, &actor, bookmark_id, &batch_ids)?;
+        tx.commit()?;
+
+        items_added += bulk.items_added;
+        skipped_entry_ids.extend(bulk.skipped_entry_ids);
+
+        if let Some(limit) = file_limit {
+            if items_added as usize >= limit {
+                file_limit_reached = true;
+                break;
+            }
+        }
+
+        if batch_count < remaining {
+            break;
+        }
+    }
+
+    let unbookmarked_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM filesystem_entries fe
+             LEFT JOIN bookmark_items bi ON bi.bookmark_id = ?1 AND bi.entry_id = fe.id
+             WHERE fe.case_id = ?2
+               AND fe.evidence_id = ?3
+               AND fe.entry_kind != 'directory'
+               AND substr(fe.logical_path, 1, length(?4)) = ?4
+               AND bi.id IS NULL",
+            params![bookmark_id, case_id, evidence_id, prefix],
+            |row| row.get(0),
+        )
+        .context("counting remaining unbookmarked entries")?;
+
+    let truncated = cancelled || file_limit_reached || unbookmarked_count > 0;
+    let completed = !truncated;
+    let current_total_items: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bookmark_items WHERE bookmark_id = ?1",
+            params![bookmark_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(items_added);
+    let checkpoint = LiveTraversalCheckpoint {
+        pending_directories: Vec::new(),
+        last_relative_path: None,
+        items_added: current_total_items,
+        total_candidates,
+        completed,
     };
-    let truncated = total_candidates > entry_ids.len() as i64;
-    let bulk = bulk_add_bookmark_items(case_path, bookmark_id, &entry_ids)?;
+    persist_bookmark_traversal_checkpoint(case_path, bookmark_id, &checkpoint)?;
+
     Ok(RecursiveBookmarkResult {
-        bookmark_id: bulk.bookmark_id,
-        items_added: bulk.items_added,
+        bookmark_id,
+        items_added,
         total_candidates,
         truncated,
         skipped: Vec::new(),
         skipped_count: 0,
         file_limit,
-        file_limit_reached: truncated,
-        skipped_entry_ids: bulk.skipped_entry_ids,
+        file_limit_reached,
+        skipped_entry_ids,
+        checkpoint: Some(checkpoint),
     })
 }
 
 /// Bulk-inserts one bookmark item per file from a recursive live-tree listing,
-/// in a single transaction (same rationale as `bulk_add_bookmark_items` - avoid
-/// N per-item DB round trips). Each item's `item_ref_json` includes `metadata`
-/// and `size_bytes` up front so report rendering's `enrich_live_bookmark_item`
-/// does not need to re-open the live source once per item.
+/// in chunks of 1,000 items per transaction. Bounded-memory, cancellable, and resumable.
 fn live_volume_numbering(
     source_kind: &str,
     source_path: &str,
@@ -36563,103 +38617,129 @@ pub fn bulk_add_live_bookmark_items(
         live_volume_numbering(source_kind, source_path, volume)?;
     let mut conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let actor = audit_actor(&tx, case_id)?;
-    ensure_bookmark(&tx, case_id, bookmark_id)?;
-    ensure_evidence_source(&tx, case_id, evidence_id)?;
 
-    let mut next_order: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(item_order), 0) FROM bookmark_items WHERE bookmark_id = ?1",
-        params![bookmark_id],
-        |row| row.get(0),
-    )?;
-    let mut items_added: i64 = 0;
-    for file in files {
-        next_order = next_order.saturating_add(10);
-        let logical_path = format!("[vol {volume}] {}", file.relative_path);
-        let file_extension = file_extension_of(&file.name).unwrap_or_default();
-        let item_ref_value = serde_json::json!({
-            "kind": "live_file",
-            "entry_kind": "file",
-            "evidence_id": evidence_id,
-            "logical_path": logical_path,
-            "relative_path": file.relative_path,
-            "display_name": file.name,
-            "volume": volume,
-            "volume_index_zero_based": volume_index_zero_based,
-            "partition_number_one_based": partition_number_one_based,
-            "path": file.relative_path,
-            "volume_name": volume_name,
-            "filesystem": filesystem,
-            "size_bytes": file.size_bytes,
-            "is_deleted": file.is_deleted,
-            "symlink": false,
-            "file_extension": file_extension,
-            "created_utc": file.created_utc,
-            "modified_utc": file.modified_utc,
-            "accessed_utc": file.accessed_utc,
-            "provenance": file.provenance,
-            "reconstruction_status": file.reconstruction_status,
-            "recovery_status": file.recovery_status,
-            "ntfs_file_record_number": file.ntfs_file_record_number,
-            "ntfs_sequence_number": file.ntfs_sequence_number,
-            "ntfs_parent_record_number": file.ntfs_parent_record_number,
-            "mft_record_logical_offset": file.mft_record_logical_offset,
-            "mft_record_physical_offset": file.mft_record_physical_offset,
-            "file_data_logical_offset": file.file_data_logical_offset,
-            "file_data_physical_offset": file.file_data_physical_offset,
-            "file_data_file_offset": file.file_data_file_offset,
-            "file_data_contiguous_bytes": file.file_data_contiguous_bytes,
-            "physical_offset_basis": file.physical_offset_basis,
-            "file_data_direct_logical_mapping": file.file_data_direct_logical_mapping,
-            "offset_coordinate_system": file.offset_coordinate_system,
-            "metadata": {
-                "source_kind": source_kind,
-                "source_path": source_path,
-                "volume_index": volume,
+    let mut total_items_added: i64 = 0;
+
+    for chunk in files.chunks(RECURSIVE_BOOKMARK_BATCH_SIZE) {
+        if progress::is_cancellation_requested_active() {
+            break;
+        }
+
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actor = audit_actor(&tx, case_id)?;
+        ensure_bookmark(&tx, case_id, bookmark_id)?;
+        ensure_evidence_source(&tx, case_id, evidence_id)?;
+
+        let mut next_order: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(item_order), 0) FROM bookmark_items WHERE bookmark_id = ?1",
+            params![bookmark_id],
+            |row| row.get(0),
+        )?;
+
+        let mut items_added_chunk: i64 = 0;
+        let mut exists_stmt = tx.prepare_cached(
+            "SELECT 1 FROM bookmark_items WHERE bookmark_id = ?1 AND logical_path = ?2 LIMIT 1",
+        )?;
+
+        for file in chunk {
+            let logical_path = format!("[vol {volume}] {}", file.relative_path);
+            let already_exists = exists_stmt.exists(params![bookmark_id, &logical_path])?;
+            if already_exists {
+                continue;
+            }
+
+            next_order = next_order.saturating_add(10);
+            let file_extension = file_extension_of(&file.name).unwrap_or_default();
+            let item_ref_value = serde_json::json!({
+                "kind": "live_file",
+                "entry_kind": "file",
+                "evidence_id": evidence_id,
+                "logical_path": logical_path,
+                "relative_path": file.relative_path,
+                "display_name": file.name,
+                "volume": volume,
                 "volume_index_zero_based": volume_index_zero_based,
                 "partition_number_one_based": partition_number_one_based,
-            }
-        });
-        let data_preview = format!("Live file, {} bytes", file.size_bytes);
-        let item_ref_json = item_ref_value.to_string();
-        tx.execute(
-            "INSERT INTO bookmark_items(
-                 bookmark_id, evidence_id, entry_id, item_order, display_name, logical_path,
-                 selection_offset, selection_length, data_preview, item_ref_json
-             ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, NULL, ?6, ?7)",
-            params![
-                bookmark_id,
-                evidence_id,
-                next_order,
-                file.name,
-                logical_path,
-                data_preview,
-                item_ref_json,
-            ],
-        )?;
-        items_added += 1;
+                "path": file.relative_path,
+                "volume_name": volume_name,
+                "filesystem": filesystem,
+                "size_bytes": file.size_bytes,
+                "is_deleted": file.is_deleted,
+                "symlink": false,
+                "file_extension": file_extension,
+                "created_utc": file.created_utc,
+                "modified_utc": file.modified_utc,
+                "accessed_utc": file.accessed_utc,
+                "provenance": file.provenance,
+                "reconstruction_status": file.reconstruction_status,
+                "recovery_status": file.recovery_status,
+                "ntfs_file_record_number": file.ntfs_file_record_number,
+                "ntfs_sequence_number": file.ntfs_sequence_number,
+                "ntfs_parent_record_number": file.ntfs_parent_record_number,
+                "mft_record_logical_offset": file.mft_record_logical_offset,
+                "mft_record_physical_offset": file.mft_record_physical_offset,
+                "file_data_logical_offset": file.file_data_logical_offset,
+                "file_data_physical_offset": file.file_data_physical_offset,
+                "file_data_file_offset": file.file_data_file_offset,
+                "file_data_contiguous_bytes": file.file_data_contiguous_bytes,
+                "physical_offset_basis": file.physical_offset_basis,
+                "file_data_direct_logical_mapping": file.file_data_direct_logical_mapping,
+                "offset_coordinate_system": file.offset_coordinate_system,
+                "metadata": {
+                    "source_kind": source_kind,
+                    "source_path": source_path,
+                    "volume_index": volume,
+                    "volume_index_zero_based": volume_index_zero_based,
+                    "partition_number_one_based": partition_number_one_based,
+                }
+            });
+            let data_preview = format!("Live file, {} bytes", file.size_bytes);
+            let item_ref_json = item_ref_value.to_string();
+            tx.execute(
+                "INSERT INTO bookmark_items(
+                     bookmark_id, evidence_id, entry_id, item_order, display_name, logical_path,
+                     selection_offset, selection_length, data_preview, item_ref_json
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, NULL, ?6, ?7)",
+                params![
+                    bookmark_id,
+                    evidence_id,
+                    next_order,
+                    file.name,
+                    logical_path,
+                    data_preview,
+                    item_ref_json,
+                ],
+            )?;
+            items_added_chunk += 1;
+        }
+
+        if items_added_chunk > 0 {
+            tx.execute(
+                "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+                 VALUES (?1, 'bookmark.item.bulk_add_live', ?2, 'bookmark', ?3,
+                         json_object('items_added', ?4, 'source_kind', ?5,
+                                     'volume_index_zero_based', ?6,
+                                     'partition_number_one_based', ?7))",
+                params![
+                    case_id,
+                    actor,
+                    bookmark_id,
+                    items_added_chunk,
+                    source_kind,
+                    i64::try_from(volume_index_zero_based).unwrap_or(i64::MAX),
+                    partition_number_one_based.and_then(|value| i64::try_from(value).ok()),
+                ],
+            )?;
+        }
+
+        drop(exists_stmt);
+        tx.commit()?;
+        total_items_added += items_added_chunk;
     }
-    tx.execute(
-        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
-         VALUES (?1, 'bookmark.item.bulk_add_live', ?2, 'bookmark', ?3,
-                 json_object('items_added', ?4, 'source_kind', ?5,
-                             'volume_index_zero_based', ?6,
-                             'partition_number_one_based', ?7))",
-        params![
-            case_id,
-            actor,
-            bookmark_id,
-            items_added,
-            source_kind,
-            i64::try_from(volume_index_zero_based).unwrap_or(i64::MAX),
-            partition_number_one_based.and_then(|value| i64::try_from(value).ok()),
-        ],
-    )?;
-    tx.commit()?;
+
     Ok(BulkBookmarkItemsResult {
         bookmark_id,
-        items_added,
+        items_added: total_items_added,
         skipped_entry_ids: Vec::new(),
     })
 }
@@ -36692,6 +38772,15 @@ pub fn bookmark_live_folder_recursive(
         filesystem,
         &listing.files,
     )?;
+    let completed = !truncated && !listing.file_limit_reached;
+    let checkpoint = LiveTraversalCheckpoint {
+        pending_directories: Vec::new(),
+        last_relative_path: None,
+        items_added: bulk.items_added,
+        total_candidates,
+        completed,
+    };
+    persist_bookmark_traversal_checkpoint(case_path, bookmark_id, &checkpoint)?;
     Ok(RecursiveBookmarkResult {
         bookmark_id: bulk.bookmark_id,
         items_added: bulk.items_added,
@@ -36702,7 +38791,1105 @@ pub fn bookmark_live_folder_recursive(
         file_limit: listing.file_limit,
         file_limit_reached: listing.file_limit_reached,
         skipped_entry_ids: bulk.skipped_entry_ids,
+        checkpoint: Some(checkpoint),
     })
+}
+
+pub struct StreamingLiveBookmarkSink<'a> {
+    pub case_path: &'a Path,
+    pub case_id: i64,
+    pub bookmark_id: i64,
+    pub evidence_id: i64,
+    pub source_kind: &'a str,
+    pub source_path: &'a str,
+    pub volume: usize,
+    pub volume_index_zero_based: usize,
+    pub partition_number_one_based: Option<usize>,
+    pub volume_name: &'a str,
+    pub filesystem: &'a str,
+    pub file_limit: Option<usize>,
+    pub buffer: Vec<LiveTreeFileRef>,
+    pub items_added: i64,
+    pub total_candidates: i64,
+    pub file_limit_reached: bool,
+    pub truncated: bool,
+    pub skipped: Vec<String>,
+    pub skipped_count: u64,
+    pub directories_visited: u64,
+    pub next_order: i64,
+    pub last_relative_path: Option<String>,
+    pub existing_paths: HashSet<String>,
+}
+
+impl<'a> StreamingLiveBookmarkSink<'a> {
+    pub fn new(
+        case_path: &'a Path,
+        bookmark_id: i64,
+        evidence_id: i64,
+        source_kind: &'a str,
+        source_path: &'a str,
+        volume: usize,
+        volume_name: &'a str,
+        filesystem: &'a str,
+        max_entries: usize,
+        checkpoint: Option<&LiveTraversalCheckpoint>,
+    ) -> Result<Self> {
+        let (volume_index_zero_based, partition_number_one_based) =
+            live_volume_numbering(source_kind, source_path, volume)?;
+        let conn = open_existing_case(case_path)?;
+        let case_id = active_case_id(&conn)?;
+        ensure_bookmark(&conn, case_id, bookmark_id)?;
+        ensure_evidence_source(&conn, case_id, evidence_id)?;
+
+        let next_order: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(item_order), 0) FROM bookmark_items WHERE bookmark_id = ?1",
+            params![bookmark_id],
+            |row| row.get(0),
+        )?;
+
+        let mut existing_paths = HashSet::new();
+        let mut stmt =
+            conn.prepare("SELECT logical_path FROM bookmark_items WHERE bookmark_id = ?1")?;
+        let rows = stmt.query_map(params![bookmark_id], |row| row.get::<_, Option<String>>(0))?;
+        for r in rows {
+            if let Ok(Some(path)) = r {
+                existing_paths.insert(path);
+            }
+        }
+
+        let file_limit = (max_entries != 0).then_some(max_entries);
+        let (items_added, total_candidates) = checkpoint
+            .map(|cp| (cp.items_added, cp.total_candidates))
+            .unwrap_or((0, 0));
+
+        Ok(Self {
+            case_path,
+            case_id,
+            bookmark_id,
+            evidence_id,
+            source_kind,
+            source_path,
+            volume,
+            volume_index_zero_based,
+            partition_number_one_based,
+            volume_name,
+            filesystem,
+            file_limit,
+            buffer: Vec::with_capacity(RECURSIVE_BOOKMARK_BATCH_SIZE),
+            items_added,
+            total_candidates,
+            file_limit_reached: false,
+            truncated: false,
+            skipped: Vec::new(),
+            skipped_count: 0,
+            directories_visited: 0,
+            next_order,
+            last_relative_path: None,
+            existing_paths,
+        })
+    }
+
+    pub fn push_file(&mut self, file: LiveTreeFileRef) -> Result<bool> {
+        let logical_path = format!("[vol {}] {}", self.volume, file.relative_path);
+        if self.existing_paths.contains(&logical_path) {
+            return Ok(true);
+        }
+        self.total_candidates += 1;
+        self.last_relative_path = Some(file.relative_path.clone());
+        if let Some(limit) = self.file_limit {
+            if (self.items_added as usize + self.buffer.len()) >= limit {
+                self.file_limit_reached = true;
+                self.truncated = true;
+                return Ok(false);
+            }
+        }
+        self.buffer.push(file);
+        if let Some(limit) = self.file_limit {
+            if (self.items_added as usize + self.buffer.len()) >= limit {
+                self.file_limit_reached = true;
+                self.truncated = true;
+                if self.buffer.len() >= RECURSIVE_BOOKMARK_BATCH_SIZE {
+                    self.flush_buffer()?;
+                }
+                return Ok(false);
+            }
+        }
+        if self.buffer.len() >= RECURSIVE_BOOKMARK_BATCH_SIZE {
+            self.flush_buffer()?;
+        }
+        Ok(true)
+    }
+
+    pub fn skip(&mut self, note: String) {
+        self.skipped_count = self.skipped_count.saturating_add(1);
+        self.truncated = true;
+        if self.skipped.len() < LIVE_TREE_EXPORT_MAX_SKIP_NOTES {
+            self.skipped.push(note);
+        }
+    }
+
+    pub fn flush_buffer(&mut self) -> Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let mut conn = open_existing_case(self.case_path)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actor = audit_actor(&tx, self.case_id)?;
+        ensure_bookmark(&tx, self.case_id, self.bookmark_id)?;
+        ensure_evidence_source(&tx, self.case_id, self.evidence_id)?;
+
+        let mut exists_stmt = tx.prepare_cached(
+            "SELECT 1 FROM bookmark_items WHERE bookmark_id = ?1 AND logical_path = ?2 LIMIT 1",
+        )?;
+
+        let mut chunk_added = 0_i64;
+        for file in &self.buffer {
+            let logical_path = format!("[vol {}] {}", self.volume, file.relative_path);
+            if exists_stmt.exists(params![self.bookmark_id, &logical_path])? {
+                continue;
+            }
+
+            self.next_order = self.next_order.saturating_add(10);
+            let file_extension = file_extension_of(&file.name).unwrap_or_default();
+            let item_ref_value = serde_json::json!({
+                "kind": "live_file",
+                "entry_kind": "file",
+                "evidence_id": self.evidence_id,
+                "logical_path": logical_path,
+                "relative_path": file.relative_path,
+                "display_name": file.name,
+                "volume": self.volume,
+                "volume_index_zero_based": self.volume_index_zero_based,
+                "partition_number_one_based": self.partition_number_one_based,
+                "path": file.relative_path,
+                "volume_name": self.volume_name,
+                "filesystem": self.filesystem,
+                "size_bytes": file.size_bytes,
+                "is_deleted": file.is_deleted,
+                "symlink": false,
+                "file_extension": file_extension,
+                "created_utc": file.created_utc,
+                "modified_utc": file.modified_utc,
+                "accessed_utc": file.accessed_utc,
+                "provenance": file.provenance,
+                "reconstruction_status": file.reconstruction_status,
+                "recovery_status": file.recovery_status,
+                "ntfs_file_record_number": file.ntfs_file_record_number,
+                "ntfs_sequence_number": file.ntfs_sequence_number,
+                "ntfs_parent_record_number": file.ntfs_parent_record_number,
+                "mft_record_logical_offset": file.mft_record_logical_offset,
+                "mft_record_physical_offset": file.mft_record_physical_offset,
+                "file_data_logical_offset": file.file_data_logical_offset,
+                "file_data_physical_offset": file.file_data_physical_offset,
+                "file_data_file_offset": file.file_data_file_offset,
+                "file_data_contiguous_bytes": file.file_data_contiguous_bytes,
+                "physical_offset_basis": file.physical_offset_basis,
+                "file_data_direct_logical_mapping": file.file_data_direct_logical_mapping,
+                "offset_coordinate_system": file.offset_coordinate_system,
+                "metadata": {
+                    "source_kind": self.source_kind,
+                    "source_path": self.source_path,
+                    "volume_index": self.volume,
+                    "volume_index_zero_based": self.volume_index_zero_based,
+                    "partition_number_one_based": self.partition_number_one_based,
+                }
+            });
+            let data_preview = format!("Live file, {} bytes", file.size_bytes);
+            let item_ref_json = item_ref_value.to_string();
+            tx.execute(
+                "INSERT INTO bookmark_items(
+                     bookmark_id, evidence_id, entry_id, item_order, display_name, logical_path,
+                     selection_offset, selection_length, data_preview, item_ref_json
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, NULL, ?6, ?7)",
+                params![
+                    self.bookmark_id,
+                    self.evidence_id,
+                    self.next_order,
+                    file.name,
+                    logical_path,
+                    data_preview,
+                    item_ref_json,
+                ],
+            )?;
+            chunk_added += 1;
+            self.existing_paths.insert(logical_path);
+        }
+
+        if chunk_added > 0 {
+            tx.execute(
+                "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+                 VALUES (?1, 'bookmark.item.bulk_add_live', ?2, 'bookmark', ?3,
+                         json_object('items_added', ?4, 'source_kind', ?5,
+                                     'volume_index_zero_based', ?6,
+                                     'partition_number_one_based', ?7))",
+                params![
+                    self.case_id,
+                    actor,
+                    self.bookmark_id,
+                    chunk_added,
+                    self.source_kind,
+                    i64::try_from(self.volume_index_zero_based).unwrap_or(i64::MAX),
+                    self.partition_number_one_based.and_then(|v| i64::try_from(v).ok()),
+                ],
+            )?;
+        }
+
+        drop(exists_stmt);
+        tx.commit()?;
+        self.items_added += chunk_added;
+        self.buffer.clear();
+        Ok(())
+    }
+}
+
+fn stream_local_tree_files(
+    case_path: &Path,
+    evidence_id: i64,
+    _source_path: &str,
+    dir_path: &str,
+    sink: &mut StreamingLiveBookmarkSink<'_>,
+    checkpoint: Option<&LiveTraversalCheckpoint>,
+) -> Result<Vec<String>> {
+    let source = read_local_live_evidence(case_path, evidence_id)?;
+    if source.source_kind != "folder" {
+        bail!("recursive live listing is only available for folder evidence");
+    }
+    let (root, start) = resolve_local_folder_path(&source.source_path, dir_path)?;
+    let metadata = fs::symlink_metadata(&start)
+        .with_context(|| format!("reading evidence directory metadata {}", start.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("live listing does not follow symlinks: {}", start.display());
+    }
+    if !metadata.is_dir() {
+        bail!("local live path is not a directory: {}", start.display());
+    }
+
+    let start = ensure_under_evidence_root(&root, &start)
+        .with_context(|| format!("resolving evidence directory {}", start.display()))?;
+
+    let mut seen_directories = HashSet::new();
+    seen_directories.insert(start.clone());
+
+    let mut stack: Vec<(PathBuf, Vec<String>)> = if let Some(cp) = checkpoint {
+        if cp.completed {
+            return Ok(Vec::new());
+        }
+        if !cp.pending_directories.is_empty() {
+            cp.pending_directories
+                .iter()
+                .filter_map(|rel| {
+                    let rel_clean = rel.trim_matches('/');
+                    let parts: Vec<String> = if rel_clean.is_empty() {
+                        Vec::new()
+                    } else {
+                        rel_clean.split('/').map(String::from).collect()
+                    };
+                    let path = if rel_clean.is_empty() {
+                        start.clone()
+                    } else {
+                        start.join(rel_clean)
+                    };
+                    if let Ok(canon) = ensure_under_evidence_root(&root, &path) {
+                        seen_directories.insert(canon.clone());
+                        Some((canon, parts))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            vec![(start, Vec::new())]
+        }
+    } else {
+        vec![(start, Vec::new())]
+    };
+
+    while let Some((dir, rel_parts)) = stack.pop() {
+        if progress::is_cancellation_requested_active() {
+            sink.truncated = true;
+            stack.push((dir, rel_parts));
+            break;
+        }
+
+        let dir = match ensure_under_evidence_root(&root, &dir) {
+            Ok(dir) => dir,
+            Err(err) => {
+                sink.skip(format!("{}: {err:#}", dir.display()));
+                continue;
+            }
+        };
+        let metadata = match fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                sink.skip(format!("{}: {err}", dir.display()));
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            sink.skip(format!("{}: symbolic link not followed", dir.display()));
+            continue;
+        }
+        if !metadata.is_dir() {
+            sink.skip(format!("{}: expected a directory", dir.display()));
+            continue;
+        }
+        sink.directories_visited += 1;
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(read_dir) => read_dir,
+            Err(err) => {
+                sink.skip(format!("{}: {err}", dir.display()));
+                continue;
+            }
+        };
+
+        let mut child_dirs = Vec::new();
+        let mut dir_completed = true;
+        for child in read_dir {
+            if progress::is_cancellation_requested_active() {
+                sink.truncated = true;
+                dir_completed = false;
+                break;
+            }
+            let child = match child {
+                Ok(child) => child,
+                Err(err) => {
+                    sink.skip(format!(
+                        "{}: directory entry could not be read: {err}",
+                        dir.display()
+                    ));
+                    continue;
+                }
+            };
+            let child_path = child.path();
+            let name = child
+                .file_name()
+                .to_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| child.file_name().to_string_lossy().into_owned());
+            let mut child_rel = rel_parts.clone();
+            child_rel.push(name.clone());
+            let child_note = child_rel.join("/");
+            let metadata = match fs::symlink_metadata(&child_path) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    sink.skip(format!("{child_note}: {err}"));
+                    continue;
+                }
+            };
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                sink.skip(format!("{child_note}: symbolic link not followed"));
+                continue;
+            }
+            if file_type.is_dir() {
+                if !live_tree_depth_allowed(&child_rel) {
+                    sink.skip(format!("{child_note}: directory depth exceeds limit"));
+                    continue;
+                }
+                match ensure_under_evidence_root(&root, &child_path) {
+                    Ok(canonical) => {
+                        child_dirs.push((canonical, child_rel));
+                    }
+                    Err(err) => sink.skip(format!("{child_note}: {err:#}")),
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                sink.skip(format!("{child_note}: unsupported file type"));
+                continue;
+            }
+
+            let file_ref = LiveTreeFileRef {
+                relative_path: child_rel.join("/"),
+                name,
+                size_bytes: metadata.len(),
+                created_utc: system_time_rfc3339(metadata.created().ok()),
+                modified_utc: system_time_rfc3339(metadata.modified().ok()),
+                accessed_utc: system_time_rfc3339(metadata.accessed().ok()),
+                is_deleted: false,
+                provenance: None,
+                reconstruction_status: None,
+                recovery_status: None,
+                ntfs_file_record_number: None,
+                ntfs_sequence_number: None,
+                ntfs_parent_record_number: None,
+                mft_record_logical_offset: None,
+                mft_record_physical_offset: None,
+                file_data_logical_offset: None,
+                file_data_physical_offset: None,
+                file_data_file_offset: None,
+                file_data_contiguous_bytes: None,
+                physical_offset_basis: None,
+                file_data_direct_logical_mapping: None,
+                offset_coordinate_system: None,
+            };
+            if !sink.push_file(file_ref)? {
+                dir_completed = false;
+                break;
+            }
+        }
+
+        if dir_completed {
+            for (canon, child_rel) in child_dirs.into_iter().rev() {
+                if seen_directories.insert(canon.clone()) {
+                    stack.push((canon, child_rel));
+                } else {
+                    sink.skip(format!("{}: cycle prevented", child_rel.join("/")));
+                }
+            }
+        } else {
+            stack.push((dir, rel_parts));
+        }
+
+        if sink.file_limit_reached || progress::is_cancellation_requested_active() {
+            break;
+        }
+    }
+
+    let pending: Vec<String> = stack.iter().map(|(_, rel)| rel.join("/")).collect();
+    Ok(pending)
+}
+
+fn stream_fat_tree_files(
+    image_path: &Path,
+    volume: &LiveVolume,
+    dir_path: &str,
+    sink: &mut StreamingLiveBookmarkSink<'_>,
+    checkpoint: Option<&LiveTraversalCheckpoint>,
+) -> Result<Vec<String>> {
+    let mut opened = open_disk_image(image_path)?;
+    let slice = PartitionSlice::new(&mut *opened.reader, volume.start_offset, volume.size_bytes);
+    let fs =
+        fatfs::FileSystem::new(slice, fatfs::FsOptions::new()).context("opening FAT volume")?;
+    let root = fs.root_dir();
+    let relative = dir_path.trim_matches('/').to_string();
+
+    let mut stack: Vec<(String, Vec<String>)> = if let Some(cp) = checkpoint {
+        if cp.completed {
+            return Ok(Vec::new());
+        }
+        if !cp.pending_directories.is_empty() {
+            cp.pending_directories
+                .iter()
+                .map(|p| (p.clone(), p.split('/').map(String::from).collect()))
+                .collect()
+        } else {
+            vec![(relative, Vec::new())]
+        }
+    } else {
+        vec![(relative, Vec::new())]
+    };
+
+    while let Some((fat_path, rel_parts)) = stack.pop() {
+        if progress::is_cancellation_requested_active() {
+            sink.truncated = true;
+            stack.push((fat_path, rel_parts));
+            break;
+        }
+        sink.directories_visited += 1;
+        let dir = if fat_path.is_empty() {
+            root.clone()
+        } else {
+            match root.open_dir(&fat_path) {
+                Ok(dir) => dir,
+                Err(err) => {
+                    sink.skip(format!("{fat_path}: {err}"));
+                    continue;
+                }
+            }
+        };
+
+        let mut child_dirs = Vec::new();
+        let mut dir_completed = true;
+        for entry in dir.iter() {
+            if progress::is_cancellation_requested_active() {
+                sink.truncated = true;
+                dir_completed = false;
+                break;
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    sink.skip(format!("{fat_path}: FAT directory entry read error: {err}"));
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let child_path = if fat_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{fat_path}/{name}")
+            };
+            let mut child_rel = rel_parts.clone();
+            child_rel.push(name.clone());
+
+            if entry.is_dir() {
+                if !live_tree_depth_allowed(&child_rel) {
+                    sink.skip(format!("{child_path}: depth exceeds limit"));
+                    continue;
+                }
+                child_dirs.push((child_path, child_rel));
+                continue;
+            }
+
+            let file_ref = LiveTreeFileRef {
+                relative_path: child_rel.join("/"),
+                name,
+                size_bytes: entry.len(),
+                created_utc: fatfs_datetime_to_rfc3339(&entry.created()),
+                modified_utc: fatfs_datetime_to_rfc3339(&entry.modified()),
+                accessed_utc: fatfs_date_to_rfc3339(&entry.accessed()),
+                is_deleted: false,
+                provenance: None,
+                reconstruction_status: None,
+                recovery_status: None,
+                ntfs_file_record_number: None,
+                ntfs_sequence_number: None,
+                ntfs_parent_record_number: None,
+                mft_record_logical_offset: None,
+                mft_record_physical_offset: None,
+                file_data_logical_offset: None,
+                file_data_physical_offset: None,
+                file_data_file_offset: None,
+                file_data_contiguous_bytes: None,
+                physical_offset_basis: None,
+                file_data_direct_logical_mapping: None,
+                offset_coordinate_system: None,
+            };
+            if !sink.push_file(file_ref)? {
+                dir_completed = false;
+                break;
+            }
+        }
+
+        if dir_completed {
+            for d in child_dirs.into_iter().rev() {
+                stack.push(d);
+            }
+        } else {
+            stack.push((fat_path, rel_parts));
+        }
+
+        if sink.file_limit_reached || progress::is_cancellation_requested_active() {
+            break;
+        }
+    }
+
+    let pending = stack.iter().map(|(p, _)| p.clone()).collect();
+    Ok(pending)
+}
+
+fn stream_ext_tree_files(
+    image_path: &Path,
+    volume: &LiveVolume,
+    dir_path: &str,
+    sink: &mut StreamingLiveBookmarkSink<'_>,
+    checkpoint: Option<&LiveTraversalCheckpoint>,
+) -> Result<Vec<String>> {
+    let fs = open_ext4_superblock_bounded(image_path, volume.start_offset, volume.size_bytes)?;
+    let relative = dir_path.trim_matches('/').to_string();
+    let start = if relative.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{relative}")
+    };
+
+    let mut seen_directory_inodes = HashSet::new();
+
+    let mut stack: Vec<(String, Vec<String>)> = if let Some(cp) = checkpoint {
+        if cp.completed {
+            return Ok(Vec::new());
+        }
+        if !cp.pending_directories.is_empty() {
+            cp.pending_directories
+                .iter()
+                .map(|p| {
+                    let parts: Vec<String> = p
+                        .trim_matches('/')
+                        .split('/')
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect();
+                    (p.clone(), parts)
+                })
+                .collect()
+        } else {
+            vec![(start, Vec::new())]
+        }
+    } else {
+        vec![(start, Vec::new())]
+    };
+
+    while let Some((ext_path, rel_parts)) = stack.pop() {
+        if progress::is_cancellation_requested_active() {
+            sink.truncated = true;
+            stack.push((ext_path, rel_parts));
+            break;
+        }
+        sink.directories_visited += 1;
+        let children = match ext4_list_dir(&fs, &ext_path) {
+            Ok(children) => children,
+            Err(err) => {
+                sink.skip(format!("{ext_path}: {err}"));
+                continue;
+            }
+        };
+
+        let mut child_dirs = Vec::new();
+        let mut dir_completed = true;
+        for child in children {
+            if progress::is_cancellation_requested_active() {
+                sink.truncated = true;
+                dir_completed = false;
+                break;
+            }
+            let child_path = if ext_path == "/" {
+                format!("/{}", child.name)
+            } else {
+                format!("{ext_path}/{}", child.name)
+            };
+            let mut child_rel = rel_parts.clone();
+            child_rel.push(child.name.clone());
+
+            if child.is_dir {
+                if !live_tree_depth_allowed(&child_rel) {
+                    sink.skip(format!("{child_path}: depth exceeds limit"));
+                    continue;
+                }
+                child_dirs.push((child.inode_number, child_path, child_rel));
+                continue;
+            }
+
+            let file_ref = LiveTreeFileRef {
+                relative_path: child_rel.join("/"),
+                name: child.name,
+                size_bytes: child.size,
+                created_utc: child.btime_utc.or(child.ctime_utc),
+                modified_utc: child.mtime_utc,
+                accessed_utc: child.atime_utc,
+                is_deleted: false,
+                provenance: None,
+                reconstruction_status: None,
+                recovery_status: None,
+                ntfs_file_record_number: None,
+                ntfs_sequence_number: None,
+                ntfs_parent_record_number: None,
+                mft_record_logical_offset: None,
+                mft_record_physical_offset: None,
+                file_data_logical_offset: None,
+                file_data_physical_offset: None,
+                file_data_file_offset: None,
+                file_data_contiguous_bytes: None,
+                physical_offset_basis: None,
+                file_data_direct_logical_mapping: None,
+                offset_coordinate_system: None,
+            };
+            if !sink.push_file(file_ref)? {
+                dir_completed = false;
+                break;
+            }
+        }
+
+        if dir_completed {
+            for (inode, path, rel) in child_dirs.into_iter().rev() {
+                if seen_directory_inodes.insert(inode) {
+                    stack.push((path, rel));
+                } else {
+                    sink.skip(format!("{path}: cycle prevented"));
+                }
+            }
+        } else {
+            stack.push((ext_path, rel_parts));
+        }
+
+        if sink.file_limit_reached || progress::is_cancellation_requested_active() {
+            break;
+        }
+    }
+
+    let pending = stack.iter().map(|(p, _)| p.clone()).collect();
+    Ok(pending)
+}
+
+fn stream_ntfs_tree_files_on_reader<R: Read + Seek>(
+    reader: &mut R,
+    dir_path: &str,
+    sink: &mut StreamingLiveBookmarkSink<'_>,
+    checkpoint: Option<&LiveTraversalCheckpoint>,
+) -> Result<Vec<String>> {
+    let ntfs = ntfs::Ntfs::new(reader).context("opening NTFS volume on reader")?;
+    let relative = dir_path.trim_matches('/').to_string();
+
+    let mut root_record = ntfs
+        .root_directory(reader)
+        .context("opening NTFS root directory")?
+        .file_record_number();
+
+    for component in relative.split('/').filter(|v| !v.is_empty()) {
+        let children = collect_ntfs_dir_children(&ntfs, reader, root_record)?.children;
+        let child = children
+            .iter()
+            .find(|c| c.is_directory && c.name.eq_ignore_ascii_case(component))
+            .with_context(|| format!("directory not found: {component}"))?;
+        root_record = child.file_record_number;
+    }
+
+    let mut seen_records: HashSet<u64> = HashSet::new();
+
+    let mut stack: Vec<(u64, Vec<String>)> = if let Some(cp) = checkpoint {
+        if cp.completed {
+            return Ok(Vec::new());
+        }
+        if !cp.pending_directories.is_empty() {
+            let mut resolved_stack = Vec::new();
+            for p in &cp.pending_directories {
+                let parts: Vec<String> = p
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect();
+                let mut rec = root_record;
+                let mut found = true;
+                for part in &parts {
+                    if let Ok(res) = collect_ntfs_dir_children(&ntfs, reader, rec) {
+                        if let Some(ch) = res
+                            .children
+                            .iter()
+                            .find(|c| c.is_directory && c.name.eq_ignore_ascii_case(part))
+                        {
+                            rec = ch.file_record_number;
+                        } else {
+                            found = false;
+                            break;
+                        }
+                    } else {
+                        found = false;
+                        break;
+                    }
+                }
+                if found {
+                    resolved_stack.push((rec, parts));
+                }
+            }
+            if resolved_stack.is_empty() {
+                vec![(root_record, Vec::new())]
+            } else {
+                resolved_stack
+            }
+        } else {
+            vec![(root_record, Vec::new())]
+        }
+    } else {
+        vec![(root_record, Vec::new())]
+    };
+
+    while let Some((dir_record, rel_parts)) = stack.pop() {
+        if progress::is_cancellation_requested_active() {
+            sink.truncated = true;
+            stack.push((dir_record, rel_parts));
+            break;
+        }
+        if !seen_records.insert(dir_record) {
+            sink.skip(format!("record {dir_record} cycle prevented"));
+            continue;
+        }
+        sink.directories_visited += 1;
+        let children = match collect_ntfs_dir_children(&ntfs, reader, dir_record) {
+            Ok(result) => result.children,
+            Err(err) => {
+                sink.skip(format!("record {dir_record}: {err}"));
+                continue;
+            }
+        };
+
+        let mut child_dirs = Vec::new();
+        let mut dir_completed = true;
+        for child in children {
+            if progress::is_cancellation_requested_active() {
+                sink.truncated = true;
+                dir_completed = false;
+                break;
+            }
+            let mut child_rel = rel_parts.clone();
+            child_rel.push(child.name.clone());
+            if child.is_directory {
+                if !live_tree_depth_allowed(&child_rel) {
+                    sink.skip(format!("{}: depth exceeds limit", child.name));
+                    continue;
+                }
+                child_dirs.push((child.file_record_number, child_rel));
+                continue;
+            }
+
+            let file_ref = LiveTreeFileRef {
+                relative_path: child_rel.join("/"),
+                name: child.name,
+                size_bytes: child.size_bytes,
+                created_utc: child.standard_creation_time_utc.or(child.creation_time_utc),
+                modified_utc: child
+                    .standard_modification_time_utc
+                    .or(child.modification_time_utc),
+                accessed_utc: child.standard_access_time_utc.or(child.access_time_utc),
+                is_deleted: false,
+                provenance: None,
+                reconstruction_status: None,
+                recovery_status: None,
+                ntfs_file_record_number: Some(child.file_record_number),
+                ntfs_sequence_number: None,
+                ntfs_parent_record_number: Some(dir_record),
+                mft_record_logical_offset: None,
+                mft_record_physical_offset: None,
+                file_data_logical_offset: None,
+                file_data_physical_offset: None,
+                file_data_file_offset: None,
+                file_data_contiguous_bytes: None,
+                physical_offset_basis: None,
+                file_data_direct_logical_mapping: None,
+                offset_coordinate_system: None,
+            };
+            if !sink.push_file(file_ref)? {
+                dir_completed = false;
+                break;
+            }
+        }
+
+        if dir_completed {
+            for d in child_dirs.into_iter().rev() {
+                stack.push(d);
+            }
+        } else {
+            seen_records.remove(&dir_record);
+            stack.push((dir_record, rel_parts));
+        }
+
+        if sink.file_limit_reached || progress::is_cancellation_requested_active() {
+            break;
+        }
+    }
+
+    let pending = stack.iter().map(|(_, rel)| rel.join("/")).collect();
+    Ok(pending)
+}
+
+pub struct StreamBookmarkLiveFolderOptions<'a> {
+    pub case_path: &'a Path,
+    pub bookmark_id: i64,
+    pub evidence_id: i64,
+    pub source_kind: &'a str,
+    pub source_path: &'a str,
+    pub volume_index: usize,
+    pub volume_name: &'a str,
+    pub filesystem: &'a str,
+    pub dir_path: &'a str,
+    pub max_entries: usize,
+    pub checkpoint: Option<LiveTraversalCheckpoint>,
+    pub bitlocker_credential: Option<BitLockerUnlockCredential<'a>>,
+}
+
+pub fn stream_bookmark_live_folder(
+    options: StreamBookmarkLiveFolderOptions<'_>,
+) -> Result<RecursiveBookmarkResult> {
+    let checkpoint = match options.checkpoint {
+        Some(cp) => Some(cp),
+        None => get_bookmark_traversal_checkpoint(options.case_path, options.bookmark_id)?,
+    };
+
+    let mut sink = StreamingLiveBookmarkSink::new(
+        options.case_path,
+        options.bookmark_id,
+        options.evidence_id,
+        options.source_kind,
+        options.source_path,
+        options.volume_index,
+        options.volume_name,
+        options.filesystem,
+        options.max_entries,
+        checkpoint.as_ref(),
+    )?;
+
+    let pending_directories = match options.source_kind {
+        "folder" => stream_local_tree_files(
+            options.case_path,
+            options.evidence_id,
+            options.source_path,
+            options.dir_path,
+            &mut sink,
+            checkpoint.as_ref(),
+        )?,
+        "image" => {
+            let img_path = Path::new(options.source_path);
+            let volumes = list_image_volumes(img_path)?;
+            let volume = volumes
+                .get(options.volume_index)
+                .with_context(|| format!("volume index {} out of range", options.volume_index))?;
+
+            if volume.filesystem == BITLOCKER_LOCKED_FILESYSTEM {
+                let cred = options.bitlocker_credential.ok_or_else(|| {
+                    anyhow!("BitLocker volume requires an unlock credential to browse or bookmark")
+                })?;
+                let mut opened = open_disk_image(img_path)?;
+                let slice = PartitionSlice::new(
+                    &mut *opened.reader,
+                    volume.start_offset,
+                    volume.size_bytes,
+                );
+                let mut decrypted =
+                    bitlocker_decrypt::unlock_reader(slice, bitlocker_credential(cred)?)
+                        .with_context(|| {
+                            format!(
+                                "unlocking BitLocker volume {} for streaming bookmarking",
+                                volume.name
+                            )
+                        })?;
+                stream_ntfs_tree_files_on_reader(
+                    &mut decrypted,
+                    options.dir_path,
+                    &mut sink,
+                    checkpoint.as_ref(),
+                )?
+            } else if volume.filesystem == "NTFS" {
+                crate::ntfs_forensic::stream_ntfs_forensic_tree_files(
+                    img_path,
+                    options.volume_index,
+                    options.dir_path,
+                    &mut sink,
+                    checkpoint.as_ref(),
+                )?
+            } else if volume.filesystem == "FAT" {
+                stream_fat_tree_files(
+                    img_path,
+                    volume,
+                    options.dir_path,
+                    &mut sink,
+                    checkpoint.as_ref(),
+                )?
+            } else if volume.filesystem == "EXT" {
+                stream_ext_tree_files(
+                    img_path,
+                    volume,
+                    options.dir_path,
+                    &mut sink,
+                    checkpoint.as_ref(),
+                )?
+            } else {
+                bail!(
+                    "streaming live bookmarking is not supported for {} volumes",
+                    volume.filesystem
+                );
+            }
+        }
+        other => bail!("streaming live bookmarking is not available for {other} evidence"),
+    };
+
+    sink.flush_buffer()?;
+
+    let completed = pending_directories.is_empty() && !sink.truncated && !sink.file_limit_reached;
+    let checkpoint = LiveTraversalCheckpoint {
+        pending_directories,
+        last_relative_path: sink.last_relative_path.clone(),
+        items_added: sink.items_added,
+        total_candidates: sink.total_candidates,
+        completed,
+    };
+
+    persist_bookmark_traversal_checkpoint(options.case_path, options.bookmark_id, &checkpoint)?;
+
+    Ok(RecursiveBookmarkResult {
+        bookmark_id: options.bookmark_id,
+        items_added: sink.items_added,
+        total_candidates: sink.total_candidates,
+        truncated: sink.truncated,
+        skipped: sink.skipped,
+        skipped_count: sink.skipped_count,
+        file_limit: sink.file_limit,
+        file_limit_reached: sink.file_limit_reached,
+        skipped_entry_ids: Vec::new(),
+        checkpoint: Some(checkpoint),
+    })
+}
+
+pub fn persist_bookmark_traversal_checkpoint(
+    case_path: &Path,
+    bookmark_id: i64,
+    checkpoint: &LiveTraversalCheckpoint,
+) -> Result<()> {
+    let mut conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let actor = audit_actor(&tx, case_id)?;
+
+    let raw_source_ref: String = tx
+        .query_row(
+            "SELECT source_ref_json FROM bookmarks WHERE case_id = ?1 AND id = ?2",
+            params![case_id, bookmark_id],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("bookmark {bookmark_id} not found"))?;
+
+    let mut source_ref: serde_json::Value =
+        serde_json::from_str(&raw_source_ref).unwrap_or_else(|_| serde_json::json!({}));
+    if !source_ref.is_object() {
+        source_ref = serde_json::json!({});
+    }
+
+    let checkpoint_json = serde_json::to_value(checkpoint)?;
+    source_ref["checkpoint"] = checkpoint_json;
+    let new_source_ref_str = serde_json::to_string(&source_ref)?;
+
+    tx.execute(
+        "UPDATE bookmarks SET source_ref_json = ?1, updated_at = CURRENT_TIMESTAMP WHERE case_id = ?2 AND id = ?3",
+        params![new_source_ref_str, case_id, bookmark_id],
+    )?;
+
+    tx.execute(
+        "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+         VALUES (?1, 'bookmark.checkpoint_update', ?2, 'bookmark', ?3,
+                 json_object('bookmark_id', ?3, 'completed', ?4, 'items_added', ?5, 'total_candidates', ?6))",
+        params![
+            case_id,
+            actor,
+            bookmark_id,
+            checkpoint.completed,
+            checkpoint.items_added,
+            checkpoint.total_candidates,
+        ],
+    )?;
+
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn get_bookmark_traversal_checkpoint(
+    case_path: &Path,
+    bookmark_id: i64,
+) -> Result<Option<LiveTraversalCheckpoint>> {
+    let conn = open_existing_case(case_path)?;
+    let case_id = active_case_id(&conn)?;
+    let raw_source_ref: Option<String> = conn
+        .query_row(
+            "SELECT source_ref_json FROM bookmarks WHERE case_id = ?1 AND id = ?2",
+            params![case_id, bookmark_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let raw_source_ref = match raw_source_ref {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    let value: serde_json::Value =
+        serde_json::from_str(&raw_source_ref).unwrap_or(serde_json::Value::Null);
+    if let Some(cp_val) = value.get("checkpoint") {
+        if !cp_val.is_null() {
+            let cp: LiveTraversalCheckpoint = serde_json::from_value(cp_val.clone())?;
+            return Ok(Some(cp));
+        }
+    }
+    Ok(None)
 }
 
 /// Audit trail for a recursive live folder export.
@@ -37761,6 +40948,62 @@ pub fn export_indexed_browser_profile(
     volume_index_zero_based: Option<usize>,
     output_root: &Path,
 ) -> Result<usize> {
+    let mut read_session = EvidenceReadSession::open(case_path)?;
+    export_indexed_browser_profile_in_session(
+        case_path,
+        evidence_id,
+        source_profile_path,
+        volume_index_zero_based,
+        output_root,
+        &mut read_session,
+    )
+}
+
+/// Exports an indexed browser profile from the plaintext view of an unlocked
+/// BitLocker volume. The unlock credential is borrowed only long enough to
+/// initialize the in-memory reader; it is never copied into the case, the
+/// staged browser files, or parser diagnostics.
+///
+/// `volume_index_zero_based` must identify the same volume as `context`. This
+/// explicit binding prevents a credential-aware session from being reused for
+/// an entry on another partition. Recovered file provenance remains in the
+/// `decrypted_bitlocker_volume_logical_bytes` coordinate system recorded on
+/// the indexed source entries; no encrypted-media physical offset is inferred.
+pub fn export_indexed_browser_profile_with_bitlocker(
+    case_path: &Path,
+    evidence_id: i64,
+    source_profile_path: &str,
+    volume_index_zero_based: usize,
+    output_root: &Path,
+    context: BitLockerProcessingContext<'_>,
+) -> Result<usize> {
+    if volume_index_zero_based != context.volume_index {
+        bail!(
+            "browser profile volume index {} does not match the memory-only BitLocker reader volume index {}",
+            volume_index_zero_based,
+            context.volume_index
+        );
+    }
+    let mut read_session =
+        EvidenceReadSession::open_with_bitlocker(case_path, evidence_id, context)?;
+    export_indexed_browser_profile_in_session(
+        case_path,
+        evidence_id,
+        source_profile_path,
+        Some(volume_index_zero_based),
+        output_root,
+        &mut read_session,
+    )
+}
+
+fn export_indexed_browser_profile_in_session(
+    case_path: &Path,
+    evidence_id: i64,
+    source_profile_path: &str,
+    volume_index_zero_based: Option<usize>,
+    output_root: &Path,
+    read_session: &mut EvidenceReadSession,
+) -> Result<usize> {
     let files = {
         let conn = open_existing_case(case_path)?;
         let case_id = active_case_id(&conn)?;
@@ -37787,7 +41030,6 @@ pub fn export_indexed_browser_profile(
     fs::create_dir_all(output_root)
         .with_context(|| format!("creating browser staging root {}", output_root.display()))?;
     let mut exported = 0_usize;
-    let mut read_session = EvidenceReadSession::open(case_path)?;
     for source in sources {
         let exact_key = normalized_browser_source_path(&source.exact_path);
         let relative = if profile_key.is_empty() {
@@ -37816,7 +41058,7 @@ pub fn export_indexed_browser_profile(
                 .with_context(|| format!("creating browser staging folder {}", parent.display()))?;
         }
         recover_filesystem_entry_in_session(
-            &mut read_session,
+            read_session,
             RecoverEntryOptions {
                 entry_id: source.entry_id,
                 output_path,
@@ -47067,6 +50309,72 @@ struct PartitionSlice<'a> {
     pos: u64,
 }
 
+/// An owned bounded view used when the container reader itself must become
+/// part of a long-lived decoder (notably a worker-local BitLocker plaintext
+/// reader). It exposes only partition-relative positions to the decoder.
+struct OwnedPartitionSlice {
+    inner: Box<dyn disk_forensic::container::ReadSeek>,
+    start: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl OwnedPartitionSlice {
+    fn new(inner: Box<dyn disk_forensic::container::ReadSeek>, start: u64, len: u64) -> Self {
+        Self {
+            inner,
+            start,
+            len,
+            pos: 0,
+        }
+    }
+}
+
+impl Read for OwnedPartitionSlice {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.len - self.pos;
+        let read_len = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        let absolute = self.start.checked_add(self.pos).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "partition offset overflow")
+        })?;
+        self.inner.seek(SeekFrom::Start(absolute))?;
+        let read = self.inner.read(&mut buf[..read_len])?;
+        self.pos = self.pos.saturating_add(read as u64);
+        Ok(read)
+    }
+}
+
+impl Seek for OwnedPartitionSlice {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let next = match pos {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::Current(offset) => i128::from(self.pos) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(self.len) + i128::from(offset),
+        };
+        if next < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot seek before partition start",
+            ));
+        }
+        let next = u64::try_from(next)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "partition seek overflow"))?;
+        if next > self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot seek beyond partition end",
+            ));
+        }
+        self.pos = next;
+        Ok(self.pos)
+    }
+}
+
 impl<'a> PartitionSlice<'a> {
     fn new(inner: &'a mut dyn disk_forensic::container::ReadSeek, start: u64, len: u64) -> Self {
         Self {
@@ -49021,7 +52329,7 @@ fn report_entries_for_category(
              FROM filesystem_entries
              WHERE case_id = ?1
                 AND (?2 IS NULL OR evidence_id = ?2)
-                AND entry_kind != 'directory'
+                AND (entry_kind != 'directory' OR COALESCE(json_extract(metadata_json, '$.artifact_kind'), '') IN ('registry_hive', 'registry_key'))
                 AND COALESCE(json_extract(metadata_json, '$.category_hidden'), 0) <> 1
                 AND COALESCE(json_extract(metadata_json, '$.artifact_kind'), '')
                     NOT IN ('filesystem_parser_error', 'filesystem_parser_summary')
@@ -49038,7 +52346,7 @@ fn report_entries_for_category(
          FROM filesystem_entries
          WHERE case_id = ?1
            AND (?2 IS NULL OR evidence_id = ?2)
-           AND entry_kind != 'directory'
+           AND (entry_kind != 'directory' OR COALESCE(json_extract(metadata_json, '$.artifact_kind'), '') IN ('registry_hive', 'registry_key'))
            AND COALESCE(json_extract(metadata_json, '$.category_hidden'), 0) <> 1
            AND COALESCE(json_extract(metadata_json, '$.artifact_kind'), '')
                NOT IN ('filesystem_parser_error', 'filesystem_parser_summary')
@@ -49576,7 +52884,175 @@ fn apply_schema_migrations(conn: &Connection) -> Result<()> {
     ensure_evidence_hash_columns(conn)?;
     ensure_installed_resources_config_column(conn)?;
     ensure_filesystem_entries_indexes(conn)?;
-    ensure_evidence_jobs_checkpoint_columns(conn)
+    ensure_evidence_jobs_checkpoint_columns(conn)?;
+    ensure_processing_pipeline_tables(conn)?;
+    semantic_artifacts::ensure_schema(conn)
+}
+
+fn ensure_processing_pipeline_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS processing_plans (
+             plan_id INTEGER PRIMARY KEY,
+             case_id INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+             evidence_id INTEGER NOT NULL REFERENCES evidence_sources(id) ON DELETE CASCADE,
+             plan_type TEXT NOT NULL,
+             preset_name TEXT NOT NULL,
+             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+             status TEXT NOT NULL DEFAULT 'planned'
+                 CHECK (status IN ('planned', 'running', 'completed', 'completed_with_diagnostics', 'failed', 'cancelled', 'interrupted')),
+             target_summary_json TEXT NOT NULL DEFAULT '{}',
+             requested_processors_json TEXT NOT NULL DEFAULT '{}'
+         );
+         CREATE INDEX IF NOT EXISTS ix_processing_plans_case_evidence ON processing_plans(case_id, evidence_id);
+
+         CREATE TABLE IF NOT EXISTS processing_job_targets (
+             id INTEGER PRIMARY KEY,
+             job_id INTEGER NOT NULL REFERENCES evidence_jobs(id) ON DELETE CASCADE,
+             evidence_id INTEGER NOT NULL REFERENCES evidence_sources(id) ON DELETE CASCADE,
+             discovered_volume_id TEXT NOT NULL,
+             partition_table_index INTEGER,
+             partition_start_offset INTEGER NOT NULL,
+             partition_length INTEGER NOT NULL,
+             target_role TEXT NOT NULL DEFAULT 'primary',
+             unlocked_for_session INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS ix_processing_job_targets_job ON processing_job_targets(job_id);
+
+         CREATE TABLE IF NOT EXISTS processor_executions (
+             id INTEGER PRIMARY KEY,
+             job_id INTEGER NOT NULL REFERENCES evidence_jobs(id) ON DELETE CASCADE,
+             processor_name TEXT NOT NULL,
+             stage_index INTEGER NOT NULL,
+             status TEXT NOT NULL DEFAULT 'running'
+                 CHECK (status IN ('queued', 'running', 'completed', 'completed_with_diagnostics', 'failed', 'cancelled', 'skipped', 'interrupted', 'not_started')),
+             started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+             completed_at TEXT,
+             items_discovered INTEGER NOT NULL DEFAULT 0,
+             items_indexed INTEGER NOT NULL DEFAULT 0,
+             diagnostics_json TEXT NOT NULL DEFAULT '{}'
+         );
+         CREATE INDEX IF NOT EXISTS ix_processor_executions_job ON processor_executions(job_id);",
+    )
+    .context("ensuring processing pipeline tables")?;
+    let _ = conn.execute(
+        "ALTER TABLE processing_job_targets ADD COLUMN unlocked_for_session INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    Ok(())
+}
+
+pub fn record_processing_plan(
+    conn: &Connection,
+    case_id: i64,
+    evidence_id: i64,
+    plan_type: &str,
+    preset_name: &str,
+    target_summary: &serde_json::Value,
+    requested_processors: &serde_json::Value,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO processing_plans (
+             case_id, evidence_id, plan_type, preset_name, status,
+             target_summary_json, requested_processors_json
+         ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6)",
+        params![
+            case_id,
+            evidence_id,
+            plan_type,
+            preset_name,
+            &target_summary.to_string(),
+            &requested_processors.to_string(),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn update_processing_plan_status(conn: &Connection, plan_id: i64, status: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE processing_plans SET status = ?1 WHERE plan_id = ?2",
+        params![status, plan_id],
+    )?;
+    Ok(())
+}
+
+pub fn record_processor_execution(
+    conn: &Connection,
+    job_id: i64,
+    processor_name: &str,
+    stage_index: usize,
+    status: &str,
+    items_discovered: usize,
+    items_indexed: usize,
+    diagnostics_json: &serde_json::Value,
+) -> Result<i64> {
+    if status == "running" || status == "queued" {
+        conn.execute(
+            "INSERT INTO processor_executions (
+                 job_id, processor_name, stage_index, status,
+                 items_discovered, items_indexed, diagnostics_json,
+                 completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            params![
+                job_id,
+                processor_name,
+                stage_index as i64,
+                status,
+                items_discovered as i64,
+                items_indexed as i64,
+                &diagnostics_json.to_string(),
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO processor_executions (
+                 job_id, processor_name, stage_index, status,
+                 items_discovered, items_indexed, diagnostics_json,
+                 completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![
+                job_id,
+                processor_name,
+                stage_index as i64,
+                status,
+                items_discovered as i64,
+                items_indexed as i64,
+                &diagnostics_json.to_string(),
+            ],
+        )?;
+    }
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn update_processor_execution_status(
+    conn: &Connection,
+    execution_id: i64,
+    status: &str,
+    items_discovered: usize,
+    items_indexed: usize,
+    diagnostics_json: &serde_json::Value,
+) -> Result<()> {
+    let rows = conn.execute(
+        "UPDATE processor_executions
+         SET status = ?1,
+             completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             items_discovered = ?2,
+             items_indexed = ?3,
+             diagnostics_json = ?4
+         WHERE id = ?5",
+        params![
+            status,
+            items_discovered as i64,
+            items_indexed as i64,
+            &diagnostics_json.to_string(),
+            execution_id,
+        ],
+    )?;
+    if rows != 1 {
+        bail!(
+            "processor execution #{execution_id} could not be finalized: expected one row, updated {rows}"
+        );
+    }
+    Ok(())
 }
 
 fn ensure_filesystem_entry_text_segments_table(conn: &Connection) -> Result<()> {
@@ -49791,6 +53267,9 @@ fn ensure_evidence_hash_columns(conn: &Connection) -> Result<()> {
         "hashed_at",
         "sha256_scope",
         "acquisition_manifest_json",
+        "integrity_status",
+        "expected_sha256",
+        "integrity_details_json",
     ] {
         if !existing.iter().any(|name| name == column) {
             conn.execute(
@@ -49874,7 +53353,7 @@ fn enable_foreign_keys(conn: &Connection) -> Result<()> {
         .context("enabling SQLite foreign keys")
 }
 
-fn open_existing_case(case_path: &Path) -> Result<Connection> {
+pub fn open_existing_case(case_path: &Path) -> Result<Connection> {
     if !case_path.exists() {
         bail!("case does not exist: {}", case_path.display());
     }
@@ -49983,7 +53462,7 @@ fn schema_version_applied(conn: &Connection, version: i64) -> Result<bool> {
     .context("checking schema migration version")
 }
 
-fn active_case_id(conn: &Connection) -> Result<i64> {
+pub fn active_case_id(conn: &Connection) -> Result<i64> {
     let (count, min_id, max_id): (i64, Option<i64>, Option<i64>) =
         conn.query_row("SELECT COUNT(*), MIN(id), MAX(id) FROM cases", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -53633,6 +57112,63 @@ mod tests {
                 && hit.source_path_exact.as_deref() == Some("Finance/wire_transfer_pending.txt")
         }));
 
+        let member_bytes = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: member.id,
+                offset: 0,
+                length: 512,
+            },
+        )?;
+        assert_eq!(
+            member_bytes.bytes,
+            b"Wire transfer pending examiner review."
+        );
+        assert_eq!(member_bytes.total_size, 38);
+        assert!(member_bytes.eof);
+
+        let member_window = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: member.id,
+                offset: 5,
+                length: 8,
+            },
+        )?;
+        assert_eq!(member_window.bytes, b"transfer");
+        assert!(!member_window.eof);
+
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        conn.execute(
+            "INSERT INTO filesystem_entries(
+                 case_id, evidence_id, logical_path, name, entry_kind, metadata_json)
+             VALUES (?1, ?2, '/Parsed records/no-byte-stream', 'no-byte-stream', 'record', ?3)",
+            params![
+                case_id,
+                evidence_id,
+                serde_json::json!({
+                    "artifact_kind": "test_derived_record",
+                    "metadata_only_value": "must-not-appear-in-hex"
+                })
+                .to_string()
+            ],
+        )?;
+        let metadata_only_entry_id = conn.last_insert_rowid();
+        drop(conn);
+        let error = read_filesystem_entry_bytes(
+            &case_path,
+            ReadEntryBytesOptions {
+                entry_id: metadata_only_entry_id,
+                offset: 0,
+                length: 512,
+            },
+        )
+        .expect_err("metadata-only records must not be serialized into the Hex viewer");
+        assert!(error
+            .to_string()
+            .contains("metadata in Inspector/Properties"));
+
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
         Ok(())
@@ -54458,6 +57994,28 @@ mod tests {
         let _ = fs::remove_dir_all(output);
         let _ = fs::remove_dir_all(root_profile_output);
         Ok(())
+    }
+
+    #[test]
+    fn bitlocker_browser_staging_rejects_cross_volume_scope_without_disclosing_credential() {
+        let credential = "111111-222222-333333-444444-555555-666666-777777-888888";
+        let error = export_indexed_browser_profile_with_bitlocker(
+            Path::new("case-does-not-need-to-exist.kdft.sqlite"),
+            1,
+            "Users/Examiner/AppData/Local/Browser/User Data/Default",
+            3,
+            Path::new("unused-browser-output"),
+            BitLockerProcessingContext {
+                volume_index: 2,
+                credential: BitLockerUnlockCredential::RecoveryKey(credential),
+            },
+        )
+        .expect_err("a profile cannot cross the credential-aware reader's volume scope");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("does not match"));
+        assert!(rendered.contains("volume index 3"));
+        assert!(rendered.contains("volume index 2"));
+        assert!(!rendered.contains(credential));
     }
 
     #[test]
@@ -58403,6 +61961,28 @@ mod tests {
     }
 
     #[test]
+    fn standalone_registry_import_uses_active_examiner_cancellation() {
+        let tracker = progress::JobProgressTracker::new(
+            "standalone-registry-cancellation-test",
+            "filesystem_index",
+            None,
+        );
+        tracker.request_cancellation();
+
+        let error = progress::with_job_progress(&tracker, || {
+            collect_registry_hive_import(
+                Path::new("this-standalone-hive-must-never-be-opened.dat"),
+                "SYSTEM",
+                100,
+            )
+        })
+        .expect_err("active cancellation must stop standalone Registry import before I/O");
+
+        assert!(error_chain_is_job_cancelled(&error));
+        assert!(error.to_string().contains("cancelled by examiner request"));
+    }
+
+    #[test]
     fn process_registry_hive_evidence_reports_wrong_magic_as_unsupported() -> Result<()> {
         let case_path = unique_case_path("registry-wrong-magic");
         create_test_case(&case_path)?;
@@ -59714,9 +63294,165 @@ mod tests {
         );
         assert_eq!(
             (security_evtx.main, security_evtx.sub),
-            ("Operating System", "Event logs")
+            ("Operating System", "Windows EVTX files")
         );
         assert_eq!(security_evtx.confidence, "high");
+
+        let etl_trace = classify(
+            "/Image Analysis/Volumes/003-Basic_data_partition/ProgramData/USOShared/Logs/System/MoUxCoreWorker.4ac62e4f.etl",
+            "MoUxCoreWorker.4ac62e4f.etl",
+        );
+        assert_eq!(
+            (etl_trace.main, etl_trace.sub),
+            ("Operating System", "ETW trace containers")
+        );
+        assert!(
+            etl_trace.detail.contains("not decoded") || etl_trace.detail.contains("not decode")
+        );
+        assert_ne!(etl_trace.sub, "Windows EVTX records");
+
+        let text_log = classify(
+            "/Image Analysis/Volumes/003-Basic_data_partition/ProgramData/Vendor/Logs/agent.log",
+            "agent.log",
+        );
+        assert_eq!(
+            (text_log.main, text_log.sub),
+            ("Operating System", "Application and text logs")
+        );
+        assert_ne!(text_log.sub, "Windows EVTX records");
+
+        let adobe_manifest = classify(
+            "/Image Analysis/Volumes/003-Basic_data_partition/Users/alice/AppData/LocalLow/Adobe/GrowthSDK/Production/x64/manifest.db",
+            "manifest.db",
+        );
+        assert_eq!(
+            (adobe_manifest.main, adobe_manifest.sub),
+            ("Databases", "Application databases")
+        );
+        assert_ne!(adobe_manifest.main, "Mobile Devices");
+
+        let ios_manifest = classify(
+            "/Users/alice/Library/Application Support/MobileSync/Backup/00008110-001234567890001E/Manifest.db",
+            "Manifest.db",
+        );
+        assert_eq!(
+            (ios_manifest.main, ios_manifest.sub),
+            ("Mobile Devices", "iOS backup sources")
+        );
+        assert_eq!(ios_manifest.confidence, "medium");
+
+        let dpapi_master_key = classify(
+            "/Image Analysis/Volumes/003-Basic_data_partition/Users/alice/AppData/Roaming/Microsoft/Protect/S-1-5-21-1-2-3-1001/f5707327-01d8-4fdf-90fe-9e88f6ef2722",
+            "f5707327-01d8-4fdf-90fe-9e88f6ef2722",
+        );
+        assert_eq!(
+            (dpapi_master_key.main, dpapi_master_key.sub),
+            ("Accounts and Identity", "Protected credential material")
+        );
+        assert!(dpapi_master_key
+            .detail
+            .contains("no credential or secret value"));
+
+        let decoded_evtx_record = classify_entry(
+            "/Windows Artifacts/1/evtx/00000001-4624.record",
+            "Successful logon",
+            "record",
+            &serde_json::json!({"artifact_kind": "evtx_event_record"}),
+        );
+        assert_eq!(
+            (decoded_evtx_record.main, decoded_evtx_record.sub),
+            ("Operating System", "Windows EVTX records")
+        );
+    }
+
+    #[test]
+    fn mobile_manifest_requires_layout_or_schema_corroboration() {
+        let unrelated = classify_entry(
+            "/Users/alice/AppData/LocalLow/Adobe/GrowthSDK/manifest.db",
+            "manifest.db",
+            "file",
+            &serde_json::json!({}),
+        );
+        assert_ne!(unrelated.main, "Mobile Devices");
+
+        let schema_validated = classify_entry(
+            "/Examiner/renamed/manifest.db",
+            "manifest.db",
+            "file",
+            &serde_json::json!({"ios_manifest_schema_validated": true}),
+        );
+        assert_eq!(
+            (schema_validated.main, schema_validated.sub),
+            ("Mobile Devices", "iOS backup sources")
+        );
+        assert_eq!(schema_validated.confidence, "high");
+    }
+
+    #[test]
+    fn identity_pass_keeps_dpapi_master_key_as_undecoded_protected_material() -> Result<()> {
+        let case_path = unique_case_path("identity-dpapi-protected");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("identity-dpapi-protected-source");
+        let protect_dir = evidence_dir
+            .join("Users")
+            .join("alice")
+            .join("AppData")
+            .join("Roaming")
+            .join("Microsoft")
+            .join("Protect")
+            .join("S-1-5-21-1-2-3-1001");
+        fs::create_dir_all(&protect_dir)?;
+        let master_key_name = "f5707327-01d8-4fdf-90fe-9e88f6ef2722";
+        fs::write(
+            protect_dir.join(master_key_name),
+            b"protected-dpapi-fixture",
+        )?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_dir.clone(),
+                kind: EvidenceKind::Folder,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+        process_evidence(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 100,
+            },
+        )?;
+        let result = parse_identity_artifacts(&case_path, evidence_id)?;
+        assert_eq!(result.credential_stores_indexed, 0);
+        assert_eq!(result.protected_credential_material_indexed, 1);
+        assert_eq!(result.recovered_secret_values_indexed, 0);
+        assert_eq!(result.plaintext_secrets_indexed, 0);
+
+        let entries = list_filesystem_entries(&case_path, Some(evidence_id))?;
+        let protected = entries
+            .iter()
+            .find(|entry| {
+                entry.metadata_json["artifact_kind"].as_str()
+                    == Some("protected_credential_material")
+            })
+            .expect("identity pass emits protected DPAPI material record");
+        assert_eq!(protected.metadata_json["recovered_secret_count"], 0);
+        assert_eq!(protected.metadata_json["values_extracted"], false);
+        assert_eq!(protected.metadata_json["decryption_attempted"], false);
+        assert_eq!(
+            protected.metadata_json["material_state"].as_str(),
+            Some("protected_encrypted_candidate")
+        );
+        assert_eq!(
+            protected.metadata_json["category_sub"].as_str(),
+            Some("Protected credential material")
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
     }
 
     #[test]
@@ -62749,6 +66485,12 @@ mod tests {
         assert_eq!(bytes, b"FAT evidence artifact");
         assert_eq!(total, b"FAT evidence artifact".len() as u64);
 
+        // Verify bounded paging on FAT
+        let (fat_page, fat_total, fat_trunc) = list_image_directory_page(&fat_image, 0, "/", 0, 1)?;
+        assert_eq!(fat_total, root.len());
+        assert_eq!(fat_page.len(), 1);
+        assert_eq!(fat_trunc, root.len() > 1);
+
         // ext2 whole-image volume: /hello.txt.
         let ext_image = dir.join("ext.img");
         let payload = b"ext live payload";
@@ -62761,6 +66503,13 @@ mod tests {
         let (ext_bytes, ext_total) = read_image_directory_bytes(&ext_image, 0, "hello.txt", 0, 64)?;
         assert_eq!(ext_bytes, payload);
         assert_eq!(ext_total, payload.len() as u64);
+
+        // Verify bounded paging on EXT
+        let (ext_page, ext_page_total, ext_trunc) =
+            list_image_directory_page(&ext_image, 0, "/", 0, 10)?;
+        assert_eq!(ext_page_total, ext_root.len());
+        assert_eq!(ext_page.len(), ext_root.len());
+        assert!(!ext_trunc);
 
         // No case database is touched by live browsing.
         let _ = fs::remove_dir_all(&dir);
@@ -62842,6 +66591,29 @@ mod tests {
         let all = list_local_directory(&case_path, evidence_id, "/many")?;
         assert_eq!(all.entries.len(), 1005);
         assert!(!all.truncated);
+
+        // Verify offset-based paging matches cursor-based paging exactly
+        let off_page1 =
+            list_local_directory_offset_page(&case_path, evidence_id, "/many", 0, 1000)?;
+        assert_eq!(off_page1.entries.len(), 1000);
+        assert_eq!(off_page1.total_entries, 1005);
+        assert!(off_page1.truncated);
+        assert!(off_page1.next_cursor.is_some());
+
+        let off_page2 =
+            list_local_directory_offset_page(&case_path, evidence_id, "/many", 1000, 1000)?;
+        assert_eq!(off_page2.entries.len(), 5);
+        assert_eq!(off_page2.total_entries, 1005);
+        assert!(!off_page2.truncated);
+
+        for (a, b) in off_page1.entries.iter().zip(first.entries.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.is_dir, b.is_dir);
+        }
+        for (a, b) in off_page2.entries.iter().zip(second.entries.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.is_dir, b.is_dir);
+        }
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_dir);
@@ -67239,6 +71011,48 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.entry_kind != "directory"));
+        assert_eq!(
+            first_page.completeness.status,
+            result_completeness::ResultCompletenessStatus::Truncated
+        );
+        assert_eq!(first_page.completeness.counts.input_total, Some(4));
+        assert_eq!(first_page.completeness.counts.output_matched, Some(4));
+        assert_eq!(first_page.completeness.counts.output_emitted, 2);
+        assert_eq!(first_page.completeness.counts.output_omitted, 2);
+        match &first_page.completeness.continuation {
+            result_completeness::ResultContinuation::Cursor {
+                snapshot_generation,
+                remaining_estimate,
+                ..
+            } => {
+                assert_eq!(
+                    Some(snapshot_generation.as_str()),
+                    first_page.completeness.scope.case_generation.as_deref()
+                );
+                assert_eq!(*remaining_estimate, Some(2));
+            }
+            other => panic!("expected cursor continuation, got {other:?}"),
+        }
+        assert!(first_page
+            .completeness
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "category_query_page_limit"));
+        assert!(first_page
+            .completeness
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "upstream_artifact_coverage_not_assessed"));
+        let serialized_first_page = serde_json::to_value(&first_page)?;
+        assert_eq!(serialized_first_page["completeness"]["status"], "truncated");
+        assert_eq!(
+            serialized_first_page["completeness"]["counts"]["output_omitted"],
+            2
+        );
+        assert_eq!(
+            serialized_first_page["completeness"]["continuation"]["kind"],
+            "cursor"
+        );
 
         let second_page = list_entries_by_category(
             &case_path,
@@ -67251,6 +71065,19 @@ mod tests {
         assert_eq!(second_page.total_in_category, 4);
         assert_eq!(second_page.entries.len(), 2);
         assert_eq!(second_page.entries[0].logical_path, "/docs/c.docx");
+        assert_eq!(
+            second_page.completeness.status,
+            result_completeness::ResultCompletenessStatus::Truncated
+        );
+        assert!(matches!(
+            second_page.completeness.continuation,
+            result_completeness::ResultContinuation::Restart
+        ));
+        assert!(second_page
+            .completeness
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "category_query_page_window"));
 
         let filtered_zip = list_entries_by_category_filtered(
             &case_path,
@@ -67269,6 +71096,20 @@ mod tests {
         assert_eq!(filtered_zip.total_matching, 1);
         assert_eq!(filtered_zip.entries[0].logical_path, "/docs/z-General.zip");
         assert!(filtered_zip.next_cursor.is_none());
+        assert_eq!(
+            filtered_zip.completeness.status,
+            result_completeness::ResultCompletenessStatus::Unknown
+        );
+        assert!(matches!(
+            filtered_zip.completeness.continuation,
+            result_completeness::ResultContinuation::None
+        ));
+        assert_eq!(filtered_zip.completeness.counts.output_omitted, 0);
+        assert!(filtered_zip
+            .completeness
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "upstream_artifact_coverage_not_assessed"));
 
         let cursor_first = list_entries_by_category_filtered(
             &case_path,
@@ -67291,6 +71132,13 @@ mod tests {
             0,
         )?;
         assert_eq!(
+            cursor_first
+                .next_cursor
+                .as_ref()
+                .and_then(|cursor| cursor.snapshot_generation.as_deref()),
+            cursor_first.completeness.scope.case_generation.as_deref()
+        );
+        assert_eq!(
             cursor_second
                 .entries
                 .iter()
@@ -67299,6 +71147,45 @@ mod tests {
             vec!["/docs/c.docx", "/docs/z-General.zip"]
         );
         assert!(cursor_second.next_cursor.is_none());
+
+        let mut legacy_cursor = cursor_first.next_cursor.clone().expect("first-page cursor");
+        legacy_cursor.snapshot_generation = None;
+        let legacy_page = list_entries_by_category_filtered(
+            &case_path,
+            Some(first_evidence_id),
+            "Documents and Office",
+            Some("Word processing"),
+            &CategoryEntryFilters::default(),
+            Some(&legacy_cursor),
+            2,
+            0,
+        )?;
+        assert!(legacy_page
+            .completeness
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "category_query_legacy_unbound_cursor"));
+
+        let mutation_conn = open_existing_case(&case_path)?;
+        mutation_conn.execute(
+            "INSERT INTO audit_events(case_id, event_type, actor, object_type, object_id, details_json)
+             VALUES (?1, 'test.mutation', 'test', 'case', ?1, '{}')",
+            params![case_id],
+        )?;
+        let stale_cursor_error = list_entries_by_category_filtered(
+            &case_path,
+            Some(first_evidence_id),
+            "Documents and Office",
+            Some("Word processing"),
+            &CategoryEntryFilters::default(),
+            cursor_first.next_cursor.as_ref(),
+            2,
+            0,
+        )
+        .expect_err("cursor must not continue across a case mutation");
+        assert!(stale_cursor_error
+            .to_string()
+            .contains("different case generation"));
 
         let all_evidence_docs = list_entries_by_category(
             &case_path,
@@ -73419,6 +77306,11 @@ mod tests {
         assert_eq!(result.items_added, 4);
         assert_eq!(result.total_candidates, 4);
         assert!(!result.truncated);
+        let cp = get_bookmark_traversal_checkpoint(&case_path, bookmark_id)?
+            .expect("checkpoint should be saved");
+        assert!(cp.completed);
+        assert_eq!(cp.items_added, 4);
+        assert_eq!(cp.total_candidates, 4);
 
         let items = list_bookmark_items(&case_path, Some(bookmark_id))?;
         assert_eq!(items.len(), 4);
@@ -73577,6 +77469,186 @@ mod tests {
         // filesystem_entries must stay untouched by a live/recursive bookmark - this
         // is explicitly a no-indexing action, same guarantee as a single live bookmark.
         assert_eq!(filesystem_entry_count(&case_path)?, 0);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_source);
+        Ok(())
+    }
+
+    #[test]
+    fn bookmark_traversal_checkpoint_roundtrip_and_audit() -> Result<()> {
+        let case_path = unique_case_path("bookmark-checkpoint-roundtrip");
+        create_test_case(&case_path)?;
+        let bookmark_id = create_test_bookmark(&case_path)?;
+
+        let checkpoint = LiveTraversalCheckpoint {
+            pending_directories: vec!["folder/sub1".to_string(), "folder/sub2".to_string()],
+            last_relative_path: Some("folder/sub1/file.txt".to_string()),
+            items_added: 42,
+            total_candidates: 100,
+            completed: false,
+        };
+
+        persist_bookmark_traversal_checkpoint(&case_path, bookmark_id, &checkpoint)?;
+
+        let loaded = get_bookmark_traversal_checkpoint(&case_path, bookmark_id)?
+            .expect("checkpoint should exist");
+        assert_eq!(loaded, checkpoint);
+
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+        let (audit_count, completed_val): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), json_extract(details_json, '$.completed')
+             FROM audit_events
+             WHERE case_id = ?1 AND event_type = 'bookmark.checkpoint_update'",
+            rusqlite::params![case_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(audit_count, 1);
+        assert_eq!(completed_val, 0);
+
+        cleanup_case_path(&case_path);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_bookmark_live_folder_with_checkpoint_resumes_traversal() -> Result<()> {
+        let case_path = unique_case_path("bookmark-stream-checkpoint-resume");
+        create_test_case(&case_path)?;
+        let evidence_source = unique_temp_dir("bookmark-stream-checkpoint-resume");
+        fs::create_dir_all(evidence_source.join("Sub"))?;
+        fs::write(evidence_source.join("file1.txt"), b"1")?;
+        fs::write(evidence_source.join("file2.txt"), b"22")?;
+        fs::write(evidence_source.join("Sub").join("file3.txt"), b"333")?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_source.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let bookmark_id = create_test_bookmark(&case_path)?;
+
+        // Run 1: limit to 1 entry -> should truncate and save checkpoint
+        let result1 = stream_bookmark_live_folder(StreamBookmarkLiveFolderOptions {
+            case_path: &case_path,
+            bookmark_id,
+            evidence_id,
+            source_kind: "folder",
+            source_path: &evidence_source.to_string_lossy(),
+            volume_index: 0,
+            volume_name: "",
+            filesystem: "",
+            dir_path: "/",
+            max_entries: 1,
+            checkpoint: None,
+            bitlocker_credential: None,
+        })?;
+
+        assert_eq!(result1.items_added, 1);
+        assert!(result1.truncated);
+        assert!(result1.file_limit_reached);
+        let cp1 = result1
+            .checkpoint
+            .expect("checkpoint produced on truncation");
+        assert!(!cp1.completed);
+        assert_eq!(cp1.items_added, 1);
+
+        let stored_cp1 = get_bookmark_traversal_checkpoint(&case_path, bookmark_id)?
+            .expect("checkpoint stored in DB");
+        assert_eq!(stored_cp1, cp1);
+
+        // Run 2: resume with max_entries = 0 (unlimited) -> should complete remaining items
+        let result2 = stream_bookmark_live_folder(StreamBookmarkLiveFolderOptions {
+            case_path: &case_path,
+            bookmark_id,
+            evidence_id,
+            source_kind: "folder",
+            source_path: &evidence_source.to_string_lossy(),
+            volume_index: 0,
+            volume_name: "",
+            filesystem: "",
+            dir_path: "/",
+            max_entries: 0,
+            checkpoint: None, // Will automatically load stored checkpoint
+            bitlocker_credential: None,
+        })?;
+
+        assert_eq!(result2.items_added, 3);
+        assert!(!result2.truncated);
+        assert!(!result2.file_limit_reached);
+        let cp2 = result2
+            .checkpoint
+            .expect("checkpoint produced on completion");
+        assert!(cp2.completed);
+        assert_eq!(cp2.items_added, 3);
+
+        let items = list_bookmark_items(&case_path, Some(bookmark_id))?;
+        assert_eq!(items.len(), 3);
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_source);
+        Ok(())
+    }
+
+    #[test]
+    fn stream_bookmark_live_folder_skips_when_completed() -> Result<()> {
+        let case_path = unique_case_path("bookmark-stream-skip-completed");
+        create_test_case(&case_path)?;
+        let evidence_source = unique_temp_dir("bookmark-stream-skip-completed");
+        fs::write(evidence_source.join("file1.txt"), b"1")?;
+
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: evidence_source.clone(),
+                kind: EvidenceKind::Auto,
+                read_file_system_requested: false,
+                notes: None,
+            },
+        )?;
+        let bookmark_id = create_test_bookmark(&case_path)?;
+
+        // Complete full traversal
+        let result1 = stream_bookmark_live_folder(StreamBookmarkLiveFolderOptions {
+            case_path: &case_path,
+            bookmark_id,
+            evidence_id,
+            source_kind: "folder",
+            source_path: &evidence_source.to_string_lossy(),
+            volume_index: 0,
+            volume_name: "",
+            filesystem: "",
+            dir_path: "/",
+            max_entries: 0,
+            checkpoint: None,
+            bitlocker_credential: None,
+        })?;
+        assert_eq!(result1.items_added, 1);
+        assert!(result1.checkpoint.unwrap().completed);
+
+        // Run again: since completed is true in stored checkpoint, should return immediately
+        let result2 = stream_bookmark_live_folder(StreamBookmarkLiveFolderOptions {
+            case_path: &case_path,
+            bookmark_id,
+            evidence_id,
+            source_kind: "folder",
+            source_path: &evidence_source.to_string_lossy(),
+            volume_index: 0,
+            volume_name: "",
+            filesystem: "",
+            dir_path: "/",
+            max_entries: 0,
+            checkpoint: None,
+            bitlocker_credential: None,
+        })?;
+        assert_eq!(result2.items_added, 1);
+        assert!(!result2.truncated);
+        let items = list_bookmark_items(&case_path, Some(bookmark_id))?;
+        assert_eq!(items.len(), 1);
 
         cleanup_case_path(&case_path);
         let _ = fs::remove_dir_all(evidence_source);
@@ -77228,6 +81300,376 @@ mod tests {
         assert_eq!(
             checkpoint["source_processing_complete"].as_bool(),
             Some(false)
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    fn test_multi_partition_mbr_image_bytes() -> Result<Vec<u8>> {
+        const PARTITION_START_SECTOR: u32 = 2048;
+        const SECTOR_SIZE: usize = 512;
+        let fat_volume = test_fat_volume_bytes()?;
+        let start = PARTITION_START_SECTOR as usize * SECTOR_SIZE;
+        let sectors = u32::try_from(fat_volume.len() / SECTOR_SIZE)
+            .context("test FAT volume sector count exceeds u32")?;
+        let p2_start_sector = PARTITION_START_SECTOR + sectors + 2048;
+        let p2_sectors = 2048_u32;
+        let total_size = (p2_start_sector + p2_sectors) as usize * SECTOR_SIZE;
+        let mut image = vec![0_u8; total_size];
+
+        // Partition 0: FAT
+        let entry0 = 446;
+        image[entry0] = 0x00;
+        image[entry0 + 4] = 0x01; // FAT12
+        image[entry0 + 8..entry0 + 12].copy_from_slice(&PARTITION_START_SECTOR.to_le_bytes());
+        image[entry0 + 12..entry0 + 16].copy_from_slice(&sectors.to_le_bytes());
+        image[start..start + fat_volume.len()].copy_from_slice(&fat_volume);
+
+        // Partition 1: second partition
+        let entry1 = 446 + 16;
+        image[entry1] = 0x00;
+        image[entry1 + 4] = 0x07; // NTFS / IFS
+        image[entry1 + 8..entry1 + 12].copy_from_slice(&p2_start_sector.to_le_bytes());
+        image[entry1 + 12..entry1 + 16].copy_from_slice(&p2_sectors.to_le_bytes());
+
+        image[510] = 0x55;
+        image[511] = 0xAA;
+        Ok(image)
+    }
+
+    #[test]
+    fn targeted_volume_filters_other_partitions_from_filesystem_entries() -> Result<()> {
+        let case_path = unique_case_path("target-volume-filter");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("target-volume-source");
+        let image_path = evidence_dir.join("multi-part.img");
+        fs::write(&image_path, test_multi_partition_mbr_image_bytes()?)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path.clone(),
+                kind: EvidenceKind::Image,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        // Target ONLY partition index 1 (offset p2_start_sector * 512 = 6144 * 512)
+        // Partition 0 is the FAT partition with note.txt
+        let targets = vec![VolumeTarget::new(
+            evidence_id,
+            "vol-2",
+            Some(1),
+            6144 * 512,
+            2048 * 512,
+        )];
+
+        let result = process_evidence_with_targets(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile::default(),
+            None,
+            Some(&targets),
+        )?;
+
+        assert_eq!(result.status, "completed");
+
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+
+        // Verify that zero FAT files from partition 0 appear under /Image Analysis/Volumes/
+        let fat_volume_files: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND logical_path LIKE '/Image Analysis/Volumes/001-%'",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            fat_volume_files, 0,
+            "Untargeted FAT partition #0 MUST NOT have its files indexed"
+        );
+
+        // Verify that partition 0 record exists with excluded_by_target_filter
+        let p1_parser: String = conn.query_row(
+            "SELECT json_extract(metadata_json, '$.filesystem_parser') FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND logical_path LIKE '/Image Analysis/Partitions/001-%'",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(p1_parser, "excluded_by_target_filter");
+
+        // Verify target record was persisted in processing_job_targets
+        let target_rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM processing_job_targets WHERE job_id = ?1 AND discovered_volume_id = 'vol-2'",
+            params![result.job_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            target_rows, 1,
+            "Target volume MUST be recorded in processing_job_targets"
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_volume_geometry_mismatch_fails_closed() -> Result<()> {
+        let case_path = unique_case_path("target-geom-mismatch");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("target-geom-source");
+        let image_path = evidence_dir.join("multi-part-mismatch.img");
+        fs::write(&image_path, test_multi_partition_mbr_image_bytes()?)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path.clone(),
+                kind: EvidenceKind::Image,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        // Target with bogus start offset
+        let targets = vec![VolumeTarget::new(
+            evidence_id,
+            "vol-bogus",
+            Some(1),
+            987654321,
+            2048 * 512,
+        )];
+
+        let err = process_evidence_with_targets(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile::default(),
+            None,
+            Some(&targets),
+        )
+        .expect_err("Target offset mismatch must fail closed");
+
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("does not match any partition in disk image layout"),
+            "Expected geometry mismatch error, got: {err_str}"
+        );
+
+        cleanup_case_path(&case_path);
+        let _ = fs::remove_dir_all(evidence_dir);
+        Ok(())
+    }
+
+    fn test_custom_fat_volume_bytes(filename: &str, content: &[u8]) -> Result<Vec<u8>> {
+        let mut fat_cursor = io::Cursor::new(vec![0_u8; 1024 * 1024]);
+        fatfs::format_volume(&mut fat_cursor, fatfs::FormatVolumeOptions::new())
+            .context("formatting test custom FAT volume")?;
+        fat_cursor.seek(SeekFrom::Start(0))?;
+        {
+            let fs = fatfs::FileSystem::new(&mut fat_cursor, fatfs::FsOptions::new())
+                .context("opening test custom FAT volume")?;
+            let root = fs.root_dir();
+            let mut file = root
+                .create_file(filename)
+                .context("creating file in test custom FAT volume")?;
+            file.write_all(content)
+                .context("writing file in test custom FAT volume")?;
+        }
+        Ok(fat_cursor.into_inner())
+    }
+
+    fn test_four_partition_mbr_image_bytes() -> Result<Vec<u8>> {
+        const SECTOR_SIZE: usize = 512;
+        let p0_fat = test_custom_fat_volume_bytes("efi_boot.txt", b"EFI FAT bootloader")?;
+        let p2_fat = test_custom_fat_volume_bytes("target_os_data.txt", b"Target OS data payload")?;
+        let p3_fat = test_custom_fat_volume_bytes("recovery_diag.txt", b"Recovery diagnostics")?;
+
+        let p0_start = 2048_u32;
+        let p0_sectors = u32::try_from(p0_fat.len() / SECTOR_SIZE)?;
+
+        let p1_start = p0_start + p0_sectors;
+        let p1_sectors = 2048_u32; // 1 MB raw partition
+
+        let p2_start = p1_start + p1_sectors;
+        let p2_sectors = u32::try_from(p2_fat.len() / SECTOR_SIZE)?;
+
+        let p3_start = p2_start + p2_sectors;
+        let p3_sectors = u32::try_from(p3_fat.len() / SECTOR_SIZE)?;
+
+        let total_size = (p3_start + p3_sectors) as usize * SECTOR_SIZE;
+        let mut image = vec![0_u8; total_size];
+
+        // Partition 0 (slot 0): EFI FAT
+        let e0 = 446;
+        image[e0] = 0x00;
+        image[e0 + 4] = 0x01; // FAT12
+        image[e0 + 8..e0 + 12].copy_from_slice(&p0_start.to_le_bytes());
+        image[e0 + 12..e0 + 16].copy_from_slice(&p0_sectors.to_le_bytes());
+        let p0_byte_start = p0_start as usize * SECTOR_SIZE;
+        image[p0_byte_start..p0_byte_start + p0_fat.len()].copy_from_slice(&p0_fat);
+
+        // Partition 1 (slot 1): Raw / MSR
+        let e1 = 446 + 16;
+        image[e1] = 0x00;
+        image[e1 + 4] = 0x83; // Linux / Raw
+        image[e1 + 8..e1 + 12].copy_from_slice(&p1_start.to_le_bytes());
+        image[e1 + 12..e1 + 16].copy_from_slice(&p1_sectors.to_le_bytes());
+
+        // Partition 2 (slot 2): Target OS partition
+        let e2 = 446 + 32;
+        image[e2] = 0x00;
+        image[e2 + 4] = 0x01; // FAT12
+        image[e2 + 8..e2 + 12].copy_from_slice(&p2_start.to_le_bytes());
+        image[e2 + 12..e2 + 16].copy_from_slice(&p2_sectors.to_le_bytes());
+        let p2_byte_start = p2_start as usize * SECTOR_SIZE;
+        image[p2_byte_start..p2_byte_start + p2_fat.len()].copy_from_slice(&p2_fat);
+
+        // Partition 3 (slot 3): Recovery partition
+        let e3 = 446 + 48;
+        image[e3] = 0x00;
+        image[e3 + 4] = 0x01; // FAT12
+        image[e3 + 8..e3 + 12].copy_from_slice(&p3_start.to_le_bytes());
+        image[e3 + 12..e3 + 16].copy_from_slice(&p3_sectors.to_le_bytes());
+        let p3_byte_start = p3_start as usize * SECTOR_SIZE;
+        image[p3_byte_start..p3_byte_start + p3_fat.len()].copy_from_slice(&p3_fat);
+
+        image[510] = 0x55;
+        image[511] = 0xAA;
+        Ok(image)
+    }
+
+    #[test]
+    fn targeted_volume_four_partition_fixture_proves_selected_partition_is_parsed() -> Result<()> {
+        let case_path = unique_case_path("four-part-positive");
+        create_test_case(&case_path)?;
+        let evidence_dir = unique_temp_dir("four-part-source");
+        let image_path = evidence_dir.join("four-part.img");
+        fs::write(&image_path, test_four_partition_mbr_image_bytes()?)?;
+        let evidence_id = add_evidence(
+            &case_path,
+            AddEvidenceOptions {
+                path: image_path.clone(),
+                kind: EvidenceKind::Image,
+                read_file_system_requested: true,
+                notes: None,
+            },
+        )?;
+
+        // Partition 0 is at sector 2048 (size 2048 sectors = 1MB)
+        // Partition 1 is at sector 4096 (size 2048 sectors = 1MB)
+        // Partition 2 is at sector 6144 (size 2048 sectors = 1MB)
+        // Partition 3 is at sector 8192 (size 2048 sectors = 1MB)
+        // Target ONLY partition 2 (offset 6144 * 512, length 2048 * 512)
+        let target_start = 6144_u64 * 512;
+        let target_len = 2048_u64 * 512;
+        let mut target = VolumeTarget::new(
+            evidence_id,
+            "vol-os-target",
+            Some(2),
+            target_start,
+            target_len,
+        );
+        target.unlocked_for_session = true;
+        let targets = vec![target];
+
+        let result = process_evidence_with_targets(
+            &case_path,
+            ProcessEvidenceOptions {
+                evidence_id,
+                max_entries: 0,
+            },
+            ProcessingProfile::default(),
+            None,
+            Some(&targets),
+        )?;
+
+        assert_eq!(result.status, "completed");
+
+        let conn = open_existing_case(&case_path)?;
+        let case_id = active_case_id(&conn)?;
+
+        // 1. Verify master job type is recorded as 'forensic_analysis'
+        let job_type: String = conn.query_row(
+            "SELECT job_type FROM evidence_jobs WHERE id = ?1",
+            params![result.job_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            job_type, "forensic_analysis",
+            "Master desktop job with targets MUST be recorded as forensic_analysis"
+        );
+
+        // 2. Verify target partition 2's file IS parsed and present in filesystem_entries
+        let target_file_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND name = 'target_os_data.txt'",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            target_file_count, 1,
+            "Targeted partition 2 file 'target_os_data.txt' MUST be parsed and present"
+        );
+
+        // 3. Verify untargeted partition 0's file 'efi_boot.txt' is NOT present
+        let efi_file_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND name = 'efi_boot.txt'",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            efi_file_count, 0,
+            "Untargeted partition 0 file 'efi_boot.txt' MUST NOT be parsed"
+        );
+
+        // 4. Verify untargeted partition 3's file 'recovery_diag.txt' is NOT present
+        let recovery_file_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND name = 'recovery_diag.txt'",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            recovery_file_count, 0,
+            "Untargeted partition 3 file 'recovery_diag.txt' MUST NOT be parsed"
+        );
+
+        // 5. Verify partitions 0, 1, 3 have filesystem_parser = 'excluded_by_target_filter'
+        let excluded_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM filesystem_entries
+             WHERE case_id = ?1 AND evidence_id = ?2
+               AND json_extract(metadata_json, '$.filesystem_parser') = 'excluded_by_target_filter'",
+            params![case_id, evidence_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            excluded_count, 3,
+            "All 3 untargeted partitions must be marked excluded_by_target_filter"
+        );
+
+        // 6. Verify processing_job_targets recorded unlocked_for_session truthfully
+        let unlocked_for_session: i64 = conn.query_row(
+            "SELECT unlocked_for_session FROM processing_job_targets WHERE job_id = ?1",
+            params![result.job_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            unlocked_for_session, 1,
+            "unlocked_for_session MUST be persisted as 1 in processing_job_targets"
         );
 
         cleanup_case_path(&case_path);

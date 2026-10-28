@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kdft.local/schemas/result-completeness-v1.schema.json",
+  "title": "KDFT result completeness contract v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "counts",
+    "scope",
+    "continuation",
+    "reasons",
+    "producer",
+    "assessed_at_utc"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "status": {
+      "enum": ["complete", "partial", "truncated", "failed", "skipped", "unknown"]
+    },
+    "counts": { "$ref": "#/$defs/counts" },
+    "scope": { "$ref": "#/$defs/scope" },
+    "continuation": { "$ref": "#/$defs/continuation" },
+    "reasons": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/reason" }
+    },
+    "producer": { "$ref": "#/$defs/producer" },
+    "assessed_at_utc": { "type": "string", "format": "date-time" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "complete" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "reasons": { "maxItems": 0 },
+          "continuation": {
+            "type": "object",
+            "properties": { "kind": { "const": "none" } },
+            "required": ["kind"]
+          }
+        }
+      },
+      "else": {
+        "properties": { "reasons": { "minItems": 1 } }
+      }
+    }
+  ],
+  "$defs": {
+    "nonNegativeInteger": { "type": "integer", "minimum": 0 },
+    "nullableNonNegativeInteger": {
+      "oneOf": [
+        { "$ref": "#/$defs/nonNegativeInteger" },
+        { "type": "null" }
+      ]
+    },
+    "nullablePositiveInteger": {
+      "oneOf": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "null" }
+      ]
+    },
+    "nullableString": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "null" }
+      ]
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_unit",
+        "input_total",
+        "input_processed",
+        "input_skipped",
+        "input_failed",
+        "output_unit",
+        "output_matched",
+        "output_emitted",
+        "output_omitted"
+      ],
+      "properties": {
+        "input_unit": { "type": "string", "minLength": 1 },
+        "input_total": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "input_processed": { "$ref": "#/$defs/nonNegativeInteger" },
+        "input_skipped": { "$ref": "#/$defs/nonNegativeInteger" },
+        "input_failed": { "$ref": "#/$defs/nonNegativeInteger" },
+        "output_unit": { "type": "string", "minLength": 1 },
+        "output_matched": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "output_emitted": { "$ref": "#/$defs/nonNegativeInteger" },
+        "output_omitted": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "description",
+        "case_id",
+        "evidence_ids",
+        "case_generation",
+        "canonical_request",
+        "requested_limit",
+        "projection_version",
+        "output_format"
+      ],
+      "properties": {
+        "operation": {
+          "enum": ["parser", "query", "search", "timeline", "export", "report", "ai_context", "other"]
+        },
+        "description": { "type": "string", "minLength": 1 },
+        "case_id": { "$ref": "#/$defs/nullablePositiveInteger" },
+        "evidence_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "case_generation": { "$ref": "#/$defs/nullableString" },
+        "canonical_request": { "type": "object" },
+        "requested_limit": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "projection_version": { "$ref": "#/$defs/nullableString" },
+        "output_format": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "continuation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "none" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "opaque_token", "snapshot_generation", "remaining_estimate"],
+          "properties": {
+            "kind": { "const": "cursor" },
+            "opaque_token": { "type": "string", "minLength": 1 },
+            "snapshot_generation": { "type": "string", "minLength": 1 },
+            "remaining_estimate": { "$ref": "#/$defs/nullableNonNegativeInteger" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "checkpoint"],
+          "properties": {
+            "kind": { "const": "retry" },
+            "checkpoint": { "$ref": "#/$defs/nullableString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "restart" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "unavailable" } }
+        }
+      ]
+    },
+    "reason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "code",
+        "message",
+        "retryable",
+        "affected_input_count",
+        "affected_output_count",
+        "details"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "limit",
+            "parser_failure",
+            "unsupported",
+            "cancelled",
+            "source_unreadable",
+            "missing_dependency",
+            "policy",
+            "not_requested",
+            "legacy_unknown",
+            "other"
+          ]
+        },
+        "code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "affected_input_count": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "affected_output_count": { "$ref": "#/$defs/nullableNonNegativeInteger" },
+        "details": { "type": "object" }
+      }
+    },
+    "parserJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_job_id", "parser_execution_id", "parser_name", "parser_version"],
+      "properties": {
+        "evidence_job_id": { "$ref": "#/$defs/nullablePositiveInteger" },
+        "parser_execution_id": { "$ref": "#/$defs/nullablePositiveInteger" },
+        "parser_name": { "type": "string", "minLength": 1 },
+        "parser_version": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "component_version", "parser_jobs"],
+      "properties": {
+        "component": { "type": "string", "minLength": 1 },
+        "component_version": { "$ref": "#/$defs/nullableString" },
+        "parser_jobs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/parserJob" }
+        }
+      }
+    }
+  }
+}

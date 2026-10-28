@@ -922,7 +922,7 @@ mod tests {
                 name: "SYSTEM".to_string(),
                 size: None,
             };
-            let (records, counts) = super::super::derive_hive_records(&candidate, &import);
+            let (records, counts) = super::super::derive_hive_records(&candidate, &import)?;
             Ok((
                 decoded,
                 records.len(),

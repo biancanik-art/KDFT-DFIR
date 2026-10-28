@@ -570,10 +570,21 @@ fn decode_xml_reference(reference: &BytesRef<'_>) -> Result<String> {
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub(crate) struct CredentialStoreRecognition {
+    /// Semantic record kind emitted for this source.  A protected DPAPI
+    /// master-key component is infrastructure used to protect secrets, not a
+    /// credential store and not a recovered secret.
+    pub artifact_kind: &'static str,
     pub store_type: &'static str,
     pub recognition_basis: &'static str,
     pub confidence: &'static str,
     pub structure_validated: bool,
+    /// Describes what KDFT actually established about the material.  This is
+    /// deliberately separate from the human-readable store type so callers
+    /// cannot infer that protected bytes were decrypted.
+    pub material_state: &'static str,
+    /// Recognition alone never recovers a secret value.  A future decoder may
+    /// increase this only after a successful, provenance-preserving decode.
+    pub recovered_secret_count: usize,
 }
 
 /// Recognizes credential-store *locations* only when the basename and a known
@@ -586,10 +597,13 @@ pub(crate) fn known_credential_store_type(
     let normalized = normalized_full_path(path, name);
     let filename = name.trim().to_ascii_lowercase();
     let recognized = |store_type, recognition_basis, confidence| CredentialStoreRecognition {
+        artifact_kind: "credential_store",
         store_type,
         recognition_basis,
         confidence,
         structure_validated: false,
+        material_state: "container_or_store_candidate",
+        recovered_secret_count: 0,
     };
     if matches!(filename.as_str(), "sam" | "security")
         && (normalized.ends_with(&format!("/windows/system32/config/{filename}"))
@@ -647,12 +661,16 @@ pub(crate) fn known_credential_store_type(
             "known Windows credential/vault directory layout",
             "high",
         ))
-    } else if normalized.contains("/microsoft/protect/") {
-        Some(recognized(
-            "Windows DPAPI master-key component",
-            "known Windows DPAPI Protect directory layout",
-            "high",
-        ))
+    } else if has_dpapi_protect_sid_layout(&normalized) {
+        Some(CredentialStoreRecognition {
+            artifact_kind: "protected_credential_material",
+            store_type: "Windows DPAPI protected master-key component",
+            recognition_basis: "known Windows DPAPI Protect/SID directory layout",
+            confidence: "high",
+            structure_validated: false,
+            material_state: "protected_encrypted_candidate",
+            recovered_secret_count: 0,
+        })
     } else if normalized.contains("/.ssh/")
         && matches!(
             filename.as_str(),
@@ -685,6 +703,26 @@ pub(crate) fn known_credential_store_type(
     } else {
         None
     }
+}
+
+fn has_dpapi_protect_sid_layout(normalized_path: &str) -> bool {
+    const MARKER: &str = "/microsoft/protect/";
+    let Some(position) = normalized_path.find(MARKER) else {
+        return false;
+    };
+    let mut segments = normalized_path[position + MARKER.len()..]
+        .split('/')
+        .filter(|segment| !segment.is_empty());
+    let Some(sid) = segments.next() else {
+        return false;
+    };
+    let sid_is_well_formed = sid.strip_prefix("s-1-5-").is_some_and(|tail| {
+        !tail.is_empty()
+            && tail
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '-')
+    });
+    sid_is_well_formed && segments.next().is_some()
 }
 
 fn normalized_full_path(path: &str, name: &str) -> String {
@@ -1328,6 +1366,25 @@ mod secret_tests {
         );
         assert!(known_credential_store_type("/Temp/SAM", "SAM").is_none());
         assert!(known_credential_store_type("/Temp/Login Data", "Login Data").is_none());
+    }
+
+    #[test]
+    fn dpapi_protect_layout_is_protected_material_not_a_recovered_secret() {
+        let recognition = known_credential_store_type(
+            "/Users/alice/AppData/Roaming/Microsoft/Protect/S-1-5-21-1-2-3-1001/f5707327-01d8-4fdf-90fe-9e88f6ef2722",
+            "f5707327-01d8-4fdf-90fe-9e88f6ef2722",
+        )
+        .expect("canonical DPAPI Protect path is recognized");
+        assert_eq!(recognition.artifact_kind, "protected_credential_material");
+        assert_eq!(recognition.material_state, "protected_encrypted_candidate");
+        assert_eq!(recognition.recovered_secret_count, 0);
+        assert!(!recognition.structure_validated);
+        assert!(!recognition.store_type.contains("recovered"));
+        assert!(known_credential_store_type(
+            "/Users/alice/Documents/Microsoft/Protect/readme.txt",
+            "readme.txt"
+        )
+        .is_none());
     }
 
     #[test]

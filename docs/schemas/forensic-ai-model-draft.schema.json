@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kdft.invalid/schemas/forensic-ai-model-draft.schema.json",
+  "title": "KDFT untrusted local-model draft",
+  "description": "The only JSON shape a local model may author. Canonical artifact ids, paths, coordinates, parser provenance, coverage, status, and generation provenance are deliberately absent and are added only by KDFT.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "case_generation",
+    "claims",
+    "citation_references",
+    "limitations",
+    "suggested_next_steps"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "request_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "case_generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "headline": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "claims": {
+      "type": "array",
+      "maxItems": 500,
+      "items": { "$ref": "#/$defs/claim" }
+    },
+    "citation_references": {
+      "type": "array",
+      "maxItems": 2000,
+      "items": { "$ref": "#/$defs/citationReference" }
+    },
+    "limitations": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4000
+      }
+    },
+    "suggested_next_steps": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4000
+      }
+    }
+  },
+  "$defs": {
+    "claim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claim_id", "kind", "text", "citation_ids"],
+      "properties": {
+        "claim_id": {
+          "type": "string",
+          "pattern": "^claim-[A-Za-z0-9._-]+$",
+          "maxLength": 128
+        },
+        "kind": {
+          "enum": [
+            "observed_fact",
+            "derived_fact",
+            "model_inference",
+            "hypothesis",
+            "limitation"
+          ]
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 12000
+        },
+        "method": {
+          "type": ["string", "null"],
+          "maxLength": 4000
+        },
+        "model_confidence": {
+          "enum": ["low", "medium", "high", null]
+        },
+        "citation_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 100,
+          "items": {
+            "type": "string",
+            "pattern": "^cite-[A-Za-z0-9._-]+$",
+            "maxLength": 128
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "enum": ["observed_fact", "derived_fact", "model_inference", "hypothesis"]
+              }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "properties": { "citation_ids": { "minItems": 1 } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "enum": ["model_inference", "hypothesis"] } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["model_confidence"],
+            "properties": { "model_confidence": { "enum": ["low", "medium", "high"] } }
+          },
+          "else": {
+            "properties": { "model_confidence": { "type": "null" } }
+          }
+        },
+        {
+          "if": {
+            "properties": { "kind": { "const": "derived_fact" } },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["method"],
+            "properties": { "method": { "type": "string", "minLength": 1 } }
+          }
+        }
+      ]
+    },
+    "citationReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["citation_id", "context_handle"],
+      "properties": {
+        "citation_id": {
+          "type": "string",
+          "pattern": "^cite-[A-Za-z0-9._-]+$",
+          "maxLength": 128
+        },
+        "context_handle": {
+          "type": "string",
+          "pattern": "^ctx-[A-Za-z0-9._-]+$",
+          "maxLength": 128
+        }
+      }
+    }
+  }
+}

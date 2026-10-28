@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
-    active_case_id, add_entry_category, audit_actor, collect_registry_hive_import,
+    active_case_id, add_entry_category, audit_actor, collect_registry_hive_import_with_cancel,
     ensure_evidence_source, open_existing_case, recover_filesystem_entry_in_session,
-    sanitize_logical_segment, upsert_filesystem_entry, EvidenceReadSession, RecoverEntryOptions,
-    RegistryImportData, RegistryImportEntry,
+    sanitize_logical_segment, upsert_filesystem_entry, BitLockerProcessingContext,
+    EvidenceReadSession, RecoverEntryOptions, RegistryImportData, RegistryImportEntry,
 };
 use shimcache::decode_appcompat_cache;
 use srum::{decode_srum_database, probe_ese_database, SrumDecodeResult};
@@ -38,6 +38,8 @@ pub struct WindowsRegistryArtifactParseResult {
     pub evidence_id: i64,
     pub hives_found: usize,
     pub hives_parsed: usize,
+    pub hives_failed: usize,
+    pub hives_cancelled: usize,
     pub generic_keys_indexed: usize,
     pub generic_values_indexed: usize,
     pub amcache_records_indexed: usize,
@@ -69,6 +71,7 @@ pub struct WindowsRegistryArtifactParseResult {
     pub srum_sources_validated: usize,
     pub srum_sources_recognized_unsupported: usize,
     pub srum_sources_failed: usize,
+    pub srum_sources_cancelled: usize,
     pub srum_records_indexed: usize,
     pub srum_source_coverage: Vec<SrumSourceCoverage>,
     pub partial_artifact_coverage: bool,
@@ -77,6 +80,26 @@ pub struct WindowsRegistryArtifactParseResult {
     pub parse_errors_omitted: usize,
     pub limitations: Vec<String>,
     pub status: String,
+}
+
+impl WindowsRegistryArtifactParseResult {
+    /// Source-level denominator for the Registry/SRUM processor. Artifact row
+    /// counts are intentionally excluded because one source can emit many
+    /// decoded records.
+    pub fn discovered_sources(&self) -> usize {
+        self.hives_found.saturating_add(self.srum_sources_seen)
+    }
+
+    /// Sources that reached an explicit terminal outcome. A cancelled pass can
+    /// legitimately report fewer terminal sources than discovered sources.
+    pub fn terminal_sources(&self) -> usize {
+        self.hives_parsed
+            .saturating_add(self.hives_failed)
+            .saturating_add(self.hives_cancelled)
+            .saturating_add(self.srum_sources_validated)
+            .saturating_add(self.srum_sources_failed)
+            .saturating_add(self.srum_sources_cancelled)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,6 +222,37 @@ pub fn parse_windows_registry_artifacts(
     case_path: &Path,
     evidence_id: i64,
 ) -> Result<WindowsRegistryArtifactParseResult> {
+    parse_windows_registry_artifacts_impl(case_path, evidence_id, None)
+}
+
+/// Parses indexed registry and SRUM sources through a worker-local plaintext
+/// reader for an unlocked BitLocker volume. The unlock credential remains
+/// memory-only and is not included in the result, audit data, or diagnostics.
+pub fn parse_windows_registry_artifacts_with_bitlocker(
+    case_path: &Path,
+    evidence_id: i64,
+    context: BitLockerProcessingContext<'_>,
+) -> Result<WindowsRegistryArtifactParseResult> {
+    parse_windows_registry_artifacts_impl(case_path, evidence_id, Some(context))
+}
+
+fn active_cancellation_requested() -> bool {
+    super::progress::active_job_progress()
+        .is_some_and(|tracker| tracker.is_cancellation_requested())
+}
+
+fn fail_if_active_cancellation_requested(activity: &str) -> Result<()> {
+    if active_cancellation_requested() {
+        bail!("{activity} cancelled by examiner request");
+    }
+    Ok(())
+}
+
+fn parse_windows_registry_artifacts_impl(
+    case_path: &Path,
+    evidence_id: i64,
+    bitlocker_context: Option<BitLockerProcessingContext<'_>>,
+) -> Result<WindowsRegistryArtifactParseResult> {
     let candidates = registry_candidates(case_path, evidence_id)?;
     let srum_candidates = srum_candidates(case_path, evidence_id)?;
     let srum_sources_seen = srum_candidates.len();
@@ -227,9 +281,21 @@ pub fn parse_windows_registry_artifacts(
         status: "completed".to_string(),
         ..WindowsRegistryArtifactParseResult::default()
     };
-    let mut read_session = EvidenceReadSession::open(case_path)?;
+    let mut read_session = if let Some(context) = bitlocker_context {
+        EvidenceReadSession::open_with_bitlocker(case_path, evidence_id, context)?
+    } else {
+        EvidenceReadSession::open(case_path)?
+    };
+
+    if active_cancellation_requested() {
+        result.status = "cancelled".to_string();
+    }
 
     for candidate in &candidates {
+        if active_cancellation_requested() {
+            result.status = "cancelled".to_string();
+            break;
+        }
         super::progress::progress_current(candidate.exact_path.clone());
         match parse_one_hive(case_path, &mut read_session, evidence_id, candidate) {
             Ok(counts) => {
@@ -339,8 +405,21 @@ pub fn parse_windows_registry_artifacts(
                 result
                     .shimcache_source_coverage
                     .extend(counts.shimcache_source_coverage);
+                super::progress::progress_terminal_outcome(
+                    super::progress::ProgressTerminalOutcome::Completed,
+                );
+            }
+            Err(_error) if active_cancellation_requested() => {
+                result.hives_cancelled = result.hives_cancelled.saturating_add(1);
+                result.status = "cancelled".to_string();
+                super::progress::progress_terminal_outcome(
+                    super::progress::ProgressTerminalOutcome::Cancelled,
+                );
+                super::progress::progress_advance(candidate.exact_path.clone());
+                break;
             }
             Err(error) => {
+                result.hives_failed = result.hives_failed.saturating_add(1);
                 result.parse_error_count = result.parse_error_count.saturating_add(1);
                 if result.parse_errors.len() < ERROR_SAMPLE_LIMIT {
                     result
@@ -351,22 +430,30 @@ pub fn parse_windows_registry_artifacts(
                 }
                 super::progress::progress_error(Some(candidate.exact_path.clone()));
                 super::progress::progress_skip(Some(candidate.exact_path.clone()));
+                super::progress::progress_terminal_outcome(
+                    super::progress::ProgressTerminalOutcome::Failed,
+                );
             }
         }
         super::progress::progress_advance(candidate.exact_path.clone());
     }
 
-    for candidate in &srum_candidates {
-        super::progress::progress_current(candidate.exact_path.clone());
-        match decode_one_srum_source(&mut read_session, candidate) {
-            Ok(SrumStagedOutcome::Decoded(decoded)) => {
-                result.srum_sources_validated = result.srum_sources_validated.saturating_add(1);
-                let records = derive_srum_records(candidate, &decoded)?;
-                replace_srum_source_records(case_path, evidence_id, candidate, &records)?;
-                result.srum_records_indexed =
-                    result.srum_records_indexed.saturating_add(records.len());
-                let live_row_counts = decoded.live_row_counts.clone();
-                result.srum_source_coverage.push(SrumSourceCoverage {
+    if result.status != "cancelled" {
+        for candidate in &srum_candidates {
+            if active_cancellation_requested() {
+                result.status = "cancelled".to_string();
+                break;
+            }
+            super::progress::progress_current(candidate.exact_path.clone());
+            match decode_one_srum_source(&mut read_session, candidate) {
+                Ok(SrumStagedOutcome::Decoded(decoded)) => {
+                    result.srum_sources_validated = result.srum_sources_validated.saturating_add(1);
+                    let records = derive_srum_records(candidate, &decoded)?;
+                    replace_srum_source_records(case_path, evidence_id, candidate, &records)?;
+                    result.srum_records_indexed =
+                        result.srum_records_indexed.saturating_add(records.len());
+                    let live_row_counts = decoded.live_row_counts.clone();
+                    result.srum_source_coverage.push(SrumSourceCoverage {
                     source_entry_id: candidate.entry_id,
                     source_job_id: candidate.source_job_id,
                     source_path_exact: candidate.exact_path.clone(),
@@ -385,7 +472,7 @@ pub fn parse_windows_registry_artifacts(
                     diagnostics: decoded.diagnostics.clone(),
                     ese_header: Some(decoded.header),
                 });
-                super::progress::progress_diagnostic(
+                    super::progress::progress_diagnostic(
                     super::progress::JobDiagnosticKind::ParserDiagnostic,
                     format!(
                         "SRUM source {} decoded {} live record(s) (IdMap {}, network {}, application resource {}, connectivity {}); these are live-row counts, not ESE AutoInc/high-water estimates",
@@ -397,66 +484,104 @@ pub fn parse_windows_registry_artifacts(
                         live_row_counts.connectivity,
                     ),
                 );
-            }
-            Ok(SrumStagedOutcome::RecognizedUnsupported { header, limitation }) => {
-                result.srum_sources_validated = result.srum_sources_validated.saturating_add(1);
-                result.srum_sources_recognized_unsupported =
-                    result.srum_sources_recognized_unsupported.saturating_add(1);
-                result.srum_source_coverage.push(SrumSourceCoverage {
-                    source_entry_id: candidate.entry_id,
-                    source_job_id: candidate.source_job_id,
-                    source_path_exact: candidate.exact_path.clone(),
-                    source_size: candidate.size,
-                    status: "recognized_unsupported".to_string(),
-                    records_indexed: 0,
-                    live_row_counts: None,
-                    coverage: "ESE source header validated; no SRUM rows were claimed".to_string(),
-                    limitation: Some(limitation.clone()),
-                    diagnostics: vec![limitation.clone()],
-                    ese_header: Some(header),
-                });
-                super::progress::progress_diagnostic(
+                    super::progress::progress_terminal_outcome(
+                        super::progress::ProgressTerminalOutcome::Completed,
+                    );
+                }
+                Ok(SrumStagedOutcome::RecognizedUnsupported { header, limitation }) => {
+                    result.srum_sources_validated = result.srum_sources_validated.saturating_add(1);
+                    result.srum_sources_recognized_unsupported =
+                        result.srum_sources_recognized_unsupported.saturating_add(1);
+                    result.srum_source_coverage.push(SrumSourceCoverage {
+                        source_entry_id: candidate.entry_id,
+                        source_job_id: candidate.source_job_id,
+                        source_path_exact: candidate.exact_path.clone(),
+                        source_size: candidate.size,
+                        status: "recognized_unsupported".to_string(),
+                        records_indexed: 0,
+                        live_row_counts: None,
+                        coverage: "ESE source header validated; no SRUM rows were claimed"
+                            .to_string(),
+                        limitation: Some(limitation.clone()),
+                        diagnostics: vec![limitation.clone()],
+                        ese_header: Some(header),
+                    });
+                    super::progress::progress_diagnostic(
                     super::progress::JobDiagnosticKind::ParserDiagnostic,
                     format!(
                         "SRUM source {} is recognized but unsupported: {limitation}; no rows were claimed",
                         candidate.exact_path
                     ),
                 );
-            }
-            Err(error) => {
-                result.srum_sources_failed = result.srum_sources_failed.saturating_add(1);
-                result.parse_error_count = result.parse_error_count.saturating_add(1);
-                let error_text = format!("{}: {error:#}", candidate.exact_path);
-                if result.parse_errors.len() < ERROR_SAMPLE_LIMIT {
-                    result.parse_errors.push(error_text.clone());
-                } else {
-                    result.parse_errors_omitted = result.parse_errors_omitted.saturating_add(1);
+                    super::progress::progress_terminal_outcome(
+                        super::progress::ProgressTerminalOutcome::Unsupported,
+                    );
                 }
-                result.srum_source_coverage.push(SrumSourceCoverage {
-                    source_entry_id: candidate.entry_id,
-                    source_job_id: candidate.source_job_id,
-                    source_path_exact: candidate.exact_path.clone(),
-                    source_size: candidate.size,
-                    status: "failed".to_string(),
-                    records_indexed: 0,
-                    live_row_counts: None,
-                    coverage: "SRUM source could not be validated".to_string(),
-                    limitation: Some(error_text.clone()),
-                    diagnostics: vec![error_text],
-                    ese_header: None,
-                });
-                super::progress::progress_error(Some(candidate.exact_path.clone()));
-                super::progress::progress_skip(Some(candidate.exact_path.clone()));
+                Err(_error) if active_cancellation_requested() => {
+                    result.srum_sources_cancelled = result.srum_sources_cancelled.saturating_add(1);
+                    result.status = "cancelled".to_string();
+                    result.srum_source_coverage.push(SrumSourceCoverage {
+                        source_entry_id: candidate.entry_id,
+                        source_job_id: candidate.source_job_id,
+                        source_path_exact: candidate.exact_path.clone(),
+                        source_size: candidate.size,
+                        status: "cancelled".to_string(),
+                        records_indexed: 0,
+                        live_row_counts: None,
+                        coverage: "SRUM source processing was cancelled by the examiner"
+                            .to_string(),
+                        limitation: Some(
+                            "Processing stopped before this source reached a parser result"
+                                .to_string(),
+                        ),
+                        diagnostics: Vec::new(),
+                        ese_header: None,
+                    });
+                    super::progress::progress_terminal_outcome(
+                        super::progress::ProgressTerminalOutcome::Cancelled,
+                    );
+                }
+                Err(error) => {
+                    result.srum_sources_failed = result.srum_sources_failed.saturating_add(1);
+                    result.parse_error_count = result.parse_error_count.saturating_add(1);
+                    let error_text = format!("{}: {error:#}", candidate.exact_path);
+                    if result.parse_errors.len() < ERROR_SAMPLE_LIMIT {
+                        result.parse_errors.push(error_text.clone());
+                    } else {
+                        result.parse_errors_omitted = result.parse_errors_omitted.saturating_add(1);
+                    }
+                    result.srum_source_coverage.push(SrumSourceCoverage {
+                        source_entry_id: candidate.entry_id,
+                        source_job_id: candidate.source_job_id,
+                        source_path_exact: candidate.exact_path.clone(),
+                        source_size: candidate.size,
+                        status: "failed".to_string(),
+                        records_indexed: 0,
+                        live_row_counts: None,
+                        coverage: "SRUM source could not be validated".to_string(),
+                        limitation: Some(error_text.clone()),
+                        diagnostics: vec![error_text],
+                        ese_header: None,
+                    });
+                    super::progress::progress_error(Some(candidate.exact_path.clone()));
+                    super::progress::progress_skip(Some(candidate.exact_path.clone()));
+                    super::progress::progress_terminal_outcome(
+                        super::progress::ProgressTerminalOutcome::Failed,
+                    );
+                }
+            }
+            if let Some(coverage) = result
+                .srum_source_coverage
+                .last()
+                .filter(|coverage| coverage.source_entry_id == candidate.entry_id)
+            {
+                annotate_srum_source(case_path, evidence_id, coverage)?;
+            }
+            super::progress::progress_advance(candidate.exact_path.clone());
+            if result.status == "cancelled" {
+                break;
             }
         }
-        if let Some(coverage) = result
-            .srum_source_coverage
-            .last()
-            .filter(|coverage| coverage.source_entry_id == candidate.entry_id)
-        {
-            annotate_srum_source(case_path, evidence_id, coverage)?;
-        }
-        super::progress::progress_advance(candidate.exact_path.clone());
     }
 
     result.partial_artifact_coverage = result.srum_sources_recognized_unsupported > 0
@@ -508,7 +633,10 @@ pub fn parse_windows_registry_artifacts(
             result.shimcache_sources_failed
         ));
     }
-    result.status = if result.parse_error_count > 0 {
+    result.status = if result.status == "cancelled" {
+        result.partial_artifact_coverage = true;
+        "cancelled".to_string()
+    } else if result.parse_error_count > 0 {
         super::progress::progress_truncated(format!(
             "{} Windows Registry or SRUM source(s) could not be parsed or validated",
             result.parse_error_count
@@ -700,6 +828,9 @@ fn derive_srum_records(
     let mut records = Vec::with_capacity(total);
 
     for (ordinal, record) in decoded.id_map_records.iter().enumerate() {
+        if ordinal % 128 == 0 {
+            fail_if_active_cancellation_requested("SRUM record derivation")?;
+        }
         let display_value = record
             .decoded_value
             .as_deref()
@@ -730,6 +861,9 @@ fn derive_srum_records(
     }
 
     for (ordinal, record) in decoded.network_usage_records.iter().enumerate() {
+        if ordinal % 128 == 0 {
+            fail_if_active_cancellation_requested("SRUM record derivation")?;
+        }
         let application = record
             .app
             .decoded_value
@@ -775,6 +909,9 @@ fn derive_srum_records(
     }
 
     for (ordinal, record) in decoded.application_resource_records.iter().enumerate() {
+        if ordinal % 128 == 0 {
+            fail_if_active_cancellation_requested("SRUM record derivation")?;
+        }
         let application = record
             .app
             .decoded_value
@@ -827,6 +964,9 @@ fn derive_srum_records(
     }
 
     for (ordinal, record) in decoded.connectivity_records.iter().enumerate() {
+        if ordinal % 128 == 0 {
+            fail_if_active_cancellation_requested("SRUM record derivation")?;
+        }
         let application = record
             .app
             .decoded_value
@@ -1039,18 +1179,21 @@ fn parse_one_hive(
             }
         }
 
-        let import = collect_registry_hive_import(
+        let import = collect_registry_hive_import_with_cancel(
             &staging_path,
             &candidate.name,
             MAX_EMBEDDED_REGISTRY_ENTRIES,
+            active_cancellation_requested,
         )
         .with_context(|| format!("parsing Registry hive {}", candidate.exact_path))?;
         let is_standalone = candidate.logical_path.starts_with("/Registry/");
         let (mut records, mut counts) = if is_standalone {
-            derive_specialized_hive_records(candidate, &import)
+            fail_if_active_cancellation_requested("Registry artifact derivation")?;
+            derive_specialized_hive_records(candidate, &import)?
         } else {
-            derive_hive_records(candidate, &import)
+            derive_hive_records(candidate, &import)?
         };
+        fail_if_active_cancellation_requested("Registry external parser dispatch")?;
         if let Some(tool_path) =
             super::external_tools::configured_tool("KDFT_REGRIPPER_PATH", &["rip.exe", "rip"])
         {
@@ -1064,6 +1207,7 @@ fn parse_one_hive(
                     counts.regripper_lines = external.line_count;
                     records.append(&mut external.records);
                 }
+                Err(error) if active_cancellation_requested() => return Err(error),
                 Err(error) => {
                     counts.regripper_failed = 1;
                     records.push(regripper_failure_record(candidate, &tool_path, &error));
@@ -1147,6 +1291,9 @@ fn derive_regripper_records(
     let mut line_count = 0_usize;
     let mut omitted = 0_usize;
     for (line_index, line) in run.stdout.lines().enumerate() {
+        if line_index % 128 == 0 {
+            fail_if_active_cancellation_requested("RegRipper output derivation")?;
+        }
         let raw_line = line.trim_end_matches('\r');
         if raw_line.trim().is_empty() {
             continue;
@@ -1294,30 +1441,41 @@ fn reserve_staging_destination(entry_id: i64, name: &str) -> Result<(PathBuf, Pa
 pub(crate) fn derive_specialized_hive_records(
     candidate: &HiveCandidate,
     import: &RegistryImportData,
-) -> (Vec<DerivedRecord>, DerivedCounts) {
-    let observations = import
-        .entries
-        .iter()
-        .filter_map(value_observation)
-        .collect::<Vec<_>>();
+) -> Result<(Vec<DerivedRecord>, DerivedCounts)> {
+    let mut observations = Vec::new();
+    for (ordinal, entry) in import.entries.iter().enumerate() {
+        if ordinal % 128 == 0 {
+            fail_if_active_cancellation_requested("Registry specialized artifact derivation")?;
+        }
+        if let Some(observation) = value_observation(entry) {
+            observations.push(observation);
+        }
+    }
     let hive = candidate.name.to_ascii_lowercase();
     let mut records = Vec::new();
     let mut counts = DerivedCounts::default();
 
     if hive == "amcache.hve" {
+        fail_if_active_cancellation_requested("Registry Amcache derivation")?;
         let derived = derive_amcache(candidate, &observations);
         counts.amcache = derived.len();
         records.extend(derived);
     }
     if hive == "ntuser.dat" || hive == "usrclass.dat" {
+        fail_if_active_cancellation_requested("Registry UserAssist derivation")?;
         let derived = derive_userassist(candidate, &observations);
         counts.userassist = derived.len();
         records.extend(derived);
+        fail_if_active_cancellation_requested("Registry ShellBags derivation")?;
         let derived = derive_shellbags(candidate, &observations);
         counts.shellbags = derived.len();
         records.extend(derived);
+        fail_if_active_cancellation_requested("Registry user activity derivation")?;
         let derived = derive_user_registry_activity(candidate, &observations);
-        for record in &derived {
+        for (ordinal, record) in derived.iter().enumerate() {
+            if ordinal % 128 == 0 {
+                fail_if_active_cancellation_requested("Registry user activity derivation")?;
+            }
             match record.metadata["artifact_kind"].as_str() {
                 Some("windows_recent_docs_record") => {
                     counts.recent_docs = counts.recent_docs.saturating_add(1)
@@ -1342,19 +1500,25 @@ pub(crate) fn derive_specialized_hive_records(
             }
         }
         records.extend(derived);
+        fail_if_active_cancellation_requested("Registry mount point derivation")?;
         let derived = derive_mount_point_records(candidate, import);
         counts.mount_points = derived.len();
         records.extend(derived);
     }
     if hive == "ntuser.dat" || hive == "software" {
+        fail_if_active_cancellation_requested("Registry startup derivation")?;
         let derived = derive_startup_records(candidate, &observations);
         counts.startup = derived.len();
         records.extend(derived);
     }
     if hive == "system" {
+        fail_if_active_cancellation_requested("Registry ShimCache derivation")?;
         let (derived, coverage) = derive_shimcache(candidate, &observations);
         counts.shimcache_sources = coverage.len();
-        for source in &coverage {
+        for (ordinal, source) in coverage.iter().enumerate() {
+            if ordinal % 128 == 0 {
+                fail_if_active_cancellation_requested("Registry ShimCache derivation")?;
+            }
             match source.status.as_str() {
                 "completed" => {
                     counts.shimcache_completed = counts.shimcache_completed.saturating_add(1)
@@ -1370,7 +1534,8 @@ pub(crate) fn derive_specialized_hive_records(
         counts.shimcache_source_coverage = coverage;
         records.extend(derived);
     }
-    (records, counts)
+    fail_if_active_cancellation_requested("Registry specialized artifact derivation")?;
+    Ok((records, counts))
 }
 
 pub(crate) fn process_standalone_registry_derived_records(
@@ -1382,8 +1547,11 @@ pub(crate) fn process_standalone_registry_derived_records(
     import_data: &RegistryImportData,
     max_entries: usize,
 ) -> Result<(usize, DerivedCounts)> {
-    let (mut records, counts) = derive_specialized_hive_records(candidate, import_data);
-    for record in &mut records {
+    let (mut records, counts) = derive_specialized_hive_records(candidate, import_data)?;
+    for (ordinal, record) in records.iter_mut().enumerate() {
+        if ordinal % 128 == 0 {
+            fail_if_active_cancellation_requested("Standalone Registry artifact commit")?;
+        }
         source_metadata(&mut record.metadata, candidate);
         record.metadata["windows_registry_truncated"] = serde_json::json!(import_data.truncated);
         upsert_filesystem_entry(
@@ -1401,6 +1569,7 @@ pub(crate) fn process_standalone_registry_derived_records(
         )?;
     }
 
+    fail_if_active_cancellation_requested("Standalone Registry metadata commit")?;
     let root_metadata_json: Option<String> = conn
         .query_row(
             "SELECT metadata_json FROM filesystem_entries WHERE id = ?1",
@@ -1510,19 +1679,25 @@ pub(crate) fn process_standalone_registry_derived_records(
         }
     }
 
+    fail_if_active_cancellation_requested("Standalone Registry artifact commit")?;
     Ok((records.len(), counts))
 }
 
 fn derive_hive_records(
     candidate: &HiveCandidate,
     import: &RegistryImportData,
-) -> (Vec<DerivedRecord>, DerivedCounts) {
-    let (specialized, mut counts) = derive_specialized_hive_records(candidate, import);
+) -> Result<(Vec<DerivedRecord>, DerivedCounts)> {
+    fail_if_active_cancellation_requested("Registry artifact derivation")?;
+    let (specialized, mut counts) = derive_specialized_hive_records(candidate, import)?;
+    fail_if_active_cancellation_requested("Registry artifact derivation")?;
     counts.generic_keys = import.keys_indexed;
     counts.generic_values = import.values_indexed;
     let mut records = Vec::new();
 
-    for entry in &import.entries {
+    for (ordinal, entry) in import.entries.iter().enumerate() {
+        if ordinal % 128 == 0 {
+            fail_if_active_cancellation_requested("Registry artifact derivation")?;
+        }
         let import_root = import.root_logical_path.trim_end_matches('/');
         let entry_path = entry.logical_path.trim_end_matches('/');
         let is_hive_root = entry_path == import_root
@@ -1613,7 +1788,7 @@ fn derive_hive_records(
     }
 
     records.extend(specialized);
-    (records, counts)
+    Ok((records, counts))
 }
 
 fn value_observation(entry: &RegistryImportEntry) -> Option<ValueObservation> {
@@ -2449,7 +2624,10 @@ fn replace_source_records(
            AND json_extract(metadata_json, '$.windows_registry_source_entry_id') = ?3",
         params![case_id, evidence_id, candidate.entry_id],
     )?;
-    for record in records {
+    for (ordinal, record) in records.iter().enumerate() {
+        if ordinal % 128 == 0 {
+            fail_if_active_cancellation_requested("Registry artifact commit")?;
+        }
         upsert_filesystem_entry(
             &tx,
             case_id,
@@ -2688,6 +2866,14 @@ fn shellbag_parent_path(key_path: &str, decoded_nodes: &HashMap<String, String>)
 mod tests {
     use super::*;
 
+    fn cancellation_test_case_path(label: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("kdft-{label}-{}-{stamp}.kdft", std::process::id()))
+    }
+
     fn test_candidate(name: &str) -> HiveCandidate {
         HiveCandidate {
             entry_id: 42,
@@ -2763,6 +2949,115 @@ mod tests {
         }
 
         fs::remove_dir(&directory).expect("remove staging directory");
+    }
+
+    #[test]
+    fn registry_import_checks_cancellation_before_opening_a_hive() {
+        let error = collect_registry_hive_import_with_cancel(
+            Path::new("this-hive-must-never-be-opened.dat"),
+            "SYSTEM",
+            MAX_EMBEDDED_REGISTRY_ENTRIES,
+            || true,
+        )
+        .expect_err("an examiner cancellation must stop before hive I/O");
+        assert!(error.to_string().contains("cancelled by examiner request"));
+        assert!(error
+            .chain()
+            .any(|cause| cause.is::<crate::progress::JobCancelled>()));
+    }
+
+    #[test]
+    fn registry_pass_returns_cancelled_without_claiming_completion() {
+        let case_path = cancellation_test_case_path("registry-cancel");
+        crate::create_case(
+            &case_path,
+            crate::CreateCaseOptions {
+                name: "Registry cancellation".to_string(),
+                examiner_name: None,
+                case_number: None,
+                case_type: None,
+                description: None,
+                default_export_folder: None,
+                temporary_folder: None,
+                index_folder: None,
+            },
+        )
+        .expect("create cancellation test case");
+        let conn = crate::open_existing_case(&case_path).expect("open cancellation test case");
+        let case_id = crate::active_case_id(&conn).expect("active case");
+        conn.execute(
+            "INSERT INTO evidence_sources(id, case_id, display_name, source_kind, source_path)
+             VALUES (1, ?1, 'Empty source', 'file', 'C:/missing/empty-source.bin')",
+            [case_id],
+        )
+        .expect("insert cancellation test evidence");
+        drop(conn);
+
+        let tracker = crate::progress::JobProgressTracker::new(
+            "registry-cancellation-test",
+            "forensic_analysis",
+            None,
+        );
+        tracker.request_cancellation();
+        let result = crate::progress::with_job_progress(&tracker, || {
+            parse_windows_registry_artifacts(&case_path, 1)
+        })
+        .expect("cancelled pass returns a truthful result");
+        assert_eq!(result.status, "cancelled");
+        assert!(result.partial_artifact_coverage);
+        assert_eq!(result.hives_parsed, 0);
+
+        let _ = std::fs::remove_file(case_path);
+    }
+
+    #[test]
+    fn registry_source_counts_distinguish_discovered_from_terminal_outcomes() {
+        let result = WindowsRegistryArtifactParseResult {
+            hives_found: 8,
+            hives_parsed: 3,
+            hives_failed: 1,
+            hives_cancelled: 1,
+            srum_sources_seen: 2,
+            srum_sources_validated: 1,
+            srum_sources_failed: 0,
+            srum_sources_cancelled: 0,
+            generic_values_indexed: 42_000,
+            ..WindowsRegistryArtifactParseResult::default()
+        };
+
+        assert_eq!(result.discovered_sources(), 10);
+        assert_eq!(result.terminal_sources(), 6);
+        assert_ne!(
+            result.terminal_sources(),
+            result.generic_values_indexed,
+            "decoded row counts must never be persisted as source outcomes"
+        );
+    }
+
+    #[test]
+    fn registry_post_parse_derivation_honors_examiner_cancellation() {
+        let tracker = crate::progress::JobProgressTracker::new(
+            "registry-derivation-cancellation-test",
+            "forensic_analysis",
+            None,
+        );
+        tracker.request_cancellation();
+        let candidate = test_candidate("SYSTEM");
+        let import = RegistryImportData {
+            entries: Vec::new(),
+            keys_indexed: 0,
+            values_indexed: 0,
+            total_entries_seen: 0,
+            truncated: false,
+            root_logical_path: "/Registry/SYSTEM".to_string(),
+        };
+
+        let error = crate::progress::with_job_progress(&tracker, || {
+            derive_hive_records(&candidate, &import)
+        })
+        .expect_err("an examiner cancellation must stop post-parse Registry derivation");
+
+        assert!(error.to_string().contains("cancelled by examiner request"));
     }
 
     #[test]
@@ -3176,7 +3471,8 @@ mod tests {
             size: None,
         };
 
-        let (records, counts) = derive_hive_records(&candidate, &import);
+        let (records, counts) =
+            derive_hive_records(&candidate, &import).expect("derive registry records");
         assert_eq!(counts.generic_keys, 2);
         assert_eq!(counts.generic_values, 1);
 
@@ -3352,7 +3648,8 @@ mod tests {
             size: None,
         };
 
-        let (records, counts) = derive_hive_records(&candidate, &import);
+        let (records, counts) =
+            derive_hive_records(&candidate, &import).expect("derive registry records");
         assert_eq!(counts.generic_keys, 6);
         assert_eq!(counts.generic_values, 2);
 
@@ -3462,7 +3759,8 @@ mod tests {
             size: None,
         };
 
-        let (records, _) = derive_hive_records(&candidate, &import);
+        let (records, _) =
+            derive_hive_records(&candidate, &import).expect("derive registry records");
         let value_record = &records[0];
 
         // All Deep Search queryable fields must be present and non-empty

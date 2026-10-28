@@ -17,5 +17,10 @@ Upstream: https://github.com/microsoft/outlook-pst-rs
 License: MIT
 Copyright (c) Microsoft Corporation
 
+vhdx-core 0.2.1
+Upstream: https://github.com/SecurityRonin/vhdx-forensic
+License: Apache-2.0
+Author: Albert Hui and project contributors
+
 The dependency graph also contains third-party Rust crates distributed under their
 respective licenses. Cargo.lock records the exact dependency versions used for release builds.

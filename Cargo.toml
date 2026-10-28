@@ -8,11 +8,14 @@ members = [
     "crates/vhdx-vendored",
     "crates/kdft-case",
     "crates/kdft-cli",
+    "crates/kdft-ai-broker",
+    "crates/kdft-desktop",
+    "crates/kdft-desktop-core",
     "crates/kdft-ui",
 ]
 
 [workspace.package]
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/biancanik-art/KDFT-DFIR"
@@ -58,7 +61,7 @@ sha2 = "0.10"
 thiserror = "2"
 vdi = "0.2.0"
 zeroize = { version = "1.8", features = ["serde"] }
-zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+zip = { version = "=9.0.0", default-features = false, features = ["deflate"] }
 xpress-huffman = { version = "=0.1.2", features = ["std"] }
 
 [patch.crates-io]

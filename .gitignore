@@ -1,5 +1,7 @@
 target/
 target-release-candidate/
+target-next/
+target-staged/
 demo-output/
 ui-output/
 
@@ -10,6 +12,13 @@ exports/
 recovered/
 *.kdft.sqlite
 *.kdft1.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Locally assembled release products are published through the tagged GitHub
+# workflow, never committed as source-tree binaries.
+/kdft-v*-windows-x64.exe
+/kdft-v*-windows-x64.zip
 
 # Forensic images and containers.
 *.E01
@@ -38,6 +47,18 @@ RESUME_STATE.md
 !docs/
 docs/*
 !docs/FORENSIC_VALIDATION_CORPUS.md
+!docs/FORENSIC_MATURITY_ROADMAP.md
+!docs/normalized-artifact-query-design.md
+!docs/parser-adapter-architecture.md
+!docs/RESULT_COMPLETENESS_CONTRACT.md
+!docs/STANDALONE_DESKTOP_ARCHITECTURE.md
+!docs/LOCAL_FORENSIC_AI.md
+!docs/WINDOWS_DEV_PACKAGING.md
+!docs/AGY_FUNCTIONAL_WORKBENCH_HANDOFF.md
+!docs/schemas/
+!docs/schemas/forensic-ai-response.schema.json
+!docs/schemas/forensic-ai-model-draft.schema.json
+!docs/schemas/local-model-manifest.schema.json
 *.pdf
 *.doc
 *.docx

@@ -67,6 +67,67 @@ pub enum RateStatus {
     Unknown,
 }
 
+/// Terminal disposition counters for independently processed candidates.
+/// These are deliberately separate from diagnostic skip/error counters: one
+/// candidate must contribute to exactly one terminal disposition while it may
+/// emit any number of diagnostics.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct ProgressOutcomeCounts {
+    pub completed: u64,
+    pub partial: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub unsupported: u64,
+    pub up_to_date: u64,
+}
+
+impl ProgressOutcomeCounts {
+    fn record(&mut self, outcome: ProgressTerminalOutcome, amount: u64) {
+        let counter = match outcome {
+            ProgressTerminalOutcome::Completed => &mut self.completed,
+            ProgressTerminalOutcome::Partial => &mut self.partial,
+            ProgressTerminalOutcome::Failed => &mut self.failed,
+            ProgressTerminalOutcome::Cancelled => &mut self.cancelled,
+            ProgressTerminalOutcome::Unsupported => &mut self.unsupported,
+            ProgressTerminalOutcome::UpToDate => &mut self.up_to_date,
+        };
+        *counter = counter.saturating_add(amount);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressTerminalOutcome {
+    Completed,
+    Partial,
+    Failed,
+    Cancelled,
+    Unsupported,
+    UpToDate,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobProgressPhase {
+    Planning,
+    Recovering,
+    Parsing,
+    Committing,
+    Finalizing,
+}
+
+impl JobProgressPhase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Planning => "Planning",
+            Self::Recovering => "Recovering",
+            Self::Parsing => "Parsing",
+            Self::Committing => "Committing",
+            Self::Finalizing => "Finalizing",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CompletedStageProgress {
     pub name: String,
@@ -87,6 +148,13 @@ pub struct JobProgressSnapshot {
     pub stage_elapsed_ms: u64,
     pub completed_stages: Vec<CompletedStageProgress>,
     pub elapsed_ms: u64,
+    /// Monotonic time since the last increase in terminal-item progress.
+    /// This lets the UI distinguish an initializing stage from a stage that
+    /// has stopped producing terminal outcomes.
+    pub last_progress_age_ms: u64,
+    /// Monotonic age of the most recent bounded recovery read/write activity
+    /// in the current stage. `None` means no recovery I/O has been observed.
+    pub last_recovery_io_age_ms: Option<u64>,
     pub processed_items: u64,
     pub total_items: Option<u64>,
     pub item_unit: String,
@@ -96,6 +164,8 @@ pub struct JobProgressSnapshot {
     pub eta_status: EtaStatus,
     pub eta_seconds: Option<u64>,
     pub current_volume: Option<String>,
+    pub current_phase: Option<JobProgressPhase>,
+    pub current_source_kind: Option<String>,
     pub current_object: Option<String>,
     pub recently_processed: Vec<String>,
     pub skipped_count: u64,
@@ -112,6 +182,18 @@ pub struct JobProgressSnapshot {
     /// `truncation_reasons` after the bounded diagnostic sample filled.
     pub truncation_reasons_omitted: u64,
     pub truncation_reasons: Vec<String>,
+    pub cancellation_requested: bool,
+    pub stage_skipped_count: u64,
+    pub stage_error_count: u64,
+    pub stage_diagnostic_event_count: u64,
+    pub stage_truncation_reason_count: u64,
+    pub stage_truncation_reasons: Vec<String>,
+    pub outcome_counts: ProgressOutcomeCounts,
+    pub stage_outcome_counts: ProgressOutcomeCounts,
+    pub logical_bytes_recovered: u64,
+    pub recovery_read_operations: u64,
+    pub stage_logical_bytes_recovered: u64,
+    pub stage_recovery_read_operations: u64,
 }
 
 pub type ProgressObserver = Arc<dyn Fn(JobProgressSnapshot) + Send + Sync + 'static>;
@@ -196,6 +278,8 @@ struct TrackerState {
     total_items: Option<u64>,
     item_unit: String,
     current_volume: Option<String>,
+    current_phase: Option<JobProgressPhase>,
+    current_source_kind: Option<String>,
     current_object: Option<String>,
     recently_processed: VecDeque<String>,
     skipped_count: u64,
@@ -204,9 +288,21 @@ struct TrackerState {
     truncation_reason_count: u64,
     truncation_reasons_omitted: u64,
     truncation_reasons: Vec<String>,
+    stage_skipped_count: u64,
+    stage_error_count: u64,
+    stage_diagnostic_event_count: u64,
+    stage_truncation_reason_count: u64,
+    stage_truncation_reasons: Vec<String>,
+    outcome_counts: ProgressOutcomeCounts,
+    stage_outcome_counts: ProgressOutcomeCounts,
+    logical_bytes_recovered: u64,
+    recovery_read_operations: u64,
+    stage_logical_bytes_recovered: u64,
+    stage_recovery_read_operations: u64,
     auto_advance_database_entries: bool,
     samples: VecDeque<ProgressSample>,
     last_progress_at: Duration,
+    last_recovery_io_at: Option<Duration>,
     last_publish_at: Option<Duration>,
 }
 
@@ -288,6 +384,8 @@ impl JobProgressTracker {
                     total_items: None,
                     item_unit: "items".to_string(),
                     current_volume: None,
+                    current_phase: None,
+                    current_source_kind: None,
                     current_object: None,
                     recently_processed: VecDeque::new(),
                     skipped_count: 0,
@@ -296,9 +394,21 @@ impl JobProgressTracker {
                     truncation_reason_count: 0,
                     truncation_reasons_omitted: 0,
                     truncation_reasons: Vec::new(),
+                    stage_skipped_count: 0,
+                    stage_error_count: 0,
+                    stage_diagnostic_event_count: 0,
+                    stage_truncation_reason_count: 0,
+                    stage_truncation_reasons: Vec::new(),
+                    outcome_counts: ProgressOutcomeCounts::default(),
+                    stage_outcome_counts: ProgressOutcomeCounts::default(),
+                    logical_bytes_recovered: 0,
+                    recovery_read_operations: 0,
+                    stage_logical_bytes_recovered: 0,
+                    stage_recovery_read_operations: 0,
                     auto_advance_database_entries: false,
                     samples: VecDeque::new(),
                     last_progress_at: now,
+                    last_recovery_io_at: None,
                     last_publish_at: None,
                 }),
                 cancellation_requested: AtomicBool::new(false),
@@ -341,7 +451,17 @@ impl JobProgressTracker {
             state.processed_items = 0;
             state.total_items = total_items;
             state.item_unit = item_unit.into();
+            state.stage_skipped_count = 0;
+            state.stage_error_count = 0;
+            state.stage_diagnostic_event_count = 0;
+            state.stage_truncation_reason_count = 0;
+            state.stage_truncation_reasons.clear();
+            state.stage_outcome_counts = ProgressOutcomeCounts::default();
+            state.stage_logical_bytes_recovered = 0;
+            state.stage_recovery_read_operations = 0;
             state.current_volume = None;
+            state.current_phase = None;
+            state.current_source_kind = None;
             state.current_object = None;
             state.recently_processed.clear();
             state.auto_advance_database_entries = false;
@@ -351,6 +471,7 @@ impl JobProgressTracker {
                 processed: 0,
             });
             state.last_progress_at = now;
+            state.last_recovery_io_at = None;
         });
         self.emit_diagnostic(JobDiagnosticKind::Stage, diagnostic_name);
     }
@@ -392,6 +513,24 @@ impl JobProgressTracker {
         });
     }
 
+    /// Publishes the current bounded work identity without coupling it to
+    /// terminal-item advancement. Callers are responsible for ensuring the
+    /// object label is safe for examiner-facing display.
+    pub fn set_current_work(
+        &self,
+        phase: JobProgressPhase,
+        source_kind: impl Into<String>,
+        current_object: impl Into<String>,
+    ) {
+        let source_kind = source_kind.into();
+        let current_object = current_object.into();
+        self.mutate(false, |state, _| {
+            state.current_phase = Some(phase);
+            state.current_source_kind = Some(source_kind);
+            state.update_current_object(current_object);
+        });
+    }
+
     pub fn advance(&self, amount: u64, current_object: Option<String>) {
         self.mutate(false, |state, now| {
             if let Some(current_object) = current_object {
@@ -430,6 +569,7 @@ impl JobProgressTracker {
         let diagnostic_object = current_object.clone();
         self.mutate(false, |state, _| {
             state.skipped_count = state.skipped_count.saturating_add(1);
+            state.stage_skipped_count = state.stage_skipped_count.saturating_add(1);
             if let Some(current_object) = current_object {
                 state.update_current_object(current_object);
             }
@@ -450,6 +590,7 @@ impl JobProgressTracker {
         let diagnostic_object = current_object.clone();
         self.mutate(false, |state, _| {
             state.error_count = state.error_count.saturating_add(amount);
+            state.stage_error_count = state.stage_error_count.saturating_add(amount);
             if let Some(current_object) = current_object {
                 state.update_current_object(current_object);
             }
@@ -465,11 +606,56 @@ impl JobProgressTracker {
         );
     }
 
+    /// Records exact candidate terminal outcomes independently from parser
+    /// diagnostics and from processed-item advancement.
+    pub fn record_terminal_outcomes(&self, outcome: ProgressTerminalOutcome, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+        self.mutate(false, |state, _| {
+            state.outcome_counts.record(outcome, amount);
+            state.stage_outcome_counts.record(outcome, amount);
+        });
+    }
+
+    /// Records bounded recovery activity. Logical bytes are bytes emitted to
+    /// the reconstructed source stream; they are not claimed to be physical
+    /// or compressed-container media bytes.
+    pub fn record_recovery_io(&self, logical_bytes: u64, read_operations: u64) {
+        if logical_bytes == 0 && read_operations == 0 {
+            return;
+        }
+        self.mutate(false, |state, now| {
+            state.logical_bytes_recovered =
+                state.logical_bytes_recovered.saturating_add(logical_bytes);
+            state.recovery_read_operations = state
+                .recovery_read_operations
+                .saturating_add(read_operations);
+            state.stage_logical_bytes_recovered = state
+                .stage_logical_bytes_recovered
+                .saturating_add(logical_bytes);
+            state.stage_recovery_read_operations = state
+                .stage_recovery_read_operations
+                .saturating_add(read_operations);
+            state.last_recovery_io_at = Some(now);
+        });
+    }
+
     pub fn record_truncation(&self, reason: impl Into<String>) {
         let reason = reason.into();
         let diagnostic_reason = reason.clone();
         self.mutate(false, |state, _| {
             state.truncation_reason_count = state.truncation_reason_count.saturating_add(1);
+            state.stage_truncation_reason_count =
+                state.stage_truncation_reason_count.saturating_add(1);
+            if !state
+                .stage_truncation_reasons
+                .iter()
+                .any(|item| item == &reason)
+                && state.stage_truncation_reasons.len() < TRUNCATION_REASON_LIMIT
+            {
+                state.stage_truncation_reasons.push(reason.clone());
+            }
             // Repeated reports of an already retained reason add no examiner
             // information. New reports beyond the diagnostic sample are
             // counted rather than retained, keeping memory bounded while
@@ -509,7 +695,9 @@ impl JobProgressTracker {
     pub fn snapshot(&self) -> JobProgressSnapshot {
         let now = self.shared.clock.now();
         let state = self.shared.lock_state();
-        state.snapshot(now)
+        let mut snap = state.snapshot(now);
+        snap.cancellation_requested = self.is_cancellation_requested();
+        snap
     }
 
     pub fn truncation_reasons(&self) -> Vec<String> {
@@ -546,6 +734,8 @@ impl JobProgressTracker {
         let event = {
             let mut state = self.shared.lock_state();
             state.diagnostic_sequence = state.diagnostic_sequence.saturating_add(1);
+            state.stage_diagnostic_event_count =
+                state.stage_diagnostic_event_count.saturating_add(1);
             JobDiagnosticEvent {
                 sequence: state.diagnostic_sequence,
                 elapsed_ms: duration_ms(now.saturating_sub(state.started_at)),
@@ -647,6 +837,10 @@ impl TrackerState {
             stage_elapsed_ms: duration_ms(stage_elapsed),
             completed_stages: self.completed_stages.clone(),
             elapsed_ms: duration_ms(effective_now.saturating_sub(self.started_at)),
+            last_progress_age_ms: duration_ms(effective_now.saturating_sub(self.last_progress_at)),
+            last_recovery_io_age_ms: self
+                .last_recovery_io_at
+                .map(|at| duration_ms(effective_now.saturating_sub(at))),
             processed_items: self.processed_items,
             total_items: self.total_items,
             item_unit: self.item_unit.clone(),
@@ -656,6 +850,8 @@ impl TrackerState {
             eta_status,
             eta_seconds,
             current_volume: self.current_volume.clone(),
+            current_phase: self.current_phase,
+            current_source_kind: self.current_source_kind.clone(),
             current_object: self.current_object.clone(),
             recently_processed: self.recently_processed.iter().cloned().collect(),
             skipped_count: self.skipped_count,
@@ -664,6 +860,18 @@ impl TrackerState {
             truncation_reason_count: self.truncation_reason_count,
             truncation_reasons_omitted: self.truncation_reasons_omitted,
             truncation_reasons: self.truncation_reasons.clone(),
+            cancellation_requested: false,
+            stage_skipped_count: self.stage_skipped_count,
+            stage_error_count: self.stage_error_count,
+            stage_diagnostic_event_count: self.stage_diagnostic_event_count,
+            stage_truncation_reason_count: self.stage_truncation_reason_count,
+            stage_truncation_reasons: self.stage_truncation_reasons.clone(),
+            outcome_counts: self.outcome_counts,
+            stage_outcome_counts: self.stage_outcome_counts,
+            logical_bytes_recovered: self.logical_bytes_recovered,
+            recovery_read_operations: self.recovery_read_operations,
+            stage_logical_bytes_recovered: self.stage_logical_bytes_recovered,
+            stage_recovery_read_operations: self.stage_recovery_read_operations,
         }
     }
 
@@ -752,6 +960,10 @@ pub fn with_job_progress<T>(tracker: &JobProgressTracker, operation: impl FnOnce
     operation()
 }
 
+pub fn active_job_progress() -> Option<JobProgressTracker> {
+    ACTIVE_PROGRESS.with(|active| active.borrow().clone())
+}
+
 fn with_active_progress(operation: impl FnOnce(&JobProgressTracker)) {
     ACTIVE_PROGRESS.with(|active| {
         if let Some(tracker) = active.borrow().as_ref() {
@@ -823,6 +1035,18 @@ pub(crate) fn progress_error(current_object: Option<String>) {
 
 pub(crate) fn progress_errors(amount: u64, current_object: Option<String>) {
     with_active_progress(|tracker| tracker.record_errors(amount, current_object));
+}
+
+pub(crate) fn progress_terminal_outcome(outcome: ProgressTerminalOutcome) {
+    progress_terminal_outcomes(outcome, 1);
+}
+
+pub(crate) fn progress_terminal_outcomes(outcome: ProgressTerminalOutcome, amount: u64) {
+    with_active_progress(|tracker| tracker.record_terminal_outcomes(outcome, amount));
+}
+
+pub(crate) fn progress_recovery_io(logical_bytes: u64, read_operations: u64) {
+    with_active_progress(|tracker| tracker.record_recovery_io(logical_bytes, read_operations));
 }
 
 pub(crate) fn progress_truncated(reason: impl Into<String>) {
@@ -983,6 +1207,7 @@ mod tests {
         assert_eq!(stalled.rate_per_second, None);
         assert_eq!(stalled.rate_status, RateStatus::Unknown);
         assert_eq!(stalled.eta_status, EtaStatus::Unknown);
+        assert_eq!(stalled.last_progress_age_ms, 6_000);
     }
 
     #[test]
@@ -1226,5 +1451,166 @@ mod tests {
         assert_eq!(tracker.snapshot().state, JobProgressState::Active);
         tracker.finish(JobProgressState::Cancelled);
         assert_eq!(tracker.snapshot().state, JobProgressState::Cancelled);
+    }
+
+    #[test]
+    fn stage_counters_reset_at_stage_transition_while_whole_job_totals_accumulate() {
+        let tracker = tracker(Arc::new(FakeClock::default()));
+
+        // Stage 1
+        tracker.start_stage("Stage 1", 1, Some(2), "items", None);
+        tracker.record_skip(Some("skipped_item_1".to_string()));
+        tracker.record_error(Some("error_item_1".to_string()));
+        tracker.record_truncation("truncated_reason_1".to_string());
+
+        let snap1 = tracker.snapshot();
+        assert_eq!(snap1.stage_skipped_count, 1);
+        assert_eq!(snap1.stage_error_count, 1);
+        assert_eq!(snap1.stage_truncation_reason_count, 1);
+        assert_eq!(snap1.skipped_count, 1);
+        assert_eq!(snap1.error_count, 1);
+        assert_eq!(snap1.truncation_reason_count, 1);
+
+        // Transition to Stage 2
+        tracker.start_stage("Stage 2", 2, Some(2), "items", None);
+        let snap2_initial = tracker.snapshot();
+        // Stage-local counters MUST be reset to 0
+        assert_eq!(snap2_initial.stage_skipped_count, 0);
+        assert_eq!(snap2_initial.stage_error_count, 0);
+        assert_eq!(snap2_initial.stage_truncation_reason_count, 0);
+        // Whole-job totals MUST be preserved
+        assert_eq!(snap2_initial.skipped_count, 1);
+        assert_eq!(snap2_initial.error_count, 1);
+        assert_eq!(snap2_initial.truncation_reason_count, 1);
+
+        // Record events in Stage 2
+        tracker.record_skip(Some("skipped_item_2".to_string()));
+        tracker.record_skip(Some("skipped_item_3".to_string()));
+        let snap2_final = tracker.snapshot();
+        assert_eq!(snap2_final.stage_skipped_count, 2);
+        assert_eq!(snap2_final.stage_error_count, 0);
+        assert_eq!(snap2_final.skipped_count, 3);
+        assert_eq!(snap2_final.error_count, 1);
+    }
+
+    #[test]
+    fn failed_and_cancelled_outcomes_are_not_reported_as_skips() {
+        let tracker = tracker(Arc::new(FakeClock::default()));
+        tracker.start_stage("Windows artifacts", 3, Some(8), "sources", Some(2));
+
+        tracker.record_error(Some("failed.evtx".to_string()));
+        tracker.record_terminal_outcomes(ProgressTerminalOutcome::Failed, 1);
+        tracker.advance(1, Some("failed.evtx".to_string()));
+        let after_failure = tracker.snapshot();
+        assert_eq!(after_failure.stage_error_count, 1);
+        assert_eq!(after_failure.stage_skipped_count, 0);
+        assert_eq!(after_failure.stage_outcome_counts.failed, 1);
+
+        tracker.request_cancellation();
+        tracker.record_terminal_outcomes(ProgressTerminalOutcome::Cancelled, 1);
+        tracker.advance(1, Some("cancelled.evtx".to_string()));
+        let after_cancellation = tracker.snapshot();
+        assert_eq!(after_cancellation.stage_error_count, 1);
+        assert_eq!(after_cancellation.stage_skipped_count, 0);
+        assert_eq!(after_cancellation.stage_outcome_counts.cancelled, 1);
+        assert_eq!(after_cancellation.processed_items, 2);
+    }
+
+    #[test]
+    fn terminal_outcome_counts_are_exact_and_stage_local() {
+        let tracker = tracker(Arc::new(FakeClock::default()));
+        tracker.start_stage("Windows artifacts", 3, Some(8), "sources", Some(5));
+        tracker.record_terminal_outcomes(ProgressTerminalOutcome::Completed, 2);
+        tracker.record_terminal_outcomes(ProgressTerminalOutcome::Partial, 1);
+        tracker.record_terminal_outcomes(ProgressTerminalOutcome::UpToDate, 2);
+
+        let stage_three = tracker.snapshot();
+        assert_eq!(stage_three.stage_outcome_counts.completed, 2);
+        assert_eq!(stage_three.stage_outcome_counts.partial, 1);
+        assert_eq!(stage_three.stage_outcome_counts.up_to_date, 2);
+        assert_eq!(stage_three.stage_outcome_counts.failed, 0);
+        assert_eq!(stage_three.outcome_counts, stage_three.stage_outcome_counts);
+
+        tracker.start_stage("Browser artifacts", 4, Some(8), "profiles", Some(1));
+        let stage_four = tracker.snapshot();
+        assert_eq!(
+            stage_four.stage_outcome_counts,
+            ProgressOutcomeCounts::default()
+        );
+        assert_eq!(stage_four.outcome_counts.completed, 2);
+        assert_eq!(stage_four.outcome_counts.partial, 1);
+        assert_eq!(stage_four.outcome_counts.up_to_date, 2);
+
+        tracker.record_terminal_outcomes(ProgressTerminalOutcome::Unsupported, 1);
+        assert_eq!(tracker.snapshot().stage_outcome_counts.unsupported, 1);
+        assert_eq!(tracker.snapshot().outcome_counts.unsupported, 1);
+    }
+
+    #[test]
+    fn current_work_phase_and_safe_identity_reset_between_stages() {
+        let tracker = tracker(Arc::new(FakeClock::default()));
+        tracker.start_stage("Windows artifacts", 3, Some(8), "sources", Some(1));
+        tracker.set_current_work(
+            JobProgressPhase::Recovering,
+            "windows_event_log",
+            "windows_event_log source #42",
+        );
+
+        let recovering = tracker.snapshot();
+        assert_eq!(recovering.current_phase, Some(JobProgressPhase::Recovering));
+        assert_eq!(
+            recovering.current_source_kind.as_deref(),
+            Some("windows_event_log")
+        );
+        assert_eq!(
+            recovering.current_object.as_deref(),
+            Some("windows_event_log source #42")
+        );
+
+        tracker.set_current_work(
+            JobProgressPhase::Parsing,
+            "windows_event_log",
+            "windows_event_log source #42",
+        );
+        assert_eq!(
+            tracker.snapshot().current_phase,
+            Some(JobProgressPhase::Parsing)
+        );
+
+        tracker.start_stage("Browser artifacts", 4, Some(8), "profiles", None);
+        let next_stage = tracker.snapshot();
+        assert_eq!(next_stage.current_phase, None);
+        assert_eq!(next_stage.current_source_kind, None);
+        assert_eq!(next_stage.current_object, None);
+    }
+
+    #[test]
+    fn recovery_io_is_saturating_and_stage_local() {
+        let clock = Arc::new(FakeClock::default());
+        let tracker = tracker(clock.clone());
+        tracker.start_stage("Windows artifacts", 3, Some(8), "sources", Some(1));
+        assert_eq!(tracker.snapshot().last_recovery_io_age_ms, None);
+        tracker.record_recovery_io(1_048_576, 1);
+        tracker.record_recovery_io(512, 2);
+        clock.advance_ms(12_345);
+
+        let stage_three = tracker.snapshot();
+        assert_eq!(stage_three.stage_logical_bytes_recovered, 1_049_088);
+        assert_eq!(stage_three.stage_recovery_read_operations, 3);
+        assert_eq!(stage_three.logical_bytes_recovered, 1_049_088);
+        assert_eq!(stage_three.recovery_read_operations, 3);
+        assert_eq!(stage_three.last_recovery_io_age_ms, Some(12_345));
+
+        tracker.start_stage("Browser artifacts", 4, Some(8), "profiles", None);
+        let stage_four = tracker.snapshot();
+        assert_eq!(stage_four.stage_logical_bytes_recovered, 0);
+        assert_eq!(stage_four.stage_recovery_read_operations, 0);
+        assert_eq!(stage_four.last_recovery_io_age_ms, None);
+        assert_eq!(stage_four.logical_bytes_recovered, 1_049_088);
+        assert_eq!(stage_four.recovery_read_operations, 3);
+
+        tracker.record_recovery_io(u64::MAX, u64::MAX);
+        assert_eq!(tracker.snapshot().logical_bytes_recovered, u64::MAX);
+        assert_eq!(tracker.snapshot().recovery_read_operations, u64::MAX);
     }
 }

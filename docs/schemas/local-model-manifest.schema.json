@@ -1,0 +1,312 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kdft.invalid/schemas/local-model-manifest.schema.json",
+  "title": "KDFT installed local model manifest",
+  "description": "Immutable provenance, license, compatibility, and verification metadata for a locally installed inference model. File paths are relative to the managed model directory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "manifest_id",
+    "installed_at_utc",
+    "source",
+    "model",
+    "files",
+    "license",
+    "compatible_adapters",
+    "verification",
+    "network_state_after_install"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "manifest_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "installed_at_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/huggingFaceSource"
+        },
+        {
+          "$ref": "#/$defs/localImportSource"
+        }
+      ]
+    },
+    "model": {
+      "$ref": "#/$defs/model"
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10000,
+      "items": {
+        "$ref": "#/$defs/file"
+      }
+    },
+    "license": {
+      "$ref": "#/$defs/license"
+    },
+    "compatible_adapters": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "items": {
+        "$ref": "#/$defs/adapter"
+      }
+    },
+    "verification": {
+      "$ref": "#/$defs/verification"
+    },
+    "network_state_after_install": {
+      "const": "local_offline"
+    }
+  },
+  "$defs": {
+    "huggingFaceSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "repository_id",
+        "revision_commit",
+        "download_tool",
+        "download_tool_version"
+      ],
+      "properties": {
+        "kind": {
+          "const": "hugging_face_snapshot"
+        },
+        "repository_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$",
+          "maxLength": 512
+        },
+        "revision_commit": {
+          "description": "Immutable full Hub commit identifier; mutable branch names are not accepted.",
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{40,64}$"
+        },
+        "download_tool": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "download_tool_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "localImportSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "imported_file_sha256"
+      ],
+      "properties": {
+        "kind": {
+          "const": "local_import"
+        },
+        "imported_file_sha256": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "provenance_note": {
+          "type": ["string", "null"],
+          "maxLength": 4000
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "display_name",
+        "format",
+        "architecture",
+        "quantization",
+        "declared_context_tokens"
+      ],
+      "properties": {
+        "model_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "format": {
+          "enum": ["gguf", "onnx_genai"]
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "quantization": {
+          "type": ["string", "null"],
+          "maxLength": 256
+        },
+        "parameter_count": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "declared_context_tokens": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "chat_template_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "role",
+        "size_bytes",
+        "sha256"
+      ],
+      "properties": {
+        "relative_path": {
+          "description": "Portable relative path using forward slashes. Absolute paths and parent traversal are forbidden.",
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9._+@() -]+(?:/[A-Za-z0-9._+@() -]+)*$",
+          "maxLength": 4096
+        },
+        "role": {
+          "enum": [
+            "model_weights",
+            "tokenizer",
+            "configuration",
+            "chat_template",
+            "model_card",
+            "license",
+            "runtime_auxiliary"
+          ]
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        }
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "declared_identifier",
+        "review_status",
+        "license_text_sha256",
+        "accepted_at_utc"
+      ],
+      "properties": {
+        "declared_identifier": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "declared_name": {
+          "type": ["string", "null"],
+          "maxLength": 1024
+        },
+        "declared_url": {
+          "type": ["string", "null"],
+          "format": "uri",
+          "maxLength": 4096
+        },
+        "license_text_relative_path": {
+          "type": ["string", "null"],
+          "maxLength": 4096
+        },
+        "license_text_sha256": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]{64}$"
+        },
+        "review_status": {
+          "enum": [
+            "recognized_license_accepted",
+            "custom_license_examiner_acknowledged"
+          ]
+        },
+        "accepted_at_utc": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "accepted_by": {
+          "type": ["string", "null"],
+          "maxLength": 512
+        }
+      }
+    },
+    "adapter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adapter_id",
+        "minimum_tested_version"
+      ],
+      "properties": {
+        "adapter_id": {
+          "enum": ["llama_cpp", "onnx_runtime_genai", "ollama_developer"]
+        },
+        "minimum_tested_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "all_file_hashes_verified",
+        "all_file_sizes_verified",
+        "license_reviewed",
+        "model_metadata_parsed",
+        "verification_tool_version"
+      ],
+      "properties": {
+        "all_file_hashes_verified": {
+          "const": true
+        },
+        "all_file_sizes_verified": {
+          "const": true
+        },
+        "license_reviewed": {
+          "const": true
+        },
+        "model_metadata_parsed": {
+          "const": true
+        },
+        "verification_tool_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    }
+  }
+}

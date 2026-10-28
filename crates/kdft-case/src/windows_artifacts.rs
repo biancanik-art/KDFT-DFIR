@@ -9,7 +9,6 @@
 //! rows and searchable text segments remain intact.
 
 use anyhow::{anyhow, bail, Context, Result};
-use rayon::prelude::*;
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -19,6 +18,8 @@ use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::jumplist::{
     self, DestListMetadata, JumpListContainerKind, JumpListDiagnostic, JumpListLnkMetadata,
@@ -32,8 +33,9 @@ use super::usn::{
 use super::{
     active_case_id, add_entry_category, audit_actor, available_processing_worker_count,
     ensure_evidence_source, evtx_channel_hint, evtx_import_entry_from_record, open_existing_case,
-    recover_filesystem_entry_in_session, sanitize_logical_segment, source_path_exact_from_metadata,
-    EvidenceReadSession, EvtxParser, EvtxParserSettings, RecoverEntryOptions, RecoverEntryResult,
+    recover_filesystem_entry_in_session_bounded, sanitize_logical_segment,
+    source_path_exact_from_metadata, BitLockerProcessingContext, EvidenceReadSession, EvtxParser,
+    EvtxParserSettings, RecoverEntryOptions, RecoverEntryResult, RecoverySafetyBounds,
 };
 
 const WINDOWS_ARTIFACT_PARSER_NAME: &str = "kdft-windows-artifacts-v2";
@@ -184,6 +186,88 @@ impl WindowsArtifactKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WindowsArtifactFilter {
+    pub lnk_jump_lists: bool,
+    pub prefetch: bool,
+    pub windows_event_logs: bool,
+    pub scheduled_tasks: bool,
+}
+
+impl Default for WindowsArtifactFilter {
+    fn default() -> Self {
+        Self {
+            lnk_jump_lists: true,
+            prefetch: true,
+            windows_event_logs: true,
+            scheduled_tasks: true,
+        }
+    }
+}
+
+impl WindowsArtifactFilter {
+    pub fn matches(&self, kind: WindowsArtifactKind) -> bool {
+        match kind {
+            WindowsArtifactKind::ShellLink
+            | WindowsArtifactKind::AutomaticJumpList
+            | WindowsArtifactKind::CustomJumpList => self.lnk_jump_lists,
+            WindowsArtifactKind::Prefetch => self.prefetch,
+            WindowsArtifactKind::Evtx => self.windows_event_logs,
+            WindowsArtifactKind::ScheduledTask => self.scheduled_tasks,
+            WindowsArtifactKind::UsnJournal => true,
+        }
+    }
+}
+
+fn candidate_filter_sql(filter: Option<WindowsArtifactFilter>) -> String {
+    let Some(f) = filter else {
+        return CANDIDATE_FILTER_SQL.to_string();
+    };
+    if f.lnk_jump_lists && f.prefetch && f.windows_event_logs && f.scheduled_tasks {
+        return CANDIDATE_FILTER_SQL.to_string();
+    }
+    let mut clauses = Vec::new();
+    if f.lnk_jump_lists {
+        clauses.push("lower(name) LIKE '%.lnk'");
+        clauses.push("lower(name) LIKE '%.automaticdestinations-ms'");
+        clauses.push("lower(name) LIKE '%.customdestinations-ms'");
+        clauses.push("lower(replace(COALESCE(NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''), NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''), NULLIF(json_extract(metadata_json, '$.fat_path'), ''), NULLIF(json_extract(metadata_json, '$.ext_path'), ''), NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''), logical_path), '\\', '/')) LIKE '%.lnk'");
+        clauses.push("lower(replace(COALESCE(NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''), NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''), NULLIF(json_extract(metadata_json, '$.fat_path'), ''), NULLIF(json_extract(metadata_json, '$.ext_path'), ''), NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''), logical_path), '\\', '/')) LIKE '%.automaticdestinations-ms'");
+        clauses.push("lower(replace(COALESCE(NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''), NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''), NULLIF(json_extract(metadata_json, '$.fat_path'), ''), NULLIF(json_extract(metadata_json, '$.ext_path'), ''), NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''), logical_path), '\\', '/')) LIKE '%.customdestinations-ms'");
+    }
+    if f.prefetch {
+        clauses.push("lower(name) LIKE '%.pf'");
+        clauses.push("lower(replace(COALESCE(NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''), NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''), NULLIF(json_extract(metadata_json, '$.fat_path'), ''), NULLIF(json_extract(metadata_json, '$.ext_path'), ''), NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''), logical_path), '\\', '/')) LIKE '%.pf'");
+    }
+    if f.windows_event_logs {
+        clauses.push("lower(name) LIKE '%.evtx'");
+        clauses.push("lower(replace(COALESCE(NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''), NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''), NULLIF(json_extract(metadata_json, '$.fat_path'), ''), NULLIF(json_extract(metadata_json, '$.ext_path'), ''), NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''), logical_path), '\\', '/')) LIKE '%.evtx'");
+    }
+    if f.scheduled_tasks {
+        clauses.push("lower('/' || replace(COALESCE(NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''), NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''), NULLIF(json_extract(metadata_json, '$.fat_path'), ''), NULLIF(json_extract(metadata_json, '$.ext_path'), ''), NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''), logical_path), '\\', '/')) LIKE '%/windows/system32/tasks/%'");
+    }
+    clauses.push("lower(name) = '$usnjrnl:$j'");
+    clauses.push("(lower(COALESCE(json_extract(metadata_json, '$.ntfs_base_name'), '')) = '$usnjrnl' AND lower(COALESCE(json_extract(metadata_json, '$.ntfs_data_stream_name'), '')) = '$j')");
+    clauses.push("lower(replace(COALESCE(NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''), NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''), NULLIF(json_extract(metadata_json, '$.fat_path'), ''), NULLIF(json_extract(metadata_json, '$.ext_path'), ''), NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''), logical_path), '\\', '/')) LIKE '%/$usnjrnl:$j'");
+
+    let kinds_filter = format!("({})", clauses.join(" OR "));
+    format!(
+        r#"
+    AND entry_kind = 'file'
+    AND COALESCE(json_extract(metadata_json, '$.windows_artifact_derived'), 0) <> 1
+    AND lower('/' || replace(COALESCE(
+        NULLIF(json_extract(metadata_json, '$.source_path_exact'), ''),
+        NULLIF(json_extract(metadata_json, '$.ntfs_path'), ''),
+        NULLIF(json_extract(metadata_json, '$.fat_path'), ''),
+        NULLIF(json_extract(metadata_json, '$.ext_path'), ''),
+        NULLIF(json_extract(metadata_json, '$.local_relative_path'), ''),
+        logical_path
+    ), '\', '/')) NOT LIKE '%/windows/winsxs/%'
+    AND {kinds_filter}
+"#
+    )
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WindowsArtifactKindCounts {
     pub candidates_seen: u64,
@@ -191,6 +275,7 @@ pub struct WindowsArtifactKindCounts {
     pub partial_sources: u64,
     pub optional_coverage_incomplete_sources: u64,
     pub failed_sources: u64,
+    pub cancelled_sources: u64,
     pub derived_entries: u64,
     pub text_segments: u64,
 }
@@ -217,6 +302,7 @@ pub struct WindowsArtifactParseResult {
     pub partial_sources: u64,
     pub optional_coverage_incomplete_sources: u64,
     pub failed_sources: u64,
+    pub cancelled_sources: u64,
     pub derived_entries: u64,
     pub text_segments: u64,
     pub per_kind: BTreeMap<String, WindowsArtifactKindCounts>,
@@ -230,6 +316,133 @@ pub struct WindowsArtifactParseResult {
     pub status: String,
     pub worker_threads: usize,
     pub worker_queue_capacity: usize,
+}
+
+fn finalized_pass_status(
+    current_status: &str,
+    supported_scope_complete: bool,
+    parsed_sources: u64,
+    failed_sources: u64,
+) -> String {
+    if current_status.eq_ignore_ascii_case("cancelled") {
+        "cancelled".to_string()
+    } else if parsed_sources == 0 && failed_sources > 0 {
+        "failed".to_string()
+    } else if supported_scope_complete {
+        "completed".to_string()
+    } else {
+        "truncated".to_string()
+    }
+}
+
+struct RecoveredSource {
+    candidate: WindowsArtifactCandidate,
+    staging_directory: PathBuf,
+    staging_path: PathBuf,
+    staging_database_path: PathBuf,
+    recovery: RecoverEntryResult,
+}
+
+// The ready variant owns the complete bounded source summary until the commit
+// coordinator persists it. Keeping that ownership inline avoids an additional
+// allocation in the hot hand-off path.
+#[allow(clippy::large_enum_variant)]
+enum StagedOutcome {
+    Ready {
+        candidate: WindowsArtifactCandidate,
+        staging_directory: PathBuf,
+        staging_path: PathBuf,
+        staging_database_path: PathBuf,
+        recovery: RecoverEntryResult,
+        summary: SourceParseSummary,
+    },
+    Failed {
+        candidate: WindowsArtifactCandidate,
+        staging_directory: Option<PathBuf>,
+        staging_path: Option<PathBuf>,
+        staging_database_path: Option<PathBuf>,
+        error: anyhow::Error,
+    },
+    Cancelled {
+        candidate: WindowsArtifactCandidate,
+        staging_directory: Option<PathBuf>,
+        staging_path: Option<PathBuf>,
+        staging_database_path: Option<PathBuf>,
+    },
+}
+
+fn recovery_safety_bounds_for_kind(kind: WindowsArtifactKind) -> RecoverySafetyBounds {
+    match kind {
+        WindowsArtifactKind::ShellLink => RecoverySafetyBounds {
+            max_bytes: Some(32 * 1024 * 1024),
+            deadline: Some(std::time::Instant::now() + Duration::from_secs(30)),
+        },
+        WindowsArtifactKind::Prefetch => RecoverySafetyBounds {
+            max_bytes: Some(64 * 1024 * 1024),
+            deadline: Some(std::time::Instant::now() + Duration::from_secs(30)),
+        },
+        WindowsArtifactKind::Evtx => RecoverySafetyBounds {
+            max_bytes: Some(512 * 1024 * 1024),
+            deadline: Some(std::time::Instant::now() + Duration::from_secs(120)),
+        },
+        WindowsArtifactKind::AutomaticJumpList | WindowsArtifactKind::CustomJumpList => {
+            RecoverySafetyBounds {
+                max_bytes: Some(64 * 1024 * 1024),
+                deadline: Some(std::time::Instant::now() + Duration::from_secs(30)),
+            }
+        }
+        WindowsArtifactKind::UsnJournal => RecoverySafetyBounds {
+            max_bytes: Some(256 * 1024 * 1024),
+            deadline: Some(std::time::Instant::now() + Duration::from_secs(60)),
+        },
+        WindowsArtifactKind::ScheduledTask => RecoverySafetyBounds {
+            max_bytes: Some(16 * 1024 * 1024),
+            deadline: Some(std::time::Instant::now() + Duration::from_secs(30)),
+        },
+    }
+}
+
+fn cleanup_staging_paths(
+    staging_path: Option<&Path>,
+    staging_database_path: Option<&Path>,
+    staging_directory: Option<&Path>,
+) -> Option<String> {
+    let mut warnings = Vec::new();
+    if let Some(path) = staging_path {
+        if path.exists() {
+            if let Err(e) = fs::remove_file(path) {
+                warnings.push(format!(
+                    "removing temporary source file {}: {e:#}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if let Some(path) = staging_database_path {
+        if path.exists() {
+            if let Err(e) = fs::remove_file(path) {
+                warnings.push(format!(
+                    "removing temporary staging database {}: {e:#}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if let Some(dir) = staging_directory {
+        if dir.exists() {
+            if let Err(e) = fs::remove_dir_all(dir) {
+                warnings.push(format!(
+                    "removing temporary directory {}: {e:#}",
+                    dir.display()
+                ));
+            }
+        }
+    }
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("; "))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -384,12 +597,7 @@ struct EvtxEcmdAdapterOutcome {
     text_segments: u64,
 }
 
-#[derive(Debug)]
-struct StagedSourceOutcome {
-    parsed: SourceParseSummary,
-    cleanup_warning: Option<String>,
-}
-
+#[allow(dead_code)]
 struct StagedSourceRecovery {
     candidate: WindowsArtifactCandidate,
     staging_directory: Option<PathBuf>,
@@ -398,10 +606,13 @@ struct StagedSourceRecovery {
     parsed: Result<(RecoverEntryResult, SourceParseSummary)>,
 }
 
+#[allow(dead_code)]
 fn order_staged_sources_for_commit(staged: &mut [StagedSourceRecovery]) {
     staged.sort_unstable_by_key(|source| source.candidate.entry_id);
 }
 
+// EvidenceReadSession intentionally stays inline for one-owner worker reuse.
+#[allow(clippy::large_enum_variant)]
 enum WindowsWorkerReadSession {
     Ready(EvidenceReadSession),
     Failed(String),
@@ -490,11 +701,52 @@ pub fn parse_windows_artifacts(
     case_path: &Path,
     evidence_id: i64,
 ) -> Result<WindowsArtifactParseResult> {
-    let snapshot = candidate_snapshot(case_path, evidence_id)?;
+    parse_windows_artifacts_impl(case_path, evidence_id, None, None)
+}
+
+pub fn parse_windows_artifacts_with_filter(
+    case_path: &Path,
+    evidence_id: i64,
+    filter: WindowsArtifactFilter,
+) -> Result<WindowsArtifactParseResult> {
+    parse_windows_artifacts_impl(case_path, evidence_id, None, Some(filter))
+}
+
+/// Parses Windows artifacts from an indexed, memory-only unlocked BitLocker
+/// volume. Each worker creates one private decrypted reader and reuses it for
+/// all of its source recoveries; the credential is never written to the case.
+pub fn parse_windows_artifacts_with_bitlocker(
+    case_path: &Path,
+    evidence_id: i64,
+    context: BitLockerProcessingContext<'_>,
+) -> Result<WindowsArtifactParseResult> {
+    parse_windows_artifacts_impl(case_path, evidence_id, Some(context), None)
+}
+
+pub fn parse_windows_artifacts_with_bitlocker_and_filter(
+    case_path: &Path,
+    evidence_id: i64,
+    context: BitLockerProcessingContext<'_>,
+    filter: WindowsArtifactFilter,
+) -> Result<WindowsArtifactParseResult> {
+    parse_windows_artifacts_impl(case_path, evidence_id, Some(context), Some(filter))
+}
+
+fn parse_windows_artifacts_impl(
+    case_path: &Path,
+    evidence_id: i64,
+    bitlocker_context: Option<BitLockerProcessingContext<'_>>,
+    filter: Option<WindowsArtifactFilter>,
+) -> Result<WindowsArtifactParseResult> {
+    let snapshot = candidate_snapshot(case_path, evidence_id, filter)?;
     let worker_threads = available_processing_worker_count();
     let worker_queue_capacity = worker_threads.saturating_mul(2).max(1);
     super::progress::progress_set_unit("Windows artifact sources");
     super::progress::progress_set_total(Some(snapshot.count));
+    super::progress::progress_terminal_outcomes(
+        super::progress::ProgressTerminalOutcome::UpToDate,
+        snapshot.supported_count.saturating_sub(snapshot.count),
+    );
 
     let mut result = WindowsArtifactParseResult {
         evidence_id,
@@ -510,6 +762,7 @@ pub fn parse_windows_artifacts(
         partial_sources: 0,
         optional_coverage_incomplete_sources: 0,
         failed_sources: 0,
+        cancelled_sources: 0,
         derived_entries: 0,
         text_segments: 0,
         per_kind: BTreeMap::new(),
@@ -526,146 +779,554 @@ pub fn parse_windows_artifacts(
     };
     let mut diagnostics = DiagnosticAccumulator::default();
     let mut after_entry_id = i64::MIN;
-    let worker_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(worker_threads)
-        .thread_name(|index| format!("kdft-windows-worker-{index}"))
-        .build()
-        .context("creating the Windows artifact worker pool")?;
 
     if let Some(max_entry_id) = snapshot.max_entry_id {
         loop {
-            let candidates = candidate_page(
+            if let Some(tracker) = super::progress::active_job_progress() {
+                if tracker.is_cancellation_requested() {
+                    result.status = "cancelled".to_string();
+                    break;
+                }
+            }
+            let page_candidates = candidate_page(
                 case_path,
                 evidence_id,
                 after_entry_id,
                 max_entry_id,
                 CANDIDATE_PAGE_SIZE,
                 snapshot.reuse_committed,
+                filter,
             )?;
-            if candidates.is_empty() {
+            if page_candidates.is_empty() {
                 break;
             }
-            after_entry_id = candidates
+            after_entry_id = page_candidates
                 .last()
                 .map(|candidate| candidate.entry_id)
                 .unwrap_or(after_entry_id);
-            let expected_results = candidates.len();
-            let (sender, receiver) = std::sync::mpsc::sync_channel(worker_queue_capacity);
-            let worker_case_path = case_path.to_path_buf();
-            worker_pool.spawn(move || {
-                candidates.into_par_iter().for_each_init(
-                    || match EvidenceReadSession::open_worker_read_only(&worker_case_path) {
-                        Ok(session) => WindowsWorkerReadSession::Ready(session),
-                        Err(error) => WindowsWorkerReadSession::Failed(format!("{error:#}")),
-                    },
-                    |session, candidate| {
-                        let staged = stage_one_source(session, candidate);
-                        let _ = sender.send(staged);
-                    },
-                );
-            });
-
-            let mut staged_sources = Vec::with_capacity(expected_results);
-            for _ in 0..expected_results {
-                staged_sources.push(
-                    receiver.recv().context(
-                        "Windows artifact workers stopped before returning every source",
-                    )?,
-                );
+            let candidates: Vec<_> = if let Some(f) = filter {
+                page_candidates
+                    .into_iter()
+                    .filter(|c| f.matches(c.kind))
+                    .collect()
+            } else {
+                page_candidates
+            };
+            if candidates.is_empty() {
+                continue;
             }
-            // Worker completion order depends on source size and scheduler timing. Commit in the
-            // candidate keyset order so row IDs, bounded diagnostics, audit records, and progress
-            // are reproducible across runs while parsing remains parallel.
-            order_staged_sources_for_commit(&mut staged_sources);
+            let expected_results = candidates.len();
+            let (recovery_tx, recovery_rx) =
+                std::sync::mpsc::sync_channel::<RecoveredSource>(worker_queue_capacity);
+            let recovery_rx = Arc::new(Mutex::new(recovery_rx));
+            let (coordinator_tx, coordinator_rx) =
+                std::sync::mpsc::sync_channel::<StagedOutcome>(worker_queue_capacity);
+            let worker_case_path = case_path.to_path_buf();
+            let active_tracker = super::progress::active_job_progress();
 
-            for staged in staged_sources {
-                let candidate = staged.candidate.clone();
-                result.candidates_seen = result.candidates_seen.saturating_add(1);
-                let kind_key = candidate.kind.key().to_string();
-                let kind_counts = result.per_kind.entry(kind_key).or_default();
-                kind_counts.candidates_seen = kind_counts.candidates_seen.saturating_add(1);
-                super::progress::progress_current(candidate.source_path_exact.clone());
+            let result_ref = &mut result;
+            let diagnostics_ref = &mut diagnostics;
 
-                match commit_staged_source(case_path, staged) {
-                    Ok(outcome) => {
-                        let summary = outcome.parsed;
-                        result.parsed_sources = result.parsed_sources.saturating_add(1);
-                        kind_counts.parsed_sources = kind_counts.parsed_sources.saturating_add(1);
-                        result.derived_entries = result
-                            .derived_entries
-                            .saturating_add(summary.derived_entries);
-                        result.text_segments =
-                            result.text_segments.saturating_add(summary.text_segments);
-                        kind_counts.derived_entries = kind_counts
-                            .derived_entries
-                            .saturating_add(summary.derived_entries);
-                        kind_counts.text_segments = kind_counts
-                            .text_segments
-                            .saturating_add(summary.text_segments);
-                        if summary.partial {
-                            result.partial_sources = result.partial_sources.saturating_add(1);
-                            kind_counts.partial_sources =
-                                kind_counts.partial_sources.saturating_add(1);
-                            super::progress::progress_truncated(format!(
-                                "{} source {} was parsed with explicitly disclosed partial coverage",
-                                candidate.kind.key(),
-                                candidate.source_path_exact
-                            ));
+            std::thread::scope(|s| {
+                // 1. Dedicated Recovery Lane (concurrency 1)
+                let recovery_tx_lane = recovery_tx;
+                let coordinator_tx_recovery = coordinator_tx.clone();
+                let tracker_recovery = active_tracker.clone();
+                let candidates_ref = &candidates;
+                let worker_case_path_ref = &worker_case_path;
+
+                let _ = std::thread::Builder::new()
+                    .name("kdft-windows-recovery".to_string())
+                    .spawn_scoped(s, move || {
+                        let mut session = if let Some(context) = bitlocker_context {
+                            match EvidenceReadSession::open_worker_read_only_with_bitlocker(
+                                worker_case_path_ref,
+                                evidence_id,
+                                context,
+                            ) {
+                                Ok(sess) => WindowsWorkerReadSession::Ready(sess),
+                                Err(err) => WindowsWorkerReadSession::Failed(format!("{err:#}")),
+                            }
+                        } else {
+                            match EvidenceReadSession::open_worker_read_only(worker_case_path_ref) {
+                                Ok(sess) => WindowsWorkerReadSession::Ready(sess),
+                                Err(err) => WindowsWorkerReadSession::Failed(format!("{err:#}")),
+                            }
+                        };
+
+                        for candidate in candidates_ref {
+                            if let Some(ref t) = tracker_recovery {
+                                t.set_current_work(
+                                    super::progress::JobProgressPhase::Recovering,
+                                    candidate.kind.key(),
+                                    progress_source_label(candidate),
+                                );
+                                if t.is_cancellation_requested() {
+                                    let _ =
+                                        coordinator_tx_recovery.send(StagedOutcome::Cancelled {
+                                            candidate: candidate.clone(),
+                                            staging_directory: None,
+                                            staging_path: None,
+                                            staging_database_path: None,
+                                        });
+                                    continue;
+                                }
+                            }
+
+                            let (staging_directory, staging_path) =
+                                match create_unique_recovery_destination(
+                                    "kdft-windows-source",
+                                    candidate.entry_id,
+                                    candidate.kind.staging_suffix(),
+                                ) {
+                                    Ok(paths) => paths,
+                                    Err(error) => {
+                                        let _ =
+                                            coordinator_tx_recovery.send(StagedOutcome::Failed {
+                                                candidate: candidate.clone(),
+                                                staging_directory: None,
+                                                staging_path: None,
+                                                staging_database_path: None,
+                                                error,
+                                            });
+                                        continue;
+                                    }
+                                };
+                            let staging_database_path = staging_directory.join("parsed.sqlite");
+                            let bounds = recovery_safety_bounds_for_kind(candidate.kind);
+
+                            let recovery_res = match &mut session {
+                                WindowsWorkerReadSession::Ready(sess) => {
+                                    run_with_optional_progress(tracker_recovery.as_ref(), || {
+                                        recover_filesystem_entry_in_session_bounded(
+                                            sess,
+                                            RecoverEntryOptions {
+                                                entry_id: candidate.entry_id,
+                                                output_path: staging_path.clone(),
+                                            },
+                                            bounds,
+                                        )
+                                    })
+                                    .with_context(|| {
+                                        format!(
+                                            "recovering {} source {}",
+                                            candidate.kind.key(),
+                                            candidate.source_path_exact
+                                        )
+                                    })
+                                }
+                                WindowsWorkerReadSession::Failed(reason) => Err(anyhow!(
+                                    "opening a worker-local evidence read session failed: {reason}"
+                                )),
+                            };
+
+                            match recovery_res {
+                                Ok(recovery) => {
+                                    let item = RecoveredSource {
+                                        candidate: candidate.clone(),
+                                        staging_directory,
+                                        staging_path,
+                                        staging_database_path,
+                                        recovery,
+                                    };
+                                    if recovery_tx_lane.send(item).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    if tracker_recovery
+                                        .as_ref()
+                                        .is_some_and(|tracker| tracker.is_cancellation_requested())
+                                    {
+                                        let _ = coordinator_tx_recovery.send(
+                                            StagedOutcome::Cancelled {
+                                                candidate: candidate.clone(),
+                                                staging_directory: Some(staging_directory),
+                                                staging_path: Some(staging_path),
+                                                staging_database_path: Some(staging_database_path),
+                                            },
+                                        );
+                                    } else {
+                                        let _ =
+                                            coordinator_tx_recovery.send(StagedOutcome::Failed {
+                                                candidate: candidate.clone(),
+                                                staging_directory: Some(staging_directory),
+                                                staging_path: Some(staging_path),
+                                                staging_database_path: Some(staging_database_path),
+                                                error,
+                                            });
+                                    }
+                                }
+                            }
                         }
-                        let optional_coverage_incomplete = summary
-                            .details
-                            .get("lnk_coverage_complete")
-                            .and_then(serde_json::Value::as_bool)
-                            == Some(false);
-                        if optional_coverage_incomplete {
-                            result.optional_coverage_incomplete_sources = result
-                                .optional_coverage_incomplete_sources
-                                .saturating_add(1);
-                            kind_counts.optional_coverage_incomplete_sources = kind_counts
-                                .optional_coverage_incomplete_sources
-                                .saturating_add(1);
-                        }
-                        diagnostics.merge(&summary.diagnostics);
-                        if let Some(warning) = outcome.cleanup_warning {
-                            diagnostics.push(source_diagnostic(
-                                candidate.entry_id,
-                                candidate.kind,
-                                &candidate.source_path_exact,
-                                warning,
-                            ));
+                        drop(recovery_tx_lane);
+                        drop(coordinator_tx_recovery);
+                    });
+
+                // 2. Parser Workers (1..=worker_threads)
+                for worker_index in 0..worker_threads {
+                    let recovery_rx_worker = Arc::clone(&recovery_rx);
+                    let coordinator_tx_parser = coordinator_tx.clone();
+                    let tracker_parser = active_tracker.clone();
+
+                    let _ = std::thread::Builder::new()
+                        .name(format!("kdft-windows-parser-{worker_index}"))
+                        .spawn_scoped(s, move || {
+                            loop {
+                                let item = {
+                                    let Ok(lock) = recovery_rx_worker.lock() else {
+                                        break;
+                                    };
+                                    match lock.recv() {
+                                        Ok(item) => item,
+                                        Err(_) => break,
+                                    }
+                                };
+
+                                let RecoveredSource {
+                                    candidate,
+                                    staging_directory,
+                                    staging_path,
+                                    staging_database_path,
+                                    recovery,
+                                } = item;
+
+                                if let Some(ref t) = tracker_parser {
+                                    t.set_current_work(
+                                        super::progress::JobProgressPhase::Parsing,
+                                        candidate.kind.key(),
+                                        progress_source_label(&candidate),
+                                    );
+                                    if t.is_cancellation_requested() {
+                                        let _ = coordinator_tx_parser.send(StagedOutcome::Cancelled {
+                                            candidate,
+                                            staging_directory: Some(staging_directory),
+                                            staging_path: Some(staging_path),
+                                            staging_database_path: Some(staging_database_path),
+                                        });
+                                        continue;
+                                    }
+                                }
+
+                                let parse_res = if let Some(ref t) = tracker_parser {
+                                    super::progress::with_job_progress(t, || {
+                                        parse_source_to_staging_database(
+                                            &candidate,
+                                            &staging_path,
+                                            &staging_database_path,
+                                        )
+                                    })
+                                } else {
+                                    parse_source_to_staging_database(
+                                        &candidate,
+                                        &staging_path,
+                                        &staging_database_path,
+                                    )
+                                };
+
+                                let outcome = match parse_res {
+                                    Ok(summary) => StagedOutcome::Ready {
+                                        candidate,
+                                        staging_directory,
+                                        staging_path,
+                                        staging_database_path,
+                                        recovery,
+                                        summary,
+                                    },
+                                    Err(_error)
+                                        if tracker_parser.as_ref().is_some_and(|tracker| {
+                                            tracker.is_cancellation_requested()
+                                        }) =>
+                                    {
+                                        StagedOutcome::Cancelled {
+                                            candidate,
+                                            staging_directory: Some(staging_directory),
+                                            staging_path: Some(staging_path),
+                                            staging_database_path: Some(staging_database_path),
+                                        }
+                                    }
+                                    Err(error) => StagedOutcome::Failed {
+                                        candidate,
+                                        staging_directory: Some(staging_directory),
+                                        staging_path: Some(staging_path),
+                                        staging_database_path: Some(staging_database_path),
+                                        error: error.context(format!(
+                                            "parsing recovered source after status {:?} wrote {} of {} byte(s)",
+                                            recovery.status, recovery.bytes_written, recovery.total_size
+                                        )),
+                                    },
+                                };
+
+                                let _ = coordinator_tx_parser.send(outcome);
+                            }
+                            drop(coordinator_tx_parser);
+                        });
+                }
+
+                // Drop coordinator's own sender so only active workers hold references
+                drop(coordinator_tx);
+
+                // 3. Coordinator loop on calling thread
+                let mut received_count = 0;
+                while received_count < expected_results {
+                    if let Some(ref tracker) = super::progress::active_job_progress() {
+                        if tracker.is_cancellation_requested() {
+                            result_ref.status = "cancelled".to_string();
                         }
                     }
-                    Err(error) => {
-                        let message = format!(
-                            "{} (entry {}): {error:#}",
-                            candidate.source_path_exact, candidate.entry_id
-                        );
-                        let failure_diagnostics =
-                            diagnostics_for_failed_attempt(&candidate, &error, &message);
-                        persist_failed_attempt(
-                            case_path,
-                            &candidate,
-                            &error,
-                            &failure_diagnostics,
-                        )?;
-                        result.failed_sources = result.failed_sources.saturating_add(1);
-                        kind_counts.failed_sources = kind_counts.failed_sources.saturating_add(1);
-                        diagnostics.merge(&failure_diagnostics);
-                        super::progress::progress_error(Some(candidate.source_path_exact.clone()));
-                        super::progress::progress_skip(Some(candidate.source_path_exact.clone()));
-                        super::progress::progress_truncated(format!(
-                            "{} source {} failed; the prior committed derived rows were preserved",
-                            candidate.kind.key(),
-                            candidate.source_path_exact
-                        ));
+
+                    match coordinator_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(outcome) => {
+                            received_count += 1;
+                            match outcome {
+                                StagedOutcome::Ready {
+                                    candidate,
+                                    staging_directory,
+                                    staging_path,
+                                    staging_database_path,
+                                    recovery,
+                                    summary,
+                                } => {
+                                    let source_label = progress_source_label(&candidate);
+                                    result_ref.candidates_seen =
+                                        result_ref.candidates_seen.saturating_add(1);
+                                    let kind_key = candidate.kind.key().to_string();
+                                    let kind_counts =
+                                        result_ref.per_kind.entry(kind_key).or_default();
+                                    kind_counts.candidates_seen =
+                                        kind_counts.candidates_seen.saturating_add(1);
+                                    if let Some(ref tracker) = active_tracker {
+                                        tracker.set_current_work(
+                                            super::progress::JobProgressPhase::Committing,
+                                            candidate.kind.key(),
+                                            source_label.clone(),
+                                        );
+                                    }
+
+                                    match replace_source_transaction(
+                                        case_path,
+                                        &candidate,
+                                        &staging_database_path,
+                                        &recovery,
+                                        summary,
+                                    ) {
+                                        Ok(summary) => {
+                                            let cleanup_warning = cleanup_staging_paths(
+                                                Some(&staging_path),
+                                                Some(&staging_database_path),
+                                                Some(&staging_directory),
+                                            );
+                                            result_ref.parsed_sources =
+                                                result_ref.parsed_sources.saturating_add(1);
+                                            kind_counts.parsed_sources =
+                                                kind_counts.parsed_sources.saturating_add(1);
+                                            result_ref.derived_entries = result_ref
+                                                .derived_entries
+                                                .saturating_add(summary.derived_entries);
+                                            result_ref.text_segments = result_ref
+                                                .text_segments
+                                                .saturating_add(summary.text_segments);
+                                            kind_counts.derived_entries = kind_counts
+                                                .derived_entries
+                                                .saturating_add(summary.derived_entries);
+                                            kind_counts.text_segments = kind_counts
+                                                .text_segments
+                                                .saturating_add(summary.text_segments);
+
+                                            if summary.partial {
+                                                result_ref.partial_sources =
+                                                    result_ref.partial_sources.saturating_add(1);
+                                                kind_counts.partial_sources =
+                                                    kind_counts.partial_sources.saturating_add(1);
+                                                super::progress::progress_truncated(format!(
+                                                    "{source_label} was parsed with explicitly disclosed partial coverage"
+                                                ));
+                                            }
+                                            super::progress::progress_terminal_outcome(
+                                                if summary.partial {
+                                                    super::progress::ProgressTerminalOutcome::Partial
+                                                } else {
+                                                    super::progress::ProgressTerminalOutcome::Completed
+                                                },
+                                            );
+
+                                            let optional_coverage_incomplete = summary
+                                                .details
+                                                .get("lnk_coverage_complete")
+                                                .and_then(serde_json::Value::as_bool)
+                                                == Some(false);
+                                            if optional_coverage_incomplete {
+                                                result_ref.optional_coverage_incomplete_sources =
+                                                    result_ref
+                                                        .optional_coverage_incomplete_sources
+                                                        .saturating_add(1);
+                                                kind_counts.optional_coverage_incomplete_sources =
+                                                    kind_counts
+                                                        .optional_coverage_incomplete_sources
+                                                        .saturating_add(1);
+                                            }
+
+                                            diagnostics_ref.merge(&summary.diagnostics);
+                                            if let Some(warning) = cleanup_warning {
+                                                diagnostics_ref.push(source_diagnostic(
+                                                    candidate.entry_id,
+                                                    candidate.kind,
+                                                    &candidate.source_path_exact,
+                                                    warning,
+                                                ));
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let message = format!(
+                                                "{} (entry {}): {error:#}",
+                                                candidate.source_path_exact, candidate.entry_id
+                                            );
+                                            let failure_diagnostics =
+                                                diagnostics_for_failed_attempt(
+                                                    &candidate, &error, &message,
+                                                );
+                                            let _ = persist_failed_attempt(
+                                                case_path,
+                                                &candidate,
+                                                &error,
+                                                &failure_diagnostics,
+                                            );
+                                            cleanup_staging_paths(
+                                                Some(&staging_path),
+                                                Some(&staging_database_path),
+                                                Some(&staging_directory),
+                                            );
+                                            result_ref.failed_sources =
+                                                result_ref.failed_sources.saturating_add(1);
+                                            kind_counts.failed_sources =
+                                                kind_counts.failed_sources.saturating_add(1);
+                                            diagnostics_ref.merge(&failure_diagnostics);
+                                            super::progress::progress_error(Some(
+                                                source_label.clone(),
+                                            ));
+                                            super::progress::progress_terminal_outcome(
+                                                super::progress::ProgressTerminalOutcome::Failed,
+                                            );
+                                            super::progress::progress_truncated(format!(
+                                                "{source_label} failed; the prior committed derived rows were preserved"
+                                            ));
+                                        }
+                                    }
+                                    super::progress::progress_advance(source_label);
+                                }
+                                StagedOutcome::Failed {
+                                    candidate,
+                                    staging_directory,
+                                    staging_path,
+                                    staging_database_path,
+                                    error,
+                                } => {
+                                    let source_label = progress_source_label(&candidate);
+                                    result_ref.candidates_seen =
+                                        result_ref.candidates_seen.saturating_add(1);
+                                    let kind_key = candidate.kind.key().to_string();
+                                    let kind_counts =
+                                        result_ref.per_kind.entry(kind_key).or_default();
+                                    kind_counts.candidates_seen =
+                                        kind_counts.candidates_seen.saturating_add(1);
+                                    if let Some(ref tracker) = active_tracker {
+                                        tracker.set_current_work(
+                                            super::progress::JobProgressPhase::Committing,
+                                            candidate.kind.key(),
+                                            source_label.clone(),
+                                        );
+                                    }
+
+                                    let message = format!(
+                                        "{} (entry {}): {error:#}",
+                                        candidate.source_path_exact, candidate.entry_id
+                                    );
+                                    let failure_diagnostics = diagnostics_for_failed_attempt(
+                                        &candidate, &error, &message,
+                                    );
+                                    let _ = persist_failed_attempt(
+                                        case_path,
+                                        &candidate,
+                                        &error,
+                                        &failure_diagnostics,
+                                    );
+                                    cleanup_staging_paths(
+                                        staging_path.as_deref(),
+                                        staging_database_path.as_deref(),
+                                        staging_directory.as_deref(),
+                                    );
+                                    result_ref.failed_sources =
+                                        result_ref.failed_sources.saturating_add(1);
+                                    kind_counts.failed_sources =
+                                        kind_counts.failed_sources.saturating_add(1);
+                                    diagnostics_ref.merge(&failure_diagnostics);
+                                    super::progress::progress_error(Some(source_label.clone()));
+                                    super::progress::progress_terminal_outcome(
+                                        super::progress::ProgressTerminalOutcome::Failed,
+                                    );
+                                    super::progress::progress_truncated(format!(
+                                        "{source_label} failed; the prior committed derived rows were preserved"
+                                    ));
+                                    super::progress::progress_advance(source_label);
+                                }
+                                StagedOutcome::Cancelled {
+                                    candidate,
+                                    staging_directory,
+                                    staging_path,
+                                    staging_database_path,
+                                } => {
+                                    let source_label = progress_source_label(&candidate);
+                                    result_ref.candidates_seen =
+                                        result_ref.candidates_seen.saturating_add(1);
+                                    let kind_key = candidate.kind.key().to_string();
+                                    let kind_counts =
+                                        result_ref.per_kind.entry(kind_key).or_default();
+                                    kind_counts.candidates_seen =
+                                        kind_counts.candidates_seen.saturating_add(1);
+                                    result_ref.cancelled_sources =
+                                        result_ref.cancelled_sources.saturating_add(1);
+                                    kind_counts.cancelled_sources =
+                                        kind_counts.cancelled_sources.saturating_add(1);
+                                    cleanup_staging_paths(
+                                        staging_path.as_deref(),
+                                        staging_database_path.as_deref(),
+                                        staging_directory.as_deref(),
+                                    );
+                                    result_ref.status = "cancelled".to_string();
+                                    super::progress::progress_terminal_outcome(
+                                        super::progress::ProgressTerminalOutcome::Cancelled,
+                                    );
+                                    if let Some(ref tracker) = active_tracker {
+                                        tracker.set_current_work(
+                                            super::progress::JobProgressPhase::Finalizing,
+                                            candidate.kind.key(),
+                                            source_label.clone(),
+                                        );
+                                    }
+                                    super::progress::progress_advance(source_label);
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            break;
+                        }
                     }
                 }
-                super::progress::progress_advance(candidate.source_path_exact.clone());
+            });
+
+            if let Some(tracker) = super::progress::active_job_progress() {
+                if tracker.is_cancellation_requested() {
+                    result.status = "cancelled".to_string();
+                    break;
+                }
             }
         }
     }
 
-    if result.candidates_seen != snapshot.count {
+    if result.candidates_seen != snapshot.count && result.status != "cancelled" {
         result.snapshot_stable = false;
         diagnostics.push(WindowsArtifactDiagnostic {
             source_entry_id: None,
@@ -684,23 +1345,46 @@ pub fn parse_windows_artifacts(
     result.diagnostic_count = diagnostics.total;
     result.diagnostics = diagnostics.samples;
     result.diagnostics_omitted = diagnostics.omitted;
-    result.supported_scope_complete = result.snapshot_stable
+    result.supported_scope_complete = result.status != "cancelled"
+        && result.snapshot_stable
         && result.partial_sources == 0
         && result.reused_partial_sources == 0
         && result.optional_coverage_incomplete_sources == 0
         && result.reused_optional_coverage_incomplete_sources == 0
         && result.failed_sources == 0
         && result.diagnostic_count == 0;
-    result.status = if result.supported_scope_complete {
-        "completed".to_string()
-    } else {
-        "truncated".to_string()
-    };
+    result.status = finalized_pass_status(
+        &result.status,
+        result.supported_scope_complete,
+        result.parsed_sources,
+        result.failed_sources,
+    );
     persist_pass_audit(case_path, &result)?;
     Ok(result)
 }
 
-fn candidate_snapshot(case_path: &Path, evidence_id: i64) -> Result<CandidateSnapshot> {
+fn progress_source_label(candidate: &WindowsArtifactCandidate) -> String {
+    format!("{} source #{}", candidate.kind.key(), candidate.entry_id)
+}
+
+/// Installs the job tracker in a worker thread's local progress context. The
+/// recovery helpers poll that context inside bounded read/decode loops; without
+/// this bridge they can see no cancellation request after candidate intake.
+fn run_with_optional_progress<T>(
+    tracker: Option<&super::progress::JobProgressTracker>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    match tracker {
+        Some(tracker) => super::progress::with_job_progress(tracker, operation),
+        None => operation(),
+    }
+}
+
+fn candidate_snapshot(
+    case_path: &Path,
+    evidence_id: i64,
+    filter: Option<WindowsArtifactFilter>,
+) -> Result<CandidateSnapshot> {
     let conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
     ensure_evidence_source(&conn, case_id, evidence_id)?;
@@ -709,7 +1393,7 @@ fn candidate_snapshot(case_path: &Path, evidence_id: i64) -> Result<CandidateSna
         params![case_id, evidence_id],
         |row| row.get(0),
     )?;
-    candidate_snapshot_conn(&conn, case_id, evidence_id, source_kind == "image")
+    candidate_snapshot_conn(&conn, case_id, evidence_id, source_kind == "image", filter)
 }
 
 fn candidate_snapshot_conn(
@@ -717,9 +1401,11 @@ fn candidate_snapshot_conn(
     case_id: i64,
     evidence_id: i64,
     reuse_committed: bool,
+    filter: Option<WindowsArtifactFilter>,
 ) -> Result<CandidateSnapshot> {
+    let filter_sql = candidate_filter_sql(filter);
     let supported_sql = format!(
-        "SELECT COUNT(*) FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2 {CANDIDATE_FILTER_SQL}"
+        "SELECT COUNT(*) FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2 {filter_sql}"
     );
     let supported_count: i64 =
         conn.query_row(&supported_sql, params![case_id, evidence_id], |row| {
@@ -729,7 +1415,7 @@ fn candidate_snapshot_conn(
         .context("Windows artifact supported source count is negative")?;
     let reused_partial_sql = format!(
         "SELECT COUNT(*) FROM filesystem_entries
-         WHERE case_id = ?1 AND evidence_id = ?2 {CANDIDATE_FILTER_SQL}
+         WHERE case_id = ?1 AND evidence_id = ?2 {filter_sql}
            AND json_extract(metadata_json, '$.windows_artifact_parser_committed.parser_name') = ?3
            AND json_extract(metadata_json, '$.windows_artifact_parser_committed.status') = 'partial'"
     );
@@ -746,7 +1432,7 @@ fn candidate_snapshot_conn(
         .context("Windows artifact reused partial source count is negative")?;
     let reused_optional_coverage_incomplete_sql = format!(
         "SELECT COUNT(*) FROM filesystem_entries
-         WHERE case_id = ?1 AND evidence_id = ?2 {CANDIDATE_FILTER_SQL}
+         WHERE case_id = ?1 AND evidence_id = ?2 {filter_sql}
            AND json_extract(metadata_json, '$.windows_artifact_parser_committed.parser_name') = ?3
            AND json_extract(metadata_json, '$.windows_artifact_parser_committed.status') = 'parsed'
            AND json_extract(metadata_json, '$.windows_artifact_parser_committed.supported_scope_complete') = 0"
@@ -770,7 +1456,7 @@ fn candidate_snapshot_conn(
         ""
     };
     let sql = format!(
-        "SELECT COUNT(*), MAX(id) FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2 {CANDIDATE_FILTER_SQL} {pending_filter}"
+        "SELECT COUNT(*), MAX(id) FROM filesystem_entries WHERE case_id = ?1 AND evidence_id = ?2 {filter_sql} {pending_filter}"
     );
     let (count, max_entry_id): (i64, Option<i64>) =
         conn.query_row(&sql, params![case_id, evidence_id], |row| {
@@ -797,6 +1483,7 @@ fn candidate_page(
     max_entry_id: i64,
     page_size: i64,
     reuse_committed: bool,
+    filter: Option<WindowsArtifactFilter>,
 ) -> Result<Vec<WindowsArtifactCandidate>> {
     let conn = open_existing_case(case_path)?;
     let case_id = active_case_id(&conn)?;
@@ -808,6 +1495,7 @@ fn candidate_page(
         max_entry_id,
         page_size,
         reuse_committed,
+        filter,
     )
 }
 
@@ -819,6 +1507,7 @@ fn candidate_page_conn(
     max_entry_id: i64,
     page_size: i64,
     reuse_committed: bool,
+    filter: Option<WindowsArtifactFilter>,
 ) -> Result<Vec<WindowsArtifactCandidate>> {
     if page_size <= 0 || page_size > CANDIDATE_PAGE_SIZE {
         bail!("Windows artifact candidate page size must be in 1..={CANDIDATE_PAGE_SIZE}");
@@ -828,12 +1517,13 @@ fn candidate_page_conn(
     } else {
         ""
     };
+    let filter_sql = candidate_filter_sql(filter);
     let sql = format!(
         "SELECT id, discovered_by_job_id, logical_path, name, metadata_json, is_deleted
          FROM filesystem_entries
          WHERE case_id = ?1 AND evidence_id = ?2
            AND id > ?3 AND id <= ?4
-           {CANDIDATE_FILTER_SQL}
+           {filter_sql}
            {pending_filter}
          ORDER BY id
          LIMIT ?5"
@@ -1007,137 +1697,6 @@ fn source_supported_scope(kind: WindowsArtifactKind) -> &'static str {
         WindowsArtifactKind::ScheduledTask => {
             "One indexed, recoverable Windows Task Scheduler XML definition; registration, principals, settings, triggers, and actions are decoded without executing the task"
         }
-    }
-}
-
-fn stage_one_source(
-    read_session: &mut WindowsWorkerReadSession,
-    candidate: WindowsArtifactCandidate,
-) -> StagedSourceRecovery {
-    let (staging_directory, staging_path) = match create_unique_recovery_destination(
-        "kdft-windows-source",
-        candidate.entry_id,
-        candidate.kind.staging_suffix(),
-    ) {
-        Ok(paths) => paths,
-        Err(error) => {
-            return StagedSourceRecovery {
-                candidate,
-                staging_directory: None,
-                staging_path: None,
-                staging_database_path: None,
-                parsed: Err(error),
-            };
-        }
-    };
-    let staging_database_path = staging_directory.join("parsed.sqlite");
-    let recovered = match read_session {
-        WindowsWorkerReadSession::Ready(session) => recover_filesystem_entry_in_session(
-            session,
-            RecoverEntryOptions {
-                entry_id: candidate.entry_id,
-                output_path: staging_path.clone(),
-            },
-        )
-        .with_context(|| {
-            format!(
-                "recovering {} source {}",
-                candidate.kind.key(),
-                candidate.source_path_exact
-            )
-        }),
-        WindowsWorkerReadSession::Failed(reason) => Err(anyhow!(
-            "opening a worker-local evidence read session failed: {reason}"
-        )),
-    };
-    let parsed = recovered.and_then(|recovery| {
-        parse_source_to_staging_database(&candidate, &staging_path, &staging_database_path)
-            .with_context(|| {
-                format!(
-                    "parsing recovered source after status {:?} wrote {} of {} byte(s)",
-                    recovery.status, recovery.bytes_written, recovery.total_size
-                )
-            })
-            .map(|summary| (recovery, summary))
-    });
-    StagedSourceRecovery {
-        candidate,
-        staging_directory: Some(staging_directory),
-        staging_path: Some(staging_path),
-        staging_database_path: Some(staging_database_path),
-        parsed,
-    }
-}
-
-fn commit_staged_source(
-    case_path: &Path,
-    staged: StagedSourceRecovery,
-) -> Result<StagedSourceOutcome> {
-    let StagedSourceRecovery {
-        candidate,
-        staging_directory,
-        staging_path,
-        staging_database_path,
-        parsed,
-    } = staged;
-    let parsed = match (parsed, staging_database_path.as_deref()) {
-        (Ok((recovery, summary)), Some(database_path)) => {
-            replace_source_transaction(case_path, &candidate, database_path, &recovery, summary)
-        }
-        (Err(error), _) => Err(error),
-        (Ok(_), None) => Err(anyhow!(
-            "Windows artifact parsing succeeded without a staging database"
-        )),
-    };
-
-    let file_cleanup = match staging_path.as_deref() {
-        Some(path) if path.exists() => fs::remove_file(path).with_context(|| {
-            format!(
-                "removing temporary {} source {}",
-                candidate.kind.key(),
-                path.display()
-            )
-        }),
-        _ => Ok(()),
-    };
-    let database_cleanup = match staging_database_path.as_deref() {
-        Some(path) if path.exists() => fs::remove_file(path).with_context(|| {
-            format!(
-                "removing temporary {} parse database {}",
-                candidate.kind.key(),
-                path.display()
-            )
-        }),
-        _ => Ok(()),
-    };
-    let directory_cleanup = match staging_directory.as_deref() {
-        Some(path) if path.exists() => fs::remove_dir(path).with_context(|| {
-            format!(
-                "removing temporary {} source directory {}",
-                candidate.kind.key(),
-                path.display()
-            )
-        }),
-        _ => Ok(()),
-    };
-    let cleanup = file_cleanup.and(database_cleanup).and(directory_cleanup);
-
-    match (parsed, cleanup) {
-        (Ok(parsed), Ok(())) => Ok(StagedSourceOutcome {
-            parsed,
-            cleanup_warning: None,
-        }),
-        (Ok(parsed), Err(cleanup_error)) => Ok(StagedSourceOutcome {
-            parsed,
-            cleanup_warning: Some(format!(
-                "{} parsed successfully, but its temporary source could not be removed: {cleanup_error:#}",
-                candidate.source_path_exact
-            )),
-        }),
-        (Err(parse_error), Ok(())) => Err(parse_error),
-        (Err(parse_error), Err(cleanup_error)) => Err(parse_error.context(format!(
-            "temporary source cleanup also failed: {cleanup_error:#}"
-        ))),
     }
 }
 
@@ -1461,6 +2020,11 @@ fn parse_scheduled_task_source(
     candidate: &WindowsArtifactCandidate,
     staging_path: &Path,
 ) -> Result<SourceParseSummary> {
+    if let Some(tracker) = super::progress::active_job_progress() {
+        if tracker.is_cancellation_requested() {
+            bail!("Scheduled task parsing cancelled by request");
+        }
+    }
     let max_task_bytes = super::scheduled_task::MAX_SCHEDULED_TASK_SOURCE_BYTES as u64;
     let source_size = fs::metadata(staging_path)
         .with_context(|| {
@@ -1574,6 +2138,11 @@ fn parse_lnk_source(
     candidate: &WindowsArtifactCandidate,
     staging_path: &Path,
 ) -> Result<SourceParseSummary> {
+    if let Some(tracker) = super::progress::active_job_progress() {
+        if tracker.is_cancellation_requested() {
+            bail!("LNK parsing cancelled by request");
+        }
+    }
     let mut file = File::open(staging_path)
         .with_context(|| format!("opening staged LNK {}", candidate.source_path_exact))?;
     let options = LnkParserOptions::default();
@@ -1673,6 +2242,11 @@ fn parse_prefetch_source(
     candidate: &WindowsArtifactCandidate,
     staging_path: &Path,
 ) -> Result<SourceParseSummary> {
+    if let Some(tracker) = super::progress::active_job_progress() {
+        if tracker.is_cancellation_requested() {
+            bail!("Prefetch parsing cancelled by request");
+        }
+    }
     let mut file = File::open(staging_path)
         .with_context(|| format!("opening staged Prefetch {}", candidate.source_path_exact))?;
     // Default construction deliberately tolerates additional parser safety fields (for example
@@ -1803,6 +2377,13 @@ fn parse_evtx_source(
     let mut diagnostics = DiagnosticAccumulator::default();
 
     for record in parser.records_json_value() {
+        if records_seen.is_multiple_of(64) {
+            if let Some(tracker) = super::progress::active_job_progress() {
+                if tracker.is_cancellation_requested() {
+                    bail!("EVTX parsing cancelled by request");
+                }
+            }
+        }
         records_seen = records_seen.saturating_add(1);
         match record {
             Ok(record) => {
@@ -2346,6 +2927,13 @@ impl UsnSink for SqliteUsnSink<'_, '_> {
     type Error = anyhow::Error;
 
     fn record(&mut self, record: &UsnRecord) -> Result<(), Self::Error> {
+        if self.derived_entries.is_multiple_of(128) {
+            if let Some(tracker) = super::progress::active_job_progress() {
+                if tracker.is_cancellation_requested() {
+                    bail!("USN parsing cancelled by request");
+                }
+            }
+        }
         self.ordinal = self.ordinal.saturating_add(1);
         let record_json = usn_record_json(record);
         let display_name = record
@@ -2375,6 +2963,13 @@ impl UsnSink for SqliteUsnSink<'_, '_> {
             "rename_pairing_claim": "none; OLD_NAME and NEW_NAME flags are preserved as independent journal observations and are not presented as a proven pair",
             "usn_record": record_json,
         });
+        if self.ordinal.is_multiple_of(128) {
+            if let Some(tracker) = super::progress::active_job_progress() {
+                if tracker.is_cancellation_requested() {
+                    bail!("USN journal parsing cancelled by examiner request");
+                }
+            }
+        }
         let logical_path = derived_logical_path(
             self.candidate,
             "usn",
@@ -2573,6 +3168,11 @@ impl SqliteJumpListSink<'_, '_> {
             },
             "jumplist": combined,
         });
+        if let Some(tracker) = super::progress::active_job_progress() {
+            if tracker.is_cancellation_requested() {
+                bail!("Jump List parsing cancelled by examiner request");
+            }
+        }
         let logical_path = derived_logical_path(
             self.candidate,
             "jumplist",
@@ -2600,6 +3200,11 @@ impl JumpListSink for SqliteJumpListSink<'_, '_> {
     type Error = anyhow::Error;
 
     fn begin_lnk(&mut self, metadata: &JumpListLnkMetadata) -> Result<(), Self::Error> {
+        if let Some(tracker) = super::progress::active_job_progress() {
+            if tracker.is_cancellation_requested() {
+                bail!("Jump List parsing cancelled by request");
+            }
+        }
         if self.active.is_some() {
             bail!("Jump List sink received begin_lnk while another embedded LNK spool is active");
         }
@@ -3422,6 +4027,34 @@ fn dest_list_metadata_json(metadata: &DestListMetadata) -> serde_json::Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recovery_worker_progress_context_observes_cancellation() {
+        let tracker =
+            crate::progress::JobProgressTracker::new("stage-3-recovery", "windows_artifacts", None);
+        tracker.request_cancellation();
+
+        let observed = run_with_optional_progress(Some(&tracker), || {
+            crate::progress::is_cancellation_requested_active()
+        });
+
+        assert!(observed);
+        assert!(!crate::progress::is_cancellation_requested_active());
+    }
+
+    #[test]
+    fn cancelled_pass_status_is_not_overwritten_during_finalization() {
+        assert_eq!(finalized_pass_status("cancelled", false, 0, 0), "cancelled");
+        assert_eq!(finalized_pass_status("CANCELLED", true, 5, 0), "cancelled");
+        assert_eq!(finalized_pass_status("cancelled", false, 0, 5), "cancelled");
+    }
+
+    #[test]
+    fn non_cancelled_pass_status_reflects_scope_completeness_and_failures() {
+        assert_eq!(finalized_pass_status("completed", true, 5, 0), "completed");
+        assert_eq!(finalized_pass_status("completed", false, 5, 1), "truncated");
+        assert_eq!(finalized_pass_status("completed", false, 0, 5), "failed");
+    }
+
     fn test_connection() -> Result<Connection> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(
@@ -3742,12 +4375,12 @@ mod tests {
             }),
         )?;
 
-        let snapshot = candidate_snapshot_conn(&conn, 1, 7, false)?;
+        let snapshot = candidate_snapshot_conn(&conn, 1, 7, false, None)?;
         assert_eq!(snapshot.supported_count, 3);
         assert_eq!(snapshot.count, 3);
         assert_eq!(snapshot.max_entry_id, Some(3));
 
-        let candidates = candidate_page_conn(&conn, 1, 7, i64::MIN, 3, 8, false)?;
+        let candidates = candidate_page_conn(&conn, 1, 7, i64::MIN, 3, 8, false, None)?;
         assert_eq!(
             candidates
                 .iter()
@@ -3904,7 +4537,7 @@ mod tests {
             [],
         )?;
 
-        let snapshot = candidate_snapshot_conn(&conn, 1, 7, true)?;
+        let snapshot = candidate_snapshot_conn(&conn, 1, 7, true, None)?;
         assert_eq!(snapshot.supported_count, 6);
         assert_eq!(snapshot.reused_partial_count, 1);
         assert_eq!(snapshot.reused_optional_coverage_incomplete_count, 1);
@@ -3918,13 +4551,13 @@ mod tests {
             "later.evtx",
             serde_json::json!({"source_path_exact": "Windows/System32/winevt/Logs/later.evtx"}),
         )?;
-        let first = candidate_page_conn(&conn, 1, 7, i64::MIN, 3, 2, true)?;
+        let first = candidate_page_conn(&conn, 1, 7, i64::MIN, 3, 2, true, None)?;
         assert_eq!(
             first.iter().map(|item| item.entry_id).collect::<Vec<_>>(),
             vec![1, 2]
         );
         assert_eq!(first[1].source_path_exact, "Windows\\Prefetch\\APP.PF");
-        let second = candidate_page_conn(&conn, 1, 7, 2, 3, 2, true)?;
+        let second = candidate_page_conn(&conn, 1, 7, 2, 3, 2, true, None)?;
         assert_eq!(
             second.iter().map(|item| item.entry_id).collect::<Vec<_>>(),
             vec![3]
@@ -4413,6 +5046,249 @@ mod tests {
                 ["previous_committed_results_preserved"],
             true
         );
+        Ok(())
+    }
+
+    #[test]
+    fn windows_artifact_filter_matches_groups() {
+        let mut filter = WindowsArtifactFilter::default();
+        assert!(filter.matches(WindowsArtifactKind::ShellLink));
+        assert!(filter.matches(WindowsArtifactKind::AutomaticJumpList));
+        assert!(filter.matches(WindowsArtifactKind::CustomJumpList));
+        assert!(filter.matches(WindowsArtifactKind::Prefetch));
+        assert!(filter.matches(WindowsArtifactKind::Evtx));
+        assert!(filter.matches(WindowsArtifactKind::ScheduledTask));
+        assert!(filter.matches(WindowsArtifactKind::UsnJournal));
+
+        // Disable prefetch only
+        filter.prefetch = false;
+        assert!(!filter.matches(WindowsArtifactKind::Prefetch));
+        assert!(filter.matches(WindowsArtifactKind::ShellLink));
+
+        // Disable LNK/JumpLists
+        filter.lnk_jump_lists = false;
+        assert!(!filter.matches(WindowsArtifactKind::ShellLink));
+        assert!(!filter.matches(WindowsArtifactKind::AutomaticJumpList));
+        assert!(!filter.matches(WindowsArtifactKind::CustomJumpList));
+
+        // Disable Event logs
+        filter.windows_event_logs = false;
+        assert!(!filter.matches(WindowsArtifactKind::Evtx));
+
+        // Disable Scheduled tasks
+        filter.scheduled_tasks = false;
+        assert!(!filter.matches(WindowsArtifactKind::ScheduledTask));
+
+        // USN Journal is always indexed when encountered
+        assert!(filter.matches(WindowsArtifactKind::UsnJournal));
+    }
+
+    #[test]
+    fn cleanup_staging_paths_removes_all_temporary_files_and_directories() -> Result<()> {
+        let (dir, file) = create_unique_recovery_destination("kdft-test-cleanup", 42, "bin")?;
+        let db_file = dir.join("parsed.sqlite");
+        fs::write(&file, b"test file content")?;
+        fs::write(&db_file, b"test db content")?;
+        assert!(file.exists());
+        assert!(db_file.exists());
+        assert!(dir.exists());
+
+        let warning = cleanup_staging_paths(Some(&file), Some(&db_file), Some(&dir));
+        assert!(warning.is_none());
+        assert!(!file.exists());
+        assert!(!db_file.exists());
+        assert!(!dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn finalized_pass_status_truthful_failure_partial_and_completed_matrix() {
+        // Cancelled always dominates
+        assert_eq!(finalized_pass_status("cancelled", true, 10, 0), "cancelled");
+        assert_eq!(finalized_pass_status("cancelled", false, 0, 5), "cancelled");
+        assert_eq!(finalized_pass_status("CANCELLED", false, 5, 5), "cancelled");
+
+        // Fatal failure: 0 parsed, >0 failed
+        assert_eq!(finalized_pass_status("completed", false, 0, 1), "failed");
+        assert_eq!(finalized_pass_status("completed", false, 0, 100), "failed");
+
+        // Partial / truncated: mixed results or incomplete scope
+        assert_eq!(finalized_pass_status("completed", false, 5, 2), "truncated");
+        assert_eq!(
+            finalized_pass_status("completed", false, 10, 0),
+            "truncated"
+        );
+
+        // Fully completed: scope complete, parsed > 0, failed == 0
+        assert_eq!(finalized_pass_status("completed", true, 10, 0), "completed");
+    }
+
+    #[test]
+    fn single_worker_mode_pipeline_liveness_and_terminal_outcomes() -> Result<()> {
+        let candidates = vec![
+            candidate(
+                101,
+                "/a.lnk",
+                "a.lnk",
+                "C:\\Users\\a.lnk",
+                WindowsArtifactKind::ShellLink,
+            ),
+            candidate(
+                102,
+                "/b.lnk",
+                "b.lnk",
+                "C:\\Users\\b.lnk",
+                WindowsArtifactKind::ShellLink,
+            ),
+        ];
+        let expected_results = candidates.len();
+        let worker_threads = 1;
+        let worker_queue_capacity = 4;
+        let (recovery_tx, recovery_rx) =
+            std::sync::mpsc::sync_channel::<RecoveredSource>(worker_queue_capacity);
+        let recovery_rx = Arc::new(Mutex::new(recovery_rx));
+        let (coordinator_tx, coordinator_rx) =
+            std::sync::mpsc::sync_channel::<StagedOutcome>(worker_queue_capacity);
+
+        std::thread::scope(|s| {
+            // Recovery lane
+            let recovery_tx_lane = recovery_tx;
+            let coordinator_tx_recovery = coordinator_tx.clone();
+            let candidates_ref = &candidates;
+
+            s.spawn(move || {
+                for candidate in candidates_ref {
+                    // Simulate failed recovery
+                    let _ = coordinator_tx_recovery.send(StagedOutcome::Failed {
+                        candidate: candidate.clone(),
+                        staging_directory: None,
+                        staging_path: None,
+                        staging_database_path: None,
+                        error: anyhow!("simulated recovery failure in test"),
+                    });
+                }
+                drop(recovery_tx_lane);
+                drop(coordinator_tx_recovery);
+            });
+
+            // Parser worker (1 thread)
+            for _ in 0..worker_threads {
+                let recovery_rx_worker = Arc::clone(&recovery_rx);
+                let coordinator_tx_parser = coordinator_tx.clone();
+                s.spawn(move || {
+                    while let Ok(lock) = recovery_rx_worker.lock() {
+                        if lock.recv().is_err() {
+                            break;
+                        }
+                    }
+                    drop(coordinator_tx_parser);
+                });
+            }
+
+            drop(coordinator_tx);
+
+            // Coordinator loop
+            let mut received_count = 0;
+            while received_count < expected_results {
+                match coordinator_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(outcome) => {
+                        received_count += 1;
+                        match outcome {
+                            StagedOutcome::Failed { candidate, .. } => {
+                                assert!(candidate.entry_id == 101 || candidate.entry_id == 102);
+                            }
+                            _ => panic!("unexpected outcome"),
+                        }
+                    }
+                    Err(e) => panic!("coordinator timed out in single worker test: {e}"),
+                }
+            }
+            assert_eq!(received_count, expected_results);
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn two_worker_mode_cancellation_delivers_terminal_outcome_for_all() -> Result<()> {
+        let candidates = vec![
+            candidate(
+                201,
+                "/x.lnk",
+                "x.lnk",
+                "C:\\Users\\x.lnk",
+                WindowsArtifactKind::ShellLink,
+            ),
+            candidate(
+                202,
+                "/y.lnk",
+                "y.lnk",
+                "C:\\Users\\y.lnk",
+                WindowsArtifactKind::ShellLink,
+            ),
+            candidate(
+                203,
+                "/z.lnk",
+                "z.lnk",
+                "C:\\Users\\z.lnk",
+                WindowsArtifactKind::ShellLink,
+            ),
+        ];
+        let expected_results = candidates.len();
+        let worker_threads = 2;
+        let worker_queue_capacity = 4;
+        let (recovery_tx, recovery_rx) =
+            std::sync::mpsc::sync_channel::<RecoveredSource>(worker_queue_capacity);
+        let recovery_rx = Arc::new(Mutex::new(recovery_rx));
+        let (coordinator_tx, coordinator_rx) =
+            std::sync::mpsc::sync_channel::<StagedOutcome>(worker_queue_capacity);
+
+        std::thread::scope(|s| {
+            let recovery_tx_lane = recovery_tx;
+            let coordinator_tx_recovery = coordinator_tx.clone();
+            let candidates_ref = &candidates;
+
+            s.spawn(move || {
+                for candidate in candidates_ref {
+                    // Simulate immediate cancellation
+                    let _ = coordinator_tx_recovery.send(StagedOutcome::Cancelled {
+                        candidate: candidate.clone(),
+                        staging_directory: None,
+                        staging_path: None,
+                        staging_database_path: None,
+                    });
+                }
+                drop(recovery_tx_lane);
+                drop(coordinator_tx_recovery);
+            });
+
+            for _ in 0..worker_threads {
+                let recovery_rx_worker = Arc::clone(&recovery_rx);
+                let coordinator_tx_parser = coordinator_tx.clone();
+                s.spawn(move || {
+                    while let Ok(lock) = recovery_rx_worker.lock() {
+                        if lock.recv().is_err() {
+                            break;
+                        }
+                    }
+                    drop(coordinator_tx_parser);
+                });
+            }
+
+            drop(coordinator_tx);
+
+            let mut cancelled_count = 0;
+            while cancelled_count < expected_results {
+                match coordinator_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(StagedOutcome::Cancelled { candidate, .. }) => {
+                        cancelled_count += 1;
+                        assert!(candidate.entry_id >= 201 && candidate.entry_id <= 203);
+                    }
+                    Ok(_) => panic!("expected Cancelled outcome"),
+                    Err(e) => panic!("cancellation timeout: {e}"),
+                }
+            }
+            assert_eq!(cancelled_count, expected_results);
+        });
         Ok(())
     }
 }
