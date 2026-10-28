@@ -319,6 +319,12 @@ mod tests {
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    fn fixture_path(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join("kdft-parser-adapter-manifest-tests")
+            .join(name)
+    }
+
     fn manifest() -> ParserRunManifest {
         let descriptor = AdapterDescriptor {
             adapter_id: "evtxecmd-json-v1".to_string(),
@@ -330,8 +336,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         };
+        let executable_path = fixture_path("EvtxECmd.exe");
+        let run_directory = fixture_path("run");
         let executable = ExecutableIdentity {
-            path: PathBuf::from("C:\\Tools\\EvtxECmd.exe"),
+            path: executable_path.clone(),
             sha256: SHA_A.to_string(),
             size_bytes: 10,
         };
@@ -356,16 +364,18 @@ mod tests {
             tool_lock,
             parser_version_reported: Some("2026.5.0".to_string()),
             command: LockedCommand {
-                program: PathBuf::from("C:\\Tools\\EvtxECmd.exe"),
+                program: executable_path,
                 argv: vec![
                     "-f".to_string(),
-                    "C:\\stage\\Security.evtx".to_string(),
+                    fixture_path("stage-Security.evtx")
+                        .to_string_lossy()
+                        .into_owned(),
                     "--json".to_string(),
-                    "C:\\run\\output".to_string(),
+                    fixture_path("run-output").to_string_lossy().into_owned(),
                     "--jsonf".to_string(),
                     "events.json".to_string(),
                 ],
-                working_directory: PathBuf::from("C:\\run"),
+                working_directory: run_directory,
             },
             configuration: SecretSafeConfiguration::empty(),
             limits: RunLimits {

@@ -697,6 +697,12 @@ mod tests {
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    fn fixture_path(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join("kdft-parser-adapter-contract-tests")
+            .join(name)
+    }
+
     fn lock() -> ToolLock {
         ToolLock {
             adapter_id: "mftecmd-json-v1".to_string(),
@@ -705,7 +711,7 @@ mod tests {
             source_repository: "https://github.com/EricZimmerman/MFTECmd".to_string(),
             source_commit: "6aadd87ae0526efca95dd5a59e62e186806cd4c8".to_string(),
             executable: ExecutableIdentity {
-                path: PathBuf::from("C:\\Tools\\MFTECmd.exe"),
+                path: fixture_path("MFTECmd.exe"),
                 sha256: SHA_A.to_string(),
                 size_bytes: 42,
             },
@@ -729,29 +735,32 @@ mod tests {
 
     #[test]
     fn locked_command_uses_discrete_argv_and_rejects_unknown_switches() {
+        let lock = lock();
         let mut command = LockedCommand {
-            program: PathBuf::from("C:\\Tools\\MFTECmd.exe"),
+            program: lock.executable.path.clone(),
             argv: vec![
                 "-f".to_string(),
-                "C:\\staged\\$MFT".to_string(),
+                fixture_path("staged-$MFT").to_string_lossy().into_owned(),
                 "--json".to_string(),
-                "C:\\output & literal".to_string(),
+                fixture_path("output & literal")
+                    .to_string_lossy()
+                    .into_owned(),
             ],
-            working_directory: PathBuf::from("C:\\run"),
+            working_directory: fixture_path("run"),
         };
-        lock().validate_command(&command).unwrap();
+        lock.validate_command(&command).unwrap();
         command.argv.push("--sync".to_string());
-        assert!(lock().validate_command(&command).is_err());
+        assert!(lock.validate_command(&command).is_err());
     }
 
     #[test]
     fn observed_executable_must_match_the_locked_hash_and_size() {
         let lock = lock();
-        lock.verify_observed_executable(Path::new("C:\\Tools\\MFTECmd.exe"), SHA_A, 42)
+        lock.verify_observed_executable(&lock.executable.path, SHA_A, 42)
             .unwrap();
         assert!(lock
             .verify_observed_executable(
-                Path::new("C:\\Tools\\MFTECmd.exe"),
+                &lock.executable.path,
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 42,
             )
