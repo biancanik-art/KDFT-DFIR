@@ -149,6 +149,7 @@ pub struct KDFTDesktopApp {
     pub folder_hash_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub pending_intake_verification: Option<kdft_desktop_core::EvidenceIntegrityRequest>,
     pub hex_viewer_origin_tab: Option<TopLevelTab>,
+    startup_window_restore_frames: u8,
 }
 
 impl KDFTDesktopApp {
@@ -283,6 +284,7 @@ impl KDFTDesktopApp {
             folder_hash_cancel: None,
             pending_intake_verification: None,
             hex_viewer_origin_tab: None,
+            startup_window_restore_frames: 4,
         };
 
         if let Some(path) = initial_case_path {
@@ -304,6 +306,18 @@ impl KDFTDesktopApp {
             || self.integrity_pending.is_some()
             || self.folder_export_pending.is_some()
             || self.folder_hash_pending.is_some()
+    }
+
+    fn restore_startup_window(&mut self, context: &egui::Context) {
+        if self.startup_window_restore_frames == 0 {
+            return;
+        }
+
+        context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        context.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.startup_window_restore_frames -= 1;
+        context.request_repaint_after(Duration::from_millis(50));
     }
 
     pub fn clear_inspector(&mut self) {
@@ -3673,6 +3687,7 @@ impl KDFTDesktopApp {
 impl eframe::App for KDFTDesktopApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.restore_startup_window(&ctx);
         self.apply_theme(&ctx);
         self.handle_close_request(&ctx);
 
