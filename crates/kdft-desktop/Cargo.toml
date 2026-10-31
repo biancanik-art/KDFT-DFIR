@@ -17,6 +17,7 @@ eframe = { version = "0.37.0", default-features = false, features = [
     "glow",
     "system_fonts",
     "wayland",
+    "wgpu",
     "x11",
 ] }
 kdft-case = { path = "../kdft-case" }
